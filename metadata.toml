@@ -1,0 +1,11 @@
+# Use $REPO/docs/conventions/metadata.md
+[repo]
+product = "@zed-rbf"
+owner = "tom-rigelblu"
+workblock_prefixes = ['ZED', 'NW']  # Array of workblock identifiers jj validates on git push
+
+[project]
+type = "product"                    # what this dir is: product | project
+product_id = ["zed"]                # short id prefix(es) this product ships, e.g. ["lum"]
+project_type = "new capabilities"   # set by prj-setup at scaffold: new venture | new product | new features | ...
+rb_drive_store = "zed-rbf-drive"    # per-product dedicated store — payload at the store root; omit → shared default store namespaced by repo-relative path
