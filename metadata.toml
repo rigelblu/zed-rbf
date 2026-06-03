@@ -1,0 +1,8 @@
+[repo]
+product = "@zed-rbf"
+owner = "tom-rigelblu"
+
+[project]
+project_type = "new capabilities"
+product_id = ["zed"]
+rb_drive_store = "zed-rbf-drive"
