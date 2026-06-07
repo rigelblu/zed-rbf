@@ -70,6 +70,7 @@ mod markdown_actions;
 mod navigation;
 mod rewrap;
 mod selection;
+mod ymd;
 
 pub(crate) use actions::*;
 pub use clipboard::ClipboardSelection;
@@ -2398,6 +2399,7 @@ impl Editor {
 
         editor.applicable_language_settings = editor.fetch_applicable_language_settings(cx);
         editor.accent_data = editor.fetch_accent_data(cx);
+        editor.refresh_ymd_highlights(cx);
 
         if let Some(breakpoints) = editor.breakpoint_store.as_ref() {
             editor
@@ -9230,6 +9232,82 @@ impl Editor {
         }
     }
 
+    fn clear_ymd_highlights(&mut self, cx: &mut Context<Self>) {
+        self.clear_highlights_with(
+            &mut |key| {
+                matches!(
+                    key,
+                    HighlightKey::YmdBackground(_) | HighlightKey::YmdLineForeground(_)
+                )
+            },
+            cx,
+        );
+    }
+
+    fn refresh_ymd_highlights(&mut self, cx: &mut Context<Self>) {
+        self.clear_ymd_highlights(cx);
+
+        let Some((snapshot, text)) = ({
+            let buffer = self.buffer.read(cx);
+            let Some(singleton_buffer) = buffer.as_singleton() else {
+                return;
+            };
+            let singleton_buffer = singleton_buffer.read(cx);
+            let is_markdown = singleton_buffer
+                .language()
+                .is_some_and(|language| language.name().as_ref() == "Markdown");
+            if !is_markdown {
+                return;
+            }
+
+            let snapshot = buffer.snapshot(cx);
+            (snapshot.len().0 <= ymd::MAX_YMD_HIGHLIGHT_BYTES).then(|| {
+                let text = snapshot.text();
+                (snapshot, text)
+            })
+        }) else {
+            return;
+        };
+
+        let mut background_ranges: [Vec<Range<Anchor>>; 8] = std::array::from_fn(|_| Vec::new());
+        let mut line_foreground_ranges: [Vec<Range<Anchor>>; 8] =
+            std::array::from_fn(|_| Vec::new());
+
+        for highlight in ymd::scan(&text) {
+            let anchor_range = snapshot.anchor_before(MultiBufferOffset(highlight.range.start))
+                ..snapshot.anchor_after(MultiBufferOffset(highlight.range.end));
+            match highlight.kind {
+                ymd::YmdHighlightKind::Background(color) => {
+                    background_ranges[color.index()].push(anchor_range);
+                }
+                ymd::YmdHighlightKind::LineForeground(color) => {
+                    line_foreground_ranges[color.index()].push(anchor_range);
+                }
+            }
+        }
+
+        let appearance = cx.theme().appearance;
+        for color in ymd::YmdColor::ALL {
+            let index = color.index();
+            if !line_foreground_ranges[index].is_empty() {
+                self.highlight_text(
+                    HighlightKey::YmdLineForeground(index),
+                    mem::take(&mut line_foreground_ranges[index]),
+                    ymd::line_foreground_style(color, appearance),
+                    cx,
+                );
+            }
+            if !background_ranges[index].is_empty() {
+                self.highlight_text(
+                    HighlightKey::YmdBackground(index),
+                    mem::take(&mut background_ranges[index]),
+                    ymd::background_style(color, appearance),
+                    cx,
+                );
+            }
+        }
+    }
+
     pub fn show_local_cursors(&self, window: &mut Window, cx: &mut App) -> bool {
         (self.read_only(cx) || self.blink_manager.read(cx).visible())
             && self.focus_handle.is_focused(window)
@@ -9422,6 +9500,7 @@ impl Editor {
                 self.bracket_fetched_tree_sitter_chunks
                     .retain(|range, _| range.start.buffer_id != buffer_id);
                 self.colorize_brackets(false, cx);
+                self.refresh_ymd_highlights(cx);
                 self.refresh_selected_text_highlights(&self.display_snapshot(cx), true, window, cx);
                 self.semantic_token_state.invalidate_buffer(&buffer_id);
                 cx.emit(EditorEvent::BufferRangesUpdated {
@@ -9463,6 +9542,7 @@ impl Editor {
                 self.display_map.update(cx, |map, cx| {
                     map.unfold_buffers(buffer_ids.iter().copied(), cx)
                 });
+                self.refresh_ymd_highlights(cx);
                 cx.emit(EditorEvent::BuffersEdited {
                     buffer_ids: buffer_ids.clone(),
                 });
@@ -9471,6 +9551,7 @@ impl Editor {
                 self.refresh_runnables(Some(*buffer_id), window, cx);
                 self.refresh_selected_text_highlights(&self.display_snapshot(cx), true, window, cx);
                 self.colorize_brackets(true, cx);
+                self.refresh_ymd_highlights(cx);
                 jsx_tag_auto_close::refresh_enabled_in_any_buffer(self, multibuffer, cx);
 
                 cx.emit(EditorEvent::Reparsed(*buffer_id));
@@ -9485,6 +9566,7 @@ impl Editor {
                 jsx_tag_auto_close::refresh_enabled_in_any_buffer(self, multibuffer, cx);
                 cx.emit(EditorEvent::Reparsed(*buffer_id));
                 self.update_edit_prediction_settings(cx);
+                self.refresh_ymd_highlights(cx);
                 cx.notify();
             }
             multi_buffer::Event::DirtyChanged => cx.emit(EditorEvent::DirtyChanged),
@@ -9650,6 +9732,7 @@ impl Editor {
             if language_settings_changed || accents_changed {
                 self.colorize_brackets(true, cx);
             }
+            self.refresh_ymd_highlights(cx);
 
             if language_settings_changed {
                 self.clear_disabled_lsp_folding_ranges(window, cx);
@@ -9721,6 +9804,7 @@ impl Editor {
 
         self.invalidate_semantic_tokens(None);
         self.refresh_semantic_tokens(None, None, cx);
+        self.refresh_ymd_highlights(cx);
         self.refresh_outline_symbols_at_cursor(cx);
     }
 
