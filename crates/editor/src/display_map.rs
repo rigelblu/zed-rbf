@@ -185,6 +185,12 @@ pub enum HighlightKey {
     SearchWithinRange,
     SelectedTextHighlight,
     SyntaxTreeView(usize),
+    // Note YmdBackground must sort after YmdLineForeground: on overlap the later
+    // key's style wins the fold, which lets a highlight span keep its own readable
+    // foreground over the whole-line color. Both stay before VimExchange so an
+    // active exchange still reads over YMD styling.
+    YmdLineForeground(usize),
+    YmdBackground(usize),
     VimExchange,
 }
 
