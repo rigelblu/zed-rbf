@@ -28,6 +28,18 @@ pub(crate) struct YmdHighlight {
     pub kind: YmdHighlightKind,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct YmdConceal {
+    pub range: Range<usize>,
+}
+
+struct YmdInlineHighlight {
+    range: Range<usize>,
+    open_marker_range: Range<usize>,
+    close_marker_range: Range<usize>,
+    color: YmdColor,
+}
+
 impl YmdColor {
     pub const ALL: [Self; 8] = [
         Self::Default,
@@ -169,6 +181,23 @@ pub(crate) fn scan(text: &str) -> Vec<YmdHighlight> {
     highlights
 }
 
+pub(crate) fn scan_conceals(text: &str) -> Vec<YmdConceal> {
+    let mut conceals = Vec::new();
+    let mut line_start = 0;
+
+    for line in text.split_inclusive('\n') {
+        let line_end = line_start + line.len();
+        let line_content_end = line_end - usize::from(line.ends_with('\n'));
+        let line_content = &text[line_start..line_content_end];
+
+        scan_line_conceals(line_content, line_start, &mut conceals);
+
+        line_start = line_end;
+    }
+
+    conceals
+}
+
 // An emoji captured by a valid `==...==` highlight pair belongs to the background
 // mechanism only; any emoji outside valid pairs is standalone and the first one
 // colors the whole line's foreground.
@@ -195,7 +224,32 @@ fn scan_line_backgrounds(
     line_start: usize,
     highlights: &mut Vec<YmdHighlight>,
 ) -> Vec<Range<usize>> {
-    let mut marker_ranges = Vec::new();
+    scan_line_background_markups(line, line_start)
+        .into_iter()
+        .map(|inline_highlight| {
+            highlights.push(YmdHighlight {
+                range: inline_highlight.range,
+                kind: YmdHighlightKind::Background(inline_highlight.color),
+            });
+            inline_highlight.open_marker_range.start - line_start
+                ..inline_highlight.close_marker_range.end - line_start
+        })
+        .collect()
+}
+
+fn scan_line_conceals(line: &str, line_start: usize, conceals: &mut Vec<YmdConceal>) {
+    for inline_highlight in scan_line_background_markups(line, line_start) {
+        conceals.push(YmdConceal {
+            range: inline_highlight.open_marker_range,
+        });
+        conceals.push(YmdConceal {
+            range: inline_highlight.close_marker_range,
+        });
+    }
+}
+
+fn scan_line_background_markups(line: &str, line_start: usize) -> Vec<YmdInlineHighlight> {
+    let mut inline_highlights = Vec::new();
     let mut search_start = 0;
 
     while let Some(open_relative) = line[search_start..].find("==") {
@@ -212,18 +266,19 @@ fn scan_line_backgrounds(
                 YmdColor::from_emoji(content).unwrap_or((YmdColor::Default, 0));
             let highlight_start = content_start + marker_len;
             if highlight_start < close {
-                highlights.push(YmdHighlight {
+                inline_highlights.push(YmdInlineHighlight {
                     range: line_start + highlight_start..line_start + close,
-                    kind: YmdHighlightKind::Background(color),
+                    open_marker_range: line_start + open..line_start + content_start + marker_len,
+                    close_marker_range: line_start + close..line_start + close + 2,
+                    color,
                 });
-                marker_ranges.push(open..close + 2);
             }
         }
 
         search_start = close + 2;
     }
 
-    marker_ranges
+    inline_highlights
 }
 
 #[cfg(test)]
@@ -242,6 +297,14 @@ mod tests {
     }
 
     #[test]
+    fn scans_default_conceal_ranges() {
+        assert_eq!(
+            scan_conceals("==hello=="),
+            vec![YmdConceal { range: 0..2 }, YmdConceal { range: 7..9 },]
+        );
+    }
+
+    #[test]
     fn scans_emoji_background_highlight_without_emoji_marker() {
         assert_eq!(
             scan("==🔴urgent=="),
@@ -253,9 +316,21 @@ mod tests {
     }
 
     #[test]
+    fn scans_emoji_conceal_ranges_with_emoji_marker() {
+        assert_eq!(
+            scan_conceals("==🔴urgent=="),
+            vec![YmdConceal { range: 0..6 }, YmdConceal { range: 12..14 },]
+        );
+    }
+
+    #[test]
     fn ignores_empty_and_unterminated_highlights() {
         assert!(scan("====").is_empty());
         assert!(scan("==missing close").is_empty());
+        assert!(scan_conceals("====").is_empty());
+        assert!(scan_conceals("==missing close").is_empty());
+        assert!(scan_conceals("==🔴==").is_empty());
+        assert!(scan_conceals("==🔴 open").is_empty());
     }
 
     #[test]
@@ -304,6 +379,10 @@ mod tests {
                 range: 2..8,
                 kind: YmdHighlightKind::Background(YmdColor::Default),
             }]
+        );
+        assert_eq!(
+            scan_conceals("==a🔴b=="),
+            vec![YmdConceal { range: 0..2 }, YmdConceal { range: 8..10 },]
         );
     }
 
@@ -374,6 +453,7 @@ mod tests {
                 kind: YmdHighlightKind::LineForeground(YmdColor::Blue),
             }]
         );
+        assert!(scan_conceals("==🔵 starts\nends==").is_empty());
     }
 
     #[test]
