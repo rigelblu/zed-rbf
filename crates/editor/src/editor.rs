@@ -436,6 +436,7 @@ struct YmdConcealCache {
     buffer_id: BufferId,
     buffer_version: clock::Global,
     conceal_ranges: Vec<Range<usize>>,
+    conceal_rows: Vec<u32>,
     folded: HashSet<(usize, usize)>,
 }
 
@@ -1203,6 +1204,7 @@ pub struct Editor {
     refresh_folding_ranges_task: Task<()>,
     ymd_concealed: bool,
     ymd_conceal_cache: Option<YmdConcealCache>,
+    ymd_revealed_rows: HashSet<MultiBufferRow>,
     inlay_hints: Option<LspInlayHintData>,
     folding_newlines: Task<()>,
     select_next_is_case_sensitive: Option<bool>,
@@ -1780,6 +1782,7 @@ impl Editor {
         clone.searchable = self.searchable;
         clone.read_only = self.read_only;
         clone.ymd_concealed = self.ymd_concealed;
+        clone.ymd_revealed_rows = self.ymd_revealed_rows.clone();
         clone.buffers_with_disabled_indent_guides =
             self.buffers_with_disabled_indent_guides.clone();
         clone.enable_mouse_wheel_zoom = self.enable_mouse_wheel_zoom;
@@ -2401,6 +2404,7 @@ impl Editor {
             post_scroll_update: Task::ready(()),
             ymd_concealed: true,
             ymd_conceal_cache: None,
+            ymd_revealed_rows: HashSet::default(),
             linked_edit_ranges: Default::default(),
             in_project_search: false,
             previous_search_ranges: None,
@@ -9331,10 +9335,20 @@ impl Editor {
             cache.folded = desired_set;
         }
 
+        self.apply_ymd_conceal_fold_delta(to_remove, to_insert, cx);
+    }
+
+    fn apply_ymd_conceal_fold_delta(
+        &mut self,
+        to_remove: Vec<Range<MultiBufferOffset>>,
+        to_insert: Vec<Range<usize>>,
+        cx: &mut Context<Self>,
+    ) {
         if to_remove.is_empty() && to_insert.is_empty() {
             return;
         }
 
+        let buffer_snapshot = self.buffer.read(cx).snapshot(cx);
         let placeholder = ymd_conceal_fold_placeholder();
         let creases = to_insert
             .into_iter()
@@ -9349,7 +9363,7 @@ impl Editor {
             // Exact stale ranges only: conceal folds are mutually non-overlapping,
             // and strict intersection leaves touching neighbors alone.
             if !to_remove.is_empty() {
-                map.remove_folds_with_type(to_remove, type_id, cx);
+                map.remove_folds_with_type(to_remove, ymd_conceal_fold_type_id(), cx);
             }
             if !creases.is_empty() {
                 map.fold(creases, cx);
@@ -9364,25 +9378,109 @@ impl Editor {
         self.active_indent_guides_state.dirty = true;
     }
 
+    fn is_ymd_markdown_singleton(&self, cx: &App) -> bool {
+        self.buffer
+            .read(cx)
+            .as_singleton()
+            .is_some_and(|singleton_buffer| {
+                singleton_buffer
+                    .read(cx)
+                    .language()
+                    .is_some_and(|language| language.name().as_ref() == "Markdown")
+            })
+    }
+
     fn ymd_markdown_snapshot_and_text(
         &self,
         cx: &mut Context<Self>,
     ) -> Option<(MultiBufferSnapshot, String)> {
-        let buffer = self.buffer.read(cx);
-        let singleton_buffer = buffer.as_singleton()?;
-        let singleton_buffer = singleton_buffer.read(cx);
-        let is_markdown = singleton_buffer
-            .language()
-            .is_some_and(|language| language.name().as_ref() == "Markdown");
-        if !is_markdown {
+        if !self.is_ymd_markdown_singleton(cx) {
             return None;
         }
 
-        let snapshot = buffer.snapshot(cx);
+        let snapshot = self.buffer.read(cx).snapshot(cx);
         (snapshot.len().0 <= ymd::MAX_YMD_HIGHLIGHT_BYTES).then(|| {
             let text = snapshot.text();
             (snapshot, text)
         })
+    }
+
+    fn ymd_cursor_rows(&self, display_snapshot: &DisplaySnapshot) -> HashSet<MultiBufferRow> {
+        self.selections
+            .all::<Point>(display_snapshot)
+            .into_iter()
+            .map(|selection| MultiBufferRow(selection.head().row))
+            .collect()
+    }
+
+    fn refresh_ymd_conceals_for_selection_change(&mut self, cx: &mut Context<Self>) {
+        // Markdown gate FIRST: the language cannot change mid-cursor-move and
+        // non-Markdown buffers have no conceal folds to clear, so they exit
+        // before any snapshot or fold work. (The language-change refresh path
+        // keeps clear-before-gate — a different invariant.) The revealed-state
+        // gate matches: while revealed there is nothing to re-conceal per row.
+        if !self.ymd_concealed || !self.is_ymd_markdown_singleton(cx) {
+            return;
+        }
+        // O(1) cap check before any snapshot work: above-cap buffers never
+        // update the reveal row set (it lives behind the cap gate), so without
+        // this they would re-run the snapshot and fold scan on every selection
+        // change, including column-only motion.
+        if self.buffer.read(cx).snapshot(cx).len().0 > ymd::MAX_YMD_HIGHLIGHT_BYTES {
+            return;
+        }
+
+        let display_snapshot = self
+            .display_map
+            .update(cx, |display_map, cx| display_map.snapshot(cx));
+        let cursor_rows = self.ymd_cursor_rows(&display_snapshot);
+        if cursor_rows == self.ymd_revealed_rows {
+            return;
+        }
+
+        // FAST PATH: with a valid scan cache the desired fold set is pure set
+        // math over cached ranges and rows — no scanner run, no buffer-text
+        // materialization, no display-map fold query. Only the row delta
+        // touches the display map.
+        let cache_delta = self
+            .ymd_singleton_buffer_identity(cx)
+            .and_then(|(buffer_id, buffer_version)| {
+                let cache = self.ymd_conceal_cache.as_ref()?;
+                (cache.buffer_id == buffer_id && cache.buffer_version == buffer_version)
+                    .then_some(cache)
+            })
+            .map(|cache| {
+                let desired_set: HashSet<(usize, usize)> = cache
+                    .conceal_ranges
+                    .iter()
+                    .zip(&cache.conceal_rows)
+                    .filter(|(_, row)| !cursor_rows.contains(&MultiBufferRow(**row)))
+                    .map(|(range, _)| (range.start, range.end))
+                    .collect();
+                let to_remove: Vec<Range<MultiBufferOffset>> = cache
+                    .folded
+                    .iter()
+                    .filter(|range| !desired_set.contains(range))
+                    .map(|&(start, end)| MultiBufferOffset(start)..MultiBufferOffset(end))
+                    .collect();
+                let to_insert: Vec<Range<usize>> = desired_set
+                    .iter()
+                    .filter(|range| !cache.folded.contains(range))
+                    .map(|&(start, end)| start..end)
+                    .collect();
+                (desired_set, to_remove, to_insert)
+            });
+
+        if let Some((desired_set, to_remove, to_insert)) = cache_delta {
+            self.ymd_revealed_rows = cursor_rows;
+            if let Some(cache) = self.ymd_conceal_cache.as_mut() {
+                cache.folded = desired_set;
+            }
+            self.apply_ymd_conceal_fold_delta(to_remove, to_insert, cx);
+            return;
+        }
+
+        self.refresh_ymd_conceals_with_cursor_rows(cursor_rows, cx);
     }
 
     fn refresh_ymd_decorations(&mut self, cx: &mut Context<Self>) {
@@ -9443,36 +9541,75 @@ impl Editor {
     }
 
     // The conceal-fold set concealed mode wants right now; empty when the buffer
-    // is not a YMD surface. Served from the version-keyed cache when the buffer
-    // has not changed, so repeated calls (toggle presses, cursor motion at
-    // `#zed-03`) never re-run the scanner.
-    fn ymd_desired_conceal_ranges(&mut self, cx: &mut Context<Self>) -> Vec<Range<usize>> {
+    // is not a YMD surface. Marker folds on cursor-head rows are excluded, and
+    // the reveal row set updates here, behind the Markdown-and-cap gate, so
+    // non-YMD editors never carry reveal state. Scan results (ranges plus their
+    // rows) are served from the identity-keyed cache when the buffer has not
+    // changed, so toggle presses and cursor motion never re-run the scanner.
+    // Validity includes the Markdown gate: a language flip does not bump the
+    // buffer version.
+    fn ymd_desired_conceal_ranges(
+        &mut self,
+        cursor_rows: Option<HashSet<MultiBufferRow>>,
+        cx: &mut Context<Self>,
+    ) -> Vec<Range<usize>> {
         let Some((buffer_id, buffer_version)) = self.ymd_singleton_buffer_identity(cx) else {
             self.ymd_conceal_cache = None;
             return Vec::new();
         };
-        if let Some(cache) = self.ymd_conceal_cache.as_ref()
-            && cache.buffer_id == buffer_id
-            && cache.buffer_version == buffer_version
-        {
-            return cache.conceal_ranges.clone();
+
+        let cache_is_valid = self.ymd_conceal_cache.as_ref().is_some_and(|cache| {
+            cache.buffer_id == buffer_id && cache.buffer_version == buffer_version
+        }) && self.is_ymd_markdown_singleton(cx);
+
+        if !cache_is_valid {
+            let Some((snapshot, text)) = self.ymd_markdown_snapshot_and_text(cx) else {
+                self.ymd_conceal_cache = None;
+                return Vec::new();
+            };
+            let conceal_ranges: Vec<Range<usize>> = ymd::scan_conceals(&text)
+                .into_iter()
+                .map(|conceal| conceal.range)
+                .collect();
+            let conceal_rows = conceal_ranges
+                .iter()
+                .map(|range| MultiBufferOffset(range.start).to_point(&snapshot).row)
+                .collect();
+            self.ymd_conceal_cache = Some(YmdConcealCache {
+                buffer_id,
+                buffer_version,
+                conceal_ranges,
+                conceal_rows,
+                folded: HashSet::default(),
+            });
         }
 
-        let Some((_, text)) = self.ymd_markdown_snapshot_and_text(cx) else {
-            self.ymd_conceal_cache = None;
-            return Vec::new();
+        // The selection-change path passes the rows it already computed; every
+        // other refresh derives them here, after the gates.
+        let cursor_rows = match cursor_rows {
+            Some(cursor_rows) => cursor_rows,
+            None => {
+                let display_snapshot = self
+                    .display_map
+                    .update(cx, |display_map, cx| display_map.snapshot(cx));
+                self.ymd_cursor_rows(&display_snapshot)
+            }
         };
-        let conceal_ranges: Vec<Range<usize>> = ymd::scan_conceals(&text)
-            .into_iter()
-            .map(|conceal| conceal.range)
-            .collect();
-        self.ymd_conceal_cache = Some(YmdConcealCache {
-            buffer_id,
-            buffer_version,
-            conceal_ranges: conceal_ranges.clone(),
-            folded: HashSet::default(),
-        });
-        conceal_ranges
+
+        let desired_ranges = if let Some(cache) = self.ymd_conceal_cache.as_ref() {
+            cache
+                .conceal_ranges
+                .iter()
+                .zip(&cache.conceal_rows)
+                .filter(|(_, row)| !cursor_rows.contains(&MultiBufferRow(**row)))
+                .map(|(range, _)| range.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        self.ymd_revealed_rows = cursor_rows;
+        desired_ranges
     }
 
     fn ymd_existing_conceal_ranges(&mut self, cx: &mut Context<Self>) -> Vec<Range<usize>> {
@@ -9490,8 +9627,24 @@ impl Editor {
     }
 
     fn refresh_ymd_conceals(&mut self, cx: &mut Context<Self>) {
+        self.refresh_ymd_conceals_impl(None, cx);
+    }
+
+    fn refresh_ymd_conceals_with_cursor_rows(
+        &mut self,
+        cursor_rows: HashSet<MultiBufferRow>,
+        cx: &mut Context<Self>,
+    ) {
+        self.refresh_ymd_conceals_impl(Some(cursor_rows), cx);
+    }
+
+    fn refresh_ymd_conceals_impl(
+        &mut self,
+        cursor_rows: Option<HashSet<MultiBufferRow>>,
+        cx: &mut Context<Self>,
+    ) {
         let desired_ranges = if self.ymd_concealed {
-            self.ymd_desired_conceal_ranges(cx)
+            self.ymd_desired_conceal_ranges(cursor_rows, cx)
         } else {
             Vec::new()
         };
@@ -9510,7 +9663,7 @@ impl Editor {
         // must re-conceal), while a buffer whose desired set is empty — no
         // markers, or every marker row revealed — renders both modes identically,
         // so the stored intent flips honestly instead of re-latching concealed.
-        let desired_ranges = self.ymd_desired_conceal_ranges(cx);
+        let desired_ranges = self.ymd_desired_conceal_ranges(None, cx);
         self.ymd_concealed = if desired_ranges.is_empty() {
             !self.ymd_concealed
         } else {
