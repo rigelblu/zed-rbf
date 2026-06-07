@@ -1694,6 +1694,8 @@ impl Editor {
             }
         }
 
+        self.refresh_ymd_conceals_for_selection_change(cx);
+
         cx.emit(EditorEvent::SelectionsChanged { local });
 
         let selections = &self.selections.disjoint_anchors_arc();
