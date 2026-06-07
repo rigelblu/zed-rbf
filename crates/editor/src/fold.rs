@@ -10,6 +10,14 @@ impl GutterDimensions {
 }
 
 impl EditorSnapshot {
+    /// Like `is_line_folded`, but ignores YMD conceal folds: concealment is display
+    /// sugar, and fold UI (gutter chevrons, fold-aware indicators) must not read
+    /// concealed rows as folded.
+    pub fn is_line_folded_by_user(&self, buffer_row: MultiBufferRow) -> bool {
+        self.display_snapshot
+            .is_line_folded_excluding_type(buffer_row, ymd_conceal_fold_type_id())
+    }
+
     pub fn render_crease_toggle(
         &self,
         buffer_row: MultiBufferRow,
@@ -18,7 +26,7 @@ impl EditorSnapshot {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<AnyElement> {
-        let folded = self.is_line_folded(buffer_row);
+        let folded = self.is_line_folded_by_user(buffer_row);
         let mut is_foldable = false;
 
         if let Some(crease) = self
@@ -79,7 +87,7 @@ impl EditorSnapshot {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<AnyElement> {
-        let folded = self.is_line_folded(buffer_row);
+        let folded = self.is_line_folded_by_user(buffer_row);
         if let Crease::Inline { render_trailer, .. } = self
             .crease_snapshot
             .query_row(buffer_row, self.buffer_snapshot())?
@@ -112,7 +120,12 @@ impl Editor {
             } else {
                 selection.range()
             };
-            if display_map.folds_in_range(range).next().is_some() {
+            // YMD conceal folds are display sugar, not user folds: a row whose only
+            // folds are conceals toggles like an unfolded row.
+            if display_map
+                .folds_in_range(range)
+                .any(|fold| !is_ymd_conceal_fold(fold))
+            {
                 self.unfold_lines(&Default::default(), window, cx)
             } else {
                 self.fold(&Default::default(), window, cx)
@@ -157,7 +170,10 @@ impl Editor {
         } else {
             selection.range()
         };
-        if display_map.folds_in_range(range).next().is_some() {
+        if display_map
+            .folds_in_range(range)
+            .any(|fold| !is_ymd_conceal_fold(fold))
+        {
             self.unfold_recursive(&Default::default(), window, cx)
         } else {
             self.fold_recursive(&Default::default(), window, cx)
@@ -228,8 +244,7 @@ impl Editor {
             let display_map = self.display_map.update(cx, |map, cx| map.snapshot(cx));
             let has_folds = display_map
                 .folds_in_range(MultiBufferOffset(0)..display_map.buffer_snapshot().len())
-                .next()
-                .is_some();
+                .any(|fold| !is_ymd_conceal_fold(fold));
             has_folds
         } else {
             let snapshot = self.buffer.read(cx).snapshot(cx);
@@ -531,6 +546,11 @@ impl Editor {
                 true,
                 cx,
             );
+            // Unfold-all is a reveal-intent operation: the flag follows the user's
+            // intent so YMD concealment opens with everything else and the next
+            // toggle press re-conceals instead of appearing dead.
+            self.ymd_concealed = false;
+            self.refresh_ymd_conceals(cx);
         } else {
             self.toggle_fold_multiple_buffers = cx.spawn(async move |editor, cx| {
                 editor
@@ -599,7 +619,11 @@ impl Editor {
         self.folds_did_change(cx);
     }
 
-    /// Removes any folds whose ranges intersect any of the given ranges.
+    /// Removes any folds whose ranges intersect any of the given ranges, skipping
+    /// YMD conceal folds: concealment is display sugar, not a user fold, so local
+    /// unfold operations (gutter unfold, unfold_lines, selection splitting, match
+    /// selection) must leave it alone. Reveal-intent operations go through
+    /// `unfold_all`, which flips `ymd_concealed` instead.
     pub fn unfold_ranges<T: ToOffset + Clone>(
         &mut self,
         ranges: &[Range<T>],
@@ -608,7 +632,12 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         self.remove_folds_with(ranges, auto_scroll, cx, |map, cx| {
-            map.unfold_intersecting(ranges.iter().cloned(), inclusive, cx);
+            map.unfold_intersecting_except_type(
+                ranges.iter().cloned(),
+                ymd_conceal_fold_type_id(),
+                inclusive,
+                cx,
+            );
         });
         self.folds_did_change(cx);
     }
@@ -819,8 +848,7 @@ impl Editor {
         let Some(buffer_snapshot) = display_snapshot.buffer_snapshot().as_singleton() else {
             return;
         };
-        let inmemory_folds = display_snapshot
-            .folds_in_range(MultiBufferOffset(0)..display_snapshot.buffer_snapshot().len())
+        let inmemory_folds = user_folds_for_serialization(&display_snapshot)
             .map(|fold| {
                 let start = fold.range.start.text_anchor_in(buffer_snapshot);
                 let end = fold.range.end.text_anchor_in(buffer_snapshot);
@@ -845,8 +873,7 @@ impl Editor {
 
         let background_executor = cx.background_executor().clone();
         const FINGERPRINT_LEN: usize = 32;
-        let db_folds = display_snapshot
-            .folds_in_range(MultiBufferOffset(0)..display_snapshot.buffer_snapshot().len())
+        let db_folds = user_folds_for_serialization(&display_snapshot)
             .map(|fold| {
                 let start = fold
                     .range
@@ -1092,4 +1119,16 @@ impl Editor {
         self.scrollbar_marker_state.dirty = true;
         self.active_indent_guides_state.dirty = true;
     }
+}
+
+/// The single query both fold-serialization paths (workspace restoration data
+/// and the `file_folds` DB rows) build from: every fold except YMD conceal
+/// folds, which are display state and must never persist. Tests call this
+/// directly so the filter line itself is load-bearing.
+pub(crate) fn user_folds_for_serialization<'a>(
+    display_snapshot: &'a DisplaySnapshot,
+) -> impl Iterator<Item = &'a crate::display_map::Fold> {
+    display_snapshot
+        .folds_in_range(MultiBufferOffset(0)..display_snapshot.buffer_snapshot().len())
+        .filter(|fold| !is_ymd_conceal_fold(*fold))
 }
