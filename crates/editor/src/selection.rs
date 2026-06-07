@@ -1330,7 +1330,13 @@ impl Editor {
             let tail;
             match &mode {
                 SelectMode::Character => {
-                    head = position.to_point(&display_map);
+                    // Clip like the Word/Line arms below: a drag position can land
+                    // inside a fold placeholder (zero-width conceal placeholders
+                    // especially), and the unclipped conversion would produce a
+                    // mid-character buffer point.
+                    head = display_map
+                        .clip_point(position, Bias::Left)
+                        .to_point(&display_map);
                     tail = pending.tail().to_point(buffer);
                 }
                 SelectMode::Word(original_range) => {

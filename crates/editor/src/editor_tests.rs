@@ -33338,6 +33338,436 @@ async fn test_ymd_highlights_clear_above_size_cap(cx: &mut gpui::TestAppContext)
 }
 
 #[gpui::test]
+async fn test_ymd_conceals_markdown_syntax_by_default_and_toggles(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    cx.set_state("ˇ==hello==\n==🔴urgent==\nplain 🔵 line\n====\n==🔴open");
+    cx.run_until_parked();
+
+    cx.update_editor(|editor, _, cx| {
+        assert_eq!(
+            editor.display_text(cx).replace('\u{2060}', ""),
+            "hello\nurgent\nplain 🔵 line\n====\n==🔴open"
+        );
+    });
+
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_ymd_conceal(&ToggleYmdConceal, window, cx);
+        assert_eq!(
+            editor.display_text(cx).replace('\u{2060}', ""),
+            "==hello==\n==🔴urgent==\nplain 🔵 line\n====\n==🔴open"
+        );
+    });
+
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_ymd_conceal(&ToggleYmdConceal, window, cx);
+        assert_eq!(
+            editor.display_text(cx).replace('\u{2060}', ""),
+            "hello\nurgent\nplain 🔵 line\n====\n==🔴open"
+        );
+    });
+
+    cx.set_state("ˇplain");
+    cx.run_until_parked();
+    cx.update_editor(|editor, _, cx| {
+        assert_eq!(editor.display_text(cx).replace('\u{2060}', ""), "plain");
+    });
+}
+
+#[gpui::test]
+async fn test_ymd_conceals_do_not_apply_to_non_markdown_buffers(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.set_state("ˇ==hello==\n==🔴urgent==");
+    cx.run_until_parked();
+
+    cx.update_editor(|editor, _, cx| {
+        assert_eq!(editor.display_text(cx), "==hello==\n==🔴urgent==");
+    });
+}
+
+#[gpui::test]
+async fn test_ymd_conceal_unfold_contract(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    cx.set_state("ˇ==hello==\n==🔴urgent==\nalpha\nbeta\ngamma");
+    cx.run_until_parked();
+
+    let concealed = "hello\nurgent\nalpha\nbeta\ngamma";
+    let raw = "==hello==\n==🔴urgent==\nalpha\nbeta\ngamma";
+
+    // A1: a reveal-intent unfold (`UnfoldAll` / vim zR) reveals YMD syntax and
+    // flips the conceal flag so the intent sticks.
+    cx.update_editor(|editor, window, cx| {
+        assert_eq!(editor.display_text(cx).replace('\u{2060}', ""), concealed);
+        editor.unfold_all(&UnfoldAll, window, cx);
+        assert_eq!(editor.display_text(cx).replace('\u{2060}', ""), raw);
+        assert!(!editor.ymd_concealed);
+    });
+
+    // D1: an edit-triggered refresh after the reveal does not surprise-re-conceal.
+    cx.update_editor(|editor, window, cx| {
+        editor.handle_input("x", window, cx);
+    });
+    cx.run_until_parked();
+    cx.update_editor(|editor, _, cx| {
+        assert_eq!(
+            editor.display_text(cx).replace('\u{2060}', ""),
+            format!("x{raw}")
+        );
+    });
+    cx.set_state("ˇ==hello==\n==🔴urgent==\nalpha\nbeta\ngamma");
+    cx.run_until_parked();
+    cx.update_editor(|editor, _, cx| {
+        assert_eq!(editor.display_text(cx).replace('\u{2060}', ""), raw);
+    });
+
+    // A2: the next toggle press re-conceals — never a dead press.
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_ymd_conceal(&ToggleYmdConceal, window, cx);
+        assert_eq!(editor.display_text(cx).replace('\u{2060}', ""), concealed);
+        assert!(editor.ymd_concealed);
+    });
+
+    // A3: user folds and conceals both open on a reveal-intent unfold.
+    cx.update_editor(|editor, window, cx| {
+        editor.fold_ranges(vec![Point::new(2, 0)..Point::new(3, 4)], true, window, cx);
+        assert!(
+            editor
+                .snapshot(window, cx)
+                .is_line_folded_by_user(MultiBufferRow(2))
+        );
+        editor.unfold_all(&UnfoldAll, window, cx);
+        assert_eq!(editor.display_text(cx).replace('\u{2060}', ""), raw);
+        assert!(
+            !editor
+                .snapshot(window, cx)
+                .is_line_folded_by_user(MultiBufferRow(2))
+        );
+        assert!(!editor.ymd_concealed);
+    });
+
+    // B1: a local untyped unfold (gutter chevron) opens the user fold wrapping
+    // concealed rows but leaves the conceal folds and the flag alone.
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_ymd_conceal(&ToggleYmdConceal, window, cx);
+        editor.fold_ranges(vec![Point::new(0, 0)..Point::new(2, 5)], true, window, cx);
+        assert!(
+            editor
+                .snapshot(window, cx)
+                .is_line_folded_by_user(MultiBufferRow(0))
+        );
+        editor.unfold_at(MultiBufferRow(0), window, cx);
+        assert!(
+            !editor
+                .snapshot(window, cx)
+                .is_line_folded_by_user(MultiBufferRow(0))
+        );
+        assert_eq!(editor.display_text(cx).replace('\u{2060}', ""), concealed);
+        assert!(editor.ymd_concealed);
+    });
+
+    // B2: splitting a selection across concealed rows completes with conceals intact.
+    cx.set_state("«==hello==\n==🔴urgent==\nalphaˇ»\nbeta\ngamma");
+    cx.run_until_parked();
+    cx.update_editor(|editor, window, cx| {
+        editor.split_selection_into_lines(&Default::default(), window, cx);
+        assert_eq!(editor.selections.count(), 3);
+        assert_eq!(editor.display_text(cx).replace('\u{2060}', ""), concealed);
+    });
+
+    // C1: the toggle resyncs from the actual fold state, so even after conceal
+    // folds were stripped behind the flag's back the press still visibly conceals.
+    cx.update_editor(|editor, window, cx| {
+        let buffer_length = editor.buffer().read(cx).snapshot(cx).len();
+        editor.display_map.update(cx, |map, cx| {
+            map.unfold_intersecting([MultiBufferOffset(0)..buffer_length], true, cx);
+        });
+        assert_eq!(editor.display_text(cx).replace('\u{2060}', ""), raw);
+        assert!(editor.ymd_concealed, "flag is stale by construction");
+        editor.toggle_ymd_conceal(&ToggleYmdConceal, window, cx);
+        assert_eq!(editor.display_text(cx).replace('\u{2060}', ""), concealed);
+        assert!(editor.ymd_concealed);
+    });
+}
+
+#[gpui::test]
+async fn test_ymd_conceal_select_all_matches_keeps_conceals(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    // Searching the marker emoji makes a match range strictly intersect the
+    // open-marker fold of `==🔴hot==`, so this pins the typed-skip predicate:
+    // without it, `select_match_ranges`'s unfold would strip that conceal.
+    cx.set_state("«🔴ˇ» note ==🔴hot== text\n==tail==");
+    cx.run_until_parked();
+
+    cx.update_editor(|editor, window, cx| {
+        assert_eq!(
+            editor.display_text(cx).replace('\u{2060}', ""),
+            "🔴 note hot text\ntail"
+        );
+        editor
+            .select_all_matches(&SelectAllMatches, window, cx)
+            .unwrap();
+        assert_eq!(editor.selections.count(), 2);
+        assert_eq!(
+            editor.display_text(cx).replace('\u{2060}', ""),
+            "🔴 note hot text\ntail"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_ymd_conceal_folds_coexist_with_user_folds(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    cx.set_state("ˇ==hello==\n==🔴urgent==\nalpha\nbeta\ngamma");
+    cx.run_until_parked();
+
+    cx.update_editor(|editor, window, cx| {
+        editor.fold_ranges(vec![Point::new(2, 0)..Point::new(3, 4)], true, window, cx);
+    });
+    cx.run_until_parked();
+
+    // Both persistence paths (restoration data and the `file_folds` DB rows)
+    // build from `user_folds_for_serialization`; asserting through it makes the
+    // filter line itself load-bearing — deleting the filter fails this test.
+    cx.update_editor(|editor, _, cx| {
+        let snapshot = editor.display_snapshot(cx);
+        let buffer_length = snapshot.buffer_snapshot().len();
+        let total_folds = snapshot
+            .folds_in_range(MultiBufferOffset(0)..buffer_length)
+            .count();
+        assert_eq!(total_folds, 5, "four conceal folds plus one user fold");
+        let serializable: Vec<_> = crate::fold::user_folds_for_serialization(&snapshot).collect();
+        assert_eq!(serializable.len(), 1);
+        let buffer_snapshot = snapshot.buffer_snapshot();
+        let user_range = serializable[0].range.start.to_point(buffer_snapshot)
+            ..serializable[0].range.end.to_point(buffer_snapshot);
+        assert_eq!(user_range, Point::new(2, 0)..Point::new(3, 4));
+    });
+
+    // An edit-triggered conceal refresh rebuilds conceal folds without touching
+    // the user fold ("reopen" applies folds in the same order: conceals fresh,
+    // then persisted user folds on top).
+    cx.update_editor(|editor, window, cx| {
+        editor.handle_input("x", window, cx);
+    });
+    cx.run_until_parked();
+    cx.update_editor(|editor, window, cx| {
+        let snapshot = editor.display_snapshot(cx);
+        let buffer_length = snapshot.buffer_snapshot().len();
+        let total_folds = snapshot
+            .folds_in_range(MultiBufferOffset(0)..buffer_length)
+            .count();
+        assert_eq!(total_folds, 5);
+        let serializable = crate::fold::user_folds_for_serialization(&snapshot).count();
+        assert_eq!(serializable, 1);
+        assert!(
+            editor
+                .snapshot(window, cx)
+                .is_line_folded_by_user(MultiBufferRow(2))
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_user_fold_helper_counts_line_end_folds(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    cx.set_state("==note== {\nbody\nˇ}");
+    cx.run_until_parked();
+
+    // Conceal-only rows read as unfolded...
+    cx.update_editor(|editor, window, cx| {
+        assert!(
+            !editor
+                .snapshot(window, cx)
+                .is_line_folded_by_user(MultiBufferRow(0))
+        );
+    });
+
+    // ...but a user fold starting exactly at `(row, line_len)` — the shape every
+    // standard gutter crease has — must read as folded (regression: the strict
+    // intersection query dropped it).
+    cx.update_editor(|editor, window, cx| {
+        editor.fold_ranges(vec![Point::new(0, 10)..Point::new(2, 1)], true, window, cx);
+        assert!(
+            editor
+                .snapshot(window, cx)
+                .is_line_folded_by_user(MultiBufferRow(0))
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_concealed_indent_header_row_is_foldable(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    cx.set_state("- ==hello==\n    child lineˇ");
+    cx.run_until_parked();
+
+    // The concealed header row still yields an indent crease (regression: the
+    // old fold gate treated the conceal folds as user folds and returned None).
+    cx.update_editor(|editor, _, cx| {
+        let snapshot = editor.display_snapshot(cx);
+        assert!(snapshot.crease_for_buffer_row(MultiBufferRow(0)).is_some());
+    });
+
+    // And folding it from the gutter path works end to end.
+    cx.update_editor(|editor, window, cx| {
+        editor.fold_at(MultiBufferRow(0), window, cx);
+        assert!(
+            editor
+                .snapshot(window, cx)
+                .is_line_folded_by_user(MultiBufferRow(0))
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_toggle_fold_all_folds_in_concealed_buffer(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    cx.set_state("- ==parent==\n    child lineˇ");
+    cx.run_until_parked();
+
+    // With zero user folds, the first ToggleFoldAll press must FOLD ALL —
+    // conceal folds must not trick the probe into routing to unfold_all
+    // (which would reveal YMD syntax instead).
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_fold_all(&ToggleFoldAll, window, cx);
+        assert!(editor.ymd_concealed, "conceal flag untouched");
+        assert!(
+            editor
+                .snapshot(window, cx)
+                .is_line_folded_by_user(MultiBufferRow(0))
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_ymd_conceal_cursor_motion_and_boundary_typing(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    cx.set_state("ˇ==hello==");
+    cx.run_until_parked();
+
+    // Concealed markers cross atomically: no extra cursor stop on the zero-width
+    // placeholder in either direction.
+    cx.update_editor(|editor, window, cx| {
+        editor.move_right(&MoveRight, window, cx);
+    });
+    cx.assert_editor_state("==ˇhello==");
+    cx.update_editor(|editor, window, cx| {
+        editor.move_right(&MoveRight, window, cx);
+    });
+    cx.assert_editor_state("==hˇello==");
+    cx.update_editor(|editor, window, cx| {
+        for _ in 0..5 {
+            editor.move_right(&MoveRight, window, cx);
+        }
+    });
+    cx.assert_editor_state("==hello==ˇ");
+    cx.update_editor(|editor, window, cx| {
+        editor.move_left(&MoveLeft, window, cx);
+    });
+    cx.assert_editor_state("==helloˇ==");
+
+    // Typing at the closing-marker boundary transiently lands at the fold edge,
+    // but the refresh re-scans and no typed text is swallowed.
+    cx.update_editor(|editor, window, cx| {
+        editor.handle_input("x", window, cx);
+    });
+    cx.run_until_parked();
+    cx.assert_editor_state("==helloxˇ==");
+    cx.update_editor(|editor, _, cx| {
+        assert_eq!(editor.display_text(cx).replace('\u{2060}', ""), "hellox");
+    });
+}
+
+#[gpui::test]
 async fn test_paste_url_from_zed_copy_creates_markdown_link_over_selected_text(
     cx: &mut gpui::TestAppContext,
 ) {
