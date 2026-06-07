@@ -408,6 +408,7 @@ impl EditorElement {
         register_action(editor, window, Editor::toggle_fold);
         register_action(editor, window, Editor::toggle_fold_recursive);
         register_action(editor, window, Editor::toggle_fold_all);
+        register_action(editor, window, Editor::toggle_ymd_conceal);
         register_action(editor, window, Editor::unfold_lines);
         register_action(editor, window, Editor::unfold_recursive);
         register_action(editor, window, Editor::unfold_all);
@@ -1836,7 +1837,7 @@ impl EditorElement {
         let buffer_point = display_point.to_point(&snapshot.display_snapshot);
 
         // do not show code action for folded line
-        if snapshot.is_line_folded(MultiBufferRow(buffer_point.row)) {
+        if snapshot.is_line_folded_by_user(MultiBufferRow(buffer_point.row)) {
             return None;
         }
 
@@ -1854,7 +1855,7 @@ impl EditorElement {
 
         let is_valid_row = |row_candidate: u32| -> bool {
             // move to other row if folded row
-            if snapshot.is_line_folded(MultiBufferRow(row_candidate)) {
+            if snapshot.is_line_folded_by_user(MultiBufferRow(row_candidate)) {
                 return false;
             }
             if buffer_point.row == row_candidate {
@@ -3127,7 +3128,9 @@ impl EditorElement {
             Block::Custom(custom) => {
                 let block_start = custom.start().to_point(&snapshot.buffer_snapshot());
                 let block_end = custom.end().to_point(&snapshot.buffer_snapshot());
-                if block.place_near() && snapshot.is_line_folded(MultiBufferRow(block_start.row)) {
+                if block.place_near()
+                    && snapshot.is_line_folded_by_user(MultiBufferRow(block_start.row))
+                {
                     return None;
                 }
                 let align_to = block_start.to_display_point(snapshot);
@@ -6589,7 +6592,7 @@ impl Gutter<'_> {
                 .to_point(self.snapshot)
                 .row,
         );
-        if self.snapshot.is_line_folded(row) {
+        if self.snapshot.is_line_folded_by_user(row) {
             return None;
         }
 

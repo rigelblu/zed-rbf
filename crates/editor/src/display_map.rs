@@ -860,6 +860,50 @@ impl DisplayMap {
         self_new_wrap_snapshot
     }
 
+    /// Removes any folds whose ranges intersect any of the given ranges, except
+    /// folds tagged with the given type. Lets user-driven unfold operations leave
+    /// synthetic display folds (e.g. YMD concealment) in place.
+    #[instrument(skip_all)]
+    pub fn unfold_intersecting_except_type<T: ToOffset>(
+        &mut self,
+        ranges: impl IntoIterator<Item = Range<T>>,
+        except_type_id: TypeId,
+        inclusive: bool,
+        cx: &mut Context<Self>,
+    ) -> WrapSnapshot {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let offset_ranges = ranges
+            .into_iter()
+            .map(|range| range.start.to_offset(&snapshot)..range.end.to_offset(&snapshot))
+            .collect::<Vec<_>>();
+        let edits = self.buffer_subscription.consume().into_inner();
+        let tab_size = Self::tab_size(&self.buffer, cx);
+
+        let (snapshot, edits) = self.inlay_map.sync(snapshot, edits);
+        let (mut fold_map, snapshot, edits) = self.fold_map.write(snapshot, edits);
+        let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
+        let (snapshot, edits) = self
+            .wrap_map
+            .update(cx, |map, cx| map.sync(snapshot, edits, cx));
+        self.block_map.read(snapshot, edits, None);
+
+        let (snapshot, edits) = fold_map.unfold_intersecting_except_type(
+            offset_ranges.iter().cloned(),
+            except_type_id,
+            inclusive,
+        );
+        let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
+        let (self_new_wrap_snapshot, self_new_wrap_edits) = self
+            .wrap_map
+            .update(cx, |map, cx| map.sync(snapshot, edits, cx));
+
+        self.block_map
+            .write(self_new_wrap_snapshot.clone(), self_new_wrap_edits, None)
+            .remove_intersecting_replace_blocks(offset_ranges, inclusive);
+
+        self_new_wrap_snapshot
+    }
+
     #[instrument(skip_all)]
     pub fn disable_header_for_buffer(&mut self, buffer_id: BufferId, cx: &mut Context<Self>) {
         let (self_wrap_snapshot, self_wrap_edits) = self.sync_through_wrap(cx);
@@ -1424,13 +1468,22 @@ impl<'a> HighlightedChunk<'a> {
         self,
         editor_style: &'a EditorStyle,
     ) -> impl Iterator<Item = Self> + 'a {
+        // A chunk rendered by a fold/replacement element never shows its own text,
+        // so its placeholder chars (e.g. the U+2060 YMD conceal placeholder) must
+        // not be treated as visible "invisible characters" — doing so paints the
+        // hint-coloured invisible-char box over the fold and overrides its render
+        // element with a fixed-width space. Normal user folds use the "⋯"
+        // placeholder, which is not invisible, so they are unaffected.
+        if matches!(self.replacement, Some(ChunkReplacement::Renderer(_))) {
+            return itertools::Either::Left(iter::once(self));
+        }
         let mut chunks = self.text.graphemes(true).peekable();
         let mut text = self.text;
         let style = self.style;
         let is_tab = self.is_tab;
         let renderer = self.replacement;
         let is_inlay = self.is_inlay;
-        iter::from_fn(move || {
+        itertools::Either::Right(iter::from_fn(move || {
             let mut prefix_len = 0;
             while let Some(&chunk) = chunks.peek() {
                 let mut chars = chunk.chars();
@@ -1515,7 +1568,7 @@ impl<'a> HighlightedChunk<'a> {
             } else {
                 None
             }
-        })
+        }))
     }
 }
 
@@ -2160,6 +2213,28 @@ impl DisplaySnapshot {
             || self.fold_snapshot().is_line_folded(buffer_row)
     }
 
+    /// Like `is_line_folded`, but ignores folds tagged with the given type. Lets
+    /// fold UI treat rows whose only folds are synthetic display folds (e.g. YMD
+    /// concealment) as unfolded.
+    pub fn is_line_folded_excluding_type(
+        &self,
+        buffer_row: MultiBufferRow,
+        except_type_id: TypeId,
+    ) -> bool {
+        if self.block_snapshot.is_line_replaced(buffer_row) {
+            return true;
+        }
+        // The query must reach past the line end: standard gutter creases start
+        // exactly at `(row, line_len)`, and `folds_in_range`'s strict edges would
+        // drop them at `(row, line_len)` itself. Ending at the next row's column
+        // zero keeps strict-edge behavior for folds that merely touch this row.
+        let max_point = self.buffer_snapshot().max_point();
+        let row_range = MultiBufferPoint::new(buffer_row.0, 0)
+            ..MultiBufferPoint::new(buffer_row.0 + 1, 0).min(max_point);
+        self.folds_in_range(row_range)
+            .any(|fold| fold.placeholder.type_tag != Some(except_type_id))
+    }
+
     pub fn is_block_line(&self, display_row: DisplayRow) -> bool {
         self.block_snapshot.is_block_line(BlockRow(display_row.0))
     }
@@ -2300,7 +2375,10 @@ impl DisplaySnapshot {
             }
         } else if !self.use_lsp_folding_ranges
             && self.starts_indent(MultiBufferRow(start.row))
-            && !self.is_line_folded(MultiBufferRow(start.row))
+            && !self.is_line_folded_excluding_type(
+                MultiBufferRow(start.row),
+                crate::ymd_conceal_fold_type_id(),
+            )
         {
             let start_line_indent = self.line_indent_for_buffer_row(buffer_row);
             let snapshot = self.buffer_snapshot();
@@ -4160,6 +4238,48 @@ pub mod tests {
             1,
             "compound emoji should not be split into multiple chunks, got: {:?}",
             chunks,
+        );
+    }
+
+    #[test]
+    fn test_highlight_invisibles_skips_fold_render_replacements() {
+        use gpui::IntoElement as _;
+
+        let editor_style = EditorStyle::default();
+
+        // A fold render-replacement chunk whose placeholder is the U+2060 YMD
+        // conceal placeholder — an "invisible" code point. It must pass through
+        // unchanged: no hint-box style and no fixed-width-space `Str` override,
+        // because the fold's render element draws it, never its own text. (Before
+        // this gate, `highlight_invisibles` painted a lavender hint box over every
+        // conceal placeholder.)
+        let renderer = ChunkRenderer {
+            id: ChunkRendererId::Fold(FoldId(0)),
+            render: Arc::new(|_| gpui::Empty.into_any_element()),
+            constrain_width: false,
+            measured_width: None,
+        };
+        let chunk = HighlightedChunk {
+            text: "\u{2060}",
+            style: None,
+            is_tab: false,
+            is_inlay: false,
+            replacement: Some(ChunkReplacement::Renderer(renderer)),
+        };
+
+        let chunks: Vec<_> = chunk.highlight_invisibles(&editor_style).collect();
+        assert_eq!(chunks.len(), 1, "the fold chunk passes through as one chunk");
+        assert_eq!(chunks[0].text, "\u{2060}", "placeholder text is unchanged");
+        assert!(
+            chunks[0].style.is_none(),
+            "no invisible-char hint style is applied to a fold render element"
+        );
+        assert!(
+            matches!(
+                chunks[0].replacement,
+                Some(ChunkReplacement::Renderer(_))
+            ),
+            "the fold render element is preserved, not overridden by a Str"
         );
     }
 

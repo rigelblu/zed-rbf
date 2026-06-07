@@ -129,9 +129,16 @@ impl FoldPoint {
 
     #[ztracing::instrument(skip_all)]
     pub fn to_inlay_point(self, snapshot: &FoldSnapshot) -> InlayPoint {
-        let (start, _, _) = snapshot
+        let (start, _, item) = snapshot
             .transforms
             .find::<Dimensions<FoldPoint, InlayPoint>, _>((), &self, Bias::Right);
+        // A placeholder is atomic: a fold point inside its output text clamps to
+        // the fold's start. Linear overshoot into the folded buffer text can land
+        // inside a multibyte character (e.g. a concealed emoji) and panic at the
+        // next char-boundary assertion.
+        if item.is_some_and(|transform| transform.placeholder.is_some()) {
+            return start.1;
+        }
         let overshoot = self.0 - start.0.0;
         InlayPoint(start.1.0 + overshoot)
     }
@@ -256,6 +263,22 @@ impl FoldMapWriter<'_> {
         inclusive: bool,
     ) -> (FoldSnapshot, Vec<FoldEdit>) {
         self.remove_folds_with(ranges, |_| true, inclusive)
+    }
+
+    /// Removes any folds whose ranges intersect the given ranges, except folds
+    /// tagged with the given type.
+    #[ztracing::instrument(skip_all)]
+    pub(crate) fn unfold_intersecting_except_type<T: ToOffset>(
+        &mut self,
+        ranges: impl IntoIterator<Item = Range<T>>,
+        except_type_id: TypeId,
+        inclusive: bool,
+    ) -> (FoldSnapshot, Vec<FoldEdit>) {
+        self.remove_folds_with(
+            ranges,
+            |fold| fold.placeholder.type_tag != Some(except_type_id),
+            inclusive,
+        )
     }
 
     /// Removes any folds that intersect the given ranges and for which the given predicate

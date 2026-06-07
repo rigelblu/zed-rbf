@@ -405,6 +405,50 @@ trait InvalidationRegion {
     fn ranges(&self) -> &[Range<Anchor>];
 }
 
+struct YmdConcealFold;
+
+// U+2060 WORD JOINER: a default-ignorable, "zero-width" code point used as the
+// collapsed_text the fold shapes into the display run (`fold_map.rs`). It keeps
+// the placeholder one display column wide, so cursor mapping over a conceal is
+// stable (an empty placeholder would make the cursor skip the markers entirely,
+// degrading the `#zed-03` reveal-to-edit motion, and would also underflow
+// `tab_map` on a zero-length chunk). The fold renders an empty element, but Zed's
+// invisible-character highlight (`display_map.rs` `highlight_invisibles`) treated
+// U+2060 as a visible "invisible char" and painted a hint box over it (the tofu
+// bar Tom saw); that pass now skips fold render-replacement chunks, so the
+// placeholder renders nothing.
+const YMD_CONCEAL_PLACEHOLDER_TEXT: &str = "\u{2060}";
+
+fn ymd_conceal_fold_type_id() -> TypeId {
+    TypeId::of::<YmdConcealFold>()
+}
+
+fn is_ymd_conceal_fold(fold: &crate::display_map::Fold) -> bool {
+    fold.placeholder.type_tag == Some(ymd_conceal_fold_type_id())
+}
+
+// Scan results keyed to the buffer state, so cursor motion never re-runs the
+// scanner: the desired fold set on a row change is pure set math over these
+// ranges. `folded` tracks what is currently applied; it is authoritative only
+// between full syncs (external leaks heal via the toggle resync and the next
+// edit refresh).
+struct YmdConcealCache {
+    buffer_id: BufferId,
+    buffer_version: clock::Global,
+    conceal_ranges: Vec<Range<usize>>,
+    folded: HashSet<(usize, usize)>,
+}
+
+fn ymd_conceal_fold_placeholder() -> FoldPlaceholder {
+    FoldPlaceholder {
+        render: Arc::new(|_, _, _| gpui::Empty.into_any_element()),
+        constrain_width: false,
+        merge_adjacent: false,
+        type_tag: Some(ymd_conceal_fold_type_id()),
+        collapsed_text: Some(YMD_CONCEAL_PLACEHOLDER_TEXT.into()),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum SelectPhase {
     Begin {
@@ -1157,6 +1201,8 @@ pub struct Editor {
     refresh_code_lens_task: Task<()>,
     use_document_folding_ranges: bool,
     refresh_folding_ranges_task: Task<()>,
+    ymd_concealed: bool,
+    ymd_conceal_cache: Option<YmdConcealCache>,
     inlay_hints: Option<LspInlayHintData>,
     folding_newlines: Task<()>,
     select_next_is_case_sensitive: Option<bool>,
@@ -1733,6 +1779,7 @@ impl Editor {
             .clone_state(&self.scroll_manager, &my_snapshot, &clone_snapshot, cx);
         clone.searchable = self.searchable;
         clone.read_only = self.read_only;
+        clone.ymd_concealed = self.ymd_concealed;
         clone.buffers_with_disabled_indent_guides =
             self.buffers_with_disabled_indent_guides.clone();
         clone.enable_mouse_wheel_zoom = self.enable_mouse_wheel_zoom;
@@ -1740,6 +1787,7 @@ impl Editor {
         clone.needs_initial_data_update = self.enable_lsp_data;
         clone.enable_runnables = self.enable_runnables;
         clone.enable_code_lens = self.enable_code_lens;
+        clone.refresh_ymd_conceals(cx);
         clone
     }
 
@@ -2351,6 +2399,8 @@ impl Editor {
             inlay_hints: None,
             next_color_inlay_id: 0,
             post_scroll_update: Task::ready(()),
+            ymd_concealed: true,
+            ymd_conceal_cache: None,
             linked_edit_ranges: Default::default(),
             in_project_search: false,
             previous_search_ranges: None,
@@ -2399,7 +2449,7 @@ impl Editor {
 
         editor.applicable_language_settings = editor.fetch_applicable_language_settings(cx);
         editor.accent_data = editor.fetch_accent_data(cx);
-        editor.refresh_ymd_highlights(cx);
+        editor.refresh_ymd_decorations(cx);
 
         if let Some(breakpoints) = editor.breakpoint_store.as_ref() {
             editor
@@ -3881,13 +3931,13 @@ impl Editor {
                     return None;
                 }
 
-                if snapshot.is_line_folded(multibuffer_row) {
+                if snapshot.is_line_folded_by_user(multibuffer_row) {
                     // Skip folded indicators, unless it's the starting line of a fold.
                     if multibuffer_row
                         .0
                         .checked_sub(1)
                         .is_some_and(|previous_row| {
-                            snapshot.is_line_folded(MultiBufferRow(previous_row))
+                            snapshot.is_line_folded_by_user(MultiBufferRow(previous_row))
                         })
                     {
                         return None;
@@ -9244,28 +9294,106 @@ impl Editor {
         );
     }
 
+    // Diff-only conceal sync: remove and insert only the folds whose ranges
+    // changed, in one display-map update. Whole-buffer clear+refold invalidated
+    // display-map layers per fold on every refresh, which made cursor motion
+    // perceptibly slow on real documents (the named performance-bet trigger,
+    // fired 2026-06-07).
+    fn sync_ymd_conceal_folds(
+        &mut self,
+        desired_ranges: Vec<Range<usize>>,
+        cx: &mut Context<Self>,
+    ) {
+        let type_id = ymd_conceal_fold_type_id();
+        let existing_ranges = self.ymd_existing_conceal_ranges(cx);
+        let buffer_snapshot = self.buffer.read(cx).snapshot(cx);
+
+        let desired_set: HashSet<(usize, usize)> = desired_ranges
+            .iter()
+            .map(|range| (range.start, range.end))
+            .collect();
+        let existing_set: HashSet<(usize, usize)> = existing_ranges
+            .iter()
+            .map(|range| (range.start, range.end))
+            .collect();
+
+        let to_remove: Vec<Range<MultiBufferOffset>> = existing_ranges
+            .iter()
+            .filter(|range| !desired_set.contains(&(range.start, range.end)))
+            .map(|range| MultiBufferOffset(range.start)..MultiBufferOffset(range.end))
+            .collect();
+        let to_insert: Vec<Range<usize>> = desired_ranges
+            .into_iter()
+            .filter(|range| !existing_set.contains(&(range.start, range.end)))
+            .collect();
+
+        if let Some(cache) = self.ymd_conceal_cache.as_mut() {
+            cache.folded = desired_set;
+        }
+
+        if to_remove.is_empty() && to_insert.is_empty() {
+            return;
+        }
+
+        let placeholder = ymd_conceal_fold_placeholder();
+        let creases = to_insert
+            .into_iter()
+            .map(|range| {
+                let anchor_range = buffer_snapshot.anchor_before(MultiBufferOffset(range.start))
+                    ..buffer_snapshot.anchor_after(MultiBufferOffset(range.end));
+                Crease::simple(anchor_range, placeholder.clone())
+            })
+            .collect::<Vec<_>>();
+
+        self.display_map.update(cx, |map, cx| {
+            // Exact stale ranges only: conceal folds are mutually non-overlapping,
+            // and strict intersection leaves touching neighbors alone.
+            if !to_remove.is_empty() {
+                map.remove_folds_with_type(to_remove, type_id, cx);
+            }
+            if !creases.is_empty() {
+                map.fold(creases, cx);
+            }
+        });
+        self.ymd_conceal_folds_did_change(cx);
+    }
+
+    fn ymd_conceal_folds_did_change(&mut self, cx: &mut Context<Self>) {
+        cx.notify();
+        self.scrollbar_marker_state.dirty = true;
+        self.active_indent_guides_state.dirty = true;
+    }
+
+    fn ymd_markdown_snapshot_and_text(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<(MultiBufferSnapshot, String)> {
+        let buffer = self.buffer.read(cx);
+        let singleton_buffer = buffer.as_singleton()?;
+        let singleton_buffer = singleton_buffer.read(cx);
+        let is_markdown = singleton_buffer
+            .language()
+            .is_some_and(|language| language.name().as_ref() == "Markdown");
+        if !is_markdown {
+            return None;
+        }
+
+        let snapshot = buffer.snapshot(cx);
+        (snapshot.len().0 <= ymd::MAX_YMD_HIGHLIGHT_BYTES).then(|| {
+            let text = snapshot.text();
+            (snapshot, text)
+        })
+    }
+
+    fn refresh_ymd_decorations(&mut self, cx: &mut Context<Self>) {
+        self.refresh_ymd_highlights(cx);
+        self.refresh_ymd_conceals(cx);
+    }
+
     fn refresh_ymd_highlights(&mut self, cx: &mut Context<Self>) {
         self.clear_ymd_highlights(cx);
 
-        let Some((snapshot, text)) = ({
-            let buffer = self.buffer.read(cx);
-            let Some(singleton_buffer) = buffer.as_singleton() else {
-                return;
-            };
-            let singleton_buffer = singleton_buffer.read(cx);
-            let is_markdown = singleton_buffer
-                .language()
-                .is_some_and(|language| language.name().as_ref() == "Markdown");
-            if !is_markdown {
-                return;
-            }
-
-            let snapshot = buffer.snapshot(cx);
-            (snapshot.len().0 <= ymd::MAX_YMD_HIGHLIGHT_BYTES).then(|| {
-                let text = snapshot.text();
-                (snapshot, text)
-            })
-        }) else {
+        let Some((snapshot, text)) = self.ymd_markdown_snapshot_and_text(cx) else {
             return;
         };
 
@@ -9306,6 +9434,104 @@ impl Editor {
                 );
             }
         }
+    }
+
+    fn ymd_singleton_buffer_identity(&self, cx: &App) -> Option<(BufferId, clock::Global)> {
+        let singleton_buffer = self.buffer.read(cx).as_singleton()?;
+        let singleton_buffer = singleton_buffer.read(cx);
+        Some((singleton_buffer.remote_id(), singleton_buffer.version()))
+    }
+
+    // The conceal-fold set concealed mode wants right now; empty when the buffer
+    // is not a YMD surface. Served from the version-keyed cache when the buffer
+    // has not changed, so repeated calls (toggle presses, cursor motion at
+    // `#zed-03`) never re-run the scanner.
+    fn ymd_desired_conceal_ranges(&mut self, cx: &mut Context<Self>) -> Vec<Range<usize>> {
+        let Some((buffer_id, buffer_version)) = self.ymd_singleton_buffer_identity(cx) else {
+            self.ymd_conceal_cache = None;
+            return Vec::new();
+        };
+        if let Some(cache) = self.ymd_conceal_cache.as_ref()
+            && cache.buffer_id == buffer_id
+            && cache.buffer_version == buffer_version
+        {
+            return cache.conceal_ranges.clone();
+        }
+
+        let Some((_, text)) = self.ymd_markdown_snapshot_and_text(cx) else {
+            self.ymd_conceal_cache = None;
+            return Vec::new();
+        };
+        let conceal_ranges: Vec<Range<usize>> = ymd::scan_conceals(&text)
+            .into_iter()
+            .map(|conceal| conceal.range)
+            .collect();
+        self.ymd_conceal_cache = Some(YmdConcealCache {
+            buffer_id,
+            buffer_version,
+            conceal_ranges: conceal_ranges.clone(),
+            folded: HashSet::default(),
+        });
+        conceal_ranges
+    }
+
+    fn ymd_existing_conceal_ranges(&mut self, cx: &mut Context<Self>) -> Vec<Range<usize>> {
+        let snapshot = self.display_map.update(cx, |map, cx| map.snapshot(cx));
+        let buffer_snapshot = snapshot.buffer_snapshot();
+        let buffer_length = buffer_snapshot.len();
+        snapshot
+            .folds_in_range(MultiBufferOffset(0)..buffer_length)
+            .filter(|fold| is_ymd_conceal_fold(fold))
+            .map(|fold| {
+                fold.range.start.to_offset(buffer_snapshot).0
+                    ..fold.range.end.to_offset(buffer_snapshot).0
+            })
+            .collect()
+    }
+
+    fn refresh_ymd_conceals(&mut self, cx: &mut Context<Self>) {
+        let desired_ranges = if self.ymd_concealed {
+            self.ymd_desired_conceal_ranges(cx)
+        } else {
+            Vec::new()
+        };
+
+        self.sync_ymd_conceal_folds(desired_ranges, cx);
+    }
+
+    pub fn toggle_ymd_conceal(
+        &mut self,
+        _: &actions::ToggleYmdConceal,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Resync against what concealed mode WANTS, not against fold-emptiness:
+        // fold operations can strip conceal folds behind the flag's back (press
+        // must re-conceal), while a buffer whose desired set is empty — no
+        // markers, or every marker row revealed — renders both modes identically,
+        // so the stored intent flips honestly instead of re-latching concealed.
+        let desired_ranges = self.ymd_desired_conceal_ranges(cx);
+        self.ymd_concealed = if desired_ranges.is_empty() {
+            !self.ymd_concealed
+        } else {
+            let existing: HashSet<(usize, usize)> = self
+                .ymd_existing_conceal_ranges(cx)
+                .into_iter()
+                .map(|range| (range.start, range.end))
+                .collect();
+            let desired: HashSet<(usize, usize)> = desired_ranges
+                .iter()
+                .map(|range| (range.start, range.end))
+                .collect();
+            existing != desired
+        };
+
+        let desired_ranges = if self.ymd_concealed {
+            desired_ranges
+        } else {
+            Vec::new()
+        };
+        self.sync_ymd_conceal_folds(desired_ranges, cx);
     }
 
     pub fn show_local_cursors(&self, window: &mut Window, cx: &mut App) -> bool {
@@ -9500,7 +9726,7 @@ impl Editor {
                 self.bracket_fetched_tree_sitter_chunks
                     .retain(|range, _| range.start.buffer_id != buffer_id);
                 self.colorize_brackets(false, cx);
-                self.refresh_ymd_highlights(cx);
+                self.refresh_ymd_decorations(cx);
                 self.refresh_selected_text_highlights(&self.display_snapshot(cx), true, window, cx);
                 self.semantic_token_state.invalidate_buffer(&buffer_id);
                 cx.emit(EditorEvent::BufferRangesUpdated {
@@ -9542,7 +9768,7 @@ impl Editor {
                 self.display_map.update(cx, |map, cx| {
                     map.unfold_buffers(buffer_ids.iter().copied(), cx)
                 });
-                self.refresh_ymd_highlights(cx);
+                self.refresh_ymd_decorations(cx);
                 cx.emit(EditorEvent::BuffersEdited {
                     buffer_ids: buffer_ids.clone(),
                 });
@@ -9551,7 +9777,7 @@ impl Editor {
                 self.refresh_runnables(Some(*buffer_id), window, cx);
                 self.refresh_selected_text_highlights(&self.display_snapshot(cx), true, window, cx);
                 self.colorize_brackets(true, cx);
-                self.refresh_ymd_highlights(cx);
+                self.refresh_ymd_decorations(cx);
                 jsx_tag_auto_close::refresh_enabled_in_any_buffer(self, multibuffer, cx);
 
                 cx.emit(EditorEvent::Reparsed(*buffer_id));
@@ -9566,7 +9792,7 @@ impl Editor {
                 jsx_tag_auto_close::refresh_enabled_in_any_buffer(self, multibuffer, cx);
                 cx.emit(EditorEvent::Reparsed(*buffer_id));
                 self.update_edit_prediction_settings(cx);
-                self.refresh_ymd_highlights(cx);
+                self.refresh_ymd_decorations(cx);
                 cx.notify();
             }
             multi_buffer::Event::DirtyChanged => cx.emit(EditorEvent::DirtyChanged),
@@ -9732,7 +9958,7 @@ impl Editor {
             if language_settings_changed || accents_changed {
                 self.colorize_brackets(true, cx);
             }
-            self.refresh_ymd_highlights(cx);
+            self.refresh_ymd_decorations(cx);
 
             if language_settings_changed {
                 self.clear_disabled_lsp_folding_ranges(window, cx);
@@ -9804,7 +10030,7 @@ impl Editor {
 
         self.invalidate_semantic_tokens(None);
         self.refresh_semantic_tokens(None, None, cx);
-        self.refresh_ymd_highlights(cx);
+        self.refresh_ymd_decorations(cx);
         self.refresh_outline_symbols_at_cursor(cx);
     }
 

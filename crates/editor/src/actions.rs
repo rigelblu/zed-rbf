@@ -566,6 +566,8 @@ actions!(
         ToggleFoldRecursive,
         /// Toggles all folds in a buffer or all excerpts in multibuffer.
         ToggleFoldAll,
+        /// Toggles concealment of ymd highlight syntax markers.
+        ToggleYmdConceal,
         /// Formats the entire document.
         Format,
         /// Formats only the selected text.
