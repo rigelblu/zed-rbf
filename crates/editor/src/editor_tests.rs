@@ -33256,6 +33256,88 @@ async fn test_markdown_indents(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_ymd_highlights_markdown_buffers(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    cx.set_state("ˇ==hello==\n==🔴urgent==\nplain 🔵 line\n====\n==🔴open");
+    cx.run_until_parked();
+
+    cx.assert_editor_text_highlights(
+        HighlightKey::YmdBackground(0),
+        "==«hello»==\n==🔴urgent==\nplain 🔵 line\n====\n==🔴open",
+    );
+    cx.assert_editor_text_highlights(
+        HighlightKey::YmdBackground(1),
+        "==hello==\n==🔴«urgent»==\nplain 🔵 line\n====\n==🔴open",
+    );
+    cx.assert_editor_text_highlights(
+        HighlightKey::YmdLineForeground(1),
+        "==hello==\n==🔴urgent==\nplain 🔵 line\n====\n«==🔴open»",
+    );
+    cx.assert_editor_text_highlights(
+        HighlightKey::YmdLineForeground(5),
+        "==hello==\n==🔴urgent==\n«plain 🔵 line»\n====\n==🔴open",
+    );
+
+    cx.set_state("ˇplain");
+    cx.run_until_parked();
+    cx.assert_editor_text_highlights(HighlightKey::YmdBackground(0), "plain");
+    cx.assert_editor_text_highlights(HighlightKey::YmdLineForeground(5), "plain");
+}
+
+#[gpui::test]
+async fn test_ymd_highlights_do_not_apply_to_non_markdown_buffers(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.set_state("ˇ==hello==\nplain 🔵 line");
+    cx.run_until_parked();
+
+    cx.assert_editor_text_highlights(HighlightKey::YmdBackground(0), "==hello==\nplain 🔵 line");
+    cx.assert_editor_text_highlights(
+        HighlightKey::YmdLineForeground(5),
+        "==hello==\nplain 🔵 line",
+    );
+}
+
+#[gpui::test]
+async fn test_ymd_highlights_clear_above_size_cap(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    cx.set_state("ˇ==hello==");
+    cx.run_until_parked();
+    cx.assert_editor_text_highlights(HighlightKey::YmdBackground(0), "==«hello»==");
+
+    let oversized = format!(
+        "ˇ==hello==\n{}",
+        "x".repeat(crate::ymd::MAX_YMD_HIGHLIGHT_BYTES)
+    );
+    cx.set_state(&oversized);
+    cx.run_until_parked();
+    cx.assert_editor_text_highlights(HighlightKey::YmdBackground(0), &oversized.replace('ˇ', ""));
+}
+
+#[gpui::test]
 async fn test_paste_url_from_zed_copy_creates_markdown_link_over_selected_text(
     cx: &mut gpui::TestAppContext,
 ) {
