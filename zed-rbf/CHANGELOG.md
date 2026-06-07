@@ -2,6 +2,12 @@
 title: "Zed RBF Changelog"
 ---
 
+## 🟠⋯ v0.3.0 — #zed-03
+- Added cursor-line reveal: the line under each cursor head shows its raw YMD markers while every other line stays clean, re-concealing as the cursor leaves
+- Same-row cursor motion does zero fold work; multi-cursor reveals each head row
+- Fixed a dead `editor::ToggleYmdConceal` press: when the cursor already revealed every marker row, the toggle now re-conceals reliably instead of doing nothing because the resync distinguishes "no folds because revealed" from "no folds because leaked"
+- Improved large-file handling: Markdown buffers over the 100KB cap skip all conceal work on cursor motion via an O(1) size check, instead of re-running snapshots and a whole-buffer fold scan on every selection change
+
 ## 🟠⋯ v0.2.0 — #zed-02
 - Added YMD syntax concealment in Markdown buffers: `==` highlight markers (and their color emoji) hide behind the highlight, with `editor::ToggleYmdConceal` revealing and re-concealing on demand
 - Improved fold behavior around concealment: unfold-all (vim `zR`) reveals YMD syntax until the next toggle, local unfolds and fold UI ignore conceal folds, and saved folds never include them
