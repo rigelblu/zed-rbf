@@ -2,12 +2,20 @@
 title: "Zed RBF Changelog"
 ---
 
+## 🟠⋯ v0.22.0 — #zed-22
+- Added Git Panel Compare as a first-class read-only mode for reviewing current-workspace changes against a selected base without changing checkout
+- Compare Since now opens Git Panel Compare with the selected commit as the base, so direct Compare and commit-based Compare share one workflow
+- Improved Compare Since copy so commit patches, file patches, and current-workspace comparisons use distinct user-facing language
+- Compare tabs and fixed-base labels now use short SHAs for raw commit bases, with tooltips that spell out the full current-workspace relationship
+- Git Panel History commit and file row tooltips now use `Open Commit Diff` and `Open File Diff`
+
 ## 🟠⋯ v0.21.0 — #zed-21
 - Added expandable Git Panel History rows that lazily show the files changed by a commit before opening the full commit diff
 - File rows show added, modified, and deleted state and open a file-scoped commit diff without checking out the commit
 - Expanded History files follow the shared Git Panel `Flat View` / `Tree View` mode, so nested commit files can be scanned as compact rows or directory-grouped rows from the existing panel menu
 - History file expansion is a single-commit accordion, caches loaded file rows while the same repository remains active, and retries failed or canceled loads after collapse/re-expand
 - History commit and file preview clicks keep focus on the History list, so Vim `j`/`k` and arrow keys continue walking commits and expanded rows; Vim `l` expands a commit, focuses its first visible expanded row, and opens a focused file row, while `h` returns to the commit row before collapsing it
+- Expanded History rows reserve their measured height so file rows push later commits down instead of painting over them
 
 ## 🟠⋯ v0.20.0 — #zed-20
 - Added Compare Since from commit diffs, opening a read-only workspace comparison against the selected commit without checking out that commit

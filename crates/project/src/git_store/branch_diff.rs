@@ -323,6 +323,42 @@ impl BranchDiff {
             .is_some_and(|task| !task.is_ready())
     }
 
+    pub fn file_statuses(&self, cx: &App) -> Vec<(RepoPath, FileStatus)> {
+        let mut output = Vec::default();
+        let Some(repo) = self.repo.clone() else {
+            return output;
+        };
+        if self.diff_base.requires_tree_diff() && self.tree_diff.is_none() {
+            return output;
+        }
+
+        let mut seen = HashSet::default();
+        for item in repo.read(cx).cached_status() {
+            seen.insert(item.repo_path.clone());
+            let branch_diff = self
+                .tree_diff
+                .as_ref()
+                .and_then(|tree_diff| tree_diff.entries.get(&item.repo_path));
+            let Some(status) = self.merge_statuses(Some(item.status), branch_diff) else {
+                continue;
+            };
+            if status.has_changes() {
+                output.push((item.repo_path.clone(), status));
+            }
+        }
+
+        if let Some(tree_diff) = self.tree_diff.as_ref() {
+            for (path, branch_diff) in tree_diff.entries.iter() {
+                if seen.contains(path) {
+                    continue;
+                }
+                output.push((path.clone(), diff_status_to_file_status(branch_diff)));
+            }
+        }
+
+        output
+    }
+
     pub async fn reload_tree_diff(this: WeakEntity<Self>, cx: &mut AsyncApp) -> Result<()> {
         let task = this.update(cx, |this, cx| {
             let Some(diff_tree_type) = this.diff_base.tree_diff_type("HEAD".into()) else {

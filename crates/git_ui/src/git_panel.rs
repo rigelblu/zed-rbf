@@ -57,7 +57,9 @@ use project::git_store::GitAccess;
 use project::{
     Fs, Project, ProjectPath,
     git_store::{
-        CommitDataState, GitStoreEvent, Repository, RepositoryEvent, RepositoryId, pending_op,
+        CommitDataState, GitStoreEvent, Repository, RepositoryEvent, RepositoryId,
+        branch_diff::{self, BranchDiffEvent, DiffBase},
+        pending_op,
     },
     project_settings::{GitPathStyle, ProjectSettings},
 };
@@ -75,9 +77,9 @@ use strum::{IntoEnumIterator, VariantNames};
 use theme_settings::ThemeSettings;
 use time::OffsetDateTime;
 use ui::{
-    ButtonLike, Checkbox, ContextMenu, Divider, ElevationIndex, IndentGuideColors, KeyBinding,
-    PopoverMenu, ProjectEmptyState, RenderedIndentGuide, ScrollAxes, Scrollbars, SplitButton, Tab,
-    TintColor, Tooltip, WithScrollbar, prelude::*,
+    ButtonLike, Checkbox, ContextMenu, ElevationIndex, IndentGuideColors, KeyBinding, PopoverMenu,
+    ProjectEmptyState, RenderedIndentGuide, ScrollAxes, Scrollbars, SplitButton, Tab, TintColor,
+    Tooltip, WithScrollbar, prelude::*,
 };
 use util::paths::PathStyle;
 use util::{ResultExt, TryFutureExt, markdown::MarkdownInlineCode, maybe, rel_path::RelPath};
@@ -124,6 +126,8 @@ actions!(
         CollapseSelectedEntry,
         /// Activates the Changes tab.
         ActivateChangesTab,
+        /// Activates the Compare tab.
+        ActivateCompareTab,
         /// Activates the History tab.
         ActivateHistoryTab,
     ]
@@ -268,6 +272,30 @@ pub fn register(workspace: &mut Workspace) {
             });
         }
     });
+    workspace.register_action(|workspace, _: &ActivateChangesTab, window, cx| {
+        if let Some(panel) = workspace.panel::<GitPanel>(cx) {
+            workspace.open_panel::<GitPanel>(window, cx);
+            panel.update(cx, |panel, cx| {
+                panel.set_active_tab(GitPanelTab::Changes, window, cx);
+            });
+        }
+    });
+    workspace.register_action(|workspace, _: &ActivateCompareTab, window, cx| {
+        if let Some(panel) = workspace.panel::<GitPanel>(cx) {
+            workspace.open_panel::<GitPanel>(window, cx);
+            panel.update(cx, |panel, cx| {
+                panel.show_compare_with_default_base(window, cx);
+            });
+        }
+    });
+    workspace.register_action(|workspace, _: &ActivateHistoryTab, window, cx| {
+        if let Some(panel) = workspace.panel::<GitPanel>(cx) {
+            workspace.open_panel::<GitPanel>(window, cx);
+            panel.update(cx, |panel, cx| {
+                panel.set_active_tab(GitPanelTab::History, window, cx);
+            });
+        }
+    });
 }
 
 #[derive(Debug, Clone)]
@@ -286,6 +314,7 @@ struct SerializedGitPanel {
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum GitPanelTab {
     Changes,
+    Compare,
     History,
 }
 
@@ -767,6 +796,13 @@ pub struct GitPanel {
     bulk_staging: Option<BulkStaging>,
     stash_entries: GitStash,
     active_tab: GitPanelTab,
+    compare_diff: Option<Entity<branch_diff::BranchDiff>>,
+    compare_base: Option<DiffBase>,
+    compare_entries: Vec<GitStatusEntry>,
+    compare_error: Option<SharedString>,
+    compare_loading: bool,
+    compare_selected_entry: Option<usize>,
+    compare_subscription: Option<Subscription>,
     commit_history_list_state: ListState,
     commit_history_shas: Option<Vec<Oid>>,
     commit_history_error: Option<SharedString>,
@@ -825,7 +861,7 @@ pub(crate) fn commit_message_editor(
 }
 
 impl GitPanel {
-    fn new(
+    pub(crate) fn new(
         workspace: &mut Workspace,
         window: &mut Window,
         cx: &mut Context<Workspace>,
@@ -978,6 +1014,13 @@ impl GitPanel {
                 bulk_staging: None,
                 stash_entries: Default::default(),
                 active_tab: GitPanelTab::Changes,
+                compare_diff: None,
+                compare_base: None,
+                compare_entries: Vec::new(),
+                compare_error: None,
+                compare_loading: false,
+                compare_selected_entry: None,
+                compare_subscription: None,
                 commit_history_list_state: ListState::new(0, ListAlignment::Top, px(1000.)),
                 commit_history_shas: None,
                 commit_history_error: None,
@@ -1133,6 +1176,10 @@ impl GitPanel {
         dispatch_context
     }
 
+    fn changes_tab_active(&self) -> bool {
+        self.active_tab == GitPanelTab::Changes
+    }
+
     fn close_panel(&mut self, _: &Close, _window: &mut Window, cx: &mut Context<Self>) {
         cx.emit(PanelEvent::Close);
     }
@@ -1179,6 +1226,9 @@ impl GitPanel {
             self.expand_selected_history_commit(window, cx);
             return;
         }
+        if !self.changes_tab_active() {
+            return;
+        }
 
         let Some(entry) = self.get_selected_entry().cloned() else {
             return;
@@ -1205,6 +1255,9 @@ impl GitPanel {
             self.collapse_selected_history_commit(cx);
             return;
         }
+        if !self.changes_tab_active() {
+            return;
+        }
 
         let Some(entry) = self.get_selected_entry().cloned() else {
             return;
@@ -1227,6 +1280,10 @@ impl GitPanel {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.changes_tab_active() {
+            return;
+        }
+
         let first_entry = match &self.view_mode {
             GitPanelViewMode::Flat => self
                 .entries
@@ -1255,6 +1312,9 @@ impl GitPanel {
     ) {
         if self.active_tab == GitPanelTab::History {
             self.select_previous_history_entry(cx);
+            return;
+        }
+        if !self.changes_tab_active() {
             return;
         }
 
@@ -1323,6 +1383,9 @@ impl GitPanel {
             self.select_next_history_entry(cx);
             return;
         }
+        if !self.changes_tab_active() {
+            return;
+        }
 
         let item_count = self.entries.len();
         if item_count == 0 {
@@ -1372,6 +1435,10 @@ impl GitPanel {
     }
 
     fn select_last(&mut self, _: &menu::SelectLast, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.changes_tab_active() {
+            return;
+        }
+
         if self.entries.last().is_some() {
             self.selected_entry = Some(self.entries.len() - 1);
             self.scroll_to_selected_entry(cx);
@@ -1380,6 +1447,10 @@ impl GitPanel {
 
     /// Show diff view at selected entry, only if the diff view is open
     fn move_diff_to_entry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.changes_tab_active() {
+            return;
+        }
+
         maybe!({
             let workspace = self.workspace.upgrade()?;
 
@@ -1451,6 +1522,9 @@ impl GitPanel {
             self.open_selected_history_commit(window, cx);
             return;
         }
+        if !self.changes_tab_active() {
+            return;
+        }
         if let Some(GitListEntry::Directory(dir_entry)) = self
             .selected_entry
             .and_then(|i| self.entries.get(i))
@@ -1494,6 +1568,10 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.changes_tab_active() {
+            return;
+        }
+
         maybe!({
             let entry = self
                 .entries
@@ -1515,6 +1593,10 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.changes_tab_active() {
+            return;
+        }
+
         let path_style = self.project.read(cx).path_style(cx);
         maybe!({
             let list_entry = self.entries.get(self.selected_entry?)?.clone();
@@ -1566,6 +1648,10 @@ impl GitPanel {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.changes_tab_active() {
+            return;
+        }
+
         maybe!({
             let list_entry = self.entries.get(self.selected_entry?)?.clone();
             let entry = list_entry.status_entry()?.to_owned();
@@ -1603,6 +1689,10 @@ impl GitPanel {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.changes_tab_active() {
+            return;
+        }
+
         maybe!({
             let list_entry = self.entries.get(self.selected_entry?)?.clone();
             let entry = list_entry.status_entry()?.to_owned();
@@ -1764,6 +1854,10 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.changes_tab_active() {
+            return;
+        }
+
         let entries = self
             .entries
             .iter()
@@ -1810,6 +1904,10 @@ impl GitPanel {
     }
 
     fn clean_all(&mut self, _: &TrashUntrackedFiles, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.changes_tab_active() {
+            return;
+        }
+
         let workspace = self.workspace.clone();
         let Some(active_repo) = self.active_repository.clone() else {
             return;
@@ -1880,6 +1978,10 @@ impl GitPanel {
     }
 
     fn change_all_files_stage(&mut self, stage: bool, cx: &mut Context<Self>) {
+        if !self.changes_tab_active() {
+            return;
+        }
+
         let Some(active_repository) = self.active_repository.clone() else {
             return;
         };
@@ -2229,12 +2331,20 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.changes_tab_active() {
+            return;
+        }
+
         if let Some(selected_entry) = self.get_selected_entry().cloned() {
             self.toggle_staged_for_entry(&selected_entry, window, cx);
         }
     }
 
     fn stage_range(&mut self, _: &git::StageRange, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.changes_tab_active() {
+            return;
+        }
+
         let Some(index) = self.selected_entry else {
             return;
         };
@@ -2242,6 +2352,10 @@ impl GitPanel {
     }
 
     fn stage_selected(&mut self, _: &git::StageFile, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.changes_tab_active() {
+            return;
+        }
+
         let Some(selected_entry) = self.get_selected_entry() else {
             return;
         };
@@ -2259,6 +2373,10 @@ impl GitPanel {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.changes_tab_active() {
+            return;
+        }
+
         let Some(selected_entry) = self.get_selected_entry() else {
             return;
         };
@@ -3806,6 +3924,7 @@ impl GitPanel {
             .as_ref()
             .map(|repository| repository.entity_id());
         if active_repository_id != previous_active_repository_id {
+            self.clear_compare_state();
             self.set_commit_history_shas(None);
             self.commit_history_error.take();
             self.commit_history_loading = false;
@@ -5199,71 +5318,230 @@ impl GitPanel {
         )
     }
 
-    fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let active_tab = self.active_tab;
+    fn clear_compare_state(&mut self) {
+        self.compare_diff.take();
+        self.compare_base.take();
+        self.compare_entries.clear();
+        self.compare_error.take();
+        self.compare_loading = false;
+        self.compare_selected_entry = None;
+        self.compare_subscription.take();
+    }
 
-        let focus_handle = self.focus_handle.clone();
-        let tab = |id: ElementId,
-                   active: bool,
-                   show_changes: bool,
-                   label: SharedString,
-                   set_active_tab: GitPanelTab,
-                   tooltip_action: Box<dyn Action>| {
-            let focus_handle = focus_handle.clone();
+    fn compare_base_label(base: &DiffBase) -> SharedString {
+        match base {
+            DiffBase::Head => "HEAD".into(),
+            DiffBase::Merge { base_ref } | DiffBase::Since { base_ref } => {
+                format!("Base: {}", ProjectDiff::display_base_ref(base_ref)).into()
+            }
+        }
+    }
 
-            h_flex()
-                .cursor_pointer()
-                .id(id)
-                .h_full()
-                .py_1()
-                .gap_1()
-                .flex_1()
-                .justify_center()
-                .hover(|s| s.bg(cx.theme().colors().element_hover))
-                .border_b_1()
-                .when(!active, |s| {
-                    s.bg(cx.theme().colors().editor_background.opacity(0.6))
-                        .border_color(cx.theme().colors().border.opacity(0.6))
-                })
-                .child(Label::new(label.clone()).when(!active, |this| this.color(Color::Muted)))
-                .when(show_changes && self.changes_count > 0, |this| {
-                    this.child(
-                        Label::new(format!("({})", self.changes_count))
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
-                })
-                .tooltip(Tooltip::for_action_title_in(
-                    format!("Toggle {} Tab", label),
-                    tooltip_action.as_ref(),
-                    &focus_handle,
-                ))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.set_active_tab(set_active_tab, window, cx)
-                }))
+    fn show_compare_with_default_base(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_active_tab(GitPanelTab::Compare, window, cx);
+        if self.compare_base.is_some() {
+            return;
+        }
+
+        let Some(repository) = self.active_repository.clone() else {
+            self.compare_error = Some("No active repository".into());
+            cx.notify();
+            return;
         };
 
-        h_flex()
-            .relative()
-            .h(Tab::container_height(cx))
-            .w_full()
-            .child(tab(
-                ElementId::Name("changes-tab".into()),
-                active_tab == GitPanelTab::Changes,
-                true,
-                "Changes".into(),
-                GitPanelTab::Changes,
-                ActivateChangesTab.boxed_clone(),
-            ))
-            .child(Divider::vertical().color(ui::DividerColor::BorderFaded))
-            .child(tab(
-                ElementId::Name("history-tab".into()),
-                active_tab != GitPanelTab::Changes,
-                false,
-                "History".into(),
-                GitPanelTab::History,
-                ActivateHistoryTab.boxed_clone(),
-            ))
+        self.compare_loading = true;
+        self.compare_error.take();
+        cx.notify();
+
+        let default_branch =
+            repository.update(cx, |repository, _cx| repository.default_branch(true));
+        cx.spawn_in(window, async move |this, cx| {
+            let result = default_branch.await;
+            this.update_in(cx, |this, window, cx| {
+                this.compare_loading = false;
+                match result {
+                    Ok(Ok(Some(base_ref))) => {
+                        this.set_compare_base(DiffBase::Merge { base_ref }, repository, window, cx);
+                    }
+                    Ok(Ok(None)) => {
+                        this.compare_error.take();
+                    }
+                    Ok(Err(error)) => {
+                        this.compare_error =
+                            Some(format!("Could not determine default branch: {error:#}").into());
+                    }
+                    Err(_) => {
+                        this.compare_error = Some("Could not determine default branch".into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub(crate) fn show_compare_since_base_ref(
+        &mut self,
+        repository: Entity<Repository>,
+        base_ref: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_compare_base(DiffBase::Since { base_ref }, repository, window, cx);
+        self.set_active_tab(GitPanelTab::Compare, window, cx);
+    }
+
+    fn set_compare_base(
+        &mut self,
+        diff_base: DiffBase,
+        repository: Entity<Repository>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let compare_diff = if let Some(compare_diff) = self.compare_diff.clone() {
+            compare_diff.update(cx, |compare_diff, cx| {
+                compare_diff.set_repo(Some(repository.clone()), cx);
+                compare_diff.set_diff_base(diff_base.clone(), cx);
+            });
+            compare_diff
+        } else {
+            let compare_diff = cx.new(|cx| {
+                let mut compare_diff = branch_diff::BranchDiff::new(
+                    diff_base.clone(),
+                    self.project.clone(),
+                    window,
+                    cx,
+                );
+                compare_diff.set_repo(Some(repository.clone()), cx);
+                compare_diff
+            });
+            self.compare_subscription = Some(cx.subscribe_in(
+                &compare_diff,
+                window,
+                |this, _, event, _window, cx| match event {
+                    BranchDiffEvent::FileListChanged | BranchDiffEvent::DiffBaseChanged => {
+                        this.refresh_compare_entries(cx);
+                    }
+                },
+            ));
+            compare_diff
+        };
+
+        self.compare_diff = Some(compare_diff);
+        self.compare_base = Some(diff_base);
+        self.compare_error.take();
+        self.refresh_compare_entries(cx);
+    }
+
+    fn refresh_compare_entries(&mut self, cx: &mut Context<Self>) {
+        self.compare_entries.clear();
+
+        let Some(compare_diff) = self.compare_diff.as_ref() else {
+            self.compare_loading = false;
+            self.compare_selected_entry = None;
+            cx.notify();
+            return;
+        };
+
+        self.compare_loading = compare_diff.read(cx).is_tree_base_loading();
+        self.compare_entries = compare_diff
+            .read(cx)
+            .file_statuses(cx)
+            .into_iter()
+            .map(|(repo_path, status)| GitStatusEntry {
+                repo_path,
+                status,
+                staging: StageStatus::Unstaged,
+                diff_stat: None,
+            })
+            .collect();
+
+        let path_style = self.project.read(cx).path_style(cx);
+        self.compare_entries
+            .sort_by_key(|entry| entry.repo_path.display(path_style).to_string());
+
+        if self.compare_entries.is_empty() {
+            self.compare_selected_entry = None;
+        } else {
+            self.compare_selected_entry = Some(
+                self.compare_selected_entry
+                    .unwrap_or_default()
+                    .min(self.compare_entries.len() - 1),
+            );
+        }
+        cx.notify();
+    }
+
+    fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let active_tab = self.active_tab;
+        let label = match active_tab {
+            GitPanelTab::Changes if self.changes_count > 0 => {
+                format!("Changes ({})", self.changes_count)
+            }
+            GitPanelTab::Changes => "Changes".to_string(),
+            GitPanelTab::Compare => "Compare".to_string(),
+            GitPanelTab::History => "History".to_string(),
+        };
+        let git_panel = cx.weak_entity();
+
+        h_flex().h(Tab::container_height(cx)).w_full().px_1().child(
+            PopoverMenu::new("git-panel-mode-selector")
+                .trigger_with_tooltip(
+                    Button::new("git-panel-mode", label)
+                        .label_size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .end_icon(
+                            Icon::new(IconName::ChevronDown)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        ),
+                    Tooltip::text("Git Panel Mode"),
+                )
+                .menu(move |window, cx| {
+                    let git_panel = git_panel.clone();
+                    Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                        menu.entry("Changes", Some(Box::new(ActivateChangesTab)), {
+                            let git_panel = git_panel.clone();
+                            move |window, cx| {
+                                git_panel
+                                    .update(cx, |git_panel, cx| {
+                                        git_panel.set_active_tab(GitPanelTab::Changes, window, cx);
+                                    })
+                                    .ok();
+                            }
+                        })
+                        .entry("Compare", Some(Box::new(ActivateCompareTab)), {
+                            let git_panel = git_panel.clone();
+                            move |window, cx| {
+                                git_panel
+                                    .update(cx, |git_panel, cx| {
+                                        git_panel.show_compare_with_default_base(window, cx);
+                                    })
+                                    .ok();
+                            }
+                        })
+                        .entry(
+                            "History",
+                            Some(Box::new(ActivateHistoryTab)),
+                            {
+                                let git_panel = git_panel.clone();
+                                move |window, cx| {
+                                    git_panel
+                                        .update(cx, |git_panel, cx| {
+                                            git_panel.set_active_tab(
+                                                GitPanelTab::History,
+                                                window,
+                                                cx,
+                                            );
+                                        })
+                                        .ok();
+                                }
+                            },
+                        )
+                    }))
+                }),
+        )
     }
 
     fn render_history_tab(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -5274,15 +5552,305 @@ impl GitPanel {
                 self.commit_history_loading,
                 self.commit_history_shas.as_deref(),
             ) {
-                this.child(Self::render_commit_history_message(message))
+                this.child(Self::render_commit_history_message(message, cx))
             } else if let Some(history) = self.render_commit_history(window, cx) {
                 this.child(history)
             } else {
                 this.child(Self::render_commit_history_message(
                     "Loading Commit History…",
+                    cx,
                 ))
             }
         })
+    }
+
+    fn render_compare_repository_selector(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let active_repository = self.active_repository.clone()?;
+        let branch = active_repository.read(cx).branch.clone();
+        let head_commit = active_repository.read(cx).head_commit.clone();
+        let git_panel = cx.entity();
+        let display_name = SharedString::from(Arc::from(
+            active_repository
+                .read(cx)
+                .display_name()
+                .trim_end_matches("/"),
+        ));
+
+        Some(
+            div()
+                .child(PanelRepoFooter::new_without_remote(
+                    display_name,
+                    branch,
+                    head_commit,
+                    Some(git_panel),
+                ))
+                .into_any_element(),
+        )
+    }
+
+    fn render_compare_tab(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .flex_1()
+            .size_full()
+            .overflow_hidden()
+            .child(self.render_compare_header(window, cx))
+            .map(|this| {
+                if let Some(error) = self.compare_error.as_ref() {
+                    this.child(Self::render_commit_history_message(error.clone(), cx))
+                } else if self.compare_base.is_none() {
+                    this.child(Self::render_commit_history_message(
+                        "Select a base above to compare with current workspace",
+                        cx,
+                    ))
+                } else if self.compare_loading && self.compare_entries.is_empty() {
+                    this.child(Self::render_commit_history_message("Loading Compare…", cx))
+                } else if self.compare_entries.is_empty() {
+                    this.child(Self::render_commit_history_message(
+                        "No Compare changes",
+                        cx,
+                    ))
+                } else {
+                    this.child(self.render_compare_entries(window, cx))
+                }
+            })
+            .children(self.render_compare_repository_selector(cx))
+    }
+
+    fn render_compare_header(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let base_label = self
+            .compare_base
+            .as_ref()
+            .map(Self::compare_base_label)
+            .unwrap_or_else(|| "Select Base...".into());
+        let can_select_base = !matches!(self.compare_base, Some(DiffBase::Since { .. }));
+        let selected_base_ref = self.compare_base.as_ref().and_then(|base| {
+            if let DiffBase::Merge { base_ref } = base {
+                Some(base_ref.clone())
+            } else {
+                None
+            }
+        });
+        let repository = self.active_repository.clone();
+        let workspace = self.workspace.clone();
+        let git_panel = cx.weak_entity();
+
+        h_flex()
+            .h(Tab::container_height(cx))
+            .w_full()
+            .px_2()
+            .gap_2()
+            .justify_between()
+            .border_b_1()
+            .border_color(cx.theme().colors().border_variant)
+            .child(h_flex().min_w_0().gap_2().map(|this| {
+                if can_select_base {
+                    this.child(
+                        PopoverMenu::new("git-panel-compare-base-picker")
+                            .menu(move |window, cx| {
+                                let git_panel = git_panel.clone();
+                                let repository_for_picker = repository.clone();
+                                let repository_for_select = repository.clone();
+                                let on_select = Arc::new(
+                                    move |branch: git::repository::Branch,
+                                          window: &mut Window,
+                                          cx: &mut App| {
+                                        let Some(repository) = repository_for_select.clone() else {
+                                            return;
+                                        };
+                                        let base_ref: SharedString =
+                                            branch.name().to_owned().into();
+                                        git_panel
+                                            .update(cx, |git_panel, cx| {
+                                                git_panel.set_compare_base(
+                                                    DiffBase::Merge { base_ref },
+                                                    repository,
+                                                    window,
+                                                    cx,
+                                                );
+                                            })
+                                            .ok();
+                                    },
+                                );
+                                Some(branch_picker::select_popover(
+                                    workspace.clone(),
+                                    repository_for_picker,
+                                    selected_base_ref.clone(),
+                                    on_select,
+                                    window,
+                                    cx,
+                                ))
+                            })
+                            .trigger_with_tooltip(
+                                Button::new("git-panel-compare-base", base_label.clone())
+                                    .style(ButtonStyle::Subtle)
+                                    .label_size(LabelSize::Small)
+                                    .start_icon(
+                                        Icon::new(IconName::GitBranch)
+                                            .size(IconSize::Small)
+                                            .color(Color::Muted),
+                                    )
+                                    .end_icon(
+                                        Icon::new(IconName::ChevronDown)
+                                            .size(IconSize::XSmall)
+                                            .color(Color::Muted),
+                                    ),
+                                Tooltip::text("Select Compare base"),
+                            ),
+                    )
+                } else {
+                    this.child(Label::new(base_label).truncate())
+                }
+            }))
+    }
+
+    fn render_compare_entries(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let entry_count = self.compare_entries.len();
+
+        v_flex().flex_1().size_full().overflow_hidden().child(
+            uniform_list(
+                "compare_entries",
+                entry_count,
+                cx.processor(move |this, range: Range<usize>, window, cx| {
+                    range
+                        .filter_map(|ix| {
+                            this.compare_entries
+                                .get(ix)
+                                .map(|entry| this.render_compare_entry(ix, entry, window, cx))
+                        })
+                        .collect::<Vec<_>>()
+                }),
+            )
+            .size_full()
+            .flex_grow_1()
+            .track_scroll(&self.scroll_handle),
+        )
+    }
+
+    fn render_compare_entry(
+        &self,
+        ix: usize,
+        entry: &GitStatusEntry,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let settings = GitPanelSettings::get_global(cx);
+        let path_style = self.project.read(cx).path_style(cx);
+        let git_path_style = ProjectSettings::get_global(cx).git.path_style;
+        let display_name = entry.display_name(path_style);
+        let selected = self.compare_selected_entry == Some(ix);
+        let status = entry.status;
+        let file_icon = if settings.file_icons {
+            FileIcons::get_icon(entry.repo_path.as_std_path(), cx)
+        } else {
+            None
+        };
+        let label_color = if status.is_deleted() {
+            Color::Disabled
+        } else {
+            Color::Default
+        };
+        let path_color = if status.is_deleted() {
+            Color::Disabled
+        } else {
+            Color::Muted
+        };
+        let info_color = cx.theme().status().info;
+        let base_bg = if selected {
+            info_color.alpha(0.08)
+        } else {
+            cx.theme().colors().ghost_element_background
+        };
+
+        h_flex()
+            .id(ElementId::Name(
+                format!("compare_entry_{}_{}", display_name, ix).into(),
+            ))
+            .h(self.list_item_height())
+            .w_full()
+            .pl_3()
+            .pr_2()
+            .gap_1p5()
+            .border_1()
+            .border_r_2()
+            .when(selected && self.focus_handle.is_focused(window), |el| {
+                el.border_color(cx.theme().colors().panel_focused_border)
+            })
+            .bg(base_bg)
+            .hover(|s| s.bg(cx.theme().colors().ghost_element_hover))
+            .active(|s| s.bg(cx.theme().colors().ghost_element_active))
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .flex_1()
+                    .gap_1()
+                    .when(settings.file_icons, |this| {
+                        this.child(
+                            file_icon
+                                .map(|file_icon| {
+                                    Icon::from_path(file_icon)
+                                        .size(IconSize::Small)
+                                        .color(Color::Muted)
+                                })
+                                .unwrap_or_else(|| {
+                                    Icon::new(IconName::File)
+                                        .size(IconSize::Small)
+                                        .color(Color::Muted)
+                                }),
+                        )
+                    })
+                    .when(settings.status_style != StatusStyle::LabelColor, |this| {
+                        this.child(git_status_icon(status))
+                    })
+                    .child(self.path_formatted(
+                        entry.parent_dir(path_style),
+                        path_color,
+                        display_name,
+                        label_color,
+                        path_style,
+                        git_path_style,
+                        status.is_deleted(),
+                    )),
+            )
+            .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                this.compare_selected_entry = Some(ix);
+                this.open_compare_entry(ix, window, cx);
+                this.focus_handle.focus(window, cx);
+            }))
+            .into_any_element()
+    }
+
+    fn open_compare_entry(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(entry) = self.compare_entries.get(ix).cloned() else {
+            return;
+        };
+        let Some(diff_base) = self.compare_base.clone() else {
+            return;
+        };
+        let Some(repository) = self.active_repository.clone() else {
+            return;
+        };
+
+        self.workspace
+            .update(cx, |workspace, cx| {
+                ProjectDiff::deploy_with_diff_base_at(
+                    workspace,
+                    self.project.clone(),
+                    repository,
+                    diff_base,
+                    entry,
+                    window,
+                    cx,
+                );
+            })
+            .ok();
     }
 
     fn commit_history_status_message(
@@ -5304,11 +5872,18 @@ impl GitPanel {
         }
     }
 
-    fn render_commit_history_message(message: impl Into<SharedString>) -> impl IntoElement {
-        h_flex()
-            .flex_1()
-            .justify_center()
-            .child(Label::new(message).color(Color::Muted))
+    fn render_commit_history_message(
+        message: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        h_flex().flex_1().min_w_0().px_4().justify_center().child(
+            div()
+                .w_full()
+                .text_center()
+                .text_ui(cx)
+                .text_color(cx.theme().colors().text_muted)
+                .child(message.into()),
+        )
     }
 
     fn select_next_history_entry(&mut self, cx: &mut Context<Self>) {
@@ -5770,6 +6345,15 @@ impl GitPanel {
         self.set_active_tab(GitPanelTab::Changes, window, cx);
     }
 
+    fn activate_compare_tab(
+        &mut self,
+        _: &ActivateCompareTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_compare_with_default_base(window, cx);
+    }
+
     fn activate_history_tab(
         &mut self,
         _: &ActivateHistoryTab,
@@ -5785,6 +6369,9 @@ impl GitPanel {
         }
         self.active_tab = tab;
         match tab {
+            GitPanelTab::Compare => {
+                self.focus_handle.focus(window, cx);
+            }
             GitPanelTab::History => {
                 self.focus_handle.focus(window, cx);
                 self.load_commit_history(cx);
@@ -6259,7 +6846,7 @@ impl GitPanel {
                                             let full_path = full_path.clone();
                                             move |_, cx| {
                                                 Tooltip::with_meta(
-                                                    "View File Diff",
+                                                    "Open File Diff",
                                                     None,
                                                     full_path.clone(),
                                                     cx,
@@ -6545,7 +7132,7 @@ impl GitPanel {
                                     })
                                     .tooltip(move |_, cx| {
                                         Tooltip::with_meta(
-                                            "View Commit",
+                                            "Open Commit Diff",
                                             None,
                                             short_sha.clone(),
                                             cx,
@@ -7735,6 +8322,10 @@ impl GitPanel {
     pub fn active_repository(&self) -> Option<&Entity<Repository>> {
         self.active_repository.as_ref()
     }
+
+    pub(crate) fn compare_base(&self) -> Option<&DiffBase> {
+        self.compare_base.as_ref()
+    }
 }
 
 impl Render for GitPanel {
@@ -7808,6 +8399,7 @@ impl Render for GitPanel {
             .on_action(cx.listener(Self::decrease_font_size))
             .on_action(cx.listener(Self::reset_font_size))
             .on_action(cx.listener(Self::activate_changes_tab))
+            .on_action(cx.listener(Self::activate_compare_tab))
             .on_action(cx.listener(Self::activate_history_tab))
             .size_full()
             .overflow_hidden()
@@ -7844,6 +8436,7 @@ impl Render for GitPanel {
                             .when(!self.amend_pending, |this| {
                                 this.children(self.render_previous_commit(window, cx))
                             }),
+                        GitPanelTab::Compare => this.child(self.render_compare_tab(window, cx)),
                         GitPanelTab::History => this.child(self.render_history_tab(window, cx)),
                     })
                     .into_any_element(),
@@ -8067,6 +8660,7 @@ pub struct PanelRepoFooter {
     //
     // For now just take an option here, and we won't bind handlers to buttons in previews.
     git_panel: Option<Entity<GitPanel>>,
+    show_remote_button: bool,
 }
 
 impl PanelRepoFooter {
@@ -8081,6 +8675,22 @@ impl PanelRepoFooter {
             branch,
             head_commit,
             git_panel,
+            show_remote_button: true,
+        }
+    }
+
+    pub fn new_without_remote(
+        active_repository: SharedString,
+        branch: Option<Branch>,
+        head_commit: Option<CommitDetails>,
+        git_panel: Option<Entity<GitPanel>>,
+    ) -> Self {
+        Self {
+            active_repository,
+            branch,
+            head_commit,
+            git_panel,
+            show_remote_button: false,
         }
     }
 
@@ -8090,6 +8700,7 @@ impl PanelRepoFooter {
             branch,
             head_commit: None,
             git_panel: None,
+            show_remote_button: true,
         }
     }
 }
@@ -8216,11 +8827,15 @@ impl RenderOnce for PanelRepoFooter {
                     })
                     .child(div().child(branch_selector).min_w_0()),
             )
-            .children(if let Some(git_panel) = self.git_panel {
-                git_panel.update(cx, |git_panel, cx| git_panel.render_remote_button(cx))
-            } else {
-                None
-            })
+            .children(
+                if self.show_remote_button
+                    && let Some(git_panel) = self.git_panel
+                {
+                    git_panel.update(cx, |git_panel, cx| git_panel.render_remote_button(cx))
+                } else {
+                    None
+                },
+            )
     }
 }
 
@@ -9358,6 +9973,193 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_changes_mutators_ignore_stale_selection_outside_changes_tab(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            "/root",
+            json!({
+                "project": {
+                    ".git": {},
+                    "staged.txt": "staged\n",
+                    "unstaged.txt": "unstaged\n",
+                    "new.txt": "new\n",
+                },
+            }),
+        )
+        .await;
+
+        fs.set_status_for_repo(
+            Path::new(path!("/root/project/.git")),
+            &[
+                ("staged.txt", StatusCode::Modified.index()),
+                ("unstaged.txt", StatusCode::Modified.worktree()),
+                ("new.txt", FileStatus::Untracked),
+            ],
+        );
+
+        let project = Project::test(fs.clone(), [Path::new(path!("/root/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+
+        cx.read(|cx| {
+            project
+                .read(cx)
+                .worktrees(cx)
+                .next()
+                .unwrap()
+                .read(cx)
+                .as_local()
+                .unwrap()
+                .scan_complete()
+        })
+        .await;
+
+        cx.executor().run_until_parked();
+
+        let panel = workspace.update_in(cx, GitPanel::new);
+
+        let handle = cx.update_window_entity(&panel, |panel, _, _| {
+            std::mem::replace(&mut panel.update_visible_entries_task, Task::ready(()))
+        });
+        cx.executor().advance_clock(2 * UPDATE_DEBOUNCE);
+        handle.await;
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.selected_entry = Some(entry_index_for_path(&panel.entries, "unstaged.txt"));
+
+            panel.active_tab = GitPanelTab::History;
+            invoke_changes_mutators(panel, window, cx);
+
+            panel.active_tab = GitPanelTab::Compare;
+            invoke_changes_mutators(panel, window, cx);
+        });
+
+        assert!(
+            !cx.has_pending_prompt(),
+            "changes mutators should not prompt outside the Changes tab"
+        );
+
+        cx.executor().run_until_parked();
+
+        cx.read(|cx| {
+            project
+                .read(cx)
+                .worktrees(cx)
+                .next()
+                .unwrap()
+                .read(cx)
+                .as_local()
+                .unwrap()
+                .scan_complete()
+        })
+        .await;
+
+        cx.executor().run_until_parked();
+
+        let handle = cx.update_window_entity(&panel, |panel, _, _| {
+            std::mem::replace(&mut panel.update_visible_entries_task, Task::ready(()))
+        });
+        cx.executor().advance_clock(2 * UPDATE_DEBOUNCE);
+        handle.await;
+
+        panel.read_with(cx, |panel, _| {
+            assert_entry_staging(
+                &panel.entries,
+                &[
+                    ("staged.txt", StageStatus::Staged),
+                    ("unstaged.txt", StageStatus::Unstaged),
+                    ("new.txt", StageStatus::Unstaged),
+                ],
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_changes_list_actions_ignore_stale_selection_outside_changes_tab(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            "/root",
+            json!({
+                "project": {
+                    ".git": {},
+                    "alpha.txt": "alpha\n",
+                    "beta.txt": "beta\n",
+                },
+            }),
+        )
+        .await;
+
+        fs.set_status_for_repo(
+            Path::new(path!("/root/project/.git")),
+            &[
+                ("alpha.txt", StatusCode::Modified.worktree()),
+                ("beta.txt", StatusCode::Modified.worktree()),
+            ],
+        );
+
+        let project = Project::test(fs.clone(), [Path::new(path!("/root/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+
+        cx.read(|cx| {
+            project
+                .read(cx)
+                .worktrees(cx)
+                .next()
+                .unwrap()
+                .read(cx)
+                .as_local()
+                .unwrap()
+                .scan_complete()
+        })
+        .await;
+
+        cx.executor().run_until_parked();
+
+        let panel = workspace.update_in(cx, GitPanel::new);
+
+        let handle = cx.update_window_entity(&panel, |panel, _, _| {
+            std::mem::replace(&mut panel.update_visible_entries_task, Task::ready(()))
+        });
+        cx.executor().advance_clock(2 * UPDATE_DEBOUNCE);
+        handle.await;
+
+        panel.update_in(cx, |panel, window, cx| {
+            let selected_entry = entry_index_for_path(&panel.entries, "beta.txt");
+            panel.selected_entry = Some(selected_entry);
+
+            panel.active_tab = GitPanelTab::Compare;
+            invoke_changes_list_actions(panel, window, cx);
+            assert_eq!(panel.selected_entry, Some(selected_entry));
+
+            panel.active_tab = GitPanelTab::History;
+            invoke_changes_list_actions(panel, window, cx);
+            assert_eq!(panel.selected_entry, Some(selected_entry));
+        });
+
+        cx.executor().run_until_parked();
+
+        workspace.update_in(cx, |workspace, _window, cx| {
+            assert!(workspace.item_of_type::<ProjectDiff>(cx).is_none());
+            assert!(workspace.item_of_type::<SoloDiffView>(cx).is_none());
+        });
+    }
+
+    #[gpui::test]
     async fn test_bulk_staging(cx: &mut TestAppContext) {
         use GitListEntry::*;
 
@@ -10296,6 +11098,64 @@ mod tests {
                 expected_path.map(|s| s.to_string())
             );
         }
+    }
+
+    fn entry_index_for_path(entries: &[GitListEntry], path: &str) -> usize {
+        entries
+            .iter()
+            .position(|entry| {
+                entry
+                    .status_entry()
+                    .is_some_and(|entry| entry.repo_path == repo_path(path))
+            })
+            .expect("entry should exist")
+    }
+
+    fn assert_entry_staging(entries: &[GitListEntry], expected_staging: &[(&str, StageStatus)]) {
+        for (path, staging) in expected_staging {
+            let entry = entries
+                .iter()
+                .find_map(|entry| {
+                    let entry = entry.status_entry()?;
+                    (entry.repo_path == repo_path(path)).then_some(entry)
+                })
+                .expect("entry should exist");
+            assert_eq!(entry.staging, *staging, "staging for {path}");
+        }
+    }
+
+    fn invoke_changes_mutators(
+        panel: &mut GitPanel,
+        window: &mut Window,
+        cx: &mut Context<GitPanel>,
+    ) {
+        panel.revert_selected(&git::RestoreFile { skip_prompt: false }, window, cx);
+        panel.revert_selected(&git::RestoreFile { skip_prompt: true }, window, cx);
+        panel.toggle_staged_for_selected(&ToggleStaged, window, cx);
+        panel.stage_range(&git::StageRange, window, cx);
+        panel.stage_selected(&git::StageFile, window, cx);
+        panel.unstage_selected(&git::UnstageFile, window, cx);
+        panel.stage_all(&StageAll, window, cx);
+        panel.unstage_all(&UnstageAll, window, cx);
+        panel.restore_tracked_files(&RestoreTrackedFiles, window, cx);
+        panel.clean_all(&TrashUntrackedFiles, window, cx);
+        panel.add_to_gitignore(&git::AddToGitignore, window, cx);
+        panel.add_to_git_info_exclude(&git::AddToGitInfoExclude, window, cx);
+    }
+
+    fn invoke_changes_list_actions(
+        panel: &mut GitPanel,
+        window: &mut Window,
+        cx: &mut Context<GitPanel>,
+    ) {
+        panel.first_entry(&FirstEntry, window, cx);
+        panel.last_entry(&LastEntry, window, cx);
+        panel.next_entry(&NextEntry, window, cx);
+        panel.previous_entry(&PreviousEntry, window, cx);
+        panel.expand_selected_entry(&ExpandSelectedEntry, window, cx);
+        panel.collapse_selected_entry(&CollapseSelectedEntry, window, cx);
+        panel.open_diff(&menu::Confirm, window, cx);
+        panel.open_solo_diff(&menu::SecondaryConfirm, window, cx);
     }
 
     #[test]
