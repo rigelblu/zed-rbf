@@ -4,7 +4,7 @@ use collections::HashSet;
 use editor::{Editor, MultiBufferOffset};
 use git::{
     Oid,
-    repository::{InitialGraphCommitData, LogSource, RepoPath},
+    repository::{InitialGraphCommitData, RepoPath},
 };
 use gpui::{Empty, Entity, TestAppContext, VisualTestContext};
 use menu::Cancel;
@@ -183,6 +183,9 @@ async fn test_file_history_action_uses_focused_project_panel_selection(
         Path::new("/project"),
         json!({
             ".git": {},
+            "src": {
+                "nested.txt": "nested",
+            },
             "tracked1.txt": "tracked 1",
             "tracked2.txt": "tracked 2",
         }),
@@ -205,12 +208,18 @@ async fn test_file_history_action_uses_focused_project_panel_selection(
             .expect("should have active repository")
     });
     let project_panel_repo_path = RepoPath::new(&"tracked1.txt").unwrap();
+    let directory_repo_path = RepoPath::new(&"src").unwrap();
     let editor_repo_path = RepoPath::new(&"tracked2.txt").unwrap();
     let project_panel_path = repository
         .read_with(cx, |repository, cx| {
             repository.repo_path_to_project_path(&project_panel_repo_path, cx)
         })
         .expect("project panel path should resolve");
+    let directory_path = repository
+        .read_with(cx, |repository, cx| {
+            repository.repo_path_to_project_path(&directory_repo_path, cx)
+        })
+        .expect("directory project path should resolve");
     let editor_path = repository
         .read_with(cx, |repository, cx| {
             repository.repo_path_to_project_path(&editor_repo_path, cx)
@@ -277,14 +286,56 @@ async fn test_file_history_action_uses_focused_project_panel_selection(
     cx.run_until_parked();
 
     workspace.read_with(&*cx, |workspace, cx| {
-        let graphs = workspace
-            .items_of_type::<git_ui::git_graph::GitGraph>(cx)
-            .collect::<Vec<_>>();
-        assert_eq!(graphs.len(), 1);
         assert_eq!(
-            graphs[0].read(cx).log_source_for_test(),
-            &LogSource::Path(project_panel_repo_path)
+            workspace
+                .items_of_type::<git_ui::git_graph::GitGraph>(cx)
+                .count(),
+            0
         );
+        let git_panel = workspace
+            .panel::<git_ui::git_panel::GitPanel>(cx)
+            .expect("file history should open the git panel");
+        git_panel.read_with(cx, |panel, _| {
+            assert!(panel.history_tab_active_for_test());
+            assert_eq!(
+                panel.commit_history_file_scope_for_test(),
+                Some(project_panel_repo_path.clone())
+            );
+        });
+    });
+
+    multi_workspace.update_in(cx, |_multi_workspace, window, cx| {
+        project_panel.update(cx, |panel, cx| {
+            panel.select_path_for_test(directory_path.clone(), cx);
+        });
+        project_panel.update(cx, |panel, cx| {
+            panel.focus_handle(cx).focus(window, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    cx.update(|window, cx| {
+        window.dispatch_action(Box::new(git::FileHistory), cx);
+    });
+    cx.run_until_parked();
+
+    workspace.read_with(&*cx, |workspace, cx| {
+        assert_eq!(
+            workspace
+                .items_of_type::<git_ui::git_graph::GitGraph>(cx)
+                .count(),
+            0
+        );
+        let git_panel = workspace
+            .panel::<git_ui::git_panel::GitPanel>(cx)
+            .expect("existing git panel should remain open");
+        git_panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.commit_history_file_scope_for_test(),
+                Some(project_panel_repo_path.clone()),
+                "directory selections should not open file history or fall back to the editor"
+            );
+        });
     });
 }
 
