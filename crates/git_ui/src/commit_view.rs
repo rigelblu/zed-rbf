@@ -47,7 +47,6 @@ use workspace::{
 
 use crate::commit_tooltip::CommitAvatar;
 use crate::git_panel::GitPanel;
-use crate::project_diff::ProjectDiff;
 
 actions!(
     git,
@@ -566,18 +565,21 @@ impl CommitView {
             return;
         };
         let base_ref = self.commit.sha.clone();
-        let project = workspace.read(cx).project().clone();
         let repository = self.repository.clone();
         window
             .spawn(cx, async move |cx| {
-                // Activating an existing ProjectDiff deactivates the current item, which may be
+                // Focusing the Git Panel deactivates the current item, which may be
                 // this CommitView. Wait until the action handler releases its CommitView lease.
                 yield_now().await;
                 workspace
                     .update_in(cx, |workspace, window, cx| {
-                        ProjectDiff::deploy_since_base_ref(
-                            workspace, project, repository, base_ref, window, cx,
-                        );
+                        let Some(git_panel) = workspace.panel::<GitPanel>(cx) else {
+                            return;
+                        };
+                        workspace.open_panel::<GitPanel>(window, cx);
+                        git_panel.update(cx, |git_panel, cx| {
+                            git_panel.show_compare_since_base_ref(repository, base_ref, window, cx);
+                        });
                     })
                     .log_err();
             })
@@ -1371,7 +1373,9 @@ impl Render for CommitViewToolbar {
                 this.child(
                     IconButton::new("compare-since-commit", IconName::Diff)
                         .icon_size(IconSize::Small)
-                        .tooltip(Tooltip::text("Compare Since"))
+                        .tooltip(Tooltip::text(
+                            "Compare current workspace against this commit",
+                        ))
                         .on_click(move |_, window, cx| {
                             commit_view_for_compare
                                 .update(cx, |commit_view, cx| {
@@ -1439,6 +1443,7 @@ fn stash_matches_index(sha: &str, stash_index: usize, repo: &Repository) -> bool
 
 #[cfg(test)]
 mod tests {
+    use crate::project_diff::ProjectDiff;
     use gpui::{SharedString, TestAppContext};
     use project::{FakeFs, git_store::branch_diff::DiffBase};
     use serde_json::json;
@@ -1463,6 +1468,7 @@ mod tests {
                 });
             });
             theme_settings::init(theme::LoadThemes::JustBase, cx);
+            language_model::init(cx);
             editor::init(cx);
             crate::init(cx);
         });
@@ -1494,6 +1500,9 @@ mod tests {
         let base_ref: SharedString = "0123456789abcdef0123456789abcdef01234567".into();
 
         workspace.update_in(cx, |workspace, window, cx| {
+            let git_panel = GitPanel::new(workspace, window, cx);
+            workspace.add_panel(git_panel, window, cx);
+            workspace.open_panel::<GitPanel>(window, cx);
             ProjectDiff::deploy_since_base_ref(
                 workspace,
                 project.clone(),
@@ -1544,11 +1553,11 @@ mod tests {
         });
         cx.run_until_parked();
 
-        let active_diff_base = workspace.update(cx, |workspace, cx| {
+        let compare_base = workspace.update(cx, |workspace, cx| {
             workspace
-                .active_item_as::<ProjectDiff>(cx)
-                .map(|project_diff| project_diff.read(cx).diff_base(cx).clone())
+                .panel::<GitPanel>(cx)
+                .and_then(|git_panel| git_panel.read(cx).compare_base().cloned())
         });
-        assert_eq!(active_diff_base, Some(DiffBase::Since { base_ref }));
+        assert_eq!(compare_base, Some(DiffBase::Since { base_ref }));
     }
 }
