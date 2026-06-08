@@ -55,6 +55,8 @@ actions!(
         PopCurrentStash,
         DropCurrentStash,
         OpenFileAtHead,
+        /// Opens Git Panel Compare with this commit as the base.
+        CompareSinceCommit,
     ]
 );
 
@@ -558,6 +560,43 @@ impl CommitView {
             return;
         };
         self.open_file_at_head(&file, window, cx);
+    }
+
+    fn compare_since_commit(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let base_ref = self.commit.sha.clone();
+        let repository = self.repository.clone();
+        window
+            .spawn(cx, async move |cx| {
+                // Focusing the Git Panel deactivates the current item, which may be
+                // this CommitView. Wait until the action handler releases its CommitView lease.
+                yield_now().await;
+                workspace
+                    .update_in(cx, |workspace, window, cx| {
+                        let Some(git_panel) = workspace.panel::<GitPanel>(cx) else {
+                            return;
+                        };
+                        workspace.open_panel::<GitPanel>(window, cx);
+                        git_panel.update(cx, |git_panel, cx| {
+                            git_panel.show_compare_since_base_ref(repository, base_ref, window, cx);
+                        });
+                    })
+                    .log_err();
+            })
+            .detach();
+    }
+
+    fn compare_since_commit_action(
+        &mut self,
+        _: &CompareSinceCommit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.stash.is_none() {
+            self.compare_since_commit(window, cx);
+        }
     }
 
     fn render_header(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1255,6 +1294,7 @@ impl Render for CommitView {
         v_flex()
             .key_context(if is_stash { "StashDiff" } else { "CommitDiff" })
             .on_action(cx.listener(Self::open_file_at_head_action))
+            .on_action(cx.listener(Self::compare_since_commit_action))
             .size_full()
             .bg(cx.theme().colors().editor_background)
             .child(self.render_header(window, cx))
@@ -1305,6 +1345,7 @@ impl Render for CommitViewToolbar {
         });
 
         let sha_for_graph = commit_sha.to_string();
+        let commit_view_for_compare = commit_view.downgrade();
 
         h_flex()
             .gap_1()
@@ -1339,6 +1380,20 @@ impl Render for CommitViewToolbar {
             )
             .when(!is_stash, |this| {
                 this.child(
+                    IconButton::new("compare-since-commit", IconName::Diff)
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text(
+                            "Compare current workspace against this commit",
+                        ))
+                        .on_click(move |_, window, cx| {
+                            commit_view_for_compare
+                                .update(cx, |commit_view, cx| {
+                                    commit_view.compare_since_commit(window, cx);
+                                })
+                                .log_err();
+                        }),
+                )
+                .child(
                     IconButton::new("show-in-git-graph", IconName::GitGraph)
                         .icon_size(IconSize::Small)
                         .tooltip(Tooltip::text("Show in Git Graph"))
@@ -1393,4 +1448,130 @@ fn stash_matches_index(sha: &str, stash_index: usize, repo: &Repository) -> bool
         .get(stash_index)
         .map(|entry| entry.oid.to_string() == sha)
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::branch_diff::BranchDiff;
+    use crate::git_panel::GitPanel;
+    use gpui::{SharedString, TestAppContext};
+    use project::{FakeFs, git_store::diff_buffer_list::DiffBase};
+    use serde_json::json;
+    use settings::SettingsStore;
+    use util::path;
+    use workspace::MultiWorkspace;
+
+    use super::*;
+
+    fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let store = SettingsStore::test(cx);
+            cx.set_global(store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            language_model::init(cx);
+            editor::init(cx);
+            crate::init(cx);
+        });
+    }
+
+    // `compare_since_commit` runs inside a CommitView update. Opening/focusing the
+    // Git Panel deactivates the active item — this CommitView — and a re-entrant
+    // update would panic on the live entity lease. The `yield_now` in
+    // `compare_since_commit` defers that work until the lease is released; this
+    // test drives the flow with an existing Since diff tab open and asserts the
+    // panel lands on the commit's base without panicking.
+    #[gpui::test]
+    async fn test_compare_since_existing_since_diff_does_not_reenter_commit_view_update(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "a.txt": "changed",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        let repository = project.read_with(cx, |project, cx| {
+            project.active_repository(cx).expect("active repository")
+        });
+        let base_ref: SharedString = "0123456789abcdef0123456789abcdef01234567".into();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let git_panel = GitPanel::new_test(workspace, window, cx);
+            workspace.add_panel(git_panel, window, cx);
+            workspace.open_panel::<GitPanel>(window, cx);
+
+            let workspace_entity = cx.entity();
+            let since_diff = cx.new(|cx| {
+                BranchDiff::new_with_diff_base(
+                    project.clone(),
+                    workspace_entity,
+                    DiffBase::Since {
+                        base_ref: base_ref.clone(),
+                    },
+                    Some(repository.clone()),
+                    None,
+                    window,
+                    cx,
+                )
+            });
+            workspace.add_item_to_active_pane(Box::new(since_diff), None, true, window, cx);
+        });
+        cx.run_until_parked();
+
+        let commit_view = workspace.update_in(cx, |workspace, window, cx| {
+            let workspace_entity = cx.entity();
+            let commit_view = cx.new(|cx| {
+                CommitView::new(
+                    CommitDetails {
+                        sha: base_ref.clone(),
+                        message: "Compare since regression".into(),
+                        ..Default::default()
+                    },
+                    CommitDiff { files: Vec::new() },
+                    repository,
+                    project.clone(),
+                    workspace_entity.clone(),
+                    workspace_entity.downgrade(),
+                    None,
+                    window,
+                    cx,
+                )
+            });
+            workspace.add_item_to_active_pane(
+                Box::new(commit_view.clone()),
+                None,
+                true,
+                window,
+                cx,
+            );
+            commit_view
+        });
+        cx.run_until_parked();
+
+        assert!(workspace.update(cx, |workspace, cx| {
+            workspace.active_item_as::<CommitView>(cx).is_some()
+        }));
+
+        commit_view.update_in(cx, |commit_view, window, cx| {
+            commit_view.compare_since_commit(window, cx);
+        });
+        cx.run_until_parked();
+
+        let compare_base = workspace.update(cx, |workspace, cx| {
+            workspace
+                .panel::<GitPanel>(cx)
+                .and_then(|git_panel| git_panel.read(cx).compare_base().cloned())
+        });
+        assert_eq!(compare_base, Some(DiffBase::Since { base_ref }));
+    }
 }
