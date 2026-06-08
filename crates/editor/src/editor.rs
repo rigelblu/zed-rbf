@@ -8644,21 +8644,44 @@ impl Editor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let selection = self.selections.newest::<Point>(&self.display_snapshot(cx));
-
-        let start_line = selection.start.row + 1;
-        let end_line = selection.end.row + 1;
-
-        let end_line = if selection.end.column == 0 && end_line > start_line {
-            end_line - 1
-        } else {
-            end_line
-        };
+        let display_snapshot = self.display_snapshot(cx);
+        let selection = self.selections.newest::<Point>(&display_snapshot);
 
         if let Some(file_location) = self.active_buffer(cx).and_then(|buffer| {
             let project = self.project()?.read(cx);
-            let file = buffer.read(cx).file()?;
-            let path = file.path().display(project.path_style(cx));
+            let buffer = buffer.read(cx);
+            let file = buffer.file()?;
+            let buffer_id = buffer.remote_id();
+
+            let start_point = display_snapshot
+                .buffer_snapshot()
+                .point_to_buffer_point(selection.start)
+                .filter(|(snapshot, _)| snapshot.remote_id() == buffer_id)
+                .map_or(selection.start, |(_, point)| point);
+            let end_point = display_snapshot
+                .buffer_snapshot()
+                .point_to_buffer_point(selection.end)
+                .filter(|(snapshot, _)| snapshot.remote_id() == buffer_id)
+                .map_or(selection.end, |(_, point)| point);
+
+            let start_line = start_point.row + 1;
+            let end_line = end_point.row + 1;
+            let end_line = if end_point.column == 0 && end_line > start_line {
+                end_line - 1
+            } else {
+                end_line
+            };
+
+            // `file.path()` is relative to the worktree root. A file opened
+            // directly is its own single-file worktree (root == the file), so that
+            // relative path is empty — fall back to the bare file name so the
+            // location stays useful (`notes.md:12` instead of `:12`).
+            let relative_path = file.path().display(project.path_style(cx)).to_string();
+            let path = if relative_path.is_empty() {
+                file.file_name(cx).to_string()
+            } else {
+                relative_path
+            };
 
             let location = if start_line == end_line {
                 format!("{path}:{start_line}")
