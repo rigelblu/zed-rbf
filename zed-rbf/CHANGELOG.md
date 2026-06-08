@@ -2,6 +2,14 @@
 title: "Zed RBF Changelog"
 ---
 
+## 🟠⋯ v0.23.0 — #zed-23
+- Improved File History so it opens a file-scoped History view in the Git Panel instead of a separate graph tab
+- File-scoped History lists only commits whose loaded diff includes the selected path, renders those rows without expand/collapse controls, and shows the full path in the scope-label tooltip
+- File-scoped History now renders validated rows incrementally and self-refreshes during graph loading so the panel does not get stuck waiting for a tab switch
+- File-scoped History keyboard navigation now updates one reusable file-diff preview instead of requiring a click or opening a tab for every selected commit
+- Project Panel directory selections no longer open empty file-scoped History or fall back to the active editor; File History remains a file-only action
+- Kept File History read-only: previewing active-file diffs does not checkout, restore, stage, or otherwise mutate the worktree
+
 ## 🟠⋯ v0.22.0 — #zed-22
 - Added Git Panel Compare as a first-class read-only mode for reviewing current-workspace changes against a selected base without changing checkout
 - Compare Since now opens Git Panel Compare with the selected commit as the base, so direct Compare and commit-based Compare share one workflow
@@ -26,6 +34,11 @@ title: "Zed RBF Changelog"
 - Fixed Git Panel History in detached checkouts: when there is no active branch, History now loads commit rows from the current `HEAD` commit instead of staying stuck on the loading state
 - Improved History state feedback: unscanned repositories stay in Loading, invalid `HEAD` state shows an error, and genuine empty history shows `No Commit History`
 - Fixed SHA-based Git log sources to pass printable hex commit IDs to `git log`, which also repairs other SHA-backed log views that share `LogSource::Sha`
+
+## 🟠⋯ v0.18.0 — #zed-18
+- Added `markdown_image_paste_directory` for Markdown image paste, allowing pasted images to be saved under a configured file-relative directory instead of always using `assets`
+- Invalid configured directories, including empty, absolute, parent-traversal, Markdown-unsafe, and percent-encoded values, fall back to `assets`
+- Pasted-image writes reject existing symlinked target directories that resolve outside the target worktree before inserting the Markdown image link
 
 ## 🟠⋯ v0.17.0 — #zed-17
 - Added clean display for Markdown image references with alt text: off the cursor row, `![alt](assets/image.png)` reads as underlined `alt` while cursor-line reveal shows the raw image syntax for editing

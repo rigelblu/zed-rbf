@@ -528,7 +528,7 @@ pub fn init(cx: &mut App) {
             }
         });
 
-        // Forwards `git::FileHistory` to `git_ui::git_graph` when the project
+        // Forwards `git::FileHistory` to `git_ui::git_panel` when the project
         // panel is the focused source of selection. Lives here (and not in
         // `git_ui`) so that `git_ui` does not need to depend on
         // `project_panel`, which would create a dependency cycle.
@@ -549,22 +549,15 @@ pub fn init(cx: &mut App) {
                         let Some(panel) = workspace.panel::<ProjectPanel>(cx) else {
                             return;
                         };
-                        let Some(project_path) = panel.read(cx).selected_entry_project_path(cx)
+                        let Some(project_path) = panel.read(cx).selected_file_project_path(cx)
                         else {
                             return;
                         };
-                        let Some((repo_id, log_source)) =
-                            git_ui::git_graph::resolve_file_history_target_from_project_path(
-                                workspace,
-                                &project_path,
-                                cx,
-                            )
-                        else {
-                            return;
-                        };
-                        let git_store = workspace.project().read(cx).git_store().clone();
-                        git_ui::git_graph::open_or_reuse_graph(
-                            workspace, repo_id, git_store, log_source, None, window, cx,
+                        git_ui::git_panel::open_file_history_for_project_path(
+                            workspace,
+                            &project_path,
+                            window,
+                            cx,
                         );
                     })
                     .log_err();
@@ -1108,7 +1101,8 @@ impl ProjectPanel {
                 let has_git_repo = git_store
                     .repository_and_path_for_project_path(&project_path, cx)
                     .is_some();
-                let has_history = has_git_repo
+                let has_history = !is_dir
+                    && has_git_repo
                     && !git_store
                         .project_path_git_status(&project_path, cx)
                         .is_some_and(|status| status.is_created());
@@ -3894,6 +3888,17 @@ impl ProjectPanel {
 
     pub fn selected_entry_project_path(&self, cx: &App) -> Option<ProjectPath> {
         let (worktree, entry) = self.selected_sub_entry(cx)?;
+        Some(ProjectPath {
+            worktree_id: worktree.read(cx).id(),
+            path: entry.path.clone(),
+        })
+    }
+
+    fn selected_file_project_path(&self, cx: &App) -> Option<ProjectPath> {
+        let (worktree, entry) = self.selected_sub_entry(cx)?;
+        if entry.is_dir() {
+            return None;
+        }
         Some(ProjectPath {
             worktree_id: worktree.read(cx).id(),
             path: entry.path.clone(),

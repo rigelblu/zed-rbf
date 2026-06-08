@@ -86,6 +86,12 @@ pub struct CommitView {
     project: Entity<Project>,
     workspace: WeakEntity<Workspace>,
     remote: Option<GitRemote>,
+    reuse_key: Option<CommitViewReuseKey>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommitViewReuseKey {
+    FileHistoryPreview,
 }
 
 struct GitBlob {
@@ -167,6 +173,51 @@ impl CommitView {
         window: &mut Window,
         cx: &mut App,
     ) {
+        Self::open_with_options(
+            commit_sha,
+            repo,
+            workspace,
+            stash,
+            file_filter,
+            focus_opened_item,
+            None,
+            window,
+            cx,
+        );
+    }
+
+    pub fn open_file_history_preview(
+        commit_sha: String,
+        repo: WeakEntity<Repository>,
+        workspace: WeakEntity<Workspace>,
+        file_filter: RepoPath,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        Self::open_with_options(
+            commit_sha,
+            repo,
+            workspace,
+            None,
+            Some(file_filter),
+            false,
+            Some(CommitViewReuseKey::FileHistoryPreview),
+            window,
+            cx,
+        );
+    }
+
+    fn open_with_options(
+        commit_sha: String,
+        repo: WeakEntity<Repository>,
+        workspace: WeakEntity<Workspace>,
+        stash: Option<usize>,
+        file_filter: Option<RepoPath>,
+        focus_opened_item: bool,
+        reuse_key: Option<CommitViewReuseKey>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
         let commit_diff = repo
             .update(cx, |repo, _| repo.load_commit_diff(commit_sha.clone()))
             .ok();
@@ -203,6 +254,7 @@ impl CommitView {
                                 workspace_entity,
                                 workspace_handle,
                                 stash,
+                                reuse_key,
                                 window,
                                 cx,
                             )
@@ -210,6 +262,34 @@ impl CommitView {
 
                         let pane = workspace.active_pane();
                         pane.update(cx, |pane, cx| {
+                            if let Some(reuse_key) = reuse_key {
+                                let new_item_id = commit_view.item_id();
+                                let mut destination_index =
+                                    pane.replace_preview_item_id(new_item_id, window, cx);
+
+                                let existing_reusable =
+                                    pane.items().enumerate().find_map(|(index, item)| {
+                                        let view = item.downcast::<CommitView>()?;
+                                        (view.read(cx).reuse_key == Some(reuse_key))
+                                            .then_some((index, view))
+                                    });
+
+                                if let Some((index, existing)) = existing_reusable {
+                                    pane.remove_item(existing.item_id(), false, false, window, cx);
+                                    destination_index = Some(index);
+                                }
+
+                                pane.add_item(
+                                    Box::new(commit_view),
+                                    true,
+                                    focus_opened_item,
+                                    destination_index,
+                                    window,
+                                    cx,
+                                );
+                                return;
+                            }
+
                             let ix = pane.items().position(|item| {
                                 let commit_view = item.downcast::<CommitView>();
                                 commit_view
@@ -256,6 +336,7 @@ impl CommitView {
         workspace_entity: Entity<Workspace>,
         workspace: WeakEntity<Workspace>,
         stash: Option<usize>,
+        reuse_key: Option<CommitViewReuseKey>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -491,6 +572,7 @@ impl CommitView {
             project,
             workspace,
             remote,
+            reuse_key,
         }
     }
 
@@ -1273,6 +1355,7 @@ impl Item for CommitView {
                 project: self.project.clone(),
                 workspace: self.workspace.clone(),
                 remote: self.remote.clone(),
+                reuse_key: self.reuse_key,
             }
         })))
     }
@@ -1528,6 +1611,7 @@ mod tests {
                     project.clone(),
                     workspace_entity.clone(),
                     workspace_entity.downgrade(),
+                    None,
                     None,
                     window,
                     cx,

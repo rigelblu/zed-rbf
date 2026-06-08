@@ -28,7 +28,7 @@ use language::line_diff;
 use menu::{Cancel, SelectFirst, SelectLast, SelectNext, SelectPrevious};
 use picker::{Picker, PickerDelegate};
 use project::{
-    GIT_COMMAND_TASK_TAG, ProjectPath, TaskSourceKind,
+    GIT_COMMAND_TASK_TAG, TaskSourceKind,
     git_store::{
         CommitDataState, GitGraphEvent, GitStore, GitStoreEvent, GraphDataResponse, Repository,
         RepositoryEvent, RepositoryId,
@@ -1074,32 +1074,8 @@ pub fn init(cx: &mut App) {
     workspace::register_serializable_item::<GitGraph>(cx);
 
     cx.observe_new(|workspace: &mut workspace::Workspace, _, _| {
-        workspace.register_action_renderer(|div, workspace, window, cx| {
-            div.when_some(
-                resolve_file_history_target(workspace, window, cx),
-                |div, (repo_id, log_source)| {
-                    let git_store = workspace.project().read(cx).git_store().clone();
-                    let workspace = workspace.weak_handle();
-
-                    div.on_action(move |_: &git::FileHistory, window, cx| {
-                        let git_store = git_store.clone();
-                        workspace
-                            .update(cx, |workspace, cx| {
-                                open_or_reuse_graph(
-                                    workspace,
-                                    repo_id,
-                                    git_store,
-                                    log_source.clone(),
-                                    None,
-                                    window,
-                                    cx,
-                                );
-                            })
-                            .ok();
-                    })
-                },
-            )
-            .when(
+        workspace.register_action_renderer(|div, workspace, _window, cx| {
+            div.when(
                 workspace.project().read(cx).active_repository(cx).is_some(),
                 |div| {
                     let workspace = workspace.weak_handle();
@@ -1159,55 +1135,6 @@ pub fn init(cx: &mut App) {
         });
     })
     .detach();
-}
-
-/// Resolves a `git::FileHistory` target from a known project path (used by
-/// callers like `project_panel` that own a focused selection but cannot be
-/// referenced from this module due to dependency direction).
-pub fn resolve_file_history_target_from_project_path(
-    workspace: &Workspace,
-    project_path: &ProjectPath,
-    cx: &App,
-) -> Option<(RepositoryId, LogSource)> {
-    let git_store = workspace.project().read(cx).git_store();
-    let (repo, repo_path) = git_store
-        .read(cx)
-        .repository_and_path_for_project_path(project_path, cx)?;
-    let log_source = if repo_path.is_empty() {
-        LogSource::All
-    } else {
-        LogSource::Path(repo_path)
-    };
-    Some((repo.read(cx).id, log_source))
-}
-
-fn resolve_file_history_target(
-    workspace: &Workspace,
-    window: &Window,
-    cx: &App,
-) -> Option<(RepositoryId, LogSource)> {
-    if let Some(panel) = workspace.panel::<crate::git_panel::GitPanel>(cx)
-        && panel.read(cx).focus_handle(cx).contains_focused(window, cx)
-        && let Some((repository, repo_path)) = panel.read(cx).selected_file_history_target()
-    {
-        return Some((repository.read(cx).id, LogSource::Path(repo_path)));
-    }
-
-    let editor = workspace.active_item_as::<Editor>(cx)?;
-
-    let file = editor
-        .read(cx)
-        .file_at(editor.read(cx).selections.newest_anchor().head(), cx)?;
-    let project_path = ProjectPath {
-        worktree_id: file.worktree_id(cx),
-        path: file.path().clone(),
-    };
-
-    let git_store = workspace.project().read(cx).git_store();
-    let (repo, repo_path) = git_store
-        .read(cx)
-        .repository_and_path_for_project_path(&project_path, cx)?;
-    Some((repo.read(cx).id, LogSource::Path(repo_path)))
 }
 
 pub fn open_or_reuse_graph(
@@ -5525,7 +5452,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_file_history_action_uses_git_panel_and_editor_sources(cx: &mut TestAppContext) {
+    async fn test_file_history_entry_points_scope_git_panel_history(cx: &mut TestAppContext) {
         init_test(cx);
 
         let fs = FakeFs::new(cx.executor());
@@ -5620,18 +5547,25 @@ mod tests {
             .expect("workspace window should be available");
         cx.run_until_parked();
         workspace_window
-            .update(cx, |_, window, cx| {
-                window.dispatch_action(Box::new(git::FileHistory), cx);
+            .update(cx, |multi, window, cx| {
+                let workspace = multi.workspace();
+                workspace.update(cx, |workspace, cx| {
+                    crate::git_panel::open_file_history_for_project_path(
+                        workspace, &tracked1, window, cx,
+                    );
+                });
             })
             .expect("workspace window should be available");
         cx.run_until_parked();
 
         workspace.read_with(cx, |workspace, cx| {
-            let graphs = workspace.items_of_type::<GitGraph>(cx).collect::<Vec<_>>();
-            assert_eq!(graphs.len(), 1);
+            assert_eq!(workspace.items_of_type::<GitGraph>(cx).count(), 0);
+        });
+        git_panel.read_with(cx, |panel, _| {
+            assert!(panel.history_tab_active_for_test());
             assert_eq!(
-                graphs[0].read(cx).log_source,
-                LogSource::Path(tracked1_repo_path.clone())
+                panel.commit_history_file_scope_for_test(),
+                Some(tracked1_repo_path.clone())
             );
         });
 
@@ -5647,18 +5581,25 @@ mod tests {
             .expect("workspace window should be available");
         cx.run_until_parked();
         workspace_window
-            .update(cx, |_, window, cx| {
-                window.dispatch_action(Box::new(git::FileHistory), cx);
+            .update(cx, |multi, window, cx| {
+                let workspace = multi.workspace();
+                workspace.update(cx, |workspace, cx| {
+                    crate::git_panel::open_file_history_for_project_path(
+                        workspace, &tracked1, window, cx,
+                    );
+                });
             })
             .expect("workspace window should be available");
         cx.run_until_parked();
 
         workspace.read_with(cx, |workspace, cx| {
-            let graphs = workspace.items_of_type::<GitGraph>(cx).collect::<Vec<_>>();
-            assert_eq!(graphs.len(), 1);
+            assert_eq!(workspace.items_of_type::<GitGraph>(cx).count(), 0);
+        });
+        git_panel.read_with(cx, |panel, _| {
+            assert!(panel.history_tab_active_for_test());
             assert_eq!(
-                graphs[0].read(cx).log_source,
-                LogSource::Path(tracked1_repo_path.clone())
+                panel.commit_history_file_scope_for_test(),
+                Some(tracked1_repo_path.clone())
             );
         });
 
@@ -5723,22 +5664,25 @@ mod tests {
         cx.run_until_parked();
 
         workspace_window
-            .update(cx, |_, window, cx| {
-                window.dispatch_action(Box::new(git::FileHistory), cx);
+            .update(cx, |multi, window, cx| {
+                let workspace = multi.workspace();
+                workspace.update(cx, |workspace, cx| {
+                    crate::git_panel::open_file_history_for_project_path(
+                        workspace, &tracked2, window, cx,
+                    );
+                });
             })
             .expect("workspace window should be available");
         cx.run_until_parked();
 
         workspace.read_with(cx, |workspace, cx| {
-            let graphs = workspace.items_of_type::<GitGraph>(cx).collect::<Vec<_>>();
-            assert_eq!(graphs.len(), 2);
-            let latest = graphs
-                .into_iter()
-                .max_by_key(|graph| graph.entity_id())
-                .expect("expected a git graph");
+            assert_eq!(workspace.items_of_type::<GitGraph>(cx).count(), 0);
+        });
+        git_panel.read_with(cx, |panel, _| {
+            assert!(panel.history_tab_active_for_test());
             assert_eq!(
-                latest.read(cx).log_source,
-                LogSource::Path(tracked2_repo_path)
+                panel.commit_history_file_scope_for_test(),
+                Some(tracked2_repo_path)
             );
         });
     }

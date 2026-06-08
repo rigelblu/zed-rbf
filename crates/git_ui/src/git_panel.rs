@@ -265,6 +265,19 @@ pub fn register(workspace: &mut Workspace) {
             panel.update(cx, |panel, cx| panel.git_init(window, cx));
         }
     });
+    workspace.register_action(|workspace, _: &git::FileHistory, window, cx| {
+        open_file_history_for_active_target(workspace, window, cx);
+    });
+    workspace.register_action_renderer(|div, workspace, _window, _cx| {
+        let workspace = workspace.weak_handle();
+        div.on_action(move |_: &git::FileHistory, window, cx| {
+            workspace
+                .update(cx, |workspace, cx| {
+                    open_file_history_for_active_target(workspace, window, cx);
+                })
+                .ok();
+        })
+    });
     workspace.register_action(|workspace, _: &ShowGitJobQueue, window, cx| {
         if let Some(panel) = workspace.panel::<GitPanel>(cx) {
             panel.update(cx, |panel, cx| {
@@ -298,6 +311,98 @@ pub fn register(workspace: &mut Workspace) {
     });
 }
 
+pub fn open_file_history_for_project_path(
+    workspace: &mut Workspace,
+    project_path: &ProjectPath,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let git_store = workspace.project().read(cx).git_store();
+    let Some((repository, repo_path)) = git_store
+        .read(cx)
+        .repository_and_path_for_project_path(project_path, cx)
+    else {
+        return;
+    };
+
+    open_file_history_for_repo_path(workspace, repository, repo_path, window, cx);
+}
+
+fn open_file_history_for_active_target(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    if let Some(panel) = workspace.panel::<GitPanel>(cx)
+        && panel.read(cx).focus_handle(cx).contains_focused(window, cx)
+    {
+        if let Some((repository, repo_path)) = panel.read(cx).selected_file_history_target() {
+            open_file_history_for_repo_path(workspace, repository, repo_path, window, cx);
+        }
+        return;
+    }
+
+    let Some(editor) = workspace.active_item_as::<Editor>(cx) else {
+        return;
+    };
+    let Some(file) = editor
+        .read(cx)
+        .file_at(editor.read(cx).selections.newest_anchor().head(), cx)
+    else {
+        return;
+    };
+    let project_path = ProjectPath {
+        worktree_id: file.worktree_id(cx),
+        path: file.path().clone(),
+    };
+
+    open_file_history_for_project_path(workspace, &project_path, window, cx);
+}
+
+fn open_file_history_for_repo_path(
+    workspace: &mut Workspace,
+    repository: Entity<Repository>,
+    repo_path: RepoPath,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    repository.update(cx, |repository, cx| repository.set_as_active_repository(cx));
+    if workspace.panel::<GitPanel>(cx).is_none() {
+        let panel = GitPanel::new(workspace, window, cx);
+        workspace.add_panel(panel, window, cx);
+    }
+    workspace.open_panel::<GitPanel>(window, cx);
+
+    let Some(panel) = workspace.panel::<GitPanel>(cx) else {
+        return;
+    };
+
+    panel.update(cx, |panel, cx| {
+        let repository_changed = panel
+            .active_repository
+            .as_ref()
+            .is_none_or(|active_repository| {
+                active_repository.entity_id() != repository.entity_id()
+            });
+        panel.active_repository = Some(repository);
+        if repository_changed {
+            panel.clear_compare_state();
+            panel.reset_commit_history_state();
+            panel._repo_subscriptions.clear();
+        }
+        let scope = if repo_path.is_empty() {
+            CommitHistoryScope::Repository
+        } else {
+            CommitHistoryScope::File(repo_path)
+        };
+        panel.set_commit_history_scope(scope, cx);
+        panel.set_active_tab(GitPanelTab::History, window, cx);
+        if panel.active_tab == GitPanelTab::History {
+            panel.load_commit_history(cx);
+        }
+    });
+}
+
 #[derive(Debug, Clone)]
 pub enum Event {
     Focus,
@@ -316,6 +421,21 @@ enum GitPanelTab {
     Changes,
     Compare,
     History,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+enum CommitHistoryScope {
+    Repository,
+    File(RepoPath),
+}
+
+impl CommitHistoryScope {
+    fn file_path(&self) -> Option<&RepoPath> {
+        match self {
+            Self::Repository => None,
+            Self::File(path) => Some(path),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
@@ -383,6 +503,16 @@ impl GitListEntry {
             _ => 0,
         }
     }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+enum CompareListEntry {
+    File {
+        index: usize,
+        entry: GitStatusEntry,
+        depth: usize,
+    },
+    Directory(GitTreeDirEntry),
 }
 
 enum GitPanelViewMode {
@@ -581,6 +711,14 @@ struct TreeNode {
     files: Vec<GitStatusEntry>,
 }
 
+#[derive(Default)]
+struct CompareTreeNode {
+    name: SharedString,
+    path: Option<RepoPath>,
+    children: BTreeMap<SharedString, CompareTreeNode>,
+    files: Vec<(usize, GitStatusEntry)>,
+}
+
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct GitStatusEntry {
     pub(crate) repo_path: RepoPath,
@@ -629,6 +767,26 @@ impl CommitHistoryFileEntry {
 
     fn from_commit_diff(diff: &CommitDiff) -> Vec<Self> {
         diff.files.iter().map(Self::from_commit_file).collect()
+    }
+
+    fn from_commit_diff_for_scope(diff: &CommitDiff, scope: &CommitHistoryScope) -> Vec<Self> {
+        let entries = Self::from_commit_diff(diff);
+        let Some(path) = scope.file_path() else {
+            return entries;
+        };
+
+        entries
+            .into_iter()
+            .filter(|entry| &entry.repo_path == path)
+            .collect()
+    }
+
+    fn commit_diff_matches_scope(diff: &CommitDiff, scope: &CommitHistoryScope) -> bool {
+        let Some(path) = scope.file_path() else {
+            return true;
+        };
+
+        diff.files.iter().any(|file| &file.path == path)
     }
 
     fn display_name(&self, path_style: PathStyle) -> String {
@@ -802,12 +960,15 @@ pub struct GitPanel {
     compare_error: Option<SharedString>,
     compare_loading: bool,
     compare_selected_entry: Option<usize>,
+    compare_expanded_dirs: HashMap<TreeKey, bool>,
     compare_subscription: Option<Subscription>,
+    commit_history_scope: CommitHistoryScope,
     commit_history_list_state: ListState,
     commit_history_shas: Option<Vec<Oid>>,
     commit_history_error: Option<SharedString>,
     commit_history_loading: bool,
     commit_history_scanned: bool,
+    commit_history_refresh_task: Option<Task<()>>,
     expanded_history_commit: Option<Oid>,
     commit_history_file_states: HashMap<Oid, CommitHistoryFileState>,
     commit_history_file_tasks: HashMap<Oid, Task<()>>,
@@ -1020,12 +1181,15 @@ impl GitPanel {
                 compare_error: None,
                 compare_loading: false,
                 compare_selected_entry: None,
+                compare_expanded_dirs: HashMap::default(),
                 compare_subscription: None,
+                commit_history_scope: CommitHistoryScope::Repository,
                 commit_history_list_state: ListState::new(0, ListAlignment::Top, px(1000.)),
                 commit_history_shas: None,
                 commit_history_error: None,
                 commit_history_loading: false,
                 commit_history_scanned: false,
+                commit_history_refresh_task: None,
                 expanded_history_commit: None,
                 commit_history_file_states: HashMap::default(),
                 commit_history_file_tasks: HashMap::default(),
@@ -1307,11 +1471,11 @@ impl GitPanel {
     fn select_previous(
         &mut self,
         _: &menu::SelectPrevious,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.active_tab == GitPanelTab::History {
-            self.select_previous_history_entry(cx);
+            self.select_previous_history_entry(window, cx);
             return;
         }
         if !self.changes_tab_active() {
@@ -1378,9 +1542,9 @@ impl GitPanel {
         self.scroll_to_selected_entry(cx);
     }
 
-    fn select_next(&mut self, _: &menu::SelectNext, _window: &mut Window, cx: &mut Context<Self>) {
+    fn select_next(&mut self, _: &menu::SelectNext, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_tab == GitPanelTab::History {
-            self.select_next_history_entry(cx);
+            self.select_next_history_entry(window, cx);
             return;
         }
         if !self.changes_tab_active() {
@@ -3925,14 +4089,9 @@ impl GitPanel {
             .map(|repository| repository.entity_id());
         if active_repository_id != previous_active_repository_id {
             self.clear_compare_state();
-            self.set_commit_history_shas(None);
-            self.commit_history_error.take();
-            self.commit_history_loading = false;
-            self.commit_history_scanned = false;
-            self.focused_history_entry = None;
-            self.focused_history_file_entry = None;
+            self.commit_history_scope = CommitHistoryScope::Repository;
+            self.reset_commit_history_state();
             self._repo_subscriptions.clear();
-            self.clear_commit_history_file_state();
         }
 
         self.entries.clear();
@@ -4535,6 +4694,31 @@ impl GitPanel {
                 ))
             })
             .anchor(Anchor::TopRight)
+    }
+
+    fn render_tree_view_menu(&self, id: impl Into<ElementId>) -> AnyElement {
+        let focus_handle = self.focus_handle.clone();
+
+        PopoverMenu::new(id.into())
+            .trigger(
+                IconButton::new("view-mode-menu-trigger", IconName::Ellipsis)
+                    .icon_size(IconSize::Small),
+            )
+            .menu(move |window, cx| {
+                let tree_view = GitPanelSettings::get_global(cx).tree_view;
+                Some(ContextMenu::build(window, cx, {
+                    let focus_handle = focus_handle.clone();
+                    move |context_menu, _, _| {
+                        context_menu.context(focus_handle).entry(
+                            if tree_view { "Flat View" } else { "Tree View" },
+                            Some(Box::new(ToggleTreeView)),
+                            move |window, cx| window.dispatch_action(Box::new(ToggleTreeView), cx),
+                        )
+                    }
+                }))
+            })
+            .anchor(Anchor::TopRight)
+            .into_any_element()
     }
 
     pub(crate) fn render_generate_commit_message_button(
@@ -5325,6 +5509,7 @@ impl GitPanel {
         self.compare_error.take();
         self.compare_loading = false;
         self.compare_selected_entry = None;
+        self.compare_expanded_dirs.clear();
         self.compare_subscription.take();
     }
 
@@ -5545,23 +5730,28 @@ impl GitPanel {
     }
 
     fn render_history_tab(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex().flex_1().size_full().overflow_hidden().map(|this| {
-            if let Some(message) = Self::commit_history_status_message(
-                self.commit_history_error.as_ref(),
-                self.commit_history_scanned,
-                self.commit_history_loading,
-                self.commit_history_shas.as_deref(),
-            ) {
-                this.child(Self::render_commit_history_message(message, cx))
-            } else if let Some(history) = self.render_commit_history(window, cx) {
-                this.child(history)
-            } else {
-                this.child(Self::render_commit_history_message(
-                    "Loading Commit History…",
-                    cx,
-                ))
-            }
-        })
+        let is_file_history = matches!(self.commit_history_scope, CommitHistoryScope::File(_));
+        let path_style = self.project.read(cx).path_style(cx);
+        let content = if let Some(message) = Self::commit_history_status_message(
+            self.commit_history_error.as_ref(),
+            self.commit_history_scanned,
+            self.commit_history_loading,
+            self.commit_history_shas.as_deref(),
+            is_file_history,
+        ) {
+            Self::render_commit_history_message(message, cx).into_any_element()
+        } else if let Some(history) = self.render_commit_history(window, cx) {
+            history.into_any_element()
+        } else {
+            Self::render_commit_history_message("Loading Commit History…", cx).into_any_element()
+        };
+
+        v_flex()
+            .flex_1()
+            .size_full()
+            .overflow_hidden()
+            .child(self.render_commit_history_header(path_style, cx))
+            .child(content)
     }
 
     fn render_compare_repository_selector(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -5705,6 +5895,7 @@ impl GitPanel {
                     this.child(Label::new(base_label).truncate())
                 }
             }))
+            .child(self.render_tree_view_menu("compare-view-mode-menu"))
     }
 
     fn render_compare_entries(
@@ -5712,18 +5903,26 @@ impl GitPanel {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let entry_count = self.compare_entries.len();
+        let entry_count = self.compare_visible_entries(cx).len();
 
         v_flex().flex_1().size_full().overflow_hidden().child(
             uniform_list(
                 "compare_entries",
                 entry_count,
                 cx.processor(move |this, range: Range<usize>, window, cx| {
+                    let entries = this.compare_visible_entries(cx);
                     range
                         .filter_map(|ix| {
-                            this.compare_entries
-                                .get(ix)
-                                .map(|entry| this.render_compare_entry(ix, entry, window, cx))
+                            entries.get(ix).map(|entry| match entry {
+                                CompareListEntry::File {
+                                    index,
+                                    entry,
+                                    depth,
+                                } => this.render_compare_entry(*index, entry, *depth, window, cx),
+                                CompareListEntry::Directory(entry) => {
+                                    this.render_compare_directory_entry(entry, cx)
+                                }
+                            })
                         })
                         .collect::<Vec<_>>()
                 }),
@@ -5734,10 +5933,134 @@ impl GitPanel {
         )
     }
 
+    fn compare_visible_entries(&self, cx: &App) -> Vec<CompareListEntry> {
+        Self::compare_list_entries(
+            &self.compare_entries,
+            GitPanelSettings::get_global(cx).tree_view,
+            &self.compare_expanded_dirs,
+        )
+    }
+
+    fn compare_list_entries(
+        entries: &[GitStatusEntry],
+        tree_view: bool,
+        expanded_dirs: &HashMap<TreeKey, bool>,
+    ) -> Vec<CompareListEntry> {
+        if !tree_view {
+            return entries
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(index, entry)| CompareListEntry::File {
+                    index,
+                    entry,
+                    depth: 0,
+                })
+                .collect();
+        }
+
+        let mut root = CompareTreeNode::default();
+        let mut sorted_entries = entries.iter().cloned().enumerate().collect::<Vec<_>>();
+        sorted_entries.sort_by(|(_, a), (_, b)| a.repo_path.cmp(&b.repo_path));
+
+        for (index, entry) in sorted_entries {
+            let components: Vec<&str> = entry.repo_path.components().collect();
+            if components.is_empty() {
+                root.files.push((index, entry));
+                continue;
+            }
+
+            let mut current = &mut root;
+            let mut current_path = String::new();
+
+            for (component_index, component) in components.iter().enumerate() {
+                if component_index == components.len() - 1 {
+                    current.files.push((index, entry.clone()));
+                } else {
+                    if !current_path.is_empty() {
+                        current_path.push('/');
+                    }
+                    current_path.push_str(component);
+                    let dir_path = RepoPath::new(&current_path)
+                        .expect("repo path from status entry component");
+
+                    let component = SharedString::from(component.to_string());
+                    current = current
+                        .children
+                        .entry(component.clone())
+                        .or_insert_with(|| CompareTreeNode {
+                            name: component,
+                            path: Some(dir_path),
+                            ..Default::default()
+                        });
+                }
+            }
+        }
+
+        let mut rows = Vec::new();
+        Self::flatten_compare_tree(&root, 0, expanded_dirs, &mut rows);
+        rows
+    }
+
+    fn flatten_compare_tree(
+        node: &CompareTreeNode,
+        depth: usize,
+        expanded_dirs: &HashMap<TreeKey, bool>,
+        rows: &mut Vec<CompareListEntry>,
+    ) {
+        for child in node.children.values() {
+            let (terminal, name) = Self::compact_compare_directory_chain(child);
+            let Some(path) = terminal.path.clone().or_else(|| child.path.clone()) else {
+                continue;
+            };
+            let key = TreeKey {
+                section: Section::Tracked,
+                path,
+            };
+            let expanded = *expanded_dirs.get(&key).unwrap_or(&true);
+            rows.push(CompareListEntry::Directory(GitTreeDirEntry {
+                key,
+                name,
+                depth,
+                expanded,
+            }));
+
+            if expanded {
+                Self::flatten_compare_tree(terminal, depth + 1, expanded_dirs, rows);
+            }
+        }
+
+        for (index, entry) in &node.files {
+            rows.push(CompareListEntry::File {
+                index: *index,
+                entry: entry.clone(),
+                depth,
+            });
+        }
+    }
+
+    fn compact_compare_directory_chain(
+        mut node: &CompareTreeNode,
+    ) -> (&CompareTreeNode, SharedString) {
+        let mut parts = vec![node.name.clone()];
+        while node.files.is_empty() && node.children.len() == 1 {
+            let Some(child) = node.children.values().next() else {
+                continue;
+            };
+            if child.path.is_none() {
+                break;
+            }
+            parts.push(child.name.clone());
+            node = child;
+        }
+        (node, SharedString::from(parts.join("/")))
+    }
+
     fn render_compare_entry(
         &self,
         ix: usize,
         entry: &GitStatusEntry,
+        depth: usize,
         window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
@@ -5747,6 +6070,7 @@ impl GitPanel {
         let display_name = entry.display_name(path_style);
         let selected = self.compare_selected_entry == Some(ix);
         let status = entry.status;
+        let tree_view = settings.tree_view;
         let file_icon = if settings.file_icons {
             FileIcons::get_icon(entry.repo_path.as_std_path(), cx)
         } else {
@@ -5809,21 +6133,108 @@ impl GitPanel {
                     .when(settings.status_style != StatusStyle::LabelColor, |this| {
                         this.child(git_status_icon(status))
                     })
-                    .child(self.path_formatted(
-                        entry.parent_dir(path_style),
-                        path_color,
-                        display_name,
-                        label_color,
-                        path_style,
-                        git_path_style,
-                        status.is_deleted(),
-                    )),
+                    .map(|this| {
+                        if tree_view {
+                            this.pl(px(depth as f32 * TREE_INDENT)).child(
+                                self.entry_label(display_name, label_color)
+                                    .when(status.is_deleted(), Label::strikethrough)
+                                    .truncate(),
+                            )
+                        } else {
+                            this.child(self.path_formatted(
+                                entry.parent_dir(path_style),
+                                path_color,
+                                display_name,
+                                label_color,
+                                path_style,
+                                git_path_style,
+                                status.is_deleted(),
+                            ))
+                        }
+                    }),
             )
             .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
                 this.compare_selected_entry = Some(ix);
                 this.open_compare_entry(ix, window, cx);
                 this.focus_handle.focus(window, cx);
             }))
+            .into_any_element()
+    }
+
+    fn render_compare_directory_entry(
+        &self,
+        entry: &GitTreeDirEntry,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors();
+        let settings = GitPanelSettings::get_global(cx);
+        let folder_icon = if settings.folder_icons {
+            FileIcons::get_folder_icon(entry.expanded, entry.key.path.as_std_path(), cx)
+        } else {
+            FileIcons::get_chevron_icon(entry.expanded, cx)
+        };
+        let fallback_folder_icon = if settings.folder_icons {
+            if entry.expanded {
+                IconName::FolderOpen
+            } else {
+                IconName::Folder
+            }
+        } else if entry.expanded {
+            IconName::ChevronDown
+        } else {
+            IconName::ChevronRight
+        };
+
+        let name_row = h_flex()
+            .min_w_0()
+            .gap_1()
+            .pl(px(entry.depth as f32 * TREE_INDENT))
+            .child(
+                folder_icon
+                    .map(|folder_icon| {
+                        Icon::from_path(folder_icon)
+                            .size(IconSize::Small)
+                            .color(Color::Muted)
+                    })
+                    .unwrap_or_else(|| {
+                        Icon::new(fallback_folder_icon)
+                            .size(IconSize::Small)
+                            .color(Color::Muted)
+                    }),
+            )
+            .child(
+                self.entry_label(entry.name.clone(), Color::Muted)
+                    .truncate(),
+            );
+
+        h_flex()
+            .id(ElementId::Name(
+                format!("compare_dir_{}_{}", entry.name, entry.depth).into(),
+            ))
+            .h(self.list_item_height())
+            .min_w_0()
+            .w_full()
+            .pl_3()
+            .pr_1()
+            .gap_1p5()
+            .justify_between()
+            .border_1()
+            .border_r_2()
+            .bg(colors.ghost_element_background)
+            .hover(|s| s.bg(colors.ghost_element_hover))
+            .active(|s| s.bg(colors.ghost_element_active))
+            .child(name_row)
+            .on_click({
+                let key = entry.key.clone();
+                cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                    let expanded = this
+                        .compare_expanded_dirs
+                        .entry(key.clone())
+                        .or_insert(true);
+                    *expanded = !*expanded;
+                    cx.notify();
+                })
+            })
             .into_any_element()
     }
 
@@ -5858,18 +6269,94 @@ impl GitPanel {
         commit_history_scanned: bool,
         commit_history_loading: bool,
         commit_history_shas: Option<&[Oid]>,
+        is_file_history: bool,
     ) -> Option<SharedString> {
         if let Some(error) = commit_history_error {
             Some(format!("Failed to load commit history: {error}").into())
-        } else if !commit_history_scanned || commit_history_loading {
+        } else if !commit_history_scanned
+            || (commit_history_loading && commit_history_shas.is_none_or(|shas| shas.is_empty()))
+        {
             Some("Loading Commit History…".into())
         } else if commit_history_shas.is_some_and(|shas| shas.is_empty()) {
-            Some("No Commit History".into())
+            Some(
+                if is_file_history {
+                    "No File History"
+                } else {
+                    "No Commit History"
+                }
+                .into(),
+            )
         } else if commit_history_shas.is_some() {
             None
         } else {
             Some("Loading Commit History…".into())
         }
+    }
+
+    fn render_commit_history_header(
+        &self,
+        path_style: PathStyle,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(path) = self.commit_history_scope.file_path() else {
+            return h_flex()
+                .h(Tab::container_height(cx))
+                .w_full()
+                .px_2()
+                .justify_end()
+                .border_b_1()
+                .border_color(cx.theme().colors().border_variant)
+                .child(self.render_tree_view_menu("history-view-mode-menu"))
+                .into_any_element();
+        };
+
+        let file_name = path
+            .file_name()
+            .map(|name| name.to_owned())
+            .unwrap_or_else(|| path.display(path_style).to_string());
+        let full_path = path.display(path_style).to_string();
+        let header_tooltip_path = full_path.clone();
+        let repo_history_tooltip_path = full_path.clone();
+
+        h_flex()
+            .px_2()
+            .py_1()
+            .gap_1()
+            .border_b_1()
+            .border_color(cx.theme().colors().border_variant)
+            .child(
+                h_flex()
+                    .id("commit-history-file-scope")
+                    .min_w_0()
+                    .flex_1()
+                    .child(
+                        Label::new(format!("History: {file_name}"))
+                            .size(LabelSize::Small)
+                            .truncate(),
+                    )
+                    .hoverable_tooltip(move |_, cx| {
+                        Tooltip::with_meta("File History", None, header_tooltip_path.clone(), cx)
+                            .into()
+                    }),
+            )
+            .child(
+                Button::new("show_repo_history", "Repo History")
+                    .label_size(LabelSize::XSmall)
+                    .style(ButtonStyle::Subtle)
+                    .tooltip(move |_, cx| {
+                        Tooltip::with_meta(
+                            "Show Repository History",
+                            None,
+                            repo_history_tooltip_path.clone(),
+                            cx,
+                        )
+                    })
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        this.set_commit_history_scope(CommitHistoryScope::Repository, cx);
+                    })),
+            )
+            .child(self.render_tree_view_menu("history-view-mode-menu"))
+            .into_any_element()
     }
 
     fn render_commit_history_message(
@@ -5886,14 +6373,14 @@ impl GitPanel {
         )
     }
 
-    fn select_next_history_entry(&mut self, cx: &mut Context<Self>) {
+    fn select_next_history_entry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let count = self.commit_history_shas.as_ref().map_or(0, Vec::len);
         if count == 0 {
             return;
         }
 
         let Some(index) = self.focused_history_entry else {
-            self.focus_history_commit(0, cx);
+            self.focus_history_commit_for_keyboard(0, window, cx);
             return;
         };
 
@@ -5921,17 +6408,17 @@ impl GitPanel {
             }
         }
 
-        self.focus_history_commit((index + 1).min(count - 1), cx);
+        self.focus_history_commit_for_keyboard((index + 1).min(count - 1), window, cx);
     }
 
-    fn select_previous_history_entry(&mut self, cx: &mut Context<Self>) {
+    fn select_previous_history_entry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let count = self.commit_history_shas.as_ref().map_or(0, Vec::len);
         if count == 0 {
             return;
         }
 
         let Some(index) = self.focused_history_entry else {
-            self.focus_history_commit(0, cx);
+            self.focus_history_commit_for_keyboard(0, window, cx);
             return;
         };
 
@@ -5963,7 +6450,7 @@ impl GitPanel {
             return;
         }
 
-        self.focus_history_commit(new_index, cx);
+        self.focus_history_commit_for_keyboard(new_index, window, cx);
     }
 
     fn focus_history_commit(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -5972,6 +6459,38 @@ impl GitPanel {
         self.history_keyboard_nav = true;
         self.commit_history_list_state.scroll_to_reveal_item(index);
         cx.notify();
+    }
+
+    fn focus_history_commit_for_keyboard(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus_history_commit(index, cx);
+        self.preview_selected_file_history_commit(window, cx);
+    }
+
+    fn preview_selected_file_history_commit(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.commit_history_scope.file_path().cloned() else {
+            return;
+        };
+        let Some(sha) = self.selected_history_sha() else {
+            return;
+        };
+        let Some(active_repository) = self.active_repository.as_ref() else {
+            return;
+        };
+
+        CommitView::open_file_history_preview(
+            sha.to_string(),
+            active_repository.downgrade(),
+            self.workspace.clone(),
+            path,
+            window,
+            cx,
+        );
+        self.focus_handle.focus(window, cx);
     }
 
     fn commit_history_file_rows(
@@ -6223,7 +6742,12 @@ impl GitPanel {
         let Some(sha) = self.selected_history_sha() else {
             return;
         };
-        self.open_history_commit(sha, None, window, cx);
+        self.open_history_commit(
+            sha,
+            self.commit_history_scope.file_path().cloned(),
+            window,
+            cx,
+        );
     }
 
     fn selected_history_sha(&self) -> Option<Oid> {
@@ -6316,6 +6840,12 @@ impl GitPanel {
         };
 
         self.history_keyboard_nav = true;
+        if let Some(path) = self.commit_history_scope.file_path().cloned() {
+            self.open_history_commit(sha, Some(path), window, cx);
+            cx.notify();
+            return;
+        }
+
         if self.expanded_history_commit == Some(sha) {
             if self.focused_history_file_entry.is_none() {
                 self.focus_first_history_file_entry(sha, cx);
@@ -6363,6 +6893,25 @@ impl GitPanel {
         self.set_active_tab(GitPanelTab::History, window, cx);
     }
 
+    fn open_file_history(
+        &mut self,
+        _: &git::FileHistory,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((repository, repo_path)) = self.selected_file_history_target() else {
+            return;
+        };
+
+        repository.update(cx, |repository, cx| repository.set_as_active_repository(cx));
+        self.active_repository = Some(repository);
+        self.set_commit_history_scope(CommitHistoryScope::File(repo_path), cx);
+        self.set_active_tab(GitPanelTab::History, window, cx);
+        if self.active_tab == GitPanelTab::History {
+            self.load_commit_history(cx);
+        }
+    }
+
     fn set_active_tab(&mut self, tab: GitPanelTab, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_tab == tab {
             return;
@@ -6378,12 +6927,7 @@ impl GitPanel {
             }
             GitPanelTab::Changes => {
                 self.focus_handle.focus(window, cx);
-                self.set_commit_history_shas(None);
-                self.commit_history_error.take();
-                self.commit_history_loading = false;
-                self.commit_history_scanned = false;
-                self.focused_history_entry = None;
-                self.focused_history_file_entry = None;
+                self.reset_commit_history_state();
                 self._repo_subscriptions.clear();
             }
         }
@@ -6395,12 +6939,19 @@ impl GitPanel {
             return;
         };
 
-        let Some(branch) = active_repository.read(cx).branch.as_ref() else {
+        let log_source = {
+            let repository = active_repository.read(cx);
+            Self::commit_history_log_source(
+                &self.commit_history_scope,
+                repository.branch.as_ref(),
+                repository.head_commit.as_ref(),
+            )
+        };
+
+        let Some(log_source) = log_source else {
             return;
         };
 
-        let branch_name = branch.name().to_string();
-        let log_source = LogSource::Branch(branch_name.into());
         let log_order = LogOrder::DateOrder;
 
         // Kick off the git log fetch so data is ready when the user switches to History.
@@ -6436,15 +6987,34 @@ impl GitPanel {
     }
 
     fn commit_history_log_source(
+        scope: &CommitHistoryScope,
         branch: Option<&Branch>,
         head_commit: Option<&CommitDetails>,
     ) -> Option<LogSource> {
+        if let Some(path) = scope.file_path() {
+            return Some(LogSource::Path(path.clone()));
+        }
+
         if let Some(branch) = branch {
             return Some(LogSource::Branch(branch.name().into()));
         }
 
         let head_sha = head_commit?.sha.as_ref();
         Oid::from_str(head_sha).ok().map(LogSource::Sha)
+    }
+
+    fn set_commit_history_scope(&mut self, scope: CommitHistoryScope, cx: &mut Context<Self>) {
+        if self.commit_history_scope == scope {
+            return;
+        }
+
+        self.commit_history_scope = scope;
+        self.reset_commit_history_state();
+
+        if self.active_tab == GitPanelTab::History {
+            self.load_commit_history(cx);
+        }
+        cx.notify();
     }
 
     fn fetch_commit_history_shas(&mut self, cx: &mut Context<Self>) {
@@ -6456,12 +7026,15 @@ impl GitPanel {
             let repository = active_repository.read(cx);
             let branch = repository.branch.as_ref();
             let head_commit = repository.head_commit.as_ref();
-            let log_source = Self::commit_history_log_source(branch, head_commit);
+            let log_source =
+                Self::commit_history_log_source(&self.commit_history_scope, branch, head_commit);
             // A present HEAD commit whose SHA does not parse is corrupt repository
             // state, not an empty history, so it surfaces as an error rather than
             // "No Commit History".
-            let head_sha_unparseable =
-                branch.is_none() && head_commit.is_some() && log_source.is_none();
+            let head_sha_unparseable = self.commit_history_scope == CommitHistoryScope::Repository
+                && branch.is_none()
+                && head_commit.is_some()
+                && log_source.is_none();
             (log_source, head_sha_unparseable, repository.scan_id == 0)
         };
 
@@ -6509,6 +7082,59 @@ impl GitPanel {
         let history_count = shas.len();
         self.commit_history_loading = is_loading && history_count == 0 && error.is_none();
         self.commit_history_error = error;
+
+        if matches!(self.commit_history_scope, CommitHistoryScope::File(_)) {
+            if self.commit_history_error.is_some() {
+                self.commit_history_refresh_task.take();
+                self.set_commit_history_shas(None);
+                self.commit_history_loading = false;
+                self.focused_history_entry = None;
+                self.focused_history_file_entry = None;
+                self.clear_commit_history_file_state();
+                return;
+            }
+
+            if is_loading {
+                let scope = self.commit_history_scope.clone();
+                self.schedule_commit_history_refresh(scope, cx);
+                self.apply_commit_history_shas(shas, cx);
+                return;
+            } else {
+                self.commit_history_refresh_task.take();
+                self.apply_commit_history_shas(shas, cx);
+                return;
+            }
+        }
+
+        self.commit_history_refresh_task.take();
+        self.apply_commit_history_shas(shas, cx);
+    }
+
+    fn schedule_commit_history_refresh(
+        &mut self,
+        scope: CommitHistoryScope,
+        cx: &mut Context<Self>,
+    ) {
+        if self.commit_history_refresh_task.is_some() {
+            return;
+        }
+
+        self.commit_history_refresh_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(100))
+                .await;
+            this.update(cx, |this, cx| {
+                this.commit_history_refresh_task.take();
+                if this.active_tab == GitPanelTab::History && this.commit_history_scope == scope {
+                    this.fetch_commit_history_shas(cx);
+                }
+            })
+            .log_err();
+        }));
+    }
+
+    fn apply_commit_history_shas(&mut self, shas: Vec<Oid>, cx: &mut Context<Self>) {
+        let history_count = shas.len();
         self.set_commit_history_shas(Some(shas));
         if self.expanded_history_commit.is_some_and(|expanded_sha| {
             !self
@@ -6540,6 +7166,17 @@ impl GitPanel {
         self.commit_history_shas = shas;
     }
 
+    fn reset_commit_history_state(&mut self) {
+        self.commit_history_refresh_task.take();
+        self.set_commit_history_shas(None);
+        self.commit_history_error.take();
+        self.commit_history_loading = false;
+        self.commit_history_scanned = false;
+        self.focused_history_entry = None;
+        self.focused_history_file_entry = None;
+        self.clear_commit_history_file_state();
+    }
+
     fn remeasure_history_commit(&self, sha: Oid) {
         let Some(index) = self
             .commit_history_shas
@@ -6563,6 +7200,10 @@ impl GitPanel {
     }
 
     fn toggle_history_commit_files(&mut self, sha: Oid, cx: &mut Context<Self>) {
+        if self.commit_history_scope.file_path().is_some() {
+            return;
+        }
+
         if self.expanded_history_commit == Some(sha) {
             self.expanded_history_commit.take();
             self.focused_history_file_entry = None;
@@ -6591,6 +7232,7 @@ impl GitPanel {
         let Some(active_repository) = self.active_repository.clone() else {
             return;
         };
+        let commit_history_scope = self.commit_history_scope.clone();
 
         self.commit_history_file_states
             .insert(sha, CommitHistoryFileState::Loading);
@@ -6601,9 +7243,12 @@ impl GitPanel {
 
         let task = cx.spawn(async move |this, cx| {
             let file_state = match receiver.await {
-                Ok(Ok(diff)) => {
-                    CommitHistoryFileState::Loaded(CommitHistoryFileEntry::from_commit_diff(&diff))
-                }
+                Ok(Ok(diff)) => CommitHistoryFileState::Loaded(
+                    CommitHistoryFileEntry::from_commit_diff_for_scope(
+                        &diff,
+                        &commit_history_scope,
+                    ),
+                ),
                 Ok(Err(error)) => CommitHistoryFileState::Error(format!("{error:#}").into()),
                 // A canceled load surfaces as an error so a later collapse/re-expand
                 // retries it instead of leaving the row stuck on "Loading".
@@ -6613,6 +7258,9 @@ impl GitPanel {
             };
 
             this.update(cx, |this, cx| {
+                if this.commit_history_scope != commit_history_scope {
+                    return;
+                }
                 this.commit_history_file_tasks.remove(&sha);
                 this.commit_history_file_states.insert(sha, file_state);
                 this.remeasure_history_commit(sha);
@@ -6915,6 +7563,7 @@ impl GitPanel {
         let commit_history_expanded_dirs = self.commit_history_expanded_dirs.clone();
         let tree_view = GitPanelSettings::get_global(cx).tree_view;
         let path_style = self.project.read(cx).path_style(cx);
+        let is_file_history = self.commit_history_scope.file_path().is_some();
 
         let ahead_count = active_repository
             .read(cx)
@@ -7030,7 +7679,7 @@ impl GitPanel {
                                         h_flex()
                                             .gap_1()
                                             .w_full()
-                                            .pl_6()
+                                            .when(!is_file_history, |this| this.pl_6())
                                             .child(Label::new(subject).truncate())
                                             .when(is_unpushed, |this| {
                                                 this.child(
@@ -7042,55 +7691,60 @@ impl GitPanel {
                                     .child(
                                         h_flex()
                                             .gap_1()
-                                            .child(
-                                                IconButton::new(
-                                                    ElementId::Name(
-                                                        format!(
-                                                            "commit-history-files-{sha_string}"
-                                                        )
-                                                        .into(),
-                                                    ),
-                                                    if is_expanded {
-                                                        IconName::ChevronDown
-                                                    } else {
-                                                        IconName::ChevronRight
-                                                    },
-                                                )
-                                                .size(ButtonSize::Compact)
-                                                .icon_size(IconSize::XSmall)
-                                                .tooltip(move |_, cx| {
-                                                    Tooltip::simple(
+                                            .when(!is_file_history, |this| {
+                                                this.child(
+                                                    IconButton::new(
+                                                        ElementId::Name(
+                                                            format!(
+                                                                "commit-history-files-{sha_string}"
+                                                            )
+                                                            .into(),
+                                                        ),
                                                         if is_expanded {
-                                                            "Hide Changed Files"
+                                                            IconName::ChevronDown
                                                         } else {
-                                                            "Show Changed Files"
+                                                            IconName::ChevronRight
                                                         },
-                                                        cx,
                                                     )
-                                                })
-                                                .on_click({
-                                                    let git_panel = git_panel.clone();
-                                                    let sha = *sha;
-                                                    move |_, window, cx| {
-                                                        git_panel
-                                                            .update(cx, |panel, cx| {
-                                                                panel.focused_history_entry =
-                                                                    Some(index);
-                                                                panel.focused_history_file_entry =
-                                                                    None;
-                                                                panel.history_keyboard_nav = true;
-                                                                panel.toggle_history_commit_files(
-                                                                    sha, cx,
-                                                                );
-                                                                panel
-                                                                    .focus_handle
-                                                                    .focus(window, cx);
-                                                                cx.stop_propagation();
-                                                            })
-                                                            .log_err();
-                                                    }
-                                                }),
-                                            )
+                                                    .size(ButtonSize::Compact)
+                                                    .icon_size(IconSize::XSmall)
+                                                    .tooltip(move |_, cx| {
+                                                        Tooltip::simple(
+                                                            if is_expanded {
+                                                                "Hide Changed Files"
+                                                            } else {
+                                                                "Show Changed Files"
+                                                            },
+                                                            cx,
+                                                        )
+                                                    })
+                                                    .on_click({
+                                                        let git_panel = git_panel.clone();
+                                                        let sha = *sha;
+                                                        move |_, window, cx| {
+                                                            git_panel
+                                                                .update(cx, |panel, cx| {
+                                                                    panel.focused_history_entry =
+                                                                        Some(index);
+                                                                    panel
+                                                                        .focused_history_file_entry =
+                                                                        None;
+                                                                    panel.history_keyboard_nav =
+                                                                        true;
+                                                                    panel
+                                                                        .toggle_history_commit_files(
+                                                                            sha, cx,
+                                                                        );
+                                                                    panel
+                                                                        .focus_handle
+                                                                        .focus(window, cx);
+                                                                    cx.stop_propagation();
+                                                                })
+                                                                .log_err();
+                                                        }
+                                                    }),
+                                                )
+                                            })
                                             .child(avatar)
                                             .when(!author_name.is_empty(), |this| {
                                                 this.child(
@@ -7114,7 +7768,7 @@ impl GitPanel {
                                                     .color(Color::Muted),
                                             ),
                                     )
-                                    .when(is_expanded, |this| {
+                                    .when(is_expanded && !is_file_history, |this| {
                                         this.child(Self::render_commit_history_file_state(
                                             index,
                                             *sha,
@@ -7160,8 +7814,15 @@ impl GitPanel {
                                                     panel.focused_history_entry = Some(index);
                                                     panel.focused_history_file_entry = None;
                                                     panel.history_keyboard_nav = true;
-                                                    panel
-                                                        .open_history_commit(sha, None, window, cx);
+                                                    panel.open_history_commit(
+                                                        sha,
+                                                        panel
+                                                            .commit_history_scope
+                                                            .file_path()
+                                                            .cloned(),
+                                                        window,
+                                                        cx,
+                                                    );
                                                     cx.notify();
                                                 })
                                                 .log_err();
@@ -8326,6 +8987,14 @@ impl GitPanel {
     pub(crate) fn compare_base(&self) -> Option<&DiffBase> {
         self.compare_base.as_ref()
     }
+
+    pub fn commit_history_file_scope_for_test(&self) -> Option<RepoPath> {
+        self.commit_history_scope.file_path().cloned()
+    }
+
+    pub fn history_tab_active_for_test(&self) -> bool {
+        self.active_tab == GitPanelTab::History
+    }
 }
 
 impl Render for GitPanel {
@@ -8401,6 +9070,7 @@ impl Render for GitPanel {
             .on_action(cx.listener(Self::activate_changes_tab))
             .on_action(cx.listener(Self::activate_compare_tab))
             .on_action(cx.listener(Self::activate_history_tab))
+            .on_action(cx.listener(Self::open_file_history))
             .size_full()
             .overflow_hidden()
             .bg(cx.theme().colors().panel_background)
@@ -9182,7 +9852,7 @@ pub(crate) fn commit_title_exceeds_limit(title: &str, max_length: usize) -> bool
 #[cfg(test)]
 mod tests {
     use git::{
-        repository::repo_path,
+        repository::{InitialGraphCommitData, repo_path},
         status::{StatusCode, TrackedStatus, UnmergedStatus, UnmergedStatusCode},
     };
     use gpui::{TestAppContext, UpdateGlobal, VisualTestContext, px};
@@ -9208,6 +9878,14 @@ mod tests {
             editor::init(cx);
             crate::init(cx);
         });
+    }
+
+    fn graph_commit(byte: u8) -> Arc<InitialGraphCommitData> {
+        Arc::new(InitialGraphCommitData {
+            sha: Oid::from_bytes(&[byte; 20]).expect("test sha should parse"),
+            parents: SmallVec::new(),
+            ref_names: Vec::new(),
+        })
     }
 
     #[test]
@@ -9273,12 +9951,20 @@ mod tests {
         let detached_head_commit = head_commit("0123456789abcdef0123456789abcdef01234567");
 
         assert_eq!(
-            GitPanel::commit_history_log_source(Some(&branch), Some(&detached_head_commit)),
+            GitPanel::commit_history_log_source(
+                &CommitHistoryScope::Repository,
+                Some(&branch),
+                Some(&detached_head_commit)
+            ),
             Some(LogSource::Branch("main".into()))
         );
 
         assert_eq!(
-            GitPanel::commit_history_log_source(None, Some(&detached_head_commit)),
+            GitPanel::commit_history_log_source(
+                &CommitHistoryScope::Repository,
+                None,
+                Some(&detached_head_commit)
+            ),
             Some(LogSource::Sha(
                 Oid::from_str(detached_head_commit.sha.as_ref()).unwrap()
             ))
@@ -9286,20 +9972,40 @@ mod tests {
 
         let invalid_head_commit = head_commit("not-a-sha");
         assert_eq!(
-            GitPanel::commit_history_log_source(None, Some(&invalid_head_commit)),
+            GitPanel::commit_history_log_source(
+                &CommitHistoryScope::Repository,
+                None,
+                Some(&invalid_head_commit)
+            ),
             None
         );
-        assert_eq!(GitPanel::commit_history_log_source(None, None), None);
+        assert_eq!(
+            GitPanel::commit_history_log_source(&CommitHistoryScope::Repository, None, None),
+            None
+        );
+
+        let path = repo_path("src/main.rs");
+        assert_eq!(
+            GitPanel::commit_history_log_source(
+                &CommitHistoryScope::File(path.clone()),
+                Some(&branch),
+                Some(&detached_head_commit)
+            ),
+            Some(LogSource::Path(path))
+        );
     }
 
     #[test]
     fn commit_history_status_message_prioritizes_error_loading_empty_and_rows() {
-        let message =
-            |error: Option<&str>, scanned, loading, shas: Option<&[Oid]>| -> Option<String> {
-                let error = error.map(SharedString::from);
-                GitPanel::commit_history_status_message(error.as_ref(), scanned, loading, shas)
-                    .map(|message| message.to_string())
-            };
+        let message = |error: Option<&str>,
+                       scanned,
+                       loading,
+                       shas: Option<&[Oid]>|
+         -> Option<String> {
+            let error = error.map(SharedString::from);
+            GitPanel::commit_history_status_message(error.as_ref(), scanned, loading, shas, false)
+                .map(|message| message.to_string())
+        };
         let sha = Oid::from_str("0123456789abcdef0123456789abcdef01234567").unwrap();
 
         assert_eq!(
@@ -9310,8 +10016,9 @@ mod tests {
             message(None, false, false, Some(&[])),
             Some("Loading Commit History…".to_string())
         );
+        assert_eq!(message(None, true, true, Some(&[sha])), None);
         assert_eq!(
-            message(None, true, true, Some(&[sha])),
+            message(None, true, true, Some(&[])),
             Some("Loading Commit History…".to_string())
         );
         assert_eq!(
@@ -9322,6 +10029,11 @@ mod tests {
         assert_eq!(
             message(None, true, false, None),
             Some("Loading Commit History…".to_string())
+        );
+        assert_eq!(
+            GitPanel::commit_history_status_message(None, true, false, Some(&[]), true)
+                .map(|message| message.to_string()),
+            Some("No File History".to_string())
         );
     }
 
@@ -9380,6 +10092,27 @@ mod tests {
                 worktree_status: StatusCode::Unmodified,
             })
         );
+
+        let scoped_entries = CommitHistoryFileEntry::from_commit_diff_for_scope(
+            &diff,
+            &CommitHistoryScope::File(repo_path("src/modified.rs")),
+        );
+        assert_eq!(scoped_entries.len(), 1);
+        assert_eq!(scoped_entries[0].repo_path, repo_path("src/modified.rs"));
+        assert!(CommitHistoryFileEntry::commit_diff_matches_scope(
+            &diff,
+            &CommitHistoryScope::File(repo_path("src/modified.rs")),
+        ));
+
+        let empty_scoped_entries = CommitHistoryFileEntry::from_commit_diff_for_scope(
+            &diff,
+            &CommitHistoryScope::File(repo_path("missing.rs")),
+        );
+        assert!(empty_scoped_entries.is_empty());
+        assert!(!CommitHistoryFileEntry::commit_diff_matches_scope(
+            &diff,
+            &CommitHistoryScope::File(repo_path("missing.rs")),
+        ));
     }
 
     #[test]
@@ -9398,6 +10131,197 @@ mod tests {
         assert!(GitPanel::should_load_history_commit_files(Some(
             &CommitHistoryFileState::Error("loading changed files was canceled".into())
         )));
+    }
+
+    #[gpui::test]
+    async fn file_history_uses_path_log_shas_without_eager_diff_filtering(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "renamed.txt": "current\n",
+            }),
+        )
+        .await;
+
+        let first_commit = graph_commit(1);
+        let rename_follow_commit = graph_commit(2);
+        fs.set_graph_commits(
+            path!("/project/.git").as_ref(),
+            vec![first_commit.clone(), rename_follow_commit.clone()],
+        );
+
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have active repository")
+        });
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("workspace should exist");
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+        let panel = workspace.update_in(cx, GitPanel::new);
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.active_repository = Some(repository);
+            panel.set_commit_history_scope(CommitHistoryScope::File(repo_path("renamed.txt")), cx);
+            panel.set_active_tab(GitPanelTab::History, window, cx);
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.commit_history_shas,
+                Some(vec![first_commit.sha, rename_follow_commit.sha])
+            );
+            assert!(
+                panel.commit_history_file_states.is_empty(),
+                "opening file history should not eagerly load commit diffs"
+            );
+            assert!(
+                panel.commit_history_file_tasks.is_empty(),
+                "opening file history should not queue per-commit diff loads"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn file_history_repo_switch_with_same_path_resets_stale_history_state(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/repo-a"),
+            json!({
+                ".git": {},
+                "file.txt": "a\n",
+            }),
+        )
+        .await;
+        fs.insert_tree(
+            path!("/repo-b"),
+            json!({
+                ".git": {},
+                "file.txt": "b\n",
+            }),
+        )
+        .await;
+
+        fs.set_graph_commits(path!("/repo-a/.git").as_ref(), vec![graph_commit(3)]);
+        fs.set_graph_commits(path!("/repo-b/.git").as_ref(), vec![graph_commit(4)]);
+
+        let project = Project::test(
+            fs.clone(),
+            [Path::new(path!("/repo-a")), Path::new(path!("/repo-b"))],
+            cx,
+        )
+        .await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        cx.run_until_parked();
+
+        let (repo_a, repo_b) = project.read_with(cx, |project, cx| {
+            let mut repo_a = None;
+            let mut repo_b = None;
+            for repository in project.repositories(cx).values() {
+                let repository_path = repository.read(cx).work_directory_abs_path.clone();
+                if repository_path.as_ref() == Path::new(path!("/repo-a")) {
+                    repo_a = Some(repository.clone());
+                } else if repository_path.as_ref() == Path::new(path!("/repo-b")) {
+                    repo_b = Some(repository.clone());
+                }
+            }
+            (
+                repo_a.expect("repo-a should exist"),
+                repo_b.expect("repo-b should exist"),
+            )
+        });
+
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("workspace should exist");
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+        let panel = workspace.update_in(cx, GitPanel::new);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            open_file_history_for_repo_path(
+                workspace,
+                repo_a.clone(),
+                repo_path("file.txt"),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let stale_sha = graph_commit(9).sha;
+        panel.update_in(cx, |panel, _window, cx| {
+            panel.commit_history_file_states.insert(
+                stale_sha,
+                CommitHistoryFileState::Loaded(vec![CommitHistoryFileEntry {
+                    repo_path: repo_path("file.txt"),
+                    status: FileStatus::Tracked(TrackedStatus {
+                        index_status: StatusCode::Modified,
+                        worktree_status: StatusCode::Unmodified,
+                    }),
+                }]),
+            );
+            panel.expanded_history_commit = Some(stale_sha);
+            panel.focused_history_entry = Some(0);
+            panel.focused_history_file_entry = Some(0);
+            panel.remeasure_history_commit(stale_sha);
+            cx.notify();
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            open_file_history_for_repo_path(
+                workspace,
+                repo_b.clone(),
+                repo_path("file.txt"),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel
+                    .active_repository
+                    .as_ref()
+                    .map(|repository| repository.entity_id()),
+                Some(repo_b.entity_id())
+            );
+            assert_eq!(
+                panel.commit_history_file_scope_for_test(),
+                Some(repo_path("file.txt"))
+            );
+            assert!(
+                panel.commit_history_file_states.is_empty(),
+                "repo switches should clear file-history diff state even when the relative path stays the same"
+            );
+            assert_eq!(panel.expanded_history_commit, None);
+            assert_eq!(panel.focused_history_file_entry, None);
+        });
     }
 
     #[test]
@@ -9522,6 +10446,130 @@ mod tests {
         );
     }
 
+    #[test]
+    fn compare_list_entries_follow_tree_view_setting() {
+        let entries = vec![
+            GitStatusEntry {
+                repo_path: repo_path("alpha.txt"),
+                status: FileStatus::Tracked(TrackedStatus {
+                    index_status: StatusCode::Modified,
+                    worktree_status: StatusCode::Unmodified,
+                }),
+                staging: StageStatus::Unstaged,
+                diff_stat: None,
+            },
+            GitStatusEntry {
+                repo_path: repo_path("src/main.rs"),
+                status: FileStatus::Tracked(TrackedStatus {
+                    index_status: StatusCode::Added,
+                    worktree_status: StatusCode::Unmodified,
+                }),
+                staging: StageStatus::Unstaged,
+                diff_stat: None,
+            },
+            GitStatusEntry {
+                repo_path: repo_path("src/lib/mod.rs"),
+                status: FileStatus::Tracked(TrackedStatus {
+                    index_status: StatusCode::Deleted,
+                    worktree_status: StatusCode::Unmodified,
+                }),
+                staging: StageStatus::Unstaged,
+                diff_stat: None,
+            },
+        ];
+
+        let flat_rows = GitPanel::compare_list_entries(&entries, false, &HashMap::default());
+        assert_eq!(
+            flat_rows,
+            vec![
+                CompareListEntry::File {
+                    index: 0,
+                    entry: entries[0].clone(),
+                    depth: 0,
+                },
+                CompareListEntry::File {
+                    index: 1,
+                    entry: entries[1].clone(),
+                    depth: 0,
+                },
+                CompareListEntry::File {
+                    index: 2,
+                    entry: entries[2].clone(),
+                    depth: 0,
+                },
+            ]
+        );
+
+        let tree_rows = GitPanel::compare_list_entries(&entries, true, &HashMap::default());
+        assert_eq!(
+            tree_rows,
+            vec![
+                CompareListEntry::Directory(GitTreeDirEntry {
+                    key: TreeKey {
+                        section: Section::Tracked,
+                        path: repo_path("src"),
+                    },
+                    name: "src".into(),
+                    depth: 0,
+                    expanded: true,
+                }),
+                CompareListEntry::Directory(GitTreeDirEntry {
+                    key: TreeKey {
+                        section: Section::Tracked,
+                        path: repo_path("src/lib"),
+                    },
+                    name: "lib".into(),
+                    depth: 1,
+                    expanded: true,
+                }),
+                CompareListEntry::File {
+                    index: 2,
+                    entry: entries[2].clone(),
+                    depth: 2,
+                },
+                CompareListEntry::File {
+                    index: 1,
+                    entry: entries[1].clone(),
+                    depth: 1,
+                },
+                CompareListEntry::File {
+                    index: 0,
+                    entry: entries[0].clone(),
+                    depth: 0,
+                },
+            ]
+        );
+
+        let mut collapsed_dirs = HashMap::default();
+        collapsed_dirs.insert(
+            TreeKey {
+                section: Section::Tracked,
+                path: repo_path("src"),
+            },
+            false,
+        );
+        let collapsed_rows = GitPanel::compare_list_entries(&entries, true, &collapsed_dirs);
+        assert_eq!(
+            collapsed_rows,
+            vec![
+                CompareListEntry::Directory(GitTreeDirEntry {
+                    key: TreeKey {
+                        section: Section::Tracked,
+                        path: repo_path("src"),
+                    },
+                    name: "src".into(),
+                    depth: 0,
+                    expanded: false,
+                }),
+                CompareListEntry::File {
+                    index: 0,
+                    entry: entries[0].clone(),
+                    depth: 0,
+                },
+            ]
+        );
+    }
+
     #[gpui::test]
     async fn commit_history_keyboard_navigation_walks_expanded_files(cx: &mut TestAppContext) {
         init_test(cx);
@@ -9624,6 +10672,10 @@ mod tests {
             assert_eq!(panel.expanded_history_commit, None);
             assert_eq!(panel.focused_history_entry, Some(1));
             assert_eq!(panel.focused_history_file_entry, None);
+
+            panel.commit_history_scope = CommitHistoryScope::File(repo_path("alpha.txt"));
+            panel.toggle_history_commit_files(expanded_sha, cx);
+            assert_eq!(panel.expanded_history_commit, None);
         });
     }
 
