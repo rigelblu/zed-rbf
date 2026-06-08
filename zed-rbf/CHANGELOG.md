@@ -2,6 +2,11 @@
 title: "Zed RBF Changelog"
 ---
 
+## 🟠⋯ v0.8.0 — #zed-08
+- Added always-raw YMD syntax in expanded diff hunks: expanding a Markdown diff hunk shows every changed row's exact syntax — `==` highlight markers, color emoji, link `[label](url)`, and `---` dashes — with no concealment, no color, and no rule blocks, on both the added and the deleted side, so diff review shows precisely what changed
+- Expanding or collapsing a hunk updates the reveal immediately, and collapsing restores the clean concealed view (with color and rule blocks) on those rows
+- Normal non-diff rows are unaffected: clean concealed display off the cursor row, with cursor-line reveal and `editor::ToggleYmdConceal` unchanged
+
 ## 🟠⋯ v0.7.0 — #zed-07
 - Added Markdown horizontal rules: a thematic-break line (`---`, `----`, or spaced `- - -`) renders as a thin full-width hairline rule, so section breaks read as structure instead of raw dashes
 - The rule is a quiet 1px hairline in the theme's border color, vertically centered in the row — a calm separator, not a heavy bar

@@ -1817,8 +1817,9 @@ impl Editor {
         clone.needs_initial_data_update = self.enable_lsp_data;
         clone.enable_runnables = self.enable_runnables;
         clone.enable_code_lens = self.enable_code_lens;
-        clone.refresh_ymd_conceals(cx);
-        clone.refresh_ymd_thematic_break_blocks(None, cx);
+        let clone_diff_rows = clone.ymd_diff_rows(cx);
+        clone.refresh_ymd_conceals(&clone_diff_rows, cx);
+        clone.refresh_ymd_thematic_break_blocks(None, &clone_diff_rows, cx);
         clone
     }
 
@@ -9444,6 +9445,29 @@ impl Editor {
             .collect()
     }
 
+    // Rows inside an expanded diff hunk (added/modified/deleted), keyed by
+    // multibuffer row. Diff review is correctness work, so these rows render
+    // FULLY RAW — no conceal fold, no rule block, no YMD highlight — keeping the
+    // exact syntax that changed visible (the #zed-08 full-raw contract). The set
+    // is empty (and unallocated) when nothing is diffed, the common case; it is
+    // computed once per decoration refresh and shared by all three consumers
+    // rather than rescanned in each.
+    fn ymd_diff_rows(&self, cx: &App) -> HashSet<MultiBufferRow> {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        // O(1) bail for the common no-diff case: with no registered diff there are
+        // no diff rows, so cursor motion never walks every row's metadata (the
+        // durable "don't scan the whole buffer on cursor motion" rule). When a
+        // diff exists the scan runs, but only while a diff is actually present.
+        if !snapshot.has_diff_hunks() {
+            return HashSet::default();
+        }
+        snapshot
+            .row_infos(MultiBufferRow(0))
+            .filter(|row_info| row_info.diff_status.is_some())
+            .filter_map(|row_info| row_info.multibuffer_row)
+            .collect()
+    }
+
     fn refresh_ymd_conceals_for_selection_change(&mut self, cx: &mut Context<Self>) {
         // Markdown gate FIRST: the language cannot change mid-cursor-move and
         // non-Markdown buffers have no conceal folds to clear, so they exit
@@ -9472,6 +9496,10 @@ impl Editor {
         if cursor_rows == self.ymd_revealed_rows {
             return;
         }
+        // Diff rows stay raw as the cursor moves, so the fast path excludes them
+        // alongside cursor rows. Derived after the row-change early return above,
+        // so pure column motion never scans row infos.
+        let diff_rows = self.ymd_diff_rows(cx);
 
         // FAST PATH: with a valid scan cache the desired fold set is pure set
         // math over cached ranges and rows — no scanner run, no buffer-text
@@ -9489,7 +9517,10 @@ impl Editor {
                     .conceal_ranges
                     .iter()
                     .zip(&cache.conceal_rows)
-                    .filter(|(_, row)| !cursor_rows.contains(&MultiBufferRow(**row)))
+                    .filter(|(_, row)| {
+                        let row = MultiBufferRow(**row);
+                        !cursor_rows.contains(&row) && !diff_rows.contains(&row)
+                    })
                     .map(|(range, _)| (range.start, range.end))
                     .collect();
                 let to_remove: Vec<Range<MultiBufferOffset>> = cache
@@ -9513,16 +9544,20 @@ impl Editor {
             }
             self.apply_ymd_conceal_fold_delta(to_remove, to_insert, cx);
         } else {
-            self.refresh_ymd_conceals_with_cursor_rows(cursor_rows.clone(), cx);
+            self.refresh_ymd_conceals_with_cursor_rows(cursor_rows.clone(), &diff_rows, cx);
         }
 
-        self.refresh_ymd_thematic_break_blocks(Some(cursor_rows), cx);
+        self.refresh_ymd_thematic_break_blocks(Some(cursor_rows), &diff_rows, cx);
     }
 
     fn refresh_ymd_decorations(&mut self, cx: &mut Context<Self>) {
-        self.refresh_ymd_highlights(cx);
-        self.refresh_ymd_conceals(cx);
-        self.refresh_ymd_thematic_break_blocks(None, cx);
+        // One diff-row scan shared by all three consumers (walk #zed-08 item 3):
+        // highlight, conceal, and block refreshes each skip these rows so diff
+        // hunks render fully raw without rescanning row infos three times.
+        let diff_rows = self.ymd_diff_rows(cx);
+        self.refresh_ymd_highlights(&diff_rows, cx);
+        self.refresh_ymd_conceals(&diff_rows, cx);
+        self.refresh_ymd_thematic_break_blocks(None, &diff_rows, cx);
     }
 
     fn clear_ymd_thematic_break_blocks(&mut self, cx: &mut Context<Self>) {
@@ -9552,6 +9587,7 @@ impl Editor {
     fn refresh_ymd_thematic_break_blocks(
         &mut self,
         cursor_rows: Option<HashSet<MultiBufferRow>>,
+        diff_rows: &HashSet<MultiBufferRow>,
         cx: &mut Context<Self>,
     ) {
         if !self.ymd_concealed {
@@ -9615,8 +9651,9 @@ impl Editor {
         let mut desired_breaks = breaks
             .into_iter()
             .filter_map(|(range, row)| {
-                (!cursor_rows.contains(&MultiBufferRow(row)))
-                    .then_some((MultiBufferRow(row), range))
+                let row = MultiBufferRow(row);
+                (!cursor_rows.contains(&row) && !diff_rows.contains(&row))
+                    .then_some((row, range))
             })
             .collect::<Vec<_>>();
         desired_breaks.sort_by_key(|(row, _)| *row);
@@ -9664,7 +9701,11 @@ impl Editor {
         }
     }
 
-    fn refresh_ymd_highlights(&mut self, cx: &mut Context<Self>) {
+    fn refresh_ymd_highlights(
+        &mut self,
+        diff_rows: &HashSet<MultiBufferRow>,
+        cx: &mut Context<Self>,
+    ) {
         self.clear_ymd_highlights(cx);
 
         let Some((snapshot, text)) = self.ymd_markdown_snapshot_and_text(cx) else {
@@ -9676,6 +9717,11 @@ impl Editor {
             std::array::from_fn(|_| Vec::new());
 
         for highlight in ymd::scan(&text) {
+            // Diff rows stay fully raw: their syntax keeps no YMD color either.
+            let row = MultiBufferRow(MultiBufferOffset(highlight.range.start).to_point(&snapshot).row);
+            if diff_rows.contains(&row) {
+                continue;
+            }
             let anchor_range = snapshot.anchor_before(MultiBufferOffset(highlight.range.start))
                 ..snapshot.anchor_after(MultiBufferOffset(highlight.range.end));
             match highlight.kind {
@@ -9711,6 +9757,14 @@ impl Editor {
 
         let link_ranges = ymd::scan_links(&text)
             .into_iter()
+            .filter(|link| {
+                let row = MultiBufferRow(
+                    MultiBufferOffset(link.label_range.start)
+                        .to_point(&snapshot)
+                        .row,
+                );
+                !diff_rows.contains(&row)
+            })
             .map(|link| {
                 snapshot.anchor_before(MultiBufferOffset(link.label_range.start))
                     ..snapshot.anchor_after(MultiBufferOffset(link.label_range.end))
@@ -9743,6 +9797,7 @@ impl Editor {
     fn ymd_desired_conceal_ranges(
         &mut self,
         cursor_rows: Option<HashSet<MultiBufferRow>>,
+        diff_rows: &HashSet<MultiBufferRow>,
         cx: &mut Context<Self>,
     ) -> Vec<Range<usize>> {
         let Some((buffer_id, buffer_version)) = self.ymd_singleton_buffer_identity(cx) else {
@@ -9800,7 +9855,10 @@ impl Editor {
                 .conceal_ranges
                 .iter()
                 .zip(&cache.conceal_rows)
-                .filter(|(_, row)| !cursor_rows.contains(&MultiBufferRow(**row)))
+                .filter(|(_, row)| {
+                    let row = MultiBufferRow(**row);
+                    !cursor_rows.contains(&row) && !diff_rows.contains(&row)
+                })
                 .map(|(range, _)| range.clone())
                 .collect()
         } else {
@@ -9825,25 +9883,31 @@ impl Editor {
             .collect()
     }
 
-    fn refresh_ymd_conceals(&mut self, cx: &mut Context<Self>) {
-        self.refresh_ymd_conceals_impl(None, cx);
+    fn refresh_ymd_conceals(
+        &mut self,
+        diff_rows: &HashSet<MultiBufferRow>,
+        cx: &mut Context<Self>,
+    ) {
+        self.refresh_ymd_conceals_impl(None, diff_rows, cx);
     }
 
     fn refresh_ymd_conceals_with_cursor_rows(
         &mut self,
         cursor_rows: HashSet<MultiBufferRow>,
+        diff_rows: &HashSet<MultiBufferRow>,
         cx: &mut Context<Self>,
     ) {
-        self.refresh_ymd_conceals_impl(Some(cursor_rows), cx);
+        self.refresh_ymd_conceals_impl(Some(cursor_rows), diff_rows, cx);
     }
 
     fn refresh_ymd_conceals_impl(
         &mut self,
         cursor_rows: Option<HashSet<MultiBufferRow>>,
+        diff_rows: &HashSet<MultiBufferRow>,
         cx: &mut Context<Self>,
     ) {
         let desired_ranges = if self.ymd_concealed {
-            self.ymd_desired_conceal_ranges(cursor_rows, cx)
+            self.ymd_desired_conceal_ranges(cursor_rows, diff_rows, cx)
         } else {
             Vec::new()
         };
@@ -9862,7 +9926,8 @@ impl Editor {
         // must re-conceal), while a buffer whose desired set is empty — no
         // markers, or every marker row revealed — renders both modes identically,
         // so the stored intent flips honestly instead of re-latching concealed.
-        let desired_ranges = self.ymd_desired_conceal_ranges(None, cx);
+        let diff_rows = self.ymd_diff_rows(cx);
+        let desired_ranges = self.ymd_desired_conceal_ranges(None, &diff_rows, cx);
         self.ymd_concealed = if desired_ranges.is_empty() {
             !self.ymd_concealed
         } else {
@@ -9884,7 +9949,7 @@ impl Editor {
             Vec::new()
         };
         self.sync_ymd_conceal_folds(desired_ranges, cx);
-        self.refresh_ymd_thematic_break_blocks(None, cx);
+        self.refresh_ymd_thematic_break_blocks(None, &diff_rows, cx);
     }
 
     pub fn show_local_cursors(&self, window: &mut Window, cx: &mut App) -> bool {
@@ -10137,6 +10202,16 @@ impl Editor {
             }
             multi_buffer::Event::DiffHunksToggled => {
                 self.refresh_runnables(None, window, cx);
+                // Expanding or collapsing a hunk changes which rows are diff
+                // rows, so YMD must re-evaluate what stays raw (walk #zed-08).
+                // It also shifts multibuffer geometry (virtual deleted rows) WITHOUT
+                // bumping the singleton buffer version that keys the conceal/block
+                // cache, so the cache's multibuffer byte offsets are now stale.
+                // Drop it first to force a re-scan against the new geometry —
+                // otherwise stale offsets are re-anchored and can land inside a
+                // multibyte char, panicking the anchor build.
+                self.ymd_conceal_cache = None;
+                self.refresh_ymd_decorations(cx);
             }
             multi_buffer::Event::LanguageChanged(buffer_id, is_fresh_language) => {
                 if !is_fresh_language {
@@ -10154,8 +10229,16 @@ impl Editor {
                 cx.emit(EditorEvent::TitleChanged);
                 cx.emit(EditorEvent::FileHandleChanged);
             }
-            multi_buffer::Event::Reloaded | multi_buffer::Event::BufferDiffChanged => {
-                cx.emit(EditorEvent::TitleChanged)
+            multi_buffer::Event::Reloaded => cx.emit(EditorEvent::TitleChanged),
+            multi_buffer::Event::BufferDiffChanged => {
+                cx.emit(EditorEvent::TitleChanged);
+                // A diff change (e.g. staging while a hunk is expanded) can add
+                // or drop diff rows without a toggle, so refresh YMD (walk
+                // #zed-08). Like a toggle it can also shift the multibuffer
+                // geometry under expanded hunks without bumping the singleton
+                // buffer version, so drop the cache first (see DiffHunksToggled).
+                self.ymd_conceal_cache = None;
+                self.refresh_ymd_decorations(cx);
             }
             multi_buffer::Event::DiagnosticsUpdated => {
                 self.update_diagnostics_state(window, cx);
