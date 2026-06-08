@@ -33478,6 +33478,100 @@ async fn test_ymd_same_row_motion_is_a_fold_no_op(cx: &mut gpui::TestAppContext)
 }
 
 #[gpui::test]
+async fn test_ymd_conceals_emoji_heading_prefixes_only(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    // H1 clean, plain (keeps `#`), H2 with a visible `⋯` after the marker, and an
+    // emoji-only heading that vanishes entirely. Cursor starts off every heading.
+    cx.set_state("ˇintro\n# 🔵 Blue Heading\n# Plain Heading\n## 🟢⋯ Green Heading\n# 🟠");
+    cx.run_until_parked();
+
+    cx.update_editor(|editor, _, cx| {
+        assert_eq!(
+            editor.display_text(cx).replace('\u{2060}', ""),
+            "intro\nBlue Heading\n# Plain Heading\n⋯ Green Heading\n"
+        );
+    });
+
+    // Cursor onto the H1 row reveals its raw `#` prefix and color emoji again.
+    cx.update_editor(|editor, window, cx| {
+        editor.move_down(&MoveDown, window, cx);
+        assert_eq!(
+            editor.display_text(cx).replace('\u{2060}', ""),
+            "intro\n# 🔵 Blue Heading\n# Plain Heading\n⋯ Green Heading\n"
+        );
+    });
+
+    // The global toggle reveals every concealed heading prefix at once.
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_ymd_conceal(&ToggleYmdConceal, window, cx);
+        assert_eq!(
+            editor.display_text(cx).replace('\u{2060}', ""),
+            "intro\n# 🔵 Blue Heading\n# Plain Heading\n## 🟢⋯ Green Heading\n# 🟠"
+        );
+    });
+
+    // Cursor onto the emoji-only `# 🟠` row (last line) reveals its raw `#` and
+    // emoji — the discovery path for the heading that otherwise vanishes. Re-conceal
+    // first (the toggle above left everything revealed), then place the cursor there.
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_ymd_conceal(&ToggleYmdConceal, window, cx);
+    });
+    cx.set_state("intro\n# 🔵 Blue Heading\n# Plain Heading\n## 🟢⋯ Green Heading\n# 🟠ˇ");
+    cx.run_until_parked();
+    cx.update_editor(|editor, _, cx| {
+        assert_eq!(
+            editor.display_text(cx).replace('\u{2060}', ""),
+            "intro\nBlue Heading\n# Plain Heading\n⋯ Green Heading\n# 🟠"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_ymd_heading_conceal_leaves_buffer_text_for_outline(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    let source = "intro\n# 🔵 Blue Heading\n## 🟢⋯ Green Heading";
+    cx.set_state(&format!("ˇ{source}"));
+    cx.run_until_parked();
+
+    // Concealment is a display-only fold: the prefix is hidden in `display_text`
+    // but the buffer text is byte-for-byte unchanged. The outline panel and
+    // breadcrumbs build from the syntax tree over this buffer text (Buffer::outline
+    // -> outline_items_containing -> syntax.matches over `&self.text`), so they keep
+    // seeing the raw `# 🔵 Blue Heading` headings regardless of the conceal folds.
+    cx.update_editor(|editor, _, cx| {
+        assert_eq!(
+            editor.display_text(cx).replace('\u{2060}', ""),
+            "intro\nBlue Heading\n⋯ Green Heading"
+        );
+    });
+    cx.update_buffer(|buffer, _| {
+        assert_eq!(buffer.text(), source);
+    });
+}
+
+#[gpui::test]
 async fn test_ymd_conceals_do_not_apply_to_non_markdown_buffers(cx: &mut gpui::TestAppContext) {
     init_test(cx, |_| {});
 
@@ -34064,7 +34158,11 @@ async fn test_drag_selection_over_concealed_emoji_does_not_panic(cx: &mut gpui::
 
     let mut cx = EditorTestContext::new(cx).await;
     cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
-    cx.set_state("## 🟠⋯ Heading line\nsecond line\nˇthird");
+    // A plain (non-heading) line so this guards ONLY the standalone-emoji conceal
+    // geometry — `#zed-05` folds emoji heading prefixes from column 0, which would
+    // otherwise move the placeholder edge this test pins. The leading `ab ` keeps
+    // the emoji at byte offset 3, matching the original placeholder columns.
+    cx.set_state("ab 🟠⋯ plain line\nsecond line\nˇthird");
     cx.run_until_parked();
 
     // The standalone 🟠 conceals, leaving a zero-width placeholder at display
