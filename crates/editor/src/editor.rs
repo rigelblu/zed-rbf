@@ -8914,7 +8914,17 @@ impl Editor {
 
             let project = self.project()?.read(cx);
             let file = buffer.file()?;
-            let path = file.path().display(project.path_style(cx));
+
+            // `file.path()` is relative to the worktree root. A file opened
+            // directly is its own single-file worktree (root == the file), so that
+            // relative path is empty — fall back to the bare file name so the
+            // location stays useful (`notes.md:12` instead of `:12`).
+            let relative_path = file.path().display(project.path_style(cx)).to_string();
+            let path = if relative_path.is_empty() {
+                file.file_name(cx).to_string()
+            } else {
+                relative_path
+            };
 
             let location = if start_line == end_line {
                 format!("{path}:{start_line}")

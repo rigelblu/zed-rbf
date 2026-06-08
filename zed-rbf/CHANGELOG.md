@@ -2,6 +2,14 @@
 title: "Zed RBF Changelog"
 ---
 
+## 🟠⋯ v0.12.0 — #zed-12
+- Added a vim `space c y` binding that copies a workspace-relative code reference to the system clipboard: a cursor on line 42 copies `crates/editor/src/editor.rs:42`, and a visual selection of lines 42 through 58 copies `crates/editor/src/editor.rs:42-58`, ready to paste into an agent prompt, PR comment, or note
+- Reuses the existing `editor::CopyFileLocation` action (still on the command palette); the binding just gives it the Neovim muscle-memory leader stroke, available whenever vim mode is on
+- A linewise (`shift-v`) selection that stops at the start of the next row trims that trailing row, so selecting lines 42-44 copies `:42-44`, not `:42-45`; a characterwise selection that ends mid-line keeps its end row
+- Fixed diff-editor line numbers: copying a file location from an expanded diff row now uses the underlying file line, not the visible diff row after deleted lines shift the hunk
+- In vim normal and visual modes, plain `space` is now a pure leader (its old single-key right-motion is unbound), so `space c y` fires crisply with no pending-motion delay — matching the common Neovim space-as-leader convention
+- The reference is relative to the active worktree and is written to the system clipboard, not a vim register, since the paste target is usually outside Zed; multi-worktree path ambiguity is not resolved here
+
 ## 🟠⋯ v0.11.0 — #zed-11
 - Added Markdown task checkboxes as display characters: off the cursor row, `- [ ] task` reads as `□ task` and `- [x] task` reads as `■ task`, so task lists scan as checkboxes instead of raw markup
 - Indentation is preserved, so a nested task keeps its indent and only the `- [ ] `/`- [x] ` marker is replaced; the task text after it is untouched

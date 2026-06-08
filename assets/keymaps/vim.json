@@ -185,6 +185,22 @@
       ".": "vim::Repeat",
     },
   },
+  // zed-rbf fork: space is a pure leader in normal/visual (Neovim convention).
+  // Unbind plain space (drops vim::WrappingRight from the block above) so the
+  // leader resolves crisply with no pending-motion delay, then hang space c y
+  // off it. Ordered unbind-then-bind so the multikey binding wins precedence.
+  {
+    "context": "(vim_mode == normal || vim_mode == visual) && !menu",
+    "bindings": {
+      "space": null,
+    },
+  },
+  {
+    "context": "(vim_mode == normal || vim_mode == visual) && !menu",
+    "bindings": {
+      "space c y": "editor::CopyFileLocation",
+    },
+  },
   {
     "context": "vim_mode == normal || vim_mode == visual || vim_mode == operator",
     "bindings": {
