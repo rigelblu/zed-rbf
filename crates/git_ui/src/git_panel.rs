@@ -5148,7 +5148,9 @@ impl GitPanel {
             } else if let Some(history) = self.render_commit_history(window, cx) {
                 this.child(history)
             } else {
-                this.child(Self::render_commit_history_message("Loading Commit History…"))
+                this.child(Self::render_commit_history_message(
+                    "Loading Commit History…",
+                ))
             }
         })
     }

@@ -25,11 +25,37 @@ use crate::{
 pub enum DiffBase {
     Head,
     Merge { base_ref: SharedString },
+    Since { base_ref: SharedString },
 }
 
 impl DiffBase {
     pub fn is_merge_base(&self) -> bool {
         matches!(self, DiffBase::Merge { .. })
+    }
+
+    pub fn requires_tree_diff(&self) -> bool {
+        matches!(self, DiffBase::Merge { .. } | DiffBase::Since { .. })
+    }
+
+    pub fn base_ref(&self) -> Option<&SharedString> {
+        match self {
+            DiffBase::Head => None,
+            DiffBase::Merge { base_ref } | DiffBase::Since { base_ref } => Some(base_ref),
+        }
+    }
+
+    fn tree_diff_type(&self, head: SharedString) -> Option<DiffTreeType> {
+        match self {
+            DiffBase::Head => None,
+            DiffBase::Merge { base_ref } => Some(DiffTreeType::MergeBase {
+                base: base_ref.clone(),
+                head,
+            }),
+            DiffBase::Since { base_ref } => Some(DiffTreeType::Since {
+                base: base_ref.clone(),
+                head,
+            }),
+        }
     }
 }
 
@@ -126,7 +152,7 @@ impl BranchDiff {
 
         self.repo = repo;
         self.tree_diff = None;
-        self.tree_diff_update_needed = self.diff_base.is_merge_base();
+        self.tree_diff_update_needed = self.diff_base.requires_tree_diff();
         self.tree_diff_base_task = None;
         self.base_commit = None;
         self.head_commit = None;
@@ -139,7 +165,7 @@ impl BranchDiff {
             return;
         }
 
-        self.tree_diff_update_needed = diff_base.is_merge_base();
+        self.tree_diff_update_needed = diff_base.requires_tree_diff();
         self.tree_diff = None;
         self.tree_diff_base_task = None;
         self.diff_base = diff_base;
@@ -279,7 +305,7 @@ impl BranchDiff {
     }
 
     fn spawn_reload_tree_diff(&mut self, cx: &mut Context<Self>) {
-        if !self.diff_base.is_merge_base() {
+        if !self.diff_base.requires_tree_diff() {
             return;
         }
 
@@ -299,22 +325,14 @@ impl BranchDiff {
 
     pub async fn reload_tree_diff(this: WeakEntity<Self>, cx: &mut AsyncApp) -> Result<()> {
         let task = this.update(cx, |this, cx| {
-            let DiffBase::Merge { base_ref } = this.diff_base.clone() else {
+            let Some(diff_tree_type) = this.diff_base.tree_diff_type("HEAD".into()) else {
                 return None;
             };
             let Some(repo) = this.repo.as_ref() else {
                 this.tree_diff.take();
                 return None;
             };
-            repo.update(cx, |repo, cx| {
-                Some(repo.diff_tree(
-                    DiffTreeType::MergeBase {
-                        base: base_ref,
-                        head: "HEAD".into(),
-                    },
-                    cx,
-                ))
-            })
+            repo.update(cx, |repo, cx| Some(repo.diff_tree(diff_tree_type, cx)))
         })?;
         let Some(task) = task else { return Ok(()) };
 
@@ -336,7 +354,7 @@ impl BranchDiff {
         let Some(repo) = self.repo.clone() else {
             return output;
         };
-        if self.diff_base.is_merge_base() && self.tree_diff.is_none() {
+        if self.diff_base.requires_tree_diff() && self.tree_diff.is_none() {
             return output;
         }
 
@@ -466,4 +484,39 @@ pub struct DiffBuffer {
     pub repo_path: RepoPath,
     pub file_status: FileStatus,
     pub load: Task<Result<(Entity<Buffer>, Entity<BufferDiff>, Entity<ConflictSet>)>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diff_base_tree_diff_type_distinguishes_merge_base_from_exact_since() {
+        let merge = DiffBase::Merge {
+            base_ref: "main".into(),
+        }
+        .tree_diff_type("HEAD".into());
+        let since = DiffBase::Since {
+            base_ref: "abc123".into(),
+        }
+        .tree_diff_type("HEAD".into());
+
+        match merge {
+            Some(DiffTreeType::MergeBase { base, head }) => {
+                assert_eq!(base.as_ref(), "main");
+                assert_eq!(head.as_ref(), "HEAD");
+            }
+            _ => panic!("merge base diff should use DiffTreeType::MergeBase"),
+        }
+
+        match since {
+            Some(DiffTreeType::Since { base, head }) => {
+                assert_eq!(base.as_ref(), "abc123");
+                assert_eq!(head.as_ref(), "HEAD");
+            }
+            _ => panic!("exact since diff should use DiffTreeType::Since"),
+        }
+
+        assert!(DiffBase::Head.tree_diff_type("HEAD".into()).is_none());
+    }
 }
