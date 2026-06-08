@@ -50,6 +50,15 @@ pub(crate) struct YmdBlockQuote {
     pub content_range: Range<usize>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct YmdCheckbox {
+    // The `- [ ] ` / `- [x] ` marker bytes (list bullet through the trailing
+    // space), which the editor replaces with a single display character. Any
+    // leading indentation stays visible, so a nested task keeps its indent.
+    pub range: Range<usize>,
+    pub checked: bool,
+}
+
 struct YmdInlineHighlight {
     range: Range<usize>,
     open_marker_range: Range<usize>,
@@ -352,6 +361,30 @@ pub(crate) fn scan_block_quotes(text: &str) -> Vec<YmdBlockQuote> {
     block_quotes
 }
 
+// Markdown task-list checkboxes (`- [ ] ` unchecked, `- [x] ` checked) after
+// optional leading spaces/tabs. Each result's range covers only the marker bytes
+// (the editor replaces them with a configurable display character via a visible
+// fold); the indentation before it and the task text after it stay raw. Lines
+// inside fenced code blocks are skipped (the #zed-09 fence exclusion): a `- [ ]`
+// in a code sample is quoted evidence and stays literal. Dialect rules (walk Q5):
+// only the dash bullet and a LOWERCASE `x` are recognized — `* [ ]`, `+ [ ]`, and
+// `- [X]` stay raw, matching what the surrounding tooling writes.
+pub(crate) fn scan_checkboxes(text: &str) -> Vec<YmdCheckbox> {
+    let mut checkboxes = Vec::new();
+    let fenced_code_ranges = fenced_code_block_ranges(text);
+
+    for_each_line(text, |line_content, line_start| {
+        if range_overlaps_any(&(line_start..line_start + line_content.len()), &fenced_code_ranges) {
+            return;
+        }
+        if let Some(checkbox) = scan_line_checkbox(line_content, line_start) {
+            checkboxes.push(checkbox);
+        }
+    });
+
+    checkboxes
+}
+
 pub(crate) fn scan_conceals(text: &str) -> Vec<YmdConceal> {
     let mut conceals = Vec::new();
     let fenced_code_ranges = fenced_code_block_ranges(text);
@@ -590,6 +623,31 @@ fn scan_line_block_quote(line: &str, line_start: usize) -> Option<YmdBlockQuote>
     (depth > 0).then(|| YmdBlockQuote {
         line_range: line_start..line_start + line.len(),
         content_range: line_start + index..line_start + line.len(),
+    })
+}
+
+// One task-list line: optional leading spaces/tabs, then exactly `- [ ] ` or
+// `- [x] ` (the trailing space is required, so `- [ ]end` with no gap is not a
+// task). The returned range spans only the six marker bytes. All bytes inspected
+// are ASCII, so the range edges land on char boundaries (the conceal crash family
+// is byte/char-boundary, so this is load-bearing). The slice is taken with
+// `get(..)` rather than indexing so a short line cannot panic.
+fn scan_line_checkbox(line: &str, line_start: usize) -> Option<YmdCheckbox> {
+    let bytes = line.as_bytes();
+    let mut index = 0;
+    while matches!(bytes.get(index), Some(b' ' | b'\t')) {
+        index += 1;
+    }
+
+    let checked = match bytes.get(index..index + 6)? {
+        b"- [ ] " => false,
+        b"- [x] " => true,
+        _ => return None,
+    };
+
+    Some(YmdCheckbox {
+        range: line_start + index..line_start + index + 6,
+        checked,
     })
 }
 
@@ -1547,5 +1605,54 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(content_fragments, vec!["quote"]);
+    }
+
+    #[test]
+    fn scans_task_checkboxes() {
+        // Unchecked, checked, and an indented (nested) task: each range covers the
+        // six marker bytes only, and the indentation before a nested marker is left
+        // out of the range so it stays visible.
+        assert_eq!(
+            scan_checkboxes("- [ ] todo\n- [x] done\n  - [ ] nested"),
+            vec![
+                YmdCheckbox {
+                    range: 0..6,
+                    checked: false,
+                },
+                YmdCheckbox {
+                    range: 11..17,
+                    checked: true,
+                },
+                YmdCheckbox {
+                    range: 24..30,
+                    checked: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn ignores_invalid_task_checkboxes() {
+        // Dialect boundaries (walk Q5): no bullet, a marker mid-line, a missing
+        // trailing space, an UPPERCASE `X`, and a non-dash bullet all stay raw.
+        assert!(scan_checkboxes("[ ] missing list marker").is_empty());
+        assert!(scan_checkboxes("text - [ ] middle").is_empty());
+        assert!(scan_checkboxes("- [ ]missing trailing space").is_empty());
+        assert!(scan_checkboxes("- [X] uppercase").is_empty());
+        assert!(scan_checkboxes("* [ ] other marker").is_empty());
+        assert!(scan_checkboxes("+ [ ] other marker").is_empty());
+    }
+
+    #[test]
+    fn skips_task_checkboxes_inside_fenced_code_blocks() {
+        // #zed-09 fence exclusion: a `- [ ]` inside a code block stays raw; only the
+        // real task after the fence is recognized.
+        assert_eq!(
+            scan_checkboxes("```md\n- [ ] code\n```\n- [x] real"),
+            vec![YmdCheckbox {
+                range: 21..27,
+                checked: true,
+            }]
+        );
     }
 }

@@ -651,6 +651,12 @@
     // Minimum number of characters to reserve space for in the gutter.
     "min_line_number_digits": 4,
   },
+  "ymd": {
+    // Character shown in place of an unchecked Markdown task checkbox (`- [ ] `).
+    "checkbox_unchecked_char": "□",
+    // Character shown in place of a checked Markdown task checkbox (`- [x] `).
+    "checkbox_checked_char": "■",
+  },
   "indent_guides": {
     // Whether to show indent guides in the editor.
     "enabled": true,
