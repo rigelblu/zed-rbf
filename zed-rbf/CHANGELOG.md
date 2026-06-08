@@ -2,6 +2,14 @@
 title: "Zed RBF Changelog"
 ---
 
+## 🟠⋯ v0.11.0 — #zed-11
+- Added Markdown task checkboxes as display characters: off the cursor row, `- [ ] task` reads as `□ task` and `- [x] task` reads as `■ task`, so task lists scan as checkboxes instead of raw markup
+- Indentation is preserved, so a nested task keeps its indent and only the `- [ ] `/`- [x] ` marker is replaced; the task text after it is untouched
+- Cursor-line reveal and `editor::ToggleYmdConceal` show the raw `- [ ]`/`- [x]` again for editing in place; the underlying text never changes
+- Checkboxes inside fenced code blocks stay raw (the v0.9.0 code-fence exclusion), and changed task rows in an expanded diff hunk stay raw (the v0.8.0 diff-row contract)
+- Configurable via `editor.ymd.checkbox_unchecked_char` and `editor.ymd.checkbox_checked_char`: any non-empty single-line string is used as-is (e.g. `"[x]"`); an empty or multi-line value falls back to the default `□`/`■`
+- Dialect rules: only the dash bullet with a lowercase `x` is recognized — `* [ ]`, `+ [ ]`, and an uppercase `- [X]` stay raw for now
+
 ## 🟠⋯ v0.10.0 — #zed-10
 - Added Markdown block-quote styling: a line that starts with a `>` marker (with up to three leading spaces) reads as quoted material — its content after the markers is muted and a vertical border is drawn in the gutter for the quote row
 - Nested quotes count too: `>> nested` and the spaced `> > nested` both style, and a bare `>` line still gets the gutter border even though it has no content to mute

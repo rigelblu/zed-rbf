@@ -31,6 +31,7 @@ pub struct EditorSettings {
     pub scrollbar: Scrollbar,
     pub minimap: Minimap,
     pub gutter: Gutter,
+    pub ymd: Ymd,
     pub scroll_beyond_last_line: ScrollBeyondLastLine,
     pub vertical_scroll_margin: f64,
     pub autoscroll_on_clicks: bool,
@@ -141,6 +142,15 @@ pub struct Gutter {
     pub folds: bool,
 }
 
+// Resolved YMD display settings. The checkbox characters are already validated
+// (see `from_settings`): each is a non-empty single-line string, so the editor
+// can build a fold placeholder from it without re-checking.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ymd {
+    pub checkbox_unchecked_char: String,
+    pub checkbox_checked_char: String,
+}
+
 /// Forcefully enable or disable the scrollbar for each axis
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ScrollbarAxes {
@@ -198,11 +208,22 @@ impl Settings for EditorSettings {
         let scrollbar = editor.scrollbar.unwrap();
         let minimap = editor.minimap.unwrap();
         let gutter = editor.gutter.unwrap();
+        let ymd = editor.ymd.unwrap();
         let axes = scrollbar.axes.unwrap();
         let toolbar = editor.toolbar.unwrap();
         let search = editor.search.unwrap();
         let drag_and_drop_selection = editor.drag_and_drop_selection.unwrap();
         let sticky_scroll = editor.sticky_scroll.unwrap();
+        // House pattern (#zed-18, walk R1): an invalid checkbox display string
+        // falls back to the built-in default rather than rendering a broken fold.
+        // Invalid means empty or newline-containing — a newline would split the
+        // placeholder across rows. Any other non-empty string is used verbatim
+        // (e.g. `"[✓]"`), trusting the user to keep it display-width-sane.
+        let checkbox_char = |value: Option<String>, default: &str| {
+            value
+                .filter(|character| !character.is_empty() && !character.contains('\n'))
+                .unwrap_or_else(|| default.to_owned())
+        };
         Self {
             cursor_blink: editor.cursor_blink.unwrap(),
             cursor_shape: editor.cursor_shape.map(Into::into),
@@ -256,6 +277,10 @@ impl Settings for EditorSettings {
                 bookmarks: gutter.bookmarks.unwrap(),
                 breakpoints: gutter.breakpoints.unwrap(),
                 folds: gutter.folds.unwrap(),
+            },
+            ymd: Ymd {
+                checkbox_unchecked_char: checkbox_char(ymd.checkbox_unchecked_char, "□"),
+                checkbox_checked_char: checkbox_char(ymd.checkbox_checked_char, "■"),
             },
             scroll_beyond_last_line: editor.scroll_beyond_last_line.unwrap(),
             vertical_scroll_margin: editor.vertical_scroll_margin.unwrap() as f64,

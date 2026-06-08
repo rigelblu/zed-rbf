@@ -451,6 +451,15 @@ struct YmdConcealCache {
     conceal_ranges: Vec<Range<usize>>,
     conceal_rows: Vec<u32>,
     folded: HashSet<(usize, usize)>,
+    // Checkbox markers are concealed like every other range (they ride in
+    // `conceal_ranges`/`conceal_rows`, so cursor/diff row filtering, the fast
+    // path, and the toggle all treat them uniformly), but they fold to a VISIBLE
+    // display character instead of the zero-width placeholder. This maps a
+    // checkbox range to the placeholder its `checked` state and the configured
+    // characters resolved to at cache-build time; a range absent here folds with
+    // the default invisible placeholder. Rebuilt when the buffer OR the checkbox
+    // settings change.
+    checkbox_placeholders: HashMap<(usize, usize), FoldPlaceholder>,
     thematic_break_ranges: Vec<Range<usize>>,
     thematic_break_rows: Vec<u32>,
 }
@@ -462,6 +471,29 @@ fn ymd_conceal_fold_placeholder() -> FoldPlaceholder {
         merge_adjacent: false,
         type_tag: Some(ymd_conceal_fold_type_id()),
         collapsed_text: Some(YMD_CONCEAL_PLACEHOLDER_TEXT.into()),
+    }
+}
+
+// A VISIBLE conceal fold that renders a task checkbox as a single display
+// character (default `□`/`■`, configurable via `editor.ymd`). Unlike the
+// zero-width conceal placeholder this one is shown, so `collapsed_text` must be
+// non-empty — an empty placeholder is the recorded "invisible box / disappears"
+// crash class. The trailing space in `format!("{display_character} ")` is
+// load-bearing: it stands in for the marker's own trailing space so the task
+// text keeps the same left margin it had raw, and it is what `display_text`
+// returns (e.g. `"□ todo"`). Shares the conceal type tag so cursor-row reveal,
+// the toggle, and the diff-sync delta treat it as one of the YMD conceal folds.
+fn ymd_checkbox_fold_placeholder(display_character: &str) -> FoldPlaceholder {
+    let collapsed_text = SharedString::from(format!("{display_character} "));
+    FoldPlaceholder {
+        render: Arc::new({
+            let collapsed_text = collapsed_text.clone();
+            move |_, _, _| div().child(collapsed_text.clone()).into_any_element()
+        }),
+        constrain_width: true,
+        merge_adjacent: false,
+        type_tag: Some(ymd_conceal_fold_type_id()),
+        collapsed_text: Some(collapsed_text),
     }
 }
 
@@ -1239,6 +1271,11 @@ pub struct Editor {
     refresh_folding_ranges_task: Task<()>,
     ymd_concealed: bool,
     ymd_conceal_cache: Option<YmdConcealCache>,
+    // The resolved checkbox display characters last baked into the conceal cache.
+    // A settings change that alters them cannot be reconciled by the range-keyed
+    // diff (the ranges are identical, only the placeholder differs), so it is
+    // detected here and forces a full checkbox-fold rebuild.
+    ymd_checkbox_chars: (String, String),
     ymd_revealed_rows: HashSet<MultiBufferRow>,
     // Multibuffer rows that currently carry a block-quote gutter border. Set and
     // cleared in lockstep with the `YmdBlockQuoteBorder` gutter highlight (one
@@ -2452,6 +2489,13 @@ impl Editor {
             post_scroll_update: Task::ready(()),
             ymd_concealed: true,
             ymd_conceal_cache: None,
+            ymd_checkbox_chars: {
+                let ymd = &EditorSettings::get_global(cx).ymd;
+                (
+                    ymd.checkbox_unchecked_char.clone(),
+                    ymd.checkbox_checked_char.clone(),
+                )
+            },
             ymd_revealed_rows: HashSet::default(),
             ymd_block_quote_rows: HashSet::default(),
             ymd_thematic_break_blocks: HashMap::default(),
@@ -9412,13 +9456,25 @@ impl Editor {
         }
 
         let buffer_snapshot = self.buffer.read(cx).snapshot(cx);
-        let placeholder = ymd_conceal_fold_placeholder();
+        let default_placeholder = ymd_conceal_fold_placeholder();
+        // A checkbox range folds to its remembered visible placeholder; every
+        // other conceal range folds to the zero-width default. The lookup is on
+        // the cache that `ymd_desired_conceal_ranges` just (re)built, so a missing
+        // entry simply means "not a checkbox" and falls back safely.
+        let checkbox_placeholders = self
+            .ymd_conceal_cache
+            .as_ref()
+            .map(|cache| &cache.checkbox_placeholders);
         let creases = to_insert
             .into_iter()
             .map(|range| {
+                let placeholder = checkbox_placeholders
+                    .and_then(|placeholders| placeholders.get(&(range.start, range.end)))
+                    .cloned()
+                    .unwrap_or_else(|| default_placeholder.clone());
                 let anchor_range = buffer_snapshot.anchor_before(MultiBufferOffset(range.start))
                     ..buffer_snapshot.anchor_after(MultiBufferOffset(range.end));
-                Crease::simple(anchor_range, placeholder.clone())
+                Crease::simple(anchor_range, placeholder)
             })
             .collect::<Vec<_>>();
 
@@ -9433,6 +9489,29 @@ impl Editor {
             }
         });
         self.ymd_conceal_folds_did_change(cx);
+    }
+
+    // Force every YMD conceal fold to be re-inserted on the next refresh by
+    // removing them all and dropping the cache. The range-keyed diff-sync can add
+    // and remove folds but cannot change a fold's placeholder in place, so a
+    // checkbox-character settings change — which keeps the same ranges but wants a
+    // new display character — has to clear the folds and let the refresh re-fold
+    // them with fresh placeholders. Settings changes are a cold path, so the
+    // whole-buffer clear is acceptable; the immediately following refresh re-folds
+    // synchronously, so no intermediate unfolded state is shown.
+    fn rebuild_ymd_checkbox_folds_after_settings_change(&mut self, cx: &mut Context<Self>) {
+        let existing_ranges = self.ymd_existing_conceal_ranges(cx);
+        if !existing_ranges.is_empty() {
+            let to_remove = existing_ranges
+                .into_iter()
+                .map(|range| MultiBufferOffset(range.start)..MultiBufferOffset(range.end))
+                .collect::<Vec<_>>();
+            self.display_map.update(cx, |map, cx| {
+                map.remove_folds_with_type(to_remove, ymd_conceal_fold_type_id(), cx);
+            });
+        }
+        self.ymd_conceal_cache = None;
+        self.refresh_ymd_decorations(cx);
     }
 
     fn ymd_conceal_folds_did_change(&mut self, cx: &mut Context<Self>) {
@@ -9894,9 +9973,35 @@ impl Editor {
                 self.ymd_conceal_cache = None;
                 return Vec::new();
             };
+            // Checkboxes conceal like every other range, but each folds to a
+            // VISIBLE display character. They join `conceal_ranges` so the row
+            // filtering, fast-path set math, and toggle treat them uniformly; the
+            // per-range placeholder is remembered so the insert path can pick the
+            // checked/unchecked character. Resolved characters are read from
+            // settings here (cache-build time); a settings change clears the cache.
+            let ymd_settings = &EditorSettings::get_global(cx).ymd;
+            let mut checkbox_placeholders: HashMap<(usize, usize), FoldPlaceholder> =
+                HashMap::default();
+            let checkbox_ranges = ymd::scan_checkboxes(&text)
+                .into_iter()
+                .map(|checkbox| {
+                    let display_character = if checkbox.checked {
+                        ymd_settings.checkbox_checked_char.as_str()
+                    } else {
+                        ymd_settings.checkbox_unchecked_char.as_str()
+                    };
+                    checkbox_placeholders.insert(
+                        (checkbox.range.start, checkbox.range.end),
+                        ymd_checkbox_fold_placeholder(display_character),
+                    );
+                    checkbox.range
+                })
+                .collect::<Vec<_>>();
+
             let mut conceal_ranges: Vec<Range<usize>> = ymd::scan_conceals(&text)
                 .into_iter()
                 .map(|conceal| conceal.range)
+                .chain(checkbox_ranges)
                 .collect();
             // Conceal the block-quote `> ` prefix (markers + trailing space). The
             // scanner puts content_range right after the markers and their space, so
@@ -9911,6 +10016,10 @@ impl Editor {
                         .push(block_quote.line_range.start..block_quote.content_range.start);
                 }
             }
+            // Restore the sorted, non-overlapping invariant the diff-sync relies on
+            // after merging the scanner outputs (conceals, checkboxes, block-quote
+            // prefixes — each sorted on its own; the sets never overlap).
+            conceal_ranges.sort_by_key(|range| (range.start, range.end));
             let conceal_rows = conceal_ranges
                 .iter()
                 .map(|range| MultiBufferOffset(range.start).to_point(&snapshot).row)
@@ -9926,6 +10035,7 @@ impl Editor {
                 conceal_ranges,
                 conceal_rows,
                 folded: HashSet::default(),
+                checkbox_placeholders,
                 thematic_break_ranges,
                 thematic_break_rows,
             });
@@ -10487,7 +10597,22 @@ impl Editor {
             if language_settings_changed || accents_changed {
                 self.colorize_brackets(true, cx);
             }
-            self.refresh_ymd_decorations(cx);
+            // A checkbox-character change keeps the same fold ranges, so the
+            // ordinary refresh's range diff would be a no-op and leave the old
+            // character on screen — force a full checkbox-fold rebuild instead.
+            let new_checkbox_chars = {
+                let ymd = &EditorSettings::get_global(cx).ymd;
+                (
+                    ymd.checkbox_unchecked_char.clone(),
+                    ymd.checkbox_checked_char.clone(),
+                )
+            };
+            if new_checkbox_chars != self.ymd_checkbox_chars {
+                self.ymd_checkbox_chars = new_checkbox_chars;
+                self.rebuild_ymd_checkbox_folds_after_settings_change(cx);
+            } else {
+                self.refresh_ymd_decorations(cx);
+            }
 
             if language_settings_changed {
                 self.clear_disabled_lsp_folding_ranges(window, cx);

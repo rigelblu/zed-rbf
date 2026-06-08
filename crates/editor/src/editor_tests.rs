@@ -33757,6 +33757,176 @@ async fn test_ymd_conceals_block_quote_markers(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_ymd_conceals_task_checkboxes(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    // Row 0 is plain text (cursor parked there), rows 1-2 are an unchecked and a
+    // checked task, row 3 is a nested (indented) task, rows 4-6 are a fenced code
+    // block whose `- [ ] code` line must stay raw.
+    cx.set_state("ˇintro\n- [ ] todo\n- [x] done\n  - [ ] nested\n```md\n- [ ] code\n```");
+    cx.run_until_parked();
+
+    // Off-cursor tasks render as the default display characters; the nested task
+    // keeps its indentation; the fenced `- [ ] code` stays raw.
+    cx.update_editor(|editor, _, cx| {
+        assert_eq!(
+            editor.display_text(cx).replace('\u{2060}', ""),
+            "intro\n□ todo\n■ done\n  □ nested\n```md\n- [ ] code\n```"
+        );
+    });
+
+    // Moving the cursor onto the unchecked task row reveals its raw `- [ ]`; the
+    // other task rows stay replaced.
+    cx.update_editor(|editor, window, cx| {
+        editor.move_down(&MoveDown, window, cx);
+        assert_eq!(
+            editor.display_text(cx).replace('\u{2060}', ""),
+            "intro\n- [ ] todo\n■ done\n  □ nested\n```md\n- [ ] code\n```"
+        );
+    });
+
+    // The global toggle reveals every task's raw syntax at once.
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_ymd_conceal(&ToggleYmdConceal, window, cx);
+        assert_eq!(
+            editor.display_text(cx).replace('\u{2060}', ""),
+            "intro\n- [ ] todo\n- [x] done\n  - [ ] nested\n```md\n- [ ] code\n```"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_ymd_task_checkboxes_use_configured_characters(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+    update_test_editor_settings(cx, &|settings| {
+        let ymd = settings.ymd.get_or_insert_default();
+        ymd.checkbox_unchecked_char = Some("o".into());
+        ymd.checkbox_checked_char = Some("x".into());
+    });
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    cx.set_state("ˇintro\n- [ ] todo\n- [x] done");
+    cx.run_until_parked();
+
+    // The configured characters replace the markers; the trailing-space margin is
+    // preserved exactly as with the defaults.
+    cx.update_editor(|editor, _, cx| {
+        assert_eq!(
+            editor.display_text(cx).replace('\u{2060}', ""),
+            "intro\no todo\nx done"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_ymd_checkbox_settings_change_updates_existing_folds(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    cx.set_state("ˇintro\n- [ ] todo\n- [x] done");
+    cx.run_until_parked();
+
+    cx.update_editor(|editor, _, cx| {
+        assert_eq!(
+            editor.display_text(cx).replace('\u{2060}', ""),
+            "intro\n□ todo\n■ done"
+        );
+    });
+
+    // Changing the characters without editing the buffer must re-render the
+    // already-folded tasks — the range-keyed diff alone would leave the old glyphs.
+    update_test_editor_settings(&mut cx, &|settings| {
+        let ymd = settings.ymd.get_or_insert_default();
+        ymd.checkbox_unchecked_char = Some("o".into());
+        ymd.checkbox_checked_char = Some("x".into());
+    });
+    cx.run_until_parked();
+
+    cx.update_editor(|editor, _, cx| {
+        assert_eq!(
+            editor.display_text(cx).replace('\u{2060}', ""),
+            "intro\no todo\nx done"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_ymd_invalid_checkbox_characters_fall_back_to_default(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+    // Adversarial settings (walk R1): an empty unchecked value and a
+    // newline-containing checked value are both invalid and fall back to the
+    // built-in `□`/`■`. A multi-character but single-line value is supported
+    // as-is — only empty/multi-line are rejected.
+    update_test_editor_settings(cx, &|settings| {
+        let ymd = settings.ymd.get_or_insert_default();
+        ymd.checkbox_unchecked_char = Some(String::new());
+        ymd.checkbox_checked_char = Some("[\n]".into());
+    });
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    cx.set_state("ˇintro\n- [ ] todo\n- [x] done");
+    cx.run_until_parked();
+
+    cx.update_editor(|editor, _, cx| {
+        assert_eq!(
+            editor.display_text(cx).replace('\u{2060}', ""),
+            "intro\n□ todo\n■ done"
+        );
+    });
+
+    // A multi-character single-line value (e.g. `"[x]"`) is used verbatim.
+    update_test_editor_settings(&mut cx, &|settings| {
+        let ymd = settings.ymd.get_or_insert_default();
+        ymd.checkbox_checked_char = Some("[x]".into());
+    });
+    cx.run_until_parked();
+
+    cx.update_editor(|editor, _, cx| {
+        assert_eq!(
+            editor.display_text(cx).replace('\u{2060}', ""),
+            "intro\n□ todo\n[x] done"
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_ymd_conceals_do_not_apply_to_non_markdown_buffers(cx: &mut gpui::TestAppContext) {
     init_test(cx, |_| {});
 
