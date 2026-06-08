@@ -33799,6 +33799,263 @@ async fn test_ymd_conceal_unfold_contract(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_ymd_replaces_thematic_breaks_with_blocks(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    // Cursor on the `intro` row keeps the `---` rule off-cursor.
+    cx.set_state("ˇintro\n---\noutro");
+    cx.run_until_parked();
+
+    // Off-cursor break becomes one rule block.
+    cx.update_editor(|editor, _, _| {
+        assert_eq!(editor.ymd_thematic_break_blocks.len(), 1);
+    });
+
+    // Cursor-row reveal (`#zed-03`) removes the block so the raw `---` is editable.
+    cx.update_editor(|editor, window, cx| {
+        editor.move_down(&MoveDown, window, cx);
+    });
+    cx.run_until_parked();
+    cx.update_editor(|editor, _, _| {
+        assert!(editor.ymd_thematic_break_blocks.is_empty());
+    });
+
+    // Moving the cursor off the break row re-inserts the block.
+    cx.update_editor(|editor, window, cx| {
+        editor.move_down(&MoveDown, window, cx);
+    });
+    cx.run_until_parked();
+    cx.update_editor(|editor, _, _| {
+        assert_eq!(editor.ymd_thematic_break_blocks.len(), 1);
+    });
+
+    // The global toggle removes the rule blocks (concealment off shows raw dashes).
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_ymd_conceal(&ToggleYmdConceal, window, cx);
+        assert!(editor.ymd_thematic_break_blocks.is_empty());
+    });
+}
+
+#[gpui::test]
+async fn test_ymd_thematic_break_blocks_only_churn_changed_rows(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    // Two rule rows (1 and 3). The cursor parks on `top` so both render.
+    cx.set_state("ˇtop\n---\nmiddle\n---\nbottom");
+    cx.run_until_parked();
+
+    let ids_before = cx.update_editor(|editor, _, _| {
+        let mut ids = editor
+            .ymd_thematic_break_blocks
+            .iter()
+            .map(|(row, id)| (row.0, *id))
+            .collect::<Vec<_>>();
+        ids.sort_by_key(|(row, _)| *row);
+        ids
+    });
+    assert_eq!(ids_before.len(), 2, "both off-cursor breaks render as rules");
+
+    // Move the cursor onto the first rule row only. Its block is removed; the
+    // second rule row's block survives untouched (diff-only churn, not a rebuild).
+    cx.update_editor(|editor, window, cx| {
+        editor.move_down(&MoveDown, window, cx);
+    });
+    cx.run_until_parked();
+    let ids_after = cx.update_editor(|editor, _, _| {
+        editor
+            .ymd_thematic_break_blocks
+            .iter()
+            .map(|(row, id)| (row.0, *id))
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(ids_after.len(), 1);
+    let (surviving_row, surviving_id) = ids_after[0];
+    assert_eq!(surviving_row, 3, "the cursor row (1) revealed, row 3 stays a rule");
+    assert_eq!(
+        surviving_id,
+        ids_before
+            .iter()
+            .find(|(row, _)| *row == 3)
+            .map(|(_, id)| *id)
+            .unwrap(),
+        "row 3's block id is preserved, not reinserted",
+    );
+}
+
+#[gpui::test]
+async fn test_ymd_thematic_break_block_follows_row_shifting_edit(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    // Cursor at the very top, off the rule row (row 1), so the `---` renders.
+    cx.set_state("ˇintro\n---\noutro");
+    cx.run_until_parked();
+    cx.update_editor(|editor, _, _| {
+        let rows = editor
+            .ymd_thematic_break_blocks
+            .keys()
+            .map(|row| row.0)
+            .collect::<Vec<_>>();
+        assert_eq!(rows, vec![1], "the rule block is keyed at its starting row");
+    });
+
+    // Insert a line ABOVE the rule, shifting it from row 1 to row 2. The edit fires
+    // a refresh that re-scans the new text: the stale row-1 key misses the new
+    // desired set and its block is removed, a fresh block is inserted at row 2. The
+    // map must end with exactly one block keyed at the NEW row — no orphan left at
+    // the stale row 1 (walk Q4 row-keyed churn, made concrete).
+    cx.update_editor(|editor, window, cx| {
+        editor.insert("added\n", window, cx);
+    });
+    cx.run_until_parked();
+    cx.update_editor(|editor, _, cx| {
+        assert_eq!(editor.text(cx), "added\nintro\n---\noutro");
+        let rows = editor
+            .ymd_thematic_break_blocks
+            .keys()
+            .map(|row| row.0)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            vec![2],
+            "the block follows the shifted rule row with no orphan at the stale row",
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_ymd_delete_line_above_rule_reveals_dashes_without_losing_them(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    // Tom's repro: a blank line sits above the rule. Cursor on the blank line
+    // (row 1), OFF the rule row (row 2), so the `---` renders as a Replace block.
+    cx.set_state("intro\nˇ\n---\noutro");
+    cx.run_until_parked();
+    cx.update_editor(|editor, _, _| {
+        assert_eq!(editor.ymd_thematic_break_blocks.len(), 1);
+    });
+
+    // Delete the blank line the cursor is on (the same `editor::DeleteLine` action
+    // the palette/keybindings invoke). ACCEPTED behavior ("live with it",
+    // 2026-06-08): the delete lands the cursor on the rule row, so per-cursor reveal
+    // drops the block and shows the raw `---`. The dashes are NEVER lost — only the
+    // hairline rendering, and only while the cursor sits on the row.
+    cx.update_editor(|editor, window, cx| {
+        editor.delete_line(&DeleteLine, window, cx);
+    });
+    cx.run_until_parked();
+    cx.update_editor(|editor, _, cx| {
+        assert_eq!(
+            editor.text(cx),
+            "intro\n---\noutro",
+            "the blank line is deleted and the `---` rule text is preserved",
+        );
+        assert!(
+            editor.ymd_thematic_break_blocks.is_empty(),
+            "the cursor landed on the rule row, so the rule reveals its raw `---`",
+        );
+    });
+
+    // Move the cursor off the rule row — the hairline re-inserts. The rule was
+    // revealed, never destroyed.
+    cx.update_editor(|editor, window, cx| {
+        editor.move_up(&MoveUp, window, cx);
+    });
+    cx.run_until_parked();
+    cx.update_editor(|editor, _, _| {
+        assert_eq!(
+            editor.ymd_thematic_break_blocks.len(),
+            1,
+            "the rule self-heals to a hairline once the cursor leaves its row",
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_ymd_yank_across_rule_row_yields_raw_dashes(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    // A reversed selection (`«ˇ…»`) puts the cursor HEAD on the `intro` row (row 0),
+    // OFF the rule row, while the selection SPANS down across the `---` row into
+    // `outro`. Cursor-row reveal (`#zed-03`) only touches head rows, so the rule
+    // row keeps its Replace block rendered through the copy — this exercises the
+    // block-PRESENT path that walk Q6 demands, not the reveal-then-copy tautology.
+    cx.set_state("«ˇintro\n---\noutro»");
+    cx.run_until_parked();
+    cx.update_editor(|editor, _, _| {
+        assert_eq!(
+            editor.ymd_thematic_break_blocks.len(),
+            1,
+            "the rule block is rendered on the spanned row at copy time",
+        );
+    });
+
+    // Copy the selection that spans the rendered rule. The Replace block is a
+    // display-only artifact — `copy` reads buffer text, never the block layer — so
+    // the clipboard carries the RAW `---` line, never the rendered horizontal rule.
+    cx.update_editor(|editor, window, cx| editor.copy(&Copy, window, cx));
+    let copied = cx
+        .read_from_clipboard()
+        .and_then(|item| item.text().as_deref().map(str::to_string));
+    assert_eq!(copied, Some("intro\n---\noutro".to_string()));
+    assert!(
+        copied.as_deref().is_some_and(|text| text.contains("\n---\n")),
+        "the raw `---` line is present in the yanked text, not a rendered rule",
+    );
+}
+
+#[gpui::test]
 async fn test_ymd_conceal_select_all_matches_keeps_conceals(cx: &mut gpui::TestAppContext) {
     init_test(cx, |_| {});
 

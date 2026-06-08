@@ -428,16 +428,18 @@ fn is_ymd_conceal_fold(fold: &crate::display_map::Fold) -> bool {
 }
 
 // Scan results keyed to the buffer state, so cursor motion never re-runs the
-// scanner: the desired fold set on a row change is pure set math over these
-// ranges. `folded` tracks what is currently applied; it is authoritative only
-// between full syncs (external leaks heal via the toggle resync and the next
-// edit refresh).
+// scanner: the desired fold set (conceals) and rule-block set (thematic breaks)
+// on a row change are pure set math over these ranges. `folded` tracks what is
+// currently applied; it is authoritative only between full syncs (external leaks
+// heal via the toggle resync and the next edit refresh).
 struct YmdConcealCache {
     buffer_id: BufferId,
     buffer_version: clock::Global,
     conceal_ranges: Vec<Range<usize>>,
     conceal_rows: Vec<u32>,
     folded: HashSet<(usize, usize)>,
+    thematic_break_ranges: Vec<Range<usize>>,
+    thematic_break_rows: Vec<u32>,
 }
 
 fn ymd_conceal_fold_placeholder() -> FoldPlaceholder {
@@ -448,6 +450,26 @@ fn ymd_conceal_fold_placeholder() -> FoldPlaceholder {
         type_tag: Some(ymd_conceal_fold_type_id()),
         collapsed_text: Some(YMD_CONCEAL_PLACEHOLDER_TEXT.into()),
     }
+}
+
+// The hairline a thematic-break line renders as (walk Q9): a 1px rule in the
+// theme's `border_variant` color, full width, vertically centered in the row. The
+// block occupies one row height so the replaced line keeps its vertical footprint.
+fn ymd_thematic_break_render() -> RenderBlock {
+    Arc::new(|cx: &mut BlockContext| {
+        div()
+            .w_full()
+            .h(cx.line_height)
+            .flex()
+            .items_center()
+            .child(
+                div()
+                    .w_full()
+                    .h(px(1.))
+                    .bg(cx.theme().colors().border_variant),
+            )
+            .into_any_element()
+    })
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1205,6 +1227,11 @@ pub struct Editor {
     ymd_concealed: bool,
     ymd_conceal_cache: Option<YmdConcealCache>,
     ymd_revealed_rows: HashSet<MultiBufferRow>,
+    // Row-keyed (walk Q4): the map is rebuilt when buffer edits shift rows, so a
+    // stale key heals on the next refresh. Anchor-keying was considered and PARKED
+    // — it touches the verified block mechanism, and the churn is acceptable until
+    // rule-dense documents argue otherwise.
+    ymd_thematic_break_blocks: HashMap<MultiBufferRow, CustomBlockId>,
     inlay_hints: Option<LspInlayHintData>,
     folding_newlines: Task<()>,
     select_next_is_case_sensitive: Option<bool>,
@@ -1791,6 +1818,7 @@ impl Editor {
         clone.enable_runnables = self.enable_runnables;
         clone.enable_code_lens = self.enable_code_lens;
         clone.refresh_ymd_conceals(cx);
+        clone.refresh_ymd_thematic_break_blocks(None, cx);
         clone
     }
 
@@ -2405,6 +2433,7 @@ impl Editor {
             ymd_concealed: true,
             ymd_conceal_cache: None,
             ymd_revealed_rows: HashSet::default(),
+            ymd_thematic_break_blocks: HashMap::default(),
             linked_edit_ranges: Default::default(),
             in_project_search: false,
             previous_search_ranges: None,
@@ -9432,6 +9461,10 @@ impl Editor {
             return;
         }
 
+        // ONE shared display-map snapshot for the whole selection-change path
+        // (walk item 3, extending `#zed-03`'s reorder+dedupe): the cursor rows it
+        // yields feed the revealed-state guard, the conceal refresh, AND the rule
+        // block refresh — none of them re-snapshots the display map.
         let display_snapshot = self
             .display_map
             .update(cx, |display_map, cx| display_map.snapshot(cx));
@@ -9474,20 +9507,161 @@ impl Editor {
             });
 
         if let Some((desired_set, to_remove, to_insert)) = cache_delta {
-            self.ymd_revealed_rows = cursor_rows;
+            self.ymd_revealed_rows = cursor_rows.clone();
             if let Some(cache) = self.ymd_conceal_cache.as_mut() {
                 cache.folded = desired_set;
             }
             self.apply_ymd_conceal_fold_delta(to_remove, to_insert, cx);
-            return;
+        } else {
+            self.refresh_ymd_conceals_with_cursor_rows(cursor_rows.clone(), cx);
         }
 
-        self.refresh_ymd_conceals_with_cursor_rows(cursor_rows, cx);
+        self.refresh_ymd_thematic_break_blocks(Some(cursor_rows), cx);
     }
 
     fn refresh_ymd_decorations(&mut self, cx: &mut Context<Self>) {
         self.refresh_ymd_highlights(cx);
         self.refresh_ymd_conceals(cx);
+        self.refresh_ymd_thematic_break_blocks(None, cx);
+    }
+
+    fn clear_ymd_thematic_break_blocks(&mut self, cx: &mut Context<Self>) {
+        let block_ids = mem::take(&mut self.ymd_thematic_break_blocks)
+            .into_values()
+            .collect::<HashSet<_>>();
+        if !block_ids.is_empty() {
+            self.remove_blocks(block_ids, None, cx);
+        }
+    }
+
+    // First block-based YMD feature: each off-cursor thematic break becomes a
+    // `BlockPlacement::Replace` rule block. The desired rows (scanned breaks minus
+    // cursor-head rows) are diffed against the inserted block IDs — stale blocks are
+    // removed, missing ones inserted — so cursor motion and toggling reconcile in
+    // place. `cursor_rows` is passed by the selection-change path (which already
+    // computed it from a shared display-map snapshot, walk item 3); other callers
+    // pass `None` and it is derived here.
+    //
+    // A rule reveals its raw `---` on the cursor row exactly like an inline conceal,
+    // so it can be edited in place. Accepted consequence (ruled "live with it",
+    // 2026-06-08): an edit that lands the cursor on a rule row — e.g. deleting the
+    // line directly above — reveals that rule until the cursor leaves. The `---` is
+    // never lost (only the block rendering is dropped while the cursor sits on the
+    // row); moving off re-inserts the rule. Suppressing only the edit-induced reveal
+    // was judged not worth the added complexity on the cursor-motion hot path.
+    fn refresh_ymd_thematic_break_blocks(
+        &mut self,
+        cursor_rows: Option<HashSet<MultiBufferRow>>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.ymd_concealed {
+            self.clear_ymd_thematic_break_blocks(cx);
+            return;
+        }
+
+        // Resolve cursor rows: the selection-change path passes them; other callers
+        // derive them here.
+        let cursor_rows = match cursor_rows {
+            Some(cursor_rows) => cursor_rows,
+            None => {
+                let display_snapshot = self
+                    .display_map
+                    .update(cx, |display_map, cx| display_map.snapshot(cx));
+                self.ymd_cursor_rows(&display_snapshot)
+            }
+        };
+
+        // Break ranges + their rows come from the identity-keyed cache when the
+        // buffer is unchanged, so cursor motion never re-materializes the buffer text
+        // or re-runs the scanner — the conceal refresh that precedes every block
+        // refresh primes the cache; the scan is the cold-path fallback. The cached
+        // byte offsets stay valid because the cache key includes the buffer version.
+        let is_markdown = self.is_ymd_markdown_singleton(cx);
+        let cached_breaks = self
+            .ymd_singleton_buffer_identity(cx)
+            .and_then(|(buffer_id, buffer_version)| {
+                let cache = self.ymd_conceal_cache.as_ref()?;
+                (is_markdown
+                    && cache.buffer_id == buffer_id
+                    && cache.buffer_version == buffer_version)
+                    .then(|| {
+                        cache
+                            .thematic_break_ranges
+                            .iter()
+                            .cloned()
+                            .zip(cache.thematic_break_rows.iter().copied())
+                            .collect::<Vec<(Range<usize>, u32)>>()
+                    })
+            });
+
+        let (snapshot, breaks) = match cached_breaks {
+            Some(breaks) => (self.buffer.read(cx).snapshot(cx), breaks),
+            None => {
+                let Some((snapshot, text)) = self.ymd_markdown_snapshot_and_text(cx) else {
+                    self.clear_ymd_thematic_break_blocks(cx);
+                    return;
+                };
+                let breaks = ymd::scan_thematic_breaks(&text)
+                    .into_iter()
+                    .map(|range| {
+                        let row = MultiBufferOffset(range.start).to_point(&snapshot).row;
+                        (range, row)
+                    })
+                    .collect::<Vec<_>>();
+                (snapshot, breaks)
+            }
+        };
+
+        let mut desired_breaks = breaks
+            .into_iter()
+            .filter_map(|(range, row)| {
+                (!cursor_rows.contains(&MultiBufferRow(row)))
+                    .then_some((MultiBufferRow(row), range))
+            })
+            .collect::<Vec<_>>();
+        desired_breaks.sort_by_key(|(row, _)| *row);
+
+        let desired_rows = desired_breaks
+            .iter()
+            .map(|(row, _)| *row)
+            .collect::<HashSet<_>>();
+        let block_ids_to_remove = self
+            .ymd_thematic_break_blocks
+            .keys()
+            .copied()
+            .filter(|row| !desired_rows.contains(row))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .filter_map(|row| self.ymd_thematic_break_blocks.remove(&row))
+            .collect::<HashSet<_>>();
+        if !block_ids_to_remove.is_empty() {
+            self.remove_blocks(block_ids_to_remove, None, cx);
+        }
+
+        let mut rows_to_insert = Vec::new();
+        let mut blocks = Vec::new();
+        for (row, range) in desired_breaks {
+            if self.ymd_thematic_break_blocks.contains_key(&row) {
+                continue;
+            }
+            let start = snapshot.anchor_before(MultiBufferOffset(range.start));
+            let end = snapshot.anchor_after(MultiBufferOffset(range.end));
+            rows_to_insert.push(row);
+            blocks.push(BlockProperties {
+                placement: BlockPlacement::Replace(start..=end),
+                height: Some(1),
+                style: BlockStyle::Spacer,
+                render: ymd_thematic_break_render(),
+                priority: 0,
+            });
+        }
+
+        if !blocks.is_empty() {
+            let block_ids = self.insert_blocks(blocks, None, cx);
+            for (row, block_id) in rows_to_insert.into_iter().zip(block_ids) {
+                self.ymd_thematic_break_blocks.insert(row, block_id);
+            }
+        }
     }
 
     fn refresh_ymd_highlights(&mut self, cx: &mut Context<Self>) {
@@ -9593,12 +9767,19 @@ impl Editor {
                 .iter()
                 .map(|range| MultiBufferOffset(range.start).to_point(&snapshot).row)
                 .collect();
+            let thematic_break_ranges = ymd::scan_thematic_breaks(&text);
+            let thematic_break_rows = thematic_break_ranges
+                .iter()
+                .map(|range| MultiBufferOffset(range.start).to_point(&snapshot).row)
+                .collect();
             self.ymd_conceal_cache = Some(YmdConcealCache {
                 buffer_id,
                 buffer_version,
                 conceal_ranges,
                 conceal_rows,
                 folded: HashSet::default(),
+                thematic_break_ranges,
+                thematic_break_rows,
             });
         }
 
@@ -9703,6 +9884,7 @@ impl Editor {
             Vec::new()
         };
         self.sync_ymd_conceal_folds(desired_ranges, cx);
+        self.refresh_ymd_thematic_break_blocks(None, cx);
     }
 
     pub fn show_local_cursors(&self, window: &mut Window, cx: &mut App) -> bool {
