@@ -2,6 +2,11 @@
 title: "Zed RBF Changelog"
 ---
 
+## 🟠⋯ v0.19.0 — #zed-19
+- Fixed Git Panel History in detached checkouts: when there is no active branch, History now loads commit rows from the current `HEAD` commit instead of staying stuck on the loading state
+- Improved History state feedback: unscanned repositories stay in Loading, invalid `HEAD` state shows an error, and genuine empty history shows `No Commit History`
+- Fixed SHA-based Git log sources to pass printable hex commit IDs to `git log`, which also repairs other SHA-backed log views that share `LogSource::Sha`
+
 ## 🟠⋯ v0.17.0 — #zed-17
 - Added clean display for Markdown image references with alt text: off the cursor row, `![alt](assets/image.png)` reads as underlined `alt` while cursor-line reveal shows the raw image syntax for editing
 - Hovering a resolved local Markdown image reference shows the image in the standard hover popover; missing, remote, data, and unsupported paths fall back to normal hover behavior
