@@ -2,6 +2,11 @@
 title: "Zed RBF Changelog"
 ---
 
+## 🟠⋯ v0.9.0 — #zed-09
+- Added code-fence exclusion: fenced code blocks (``` or ~~~) keep their contents fully literal — YMD never colors, conceals, underlines, or rules anything inside a fence, so pasted code with YMD-like syntax (`==text==`, color emoji, `[label](url)`, `---`) stays exactly as written
+- The whole fenced block including its delimiter lines is excluded, and an unclosed fence keeps the rest of the file literal so in-progress code stays raw as you type; ordinary Markdown outside fences still styles normally
+- A `---` inside a fence no longer renders as a horizontal rule (closing the deferral noted in v0.7.0); indented code blocks and inline code spans stay in scope for a later slice
+
 ## 🟠⋯ v0.8.0 — #zed-08
 - Added always-raw YMD syntax in expanded diff hunks: expanding a Markdown diff hunk shows every changed row's exact syntax — `==` highlight markers, color emoji, link `[label](url)`, and `---` dashes — with no concealment, no color, and no rule blocks, on both the added and the deleted side, so diff review shows precisely what changed
 - Expanding or collapsing a hunk updates the reveal immediately, and collapsing restores the clean concealed view (with color and rule blocks) on those rows
