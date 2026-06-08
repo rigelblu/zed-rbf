@@ -13948,6 +13948,7 @@ dependencies = [
  "text",
  "toml 0.8.23",
  "tracing",
+ "unicode-width",
  "unindent",
  "url",
  "util",

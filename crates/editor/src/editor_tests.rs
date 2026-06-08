@@ -9513,6 +9513,203 @@ async fn test_clipboard_line_numbers_from_multibuffer(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn test_markdown_table_formatter_aligns_tables() {
+    let input = indoc! {"
+        | Name | Description | Status |
+        |---|---|---|
+        | foo | short | done |
+        | barbaz | much longer description here | pending |
+    "};
+    let expected = indoc! {"
+        | Name   | Description                  | Status  |
+        | ------ | ---------------------------- | ------- |
+        | foo    | short                        | done    |
+        | barbaz | much longer description here | pending |
+    "};
+
+    let output = project::markdown_table_formatter::align_markdown_tables(input)
+        .expect("messy table should align");
+    assert_eq!(output, expected);
+    assert!(
+        project::markdown_table_formatter::align_markdown_tables(&output).is_none(),
+        "aligned table should be idempotent"
+    );
+}
+
+#[gpui::test]
+fn test_markdown_table_formatter_handles_markers_and_fences() {
+    let input = indoc! {r#"
+        | left | right | center |
+        |:---|---:|:-:|
+        | a | b | c |
+
+        | Cmd | Note |
+        |---|---|
+        | `ls | grep` | escaped \| pipe |
+
+        ```md
+        | no | change |
+        |---|---|
+        ```
+    "#};
+
+    let output = project::markdown_table_formatter::align_markdown_tables(input)
+        .expect("messy tables should align");
+
+    assert!(output.contains("| left | right | center |"));
+    assert!(output.contains("| :--- | ----: | :----: |"));
+    assert!(output.contains("| a    |     b |   c    |"));
+    assert!(output.contains("| `ls | grep` | escaped \\| pipe |"));
+    assert!(output.contains("```md\n| no | change |\n|---|---|\n```"));
+}
+
+#[gpui::test]
+fn test_markdown_table_formatter_pads_uneven_rows() {
+    let input = indoc! {"
+        | Name | Value |
+        |---|---|
+        | a |
+        | bb | 2 |
+    "};
+    let expected = indoc! {"
+        | Name | Value |
+        | ---- | ----- |
+        | a    |       |
+        | bb   | 2     |
+    "};
+
+    let output = project::markdown_table_formatter::align_markdown_tables(input)
+        .expect("uneven rows should align with empty padding cells");
+    assert_eq!(output, expected);
+    assert!(
+        project::markdown_table_formatter::align_markdown_tables(&output).is_none(),
+        "padded table should be idempotent"
+    );
+}
+
+#[gpui::test]
+async fn test_markdown_table_alignment_on_save_when_enabled(cx: &mut TestAppContext) {
+    init_test(cx, |settings| {
+        settings.defaults.align_markdown_tables_on_save = Some(true);
+        settings.defaults.formatter = Some(FormatterList::Single(Formatter::None));
+        settings.defaults.remove_trailing_whitespace_on_save = Some(false);
+        settings.defaults.ensure_final_newline_on_save = Some(false);
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_file(path!("/file.md"), Default::default()).await;
+    let project = Project::test(fs, [path!("/").as_ref()], cx).await;
+    project
+        .read_with(cx, |project, _| project.languages().clone())
+        .add(markdown_lang());
+
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/file.md"), cx)
+        })
+        .await
+        .unwrap();
+    let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+    let (editor, cx) = cx.add_window_view(|window, cx| {
+        build_editor_with_project(project.clone(), buffer, window, cx)
+    });
+    editor.update_in(cx, |editor, window, cx| {
+        editor.set_text("| a | bb |\n|---|---|\n| longer | c |\n", window, cx)
+    });
+
+    let save = editor
+        .update_in(cx, |editor, window, cx| {
+            editor.save(SaveOptions::default(), project.clone(), window, cx)
+        })
+        .unwrap();
+    save.await;
+
+    assert_eq!(
+        editor.update(cx, |editor, cx| editor.text(cx)),
+        "| a      | bb  |\n| ------ | --- |\n| longer | c   |\n"
+    );
+}
+
+#[gpui::test]
+async fn test_markdown_table_alignment_on_save_requires_setting(cx: &mut TestAppContext) {
+    init_test(cx, |settings| {
+        settings.defaults.align_markdown_tables_on_save = Some(false);
+        settings.defaults.formatter = Some(FormatterList::Single(Formatter::None));
+        settings.defaults.remove_trailing_whitespace_on_save = Some(false);
+        settings.defaults.ensure_final_newline_on_save = Some(false);
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_file(path!("/file.md"), Default::default()).await;
+    let project = Project::test(fs, [path!("/").as_ref()], cx).await;
+    project
+        .read_with(cx, |project, _| project.languages().clone())
+        .add(markdown_lang());
+
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/file.md"), cx)
+        })
+        .await
+        .unwrap();
+    let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+    let (editor, cx) = cx.add_window_view(|window, cx| {
+        build_editor_with_project(project.clone(), buffer, window, cx)
+    });
+    let messy_table = "| a | bb |\n|---|---|\n| longer | c |\n";
+    editor.update_in(cx, |editor, window, cx| {
+        editor.set_text(messy_table, window, cx)
+    });
+
+    let save = editor
+        .update_in(cx, |editor, window, cx| {
+            editor.save(SaveOptions::default(), project.clone(), window, cx)
+        })
+        .unwrap();
+    save.await;
+
+    assert_eq!(editor.update(cx, |editor, cx| editor.text(cx)), messy_table);
+}
+
+#[gpui::test]
+async fn test_markdown_table_alignment_on_save_skips_non_markdown_buffers(cx: &mut TestAppContext) {
+    init_test(cx, |settings| {
+        settings.defaults.align_markdown_tables_on_save = Some(true);
+        settings.defaults.formatter = Some(FormatterList::Single(Formatter::None));
+        settings.defaults.remove_trailing_whitespace_on_save = Some(false);
+        settings.defaults.ensure_final_newline_on_save = Some(false);
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_file(path!("/file.txt"), Default::default()).await;
+    let project = Project::test(fs, [path!("/").as_ref()], cx).await;
+
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/file.txt"), cx)
+        })
+        .await
+        .unwrap();
+    let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+    let (editor, cx) = cx.add_window_view(|window, cx| {
+        build_editor_with_project(project.clone(), buffer, window, cx)
+    });
+    let messy_table = "| a | bb |\n|---|---|\n| longer | c |\n";
+    editor.update_in(cx, |editor, window, cx| {
+        editor.set_text(messy_table, window, cx)
+    });
+
+    let save = editor
+        .update_in(cx, |editor, window, cx| {
+            editor.save(SaveOptions::default(), project.clone(), window, cx)
+        })
+        .unwrap();
+    save.await;
+
+    assert_eq!(editor.update(cx, |editor, cx| editor.text(cx)), messy_table);
+}
+
+#[gpui::test]
 async fn test_paste_multiline(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 

@@ -2,6 +2,12 @@
 title: "Zed RBF Changelog"
 ---
 
+## 🟠⋯ v0.13.0 — #zed-13
+- Added Markdown table alignment on save: with `align_markdown_tables_on_save` enabled for Markdown, saving pads each table's columns to a consistent width so they line up, preserving the left, right, and center alignment markers (`:--`, `--:`, `:--:`)
+- Cell widths are measured by display width, so a table whose cells hold wide glyphs or emoji still pads to aligned columns in the saved text
+- Inline-code pipes inside CommonMark code spans, including multi-backtick spans, and escaped `\|` pipes are not treated as column boundaries; tables inside fenced code blocks are left exactly as written
+- Opt-in and independent of `format_on_save`: alignment runs after your configured formatters whenever the setting is on, is a no-op outside Markdown buffers, and leaves an already-aligned table unchanged on a second save
+
 ## 🟠⋯ v0.12.0 — #zed-12
 - Added a vim `space c y` binding that copies a workspace-relative code reference to the system clipboard: a cursor on line 42 copies `crates/editor/src/editor.rs:42`, and a visual selection of lines 42 through 58 copies `crates/editor/src/editor.rs:42-58`, ready to paste into an agent prompt, PR comment, or note
 - Reuses the existing `editor::CopyFileLocation` action (still on the command palette); the binding just gives it the Neovim muscle-memory leader stroke, available whenever vim mode is on
