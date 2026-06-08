@@ -2,6 +2,15 @@
 title: "Zed RBF Changelog"
 ---
 
+## 🟠⋯ v0.7.0 — #zed-07
+- Added Markdown horizontal rules: a thematic-break line (`---`, `----`, or spaced `- - -`) renders as a thin full-width hairline rule, so section breaks read as structure instead of raw dashes
+- The rule is a quiet 1px hairline in the theme's border color, vertically centered in the row — a calm separator, not a heavy bar
+- Cursor-line reveal and `editor::ToggleYmdConceal` show the raw `---` for editing in place; the underlying text never changes, so yanking a rule row copies the raw `---`
+- Known constraint: because a rule reveals on its cursor row, deleting the line directly above one briefly shows its raw `---` as the cursor lands there — the dashes are never lost, and the hairline returns the moment the cursor leaves the row
+- Improved performance: rule rendering reuses the buffer-version-keyed YMD scan cache shared with concealment, so moving the cursor never rescans the buffer on a rule-bearing file
+- Only the dash family renders: `***` and `___` thematic breaks deliberately stay raw, and a document's top-of-file YAML frontmatter delimiters are left alone
+- Thematic breaks inside fenced code blocks and changed `---` rows in expanded diff hunks may still render as rules until later slices add code-fence and diff-row exclusion
+
 ## 🟠⋯ v0.6.0 — #zed-06
 - Added inline Markdown link concealment: a single-line `[label](url)` reads as just its `label` in clean view, with the `[` and `](url)` syntax hidden so links scan like links, not raw markup
 - The label carries a quiet 1px underline in the default text color — calm and professional, deliberately not a loud link-blue — so a link inside a `==highlight==` keeps the highlight's colors and only gains the underline

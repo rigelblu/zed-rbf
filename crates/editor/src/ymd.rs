@@ -190,6 +190,59 @@ fn for_each_line(text: &str, mut callback: impl FnMut(&str, usize)) {
     }
 }
 
+// Byte offset past the YAML frontmatter block, or 0 when there is none. Walk Q3 —
+// KEEP LOOSE (Tom's call): ANY break-shaped line 1 opens the skip, not only a bare
+// `---`. The block ends after the next break-shaped line (its closing delimiter);
+// with no closing delimiter only line 1 is skipped. The deliberate consequence: a
+// frontmatter-less document that opens with a real rule loses that rule's
+// replacement, and — because the following break-shaped line is then read as the
+// closing delimiter — the next rule's replacement too. Documented as a bet in the
+// brief; no tightening here.
+fn frontmatter_skip_end(text: &str) -> usize {
+    let Some(first_line) = text.split_inclusive('\n').next() else {
+        return 0;
+    };
+    let first_line_content_end = first_line.len() - usize::from(first_line.ends_with('\n'));
+    if !is_thematic_break_line(&text[..first_line_content_end]) {
+        return 0;
+    }
+
+    let mut line_start = first_line.len();
+    for line in text[line_start..].split_inclusive('\n') {
+        let line_end = line_start + line.len();
+        let line_content_end = line_end - usize::from(line.ends_with('\n'));
+        if is_thematic_break_line(&text[line_start..line_content_end]) {
+            return line_end;
+        }
+        line_start = line_end;
+    }
+
+    first_line.len()
+}
+
+// A dash-only Markdown thematic break: up to 3 leading spaces, then a run of `-`
+// (>= 3 total) with optional interior spaces/tabs (so `- - -` qualifies). Walk Q2:
+// the `*`/`_` families are deliberately NOT recognized — only `-` renders as a
+// rule. Indented 4+ spaces (code) and any other character disqualify the line.
+fn is_thematic_break_line(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let leading_spaces = bytes.iter().take_while(|byte| **byte == b' ').count();
+    if leading_spaces > 3 {
+        return false;
+    }
+
+    let mut dash_count = 0;
+    for byte in &bytes[leading_spaces..] {
+        match *byte {
+            b'-' => dash_count += 1,
+            b' ' | b'\t' => {}
+            _ => return false,
+        }
+    }
+
+    dash_count >= 3
+}
+
 pub(crate) fn scan(text: &str) -> Vec<YmdHighlight> {
     let mut highlights = Vec::new();
 
@@ -220,6 +273,26 @@ pub(crate) fn scan_links(text: &str) -> Vec<YmdLink> {
         links.extend(scan_line_links(line_content, line_start));
     });
     links
+}
+
+// Byte ranges of Markdown thematic-break lines (`---`, `----`, spaced `- - -`)
+// that should render as a horizontal rule. Permanent dialect rule (walk Q2): only
+// the dash (`-`) family is recognized — `***` and `___` thematic breaks stay raw.
+// A leading run of break-shaped lines is skipped as YAML frontmatter delimiters
+// (see `frontmatter_skip_end`); the loose opener is a deliberate bet documented in
+// the brief. Each returned range covers the line's content (no trailing newline),
+// which the editor replaces with a `BlockPlacement::Replace` rule block.
+pub(crate) fn scan_thematic_breaks(text: &str) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let frontmatter_skip_end = frontmatter_skip_end(text);
+
+    for_each_line(text, |line_content, line_start| {
+        if line_start >= frontmatter_skip_end && is_thematic_break_line(line_content) {
+            ranges.push(line_start..line_start + line_content.len());
+        }
+    });
+
+    ranges
 }
 
 pub(crate) fn scan_conceals(text: &str) -> Vec<YmdConceal> {
@@ -1086,5 +1159,74 @@ mod tests {
             }]
         );
         assert_eq!(links[0].close_marker_range.end, line.len());
+    }
+
+    #[test]
+    fn scans_thematic_breaks() {
+        // The three accepted forms: a bare `---`, a longer `----`, and the spaced
+        // `- - -` (with up to 3 leading spaces). Each range covers the line content
+        // only, no trailing newline.
+        assert_eq!(
+            scan_thematic_breaks("text\n---\nmore\n  - - -\n----"),
+            vec![5..8, 14..21, 22..26]
+        );
+    }
+
+    #[test]
+    fn ignores_non_break_dash_lines() {
+        // Two dashes, a dash line with trailing text, and a code-indented (4 spaces)
+        // run all stay raw.
+        assert!(scan_thematic_breaks("--").is_empty());
+        assert!(scan_thematic_breaks("--- text").is_empty());
+        assert!(scan_thematic_breaks("    ---").is_empty());
+    }
+
+    #[test]
+    fn star_and_underscore_thematic_breaks_stay_raw() {
+        // PIN (walk Q2 — permanent dialect rule): only the dash (`-`) family renders
+        // as a rule. CommonMark also treats `***`, `___`, and their spaced/longer
+        // variants as thematic breaks, but this editor deliberately leaves them raw.
+        // If a future change ever recognizes `*`/`_`, this assertion fails first.
+        assert!(scan_thematic_breaks("***").is_empty());
+        assert!(scan_thematic_breaks("___").is_empty());
+        assert!(scan_thematic_breaks("* * *").is_empty());
+        assert!(scan_thematic_breaks("_____").is_empty());
+        // A dash break on a later line still renders — only the `*`/`_` lines are inert.
+        assert_eq!(scan_thematic_breaks("***\n---"), vec![4..7]);
+    }
+
+    #[test]
+    fn skips_yaml_frontmatter_break_delimiters() {
+        // A break-shaped line 1 opens a frontmatter skip; the opening and closing
+        // delimiters are both skipped, and only a body `---` after them renders.
+        let text = "---\ntitle: Test\n---\nbody\n---";
+        let ranges = scan_thematic_breaks(text);
+        assert_eq!(ranges, vec![25..28]);
+        assert_eq!(&text[ranges[0].clone()], "---");
+    }
+
+    #[test]
+    fn rule_immediately_after_frontmatter_renders() {
+        // Pins the `>=` boundary in `scan_thematic_breaks`: the closing `---`'s
+        // line_end equals the next line's line_start, so a `---` on the very line
+        // after the frontmatter close is NOT swallowed by the skip — it renders.
+        let text = "---\nk: v\n---\n---\nx";
+        let ranges = scan_thematic_breaks(text);
+        assert_eq!(ranges, vec![13..16]);
+        assert_eq!(&text[ranges[0].clone()], "---");
+    }
+
+    #[test]
+    fn frontmatter_less_opener_loses_two_rules_loose_bet() {
+        // Documents the deliberate loose-opener bet (walk Q3, Tom's override of the
+        // tighten rec): there is NO real frontmatter here, but because line 1 is
+        // break-shaped it opens the skip, and the next break-shaped line is read as
+        // the closing delimiter. So a document that genuinely opens with a rule loses
+        // BOTH that rule's replacement and the next one — only the third `---` renders.
+        let text = "---\n---\n---";
+        assert_eq!(scan_thematic_breaks(text), vec![8..11]);
+        // A non-break line 1 means no skip at all — every `---` renders.
+        let text = "intro\n---\n---";
+        assert_eq!(scan_thematic_breaks(text), vec![6..9, 10..13]);
     }
 }
