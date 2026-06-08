@@ -72,6 +72,8 @@ pub struct EditorSettingsContent {
     pub minimap: Option<MinimapContent>,
     /// Gutter related settings
     pub gutter: Option<GutterContent>,
+    /// YMD ("Your Own Markdown") display settings.
+    pub ymd: Option<YmdContent>,
     /// Whether the editor will scroll beyond the last line.
     ///
     /// Default: one_page
@@ -501,6 +503,24 @@ pub struct GutterContent {
     ///
     /// Default: true
     pub folds: Option<bool>,
+}
+
+/// YMD ("Your Own Markdown") display settings.
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq, Eq)]
+pub struct YmdContent {
+    /// Character shown in place of an unchecked Markdown task checkbox
+    /// (`- [ ] `) off the cursor row. Any non-empty single-line string is used
+    /// as-is; an empty or multi-line value falls back to the default.
+    ///
+    /// Default: □
+    pub checkbox_unchecked_char: Option<String>,
+    /// Character shown in place of a checked Markdown task checkbox (`- [x] `)
+    /// off the cursor row. Any non-empty single-line string is used as-is; an
+    /// empty or multi-line value falls back to the default.
+    ///
+    /// Default: ■
+    pub checkbox_checked_char: Option<String>,
 }
 
 /// Whether to display code lenses from language servers above code elements.
