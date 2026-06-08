@@ -1814,10 +1814,16 @@ impl GitRepository for RealGitRepository {
     fn diff_tree(&self, request: DiffTreeType) -> BoxFuture<'_, Result<TreeDiff>> {
         let git = self.git_binary_in_worktree();
         let working_directory = self.working_directory.clone();
-        let merge_base_ref = match &request {
-            DiffTreeType::MergeBaseWithWorktree { base } => Some(base.clone()),
+        // Only the worktree variants need the recreated-file fixup below, and each resolves
+        // the tree it compares against differently: `MergeBaseWithWorktree` diffs against the
+        // merge base of `base` and `HEAD`, while `SinceWithWorktree` diffs against `base` itself.
+        let worktree_base_ref = match &request {
+            DiffTreeType::MergeBaseWithWorktree { base }
+            | DiffTreeType::SinceWithWorktree { base } => Some(base.clone()),
             DiffTreeType::MergeBase { .. } | DiffTreeType::Since { .. } => None,
         };
+        let worktree_base_is_merge_base =
+            matches!(request, DiffTreeType::MergeBaseWithWorktree { .. });
 
         let args = match request {
             DiffTreeType::MergeBase { base, head } => [
@@ -1854,6 +1860,16 @@ impl GitRepository for RealGitRepository {
             ]
             .map(OsString::from)
             .to_vec(),
+            DiffTreeType::SinceWithWorktree { base } => [
+                "diff",
+                "--raw",
+                "-z",
+                "--abbrev=64",
+                "--no-renames",
+                base.as_str(),
+            ]
+            .map(OsString::from)
+            .to_vec(),
         };
 
         self.executor
@@ -1867,7 +1883,7 @@ impl GitRepository for RealGitRepository {
 
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let mut tree_diff = stdout.parse::<TreeDiff>()?;
-                let Some(merge_base_ref) = merge_base_ref else {
+                let Some(worktree_base_ref) = worktree_base_ref else {
                     return Ok(tree_diff);
                 };
                 let Some(working_directory) = working_directory else {
@@ -1890,7 +1906,7 @@ impl GitRepository for RealGitRepository {
                 // Files the diff reports as deleted but that exist on disk
                 // (deleted from the index or from a commit, then recreated).
                 // `git diff` compares them against the index, so compare their
-                // disk contents against the merge base ourselves.
+                // disk contents against the base tree ourselves.
                 let recreated: Vec<(RepoPath, Oid)> = status
                     .entries
                     .iter()
@@ -1913,16 +1929,21 @@ impl GitRepository for RealGitRepository {
                     return Ok(tree_diff);
                 }
 
-                let merge_base_output = git
-                    .build_command(&["merge-base", merge_base_ref.as_ref(), "HEAD"])
-                    .output()
-                    .await?;
-                if !merge_base_output.status.success() {
-                    let stderr = String::from_utf8_lossy(&merge_base_output.stderr);
-                    anyhow::bail!("git merge-base failed: {stderr}");
-                }
-                let merge_base = String::from_utf8_lossy(&merge_base_output.stdout);
-                let merge_base = merge_base.trim();
+                let base_tree = if worktree_base_is_merge_base {
+                    let merge_base_output = git
+                        .build_command(&["merge-base", worktree_base_ref.as_ref(), "HEAD"])
+                        .output()
+                        .await?;
+                    if !merge_base_output.status.success() {
+                        let stderr = String::from_utf8_lossy(&merge_base_output.stderr);
+                        anyhow::bail!("git merge-base failed: {stderr}");
+                    }
+                    String::from_utf8_lossy(&merge_base_output.stdout)
+                        .trim()
+                        .to_owned()
+                } else {
+                    worktree_base_ref.to_string()
+                };
 
                 for (path, old) in recreated {
                     let full_path = working_directory.join(path.as_std_path());
@@ -1932,7 +1953,8 @@ impl GitRepository for RealGitRepository {
                     };
                     let base_entry = git
                         .build_command(
-                            &["ls-tree", merge_base, "--", path.as_unix_str()].map(OsString::from),
+                            &["ls-tree", base_tree.as_str(), "--", path.as_unix_str()]
+                                .map(OsString::from),
                         )
                         .output()
                         .await?;

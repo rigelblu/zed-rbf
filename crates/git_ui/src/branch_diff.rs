@@ -155,7 +155,9 @@ impl BranchDiff {
         let selected_branch = workspace.active_item_as::<Self>(cx).and_then(|item| {
             match item.read(cx).diff_base(cx) {
                 DiffBase::Merge { base_ref } => Some(base_ref.clone()),
-                DiffBase::Head | DiffBase::Index | DiffBase::Staged => None,
+                DiffBase::Head | DiffBase::Index | DiffBase::Staged | DiffBase::Since { .. } => {
+                    None
+                }
             }
         });
         let workspace_handle = workspace.weak_handle();
@@ -488,7 +490,9 @@ impl Item for BranchDiff {
     fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
         match self.diff_base(cx) {
             DiffBase::Merge { base_ref } => format!("Changes since {}", base_ref).into(),
-            DiffBase::Head | DiffBase::Index | DiffBase::Staged => "Changes".into(),
+            DiffBase::Head | DiffBase::Index | DiffBase::Staged | DiffBase::Since { .. } => {
+                "Changes".into()
+            }
         }
     }
 
@@ -1262,7 +1266,7 @@ mod tests {
             let active_item = workspace.active_item_as::<BranchDiff>(cx).unwrap();
             let active_base_ref = match active_item.read(cx).diff_base(cx) {
                 DiffBase::Merge { base_ref } => base_ref.to_string(),
-                DiffBase::Head | DiffBase::Index | DiffBase::Staged => {
+                DiffBase::Head | DiffBase::Index | DiffBase::Staged | DiffBase::Since { .. } => {
                     panic!("expected active item to be a branch diff")
                 }
             };
@@ -1270,7 +1274,10 @@ mod tests {
                 .items_of_type::<BranchDiff>(cx)
                 .filter_map(|item| match item.read(cx).diff_base(cx) {
                     DiffBase::Merge { base_ref } => Some(base_ref.to_string()),
-                    DiffBase::Head | DiffBase::Index | DiffBase::Staged => None,
+                    DiffBase::Head
+                    | DiffBase::Index
+                    | DiffBase::Staged
+                    | DiffBase::Since { .. } => None,
                 })
                 .collect::<Vec<_>>();
             (active_base_ref, base_refs)

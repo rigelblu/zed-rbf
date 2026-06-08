@@ -510,6 +510,9 @@ pub enum DiffTreeType {
         base: SharedString,
         head: SharedString,
     },
+    SinceWithWorktree {
+        base: SharedString,
+    },
 }
 
 #[derive(Debug, PartialEq)]

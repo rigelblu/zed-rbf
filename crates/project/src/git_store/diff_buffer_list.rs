@@ -29,11 +29,45 @@ pub enum DiffBase {
     Index,
     Staged,
     Merge { base_ref: SharedString },
+    Since { base_ref: SharedString },
 }
 
 impl DiffBase {
     pub fn is_merge_base(&self) -> bool {
         matches!(self, DiffBase::Merge { .. })
+    }
+
+    pub fn requires_tree_diff(&self) -> bool {
+        matches!(self, DiffBase::Merge { .. } | DiffBase::Since { .. })
+    }
+
+    /// The committed and worktree tree diffs backing this base, if it needs any.
+    ///
+    /// `Merge` resolves both halves through the merge base of `base_ref` and `head`;
+    /// `Since` compares against `base_ref` exactly, so the two never collide even
+    /// when they name the same ref.
+    fn tree_diff_types(&self, head: SharedString) -> Option<(DiffTreeType, DiffTreeType)> {
+        match self {
+            DiffBase::Head | DiffBase::Index | DiffBase::Staged => None,
+            DiffBase::Merge { base_ref } => Some((
+                DiffTreeType::MergeBase {
+                    base: base_ref.clone(),
+                    head,
+                },
+                DiffTreeType::MergeBaseWithWorktree {
+                    base: base_ref.clone(),
+                },
+            )),
+            DiffBase::Since { base_ref } => Some((
+                DiffTreeType::Since {
+                    base: base_ref.clone(),
+                    head,
+                },
+                DiffTreeType::SinceWithWorktree {
+                    base: base_ref.clone(),
+                },
+            )),
+        }
     }
 }
 
@@ -84,9 +118,9 @@ impl DiffBufferList {
             };
 
             if should_update {
-                // Merge-base lists refresh after the tree diff reloads; other
+                // Tree-diff-backed lists refresh after the tree diff reloads; other
                 // bases have no tree diff, so notify consumers immediately.
-                if !this.diff_base.is_merge_base() {
+                if !this.diff_base.requires_tree_diff() {
                     cx.emit(BranchDiffEvent::FileListChanged);
                 }
                 *this.update_needed.borrow_mut() = ();
@@ -225,7 +259,7 @@ impl DiffBufferList {
     }
 
     fn spawn_reload_tree_diff(&mut self, cx: &mut Context<Self>) {
-        if !self.diff_base.is_merge_base() {
+        if !self.diff_base.requires_tree_diff() {
             return;
         }
 
@@ -245,7 +279,9 @@ impl DiffBufferList {
 
     pub async fn reload_tree_diff(this: WeakEntity<Self>, cx: &mut AsyncApp) -> Result<()> {
         let tasks = this.update(cx, |this, cx| {
-            let DiffBase::Merge { base_ref } = this.diff_base.clone() else {
+            let Some((committed_type, worktree_type)) =
+                this.diff_base.tree_diff_types("HEAD".into())
+            else {
                 return None;
             };
             let Some(repo) = this.repo.as_ref() else {
@@ -256,14 +292,8 @@ impl DiffBufferList {
             };
             Some(repo.update(cx, |repo, cx| {
                 (
-                    repo.diff_tree(
-                        DiffTreeType::MergeBase {
-                            base: base_ref.clone(),
-                            head: "HEAD".into(),
-                        },
-                        cx,
-                    ),
-                    repo.diff_tree(DiffTreeType::MergeBaseWithWorktree { base: base_ref }, cx),
+                    repo.diff_tree(committed_type, cx),
+                    repo.diff_tree(worktree_type, cx),
                 )
             }))
         })?;
@@ -296,7 +326,7 @@ impl DiffBufferList {
         let Some(repo) = self.repo.clone() else {
             return output;
         };
-        if self.diff_base.is_merge_base() && self.tree_diff.is_none() {
+        if self.diff_base.requires_tree_diff() && self.tree_diff.is_none() {
             return output;
         }
 
@@ -311,7 +341,7 @@ impl DiffBufferList {
                     DiffBase::Head => Some(item.status),
                     DiffBase::Index => item.status.staging().has_unstaged().then_some(item.status),
                     DiffBase::Staged => item.status.staging().has_staged().then_some(item.status),
-                    DiffBase::Merge { .. } => status_overrides_tree(
+                    DiffBase::Merge { .. } | DiffBase::Since { .. } => status_overrides_tree(
                         item.status,
                         self.committed_tree_diff
                             .as_ref()
@@ -427,7 +457,7 @@ impl DiffBufferList {
                         .await?;
                     (index_buffer, diff)
                 }
-                DiffBase::Merge { .. } => {
+                DiffBase::Merge { .. } | DiffBase::Since { .. } => {
                     let diff = if let Some(entry) = branch_diff {
                         let oid = match entry {
                             git::status::TreeDiffStatus::Added { .. } => None,
@@ -541,4 +571,101 @@ pub struct DiffBuffer {
     pub repo_path: RepoPath,
     pub file_status: FileStatus,
     pub load: Task<Result<LoadedDiffBuffer>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diff_base_tree_diff_types_distinguish_merge_base_from_exact_since() {
+        let merge = DiffBase::Merge {
+            base_ref: "main".into(),
+        }
+        .tree_diff_types("HEAD".into());
+        let since = DiffBase::Since {
+            base_ref: "abc123".into(),
+        }
+        .tree_diff_types("HEAD".into());
+
+        match merge {
+            Some((
+                DiffTreeType::MergeBase { base, head },
+                DiffTreeType::MergeBaseWithWorktree {
+                    base: worktree_base,
+                },
+            )) => {
+                assert_eq!(base.as_ref(), "main");
+                assert_eq!(head.as_ref(), "HEAD");
+                assert_eq!(worktree_base.as_ref(), "main");
+            }
+            _ => panic!("merge base diff should use the merge-base tree diff pair"),
+        }
+
+        match since {
+            Some((
+                DiffTreeType::Since { base, head },
+                DiffTreeType::SinceWithWorktree {
+                    base: worktree_base,
+                },
+            )) => {
+                assert_eq!(base.as_ref(), "abc123");
+                assert_eq!(head.as_ref(), "HEAD");
+                assert_eq!(worktree_base.as_ref(), "abc123");
+            }
+            _ => panic!("exact since diff should use the exact tree diff pair"),
+        }
+
+        for base in [DiffBase::Head, DiffBase::Index, DiffBase::Staged] {
+            assert!(base.tree_diff_types("HEAD".into()).is_none());
+        }
+    }
+
+    #[test]
+    fn diff_base_requires_tree_diff_only_for_tree_backed_bases() {
+        assert!(
+            DiffBase::Merge {
+                base_ref: "main".into()
+            }
+            .requires_tree_diff()
+        );
+        assert!(
+            DiffBase::Since {
+                base_ref: "abc123".into()
+            }
+            .requires_tree_diff()
+        );
+        assert!(!DiffBase::Head.requires_tree_diff());
+        assert!(!DiffBase::Index.requires_tree_diff());
+        assert!(!DiffBase::Staged.requires_tree_diff());
+    }
+
+    // `DiffBase` is persisted as JSON in the project diff database, so the
+    // externally tagged representation of the existing variants must not shift
+    // when a new one is added.
+    #[test]
+    fn diff_base_serde_representation_is_stable() {
+        assert_eq!(serde_json::to_string(&DiffBase::Head).unwrap(), r#""Head""#);
+        assert_eq!(
+            serde_json::to_string(&DiffBase::Merge {
+                base_ref: "main".into()
+            })
+            .unwrap(),
+            r#"{"Merge":{"base_ref":"main"}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&DiffBase::Since {
+                base_ref: "abc123".into()
+            })
+            .unwrap(),
+            r#"{"Since":{"base_ref":"abc123"}}"#
+        );
+
+        let since = DiffBase::Since {
+            base_ref: "abc123".into(),
+        };
+        let round_tripped: DiffBase =
+            serde_json::from_str(&serde_json::to_string(&since).unwrap()).unwrap();
+        assert_eq!(round_tripped, since);
+    }
 }

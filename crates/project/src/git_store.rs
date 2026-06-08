@@ -4139,20 +4139,21 @@ impl GitStore {
         mut cx: AsyncApp,
     ) -> Result<proto::GetTreeDiffResponse> {
         let repository_id = RepositoryId(request.payload.repository_id);
-        let diff_type = if request.payload.includes_worktree {
-            DiffTreeType::MergeBaseWithWorktree {
-                base: request.payload.base.into(),
-            }
-        } else if request.payload.is_merge {
-            DiffTreeType::MergeBase {
+        let diff_type = match (request.payload.is_merge, request.payload.includes_worktree) {
+            (true, false) => DiffTreeType::MergeBase {
                 base: request.payload.base.into(),
                 head: request.payload.head.into(),
-            }
-        } else {
-            DiffTreeType::Since {
+            },
+            (true, true) => DiffTreeType::MergeBaseWithWorktree {
+                base: request.payload.base.into(),
+            },
+            (false, false) => DiffTreeType::Since {
                 base: request.payload.base.into(),
                 head: request.payload.head.into(),
-            }
+            },
+            (false, true) => DiffTreeType::SinceWithWorktree {
+                base: request.payload.base.into(),
+            },
         };
 
         let diff = this
@@ -8799,11 +8800,14 @@ impl Repository {
                     let (is_merge, includes_worktree, base, head) = match diff_type {
                         DiffTreeType::MergeBase { base, head } => (true, false, base, head),
                         // Older servers ignore `includes_worktree` and use the existing fields,
-                        // so HEAD keeps this request valid as a committed-only fallback.
+                        // so HEAD keeps these requests valid as committed-only fallbacks.
                         DiffTreeType::MergeBaseWithWorktree { base } => {
                             (true, true, base, "HEAD".into())
                         }
                         DiffTreeType::Since { base, head } => (false, false, base, head),
+                        DiffTreeType::SinceWithWorktree { base } => {
+                            (false, true, base, "HEAD".into())
+                        }
                     };
                     let response = client
                         .request(proto::GetTreeDiff {
