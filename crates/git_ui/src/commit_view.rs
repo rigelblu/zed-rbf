@@ -164,6 +164,7 @@ impl CommitView {
         workspace: WeakEntity<Workspace>,
         stash: Option<usize>,
         file_filter: Option<RepoPath>,
+        focus_opened_item: bool,
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -226,13 +227,20 @@ impl CommitView {
                                 pane.add_item(
                                     Box::new(commit_view),
                                     true,
-                                    true,
+                                    focus_opened_item,
                                     Some(ix),
                                     window,
                                     cx,
                                 );
                             } else {
-                                pane.add_item(Box::new(commit_view), true, true, None, window, cx);
+                                pane.add_item(
+                                    Box::new(commit_view),
+                                    true,
+                                    focus_opened_item,
+                                    None,
+                                    window,
+                                    cx,
+                                );
                             }
                         })
                     })

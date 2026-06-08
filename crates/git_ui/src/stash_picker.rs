@@ -328,6 +328,7 @@ impl StashListDelegate {
             self.workspace.clone(),
             Some(stash_index),
             None,
+            true,
             window,
             cx,
         );
