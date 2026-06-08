@@ -550,7 +550,9 @@ impl Editor {
             // intent so YMD concealment opens with everything else and the next
             // toggle press re-conceals instead of appearing dead.
             self.ymd_concealed = false;
-            self.refresh_ymd_conceals(cx);
+            // Concealment is now off, so the desired conceal set is empty
+            // regardless of diff rows; pass an empty set instead of scanning.
+            self.refresh_ymd_conceals(&HashSet::default(), cx);
         } else {
             self.toggle_fold_multiple_buffers = cx.spawn(async move |editor, cx| {
                 editor
