@@ -9281,6 +9281,177 @@ async fn test_copy_trim_line_mode(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_copy_file_location_current_line(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.set_state(indoc! {"
+        alpha
+        betaˇ
+        gamma
+    "});
+
+    cx.update_editor(|editor, window, cx| {
+        editor.copy_file_location(&CopyFileLocation, window, cx);
+    });
+
+    assert_eq!(
+        cx.read_from_clipboard()
+            .and_then(|item| item.text().as_deref().map(str::to_string)),
+        Some("file:2".to_string())
+    );
+}
+
+#[gpui::test]
+async fn test_copy_file_location_selected_line_range(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.set_state(indoc! {"
+        alpha
+        «beta
+        gamma
+        delta
+        ˇ»epsilon
+    "});
+    cx.update_editor(|editor, _window, _cx| editor.selections.set_line_mode(true));
+
+    cx.update_editor(|editor, window, cx| {
+        editor.copy_file_location(&CopyFileLocation, window, cx);
+    });
+
+    // Linewise selection ending at column 0 of the next row trims that trailing
+    // row, so lines 2-4 are reported rather than 2-5.
+    assert_eq!(
+        cx.read_from_clipboard()
+            .and_then(|item| item.text().as_deref().map(str::to_string)),
+        Some("file:2-4".to_string())
+    );
+}
+
+#[gpui::test]
+async fn test_copy_file_location_characterwise_multiple_rows(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.set_state(indoc! {"
+        alpha
+        be«ta
+        gamma
+        deˇ»lta
+        epsilon
+    "});
+
+    cx.update_editor(|editor, window, cx| {
+        editor.copy_file_location(&CopyFileLocation, window, cx);
+    });
+
+    // A characterwise selection spanning rows 2-4 ends mid-line (column > 0), so
+    // the end row is kept and reported as the span end.
+    assert_eq!(
+        cx.read_from_clipboard()
+            .and_then(|item| item.text().as_deref().map(str::to_string)),
+        Some("file:2-4".to_string())
+    );
+}
+
+#[gpui::test]
+async fn test_copy_file_location_in_expanded_diff_uses_buffer_line(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.set_state(indoc! {"
+        one
+        ˇTWO
+        three
+        four
+    "});
+    cx.set_head_text(indoc! {"
+        removed
+        one
+        two
+        three
+        four
+    "});
+
+    cx.update_editor(|editor, window, cx| {
+        editor.expand_all_diff_hunks(&ExpandAllDiffHunks, window, cx);
+    });
+    cx.run_until_parked();
+    cx.assert_state_with_diff(
+        indoc! {"
+        - removed
+          one
+        - two
+        + ˇTWO
+          three
+          four
+    "}
+        .to_string(),
+    );
+
+    cx.update_editor(|editor, window, cx| {
+        editor.copy_file_location(&CopyFileLocation, window, cx);
+    });
+
+    assert_eq!(
+        cx.read_from_clipboard()
+            .and_then(|item| item.text().as_deref().map(str::to_string)),
+        Some("file:2".to_string())
+    );
+}
+
+#[gpui::test]
+async fn test_copy_file_location_single_file_worktree_uses_file_name(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_file(path!("/notes.md"), "alpha\nbeta\ngamma\n".into())
+        .await;
+
+    // Passing the FILE path as the worktree root creates a single-file worktree —
+    // exactly what a directly-opened file becomes — so the file's worktree-relative
+    // path is empty. CopyFileLocation must then fall back to the bare file name;
+    // before the fix the empty path dropped the name and produced just `:1`.
+    let project = Project::test(fs, [path!("/notes.md").as_ref()], cx).await;
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/notes.md"), cx)
+        })
+        .await
+        .unwrap();
+
+    // Precondition: confirm this really is the empty-path case, otherwise the test
+    // would pass with OR without the fix and guard nothing.
+    cx.update(|cx| {
+        assert!(
+            buffer.read(cx).file().unwrap().path().is_empty(),
+            "single-file worktree should have an empty worktree-relative path"
+        );
+    });
+
+    let (editor, cx) = cx.add_window_view(|window, cx| {
+        build_editor_with_project(
+            project.clone(),
+            MultiBuffer::build_from_buffer(buffer, cx),
+            window,
+            cx,
+        )
+    });
+
+    // Default cursor is at row 0 → line 1.
+    editor.update_in(cx, |editor, window, cx| {
+        editor.copy_file_location(&CopyFileLocation, window, cx);
+    });
+
+    assert_eq!(
+        cx.read_from_clipboard()
+            .and_then(|item| item.text().as_deref().map(str::to_string)),
+        Some("notes.md:1".to_string())
+    );
+}
+
+#[gpui::test]
 async fn test_clipboard_line_numbers_from_multibuffer(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
