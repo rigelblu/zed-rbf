@@ -2,6 +2,13 @@
 title: "Zed RBF Changelog"
 ---
 
+## 🟠⋯ v0.14.0 — #zed-14
+- Fixed table alignment around section dividers: a contiguous pipe block that uses repeated delimiter rows as section breaks now aligns as one table while keeping later delimiter-looking rows as content
+- Stacked tables with different delimiter column counts still split and align independently; no rows are dropped or duplicated
+- Fixed clean YMD mode in Markdown tables: concealed color emoji, highlight markers, and inline style markers now disappear like normal YMD syntax while their hidden width is absorbed into trailing cell padding, so aligned tables keep the same visible columns with conceal on or off
+- Added conceal support for balanced inline style markers (`**bold**`, `*italic*`, `_underline_`, and `~~strike~~`) while leaving common identifier text such as `snake_case` raw
+- Inline style markers inside single- or multi-backtick code spans stay raw, so literal code examples do not hide `*`, `_`, or `~~` characters
+
 ## 🟠⋯ v0.13.0 — #zed-13
 - Added Markdown table alignment on save: with `align_markdown_tables_on_save` enabled for Markdown, saving pads each table's columns to a consistent width so they line up, preserving the left, right, and center alignment markers (`:--`, `--:`, `:--:`)
 - Cell widths are measured by display width, so a table whose cells hold wide glyphs or emoji still pads to aligned columns in the saved text

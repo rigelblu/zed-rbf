@@ -260,6 +260,7 @@ use ui::{
     utils::WithRemSize,
 };
 use ui_input::ErasedEditor;
+use unicode_width::UnicodeWidthStr;
 use util::{RangeExt, ResultExt, TryFutureExt, maybe, post_inc};
 use workspace::{
     CollaboratorId, Item as WorkspaceItem, ItemId, ItemNavHistory, NavigationEntry, OpenInTerminal,
@@ -451,15 +452,11 @@ struct YmdConcealCache {
     conceal_ranges: Vec<Range<usize>>,
     conceal_rows: Vec<u32>,
     folded: HashSet<(usize, usize)>,
-    // Checkbox markers are concealed like every other range (they ride in
-    // `conceal_ranges`/`conceal_rows`, so cursor/diff row filtering, the fast
-    // path, and the toggle all treat them uniformly), but they fold to a VISIBLE
-    // display character instead of the zero-width placeholder. This maps a
-    // checkbox range to the placeholder its `checked` state and the configured
-    // characters resolved to at cache-build time; a range absent here folds with
-    // the default invisible placeholder. Rebuilt when the buffer OR the checkbox
-    // settings change.
-    checkbox_placeholders: HashMap<(usize, usize), FoldPlaceholder>,
+    // Some conceal ranges need a non-default placeholder: checkboxes render a
+    // visible glyph, and table-cell padding folds expand to absorb hidden marker
+    // width so aligned table columns do not drift in clean mode. Ranges absent
+    // here fold with the default invisible placeholder.
+    conceal_placeholders: HashMap<(usize, usize), FoldPlaceholder>,
     thematic_break_ranges: Vec<Range<usize>>,
     thematic_break_rows: Vec<u32>,
 }
@@ -495,6 +492,70 @@ fn ymd_checkbox_fold_placeholder(display_character: &str) -> FoldPlaceholder {
         type_tag: Some(ymd_conceal_fold_type_id()),
         collapsed_text: Some(collapsed_text),
     }
+}
+
+fn ymd_spaces_fold_placeholder(width: usize) -> FoldPlaceholder {
+    let collapsed_text = SharedString::from(" ".repeat(width));
+    FoldPlaceholder {
+        render: Arc::new({
+            let collapsed_text = collapsed_text.clone();
+            move |_, _, _| div().child(collapsed_text.clone()).into_any_element()
+        }),
+        constrain_width: true,
+        merge_adjacent: false,
+        type_tag: Some(ymd_conceal_fold_type_id()),
+        collapsed_text: Some(collapsed_text),
+    }
+}
+
+fn ymd_table_cell_padding_range_for_conceal(
+    text: &str,
+    range: &Range<usize>,
+) -> Option<Range<usize>> {
+    let line_start = text[..range.start].rfind('\n').map_or(0, |index| index + 1);
+    let line_end = text[range.end..]
+        .find('\n')
+        .map_or(text.len(), |index| range.end + index);
+    let line = &text[line_start..line_end];
+
+    if !line.trim_start().starts_with('|') {
+        return None;
+    }
+
+    let pipe_indices = ymd_table_pipe_indices(line);
+    if pipe_indices.len() < 2 {
+        return None;
+    }
+
+    let range_start = range.start - line_start;
+    let range_end = range.end - line_start;
+
+    pipe_indices.windows(2).find_map(|pipes| {
+        let left_pipe = pipes[0];
+        let right_pipe = pipes[1];
+        if !(left_pipe < range_start && range_end <= right_pipe) {
+            return None;
+        }
+
+        let mut padding_start = right_pipe;
+        while padding_start > left_pipe + 1 && line.as_bytes().get(padding_start - 1) == Some(&b' ')
+        {
+            padding_start -= 1;
+        }
+
+        (padding_start < right_pipe).then_some(line_start + padding_start..line_start + right_pipe)
+    })
+}
+
+fn ymd_table_pipe_indices(line: &str) -> Vec<usize> {
+    line.char_indices()
+        .filter_map(|(index, character)| {
+            (character == '|'
+                && !ymd::is_escaped_at(line, index)
+                && !ymd::is_inside_inline_code_at(line, index))
+            .then_some(index)
+        })
+        .collect()
 }
 
 // The hairline a thematic-break line renders as (walk Q9): a 1px rule in the
@@ -9438,9 +9499,7 @@ impl Editor {
         desired_ranges: Vec<Range<usize>>,
         cx: &mut Context<Self>,
     ) {
-        let type_id = ymd_conceal_fold_type_id();
         let existing_ranges = self.ymd_existing_conceal_ranges(cx);
-        let buffer_snapshot = self.buffer.read(cx).snapshot(cx);
 
         let desired_set: HashSet<(usize, usize)> = desired_ranges
             .iter()
@@ -9480,18 +9539,17 @@ impl Editor {
 
         let buffer_snapshot = self.buffer.read(cx).snapshot(cx);
         let default_placeholder = ymd_conceal_fold_placeholder();
-        // A checkbox range folds to its remembered visible placeholder; every
-        // other conceal range folds to the zero-width default. The lookup is on
-        // the cache that `ymd_desired_conceal_ranges` just (re)built, so a missing
-        // entry simply means "not a checkbox" and falls back safely.
-        let checkbox_placeholders = self
+        // Ranges with custom placeholders (checkboxes and table-cell conceals)
+        // are remembered by the cache that `ymd_desired_conceal_ranges` just
+        // (re)built; every other conceal range folds to the zero-width default.
+        let conceal_placeholders = self
             .ymd_conceal_cache
             .as_ref()
-            .map(|cache| &cache.checkbox_placeholders);
+            .map(|cache| &cache.conceal_placeholders);
         let creases = to_insert
             .into_iter()
             .map(|range| {
-                let placeholder = checkbox_placeholders
+                let placeholder = conceal_placeholders
                     .and_then(|placeholders| placeholders.get(&(range.start, range.end)))
                     .cloned()
                     .unwrap_or_else(|| default_placeholder.clone());
@@ -10003,8 +10061,9 @@ impl Editor {
             // checked/unchecked character. Resolved characters are read from
             // settings here (cache-build time); a settings change clears the cache.
             let ymd_settings = &EditorSettings::get_global(cx).ymd;
-            let mut checkbox_placeholders: HashMap<(usize, usize), FoldPlaceholder> =
+            let mut conceal_placeholders: HashMap<(usize, usize), FoldPlaceholder> =
                 HashMap::default();
+            let mut table_padding_widths: HashMap<(usize, usize), usize> = HashMap::default();
             let checkbox_ranges = ymd::scan_checkboxes(&text)
                 .into_iter()
                 .map(|checkbox| {
@@ -10013,7 +10072,7 @@ impl Editor {
                     } else {
                         ymd_settings.checkbox_unchecked_char.as_str()
                     };
-                    checkbox_placeholders.insert(
+                    conceal_placeholders.insert(
                         (checkbox.range.start, checkbox.range.end),
                         ymd_checkbox_fold_placeholder(display_character),
                     );
@@ -10021,11 +10080,33 @@ impl Editor {
                 })
                 .collect::<Vec<_>>();
 
-            let mut conceal_ranges: Vec<Range<usize>> = ymd::scan_conceals(&text)
+            let ymd_conceal_ranges = ymd::scan_conceals(&text)
                 .into_iter()
-                .map(|conceal| conceal.range)
+                .map(|conceal| {
+                    let range = conceal.range;
+                    if let Some(padding_range) =
+                        ymd_table_cell_padding_range_for_conceal(&text, &range)
+                    {
+                        *table_padding_widths
+                            .entry((padding_range.start, padding_range.end))
+                            .or_insert(0) += UnicodeWidthStr::width(&text[range.clone()]);
+                    }
+                    range
+                })
+                .collect::<Vec<_>>();
+            let mut conceal_ranges: Vec<Range<usize>> = ymd_conceal_ranges
+                .into_iter()
                 .chain(checkbox_ranges)
                 .collect();
+            for ((padding_start, padding_end), concealed_width) in table_padding_widths {
+                let padding_range = padding_start..padding_end;
+                let raw_padding_width = UnicodeWidthStr::width(&text[padding_range.clone()]);
+                conceal_placeholders.insert(
+                    (padding_start, padding_end),
+                    ymd_spaces_fold_placeholder(raw_padding_width + concealed_width),
+                );
+                conceal_ranges.push(padding_range);
+            }
             // Conceal the block-quote `> ` prefix (markers + trailing space). The
             // scanner puts content_range right after the markers and their space, so
             // line_start..content_start is exactly that prefix (covers `>`, `> `,
@@ -10058,7 +10139,7 @@ impl Editor {
                 conceal_ranges,
                 conceal_rows,
                 folded: HashSet::default(),
-                checkbox_placeholders,
+                conceal_placeholders,
                 thematic_break_ranges,
                 thematic_break_rows,
             });

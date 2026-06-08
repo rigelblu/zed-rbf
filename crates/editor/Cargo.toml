@@ -93,6 +93,7 @@ tree-sitter-python = { workspace = true, optional = true }
 ztracing.workspace = true
 tracing.workspace = true
 unicode-segmentation.workspace = true
+unicode-width.workspace = true
 unicode-script.workspace = true
 unindent = { workspace = true, optional = true }
 ui.workspace = true
@@ -131,7 +132,6 @@ tree-sitter-typescript.workspace = true
 tree-sitter-yaml.workspace = true
 tree-sitter-bash.workspace = true
 tree-sitter-md.workspace = true
-unicode-width.workspace = true
 unindent.workspace = true
 util = { workspace = true, features = ["test-support"] }
 workspace = { workspace = true, features = ["test-support"] }

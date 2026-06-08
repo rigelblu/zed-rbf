@@ -62,6 +62,7 @@ use std::{
 };
 use task::TaskVariables;
 use test::build_editor_with_project;
+use unicode_width::UnicodeWidthStr;
 use unindent::Unindent;
 use util::{
     assert_set_eq, path,
@@ -9564,6 +9565,54 @@ fn test_markdown_table_formatter_handles_markers_and_fences() {
 }
 
 #[gpui::test]
+fn test_markdown_table_formatter_aligns_sectioned_multiline_tables() {
+    let input = indoc! {"
+        | Area | Status |
+        | :-- | :-- |
+        | Alpha | done |
+        | :-- | :-- |
+        | Beta | pending |
+    "};
+    let expected = indoc! {"
+        | Area  | Status  |
+        | :---- | :------ |
+        | Alpha | done    |
+        | :--   | :--     |
+        | Beta  | pending |
+    "};
+
+    assert_eq!(
+        project::markdown_table_formatter::align_markdown_tables(input),
+        Some(expected.to_string())
+    );
+}
+
+#[gpui::test]
+fn test_markdown_table_formatter_splits_adjacent_tables_with_different_shapes() {
+    let input = indoc! {"
+        | A | B |
+        |---|---|
+        | 1 | 2 |
+        | Name | Description | Status |
+        |---|---|---|
+        | foo | short | done |
+    "};
+    let expected = indoc! {"
+        | A   | B   |
+        | --- | --- |
+        | 1   | 2   |
+        | Name | Description | Status |
+        | ---- | ----------- | ------ |
+        | foo  | short       | done   |
+    "};
+
+    assert_eq!(
+        project::markdown_table_formatter::align_markdown_tables(input),
+        Some(expected.to_string())
+    );
+}
+
+#[gpui::test]
 fn test_markdown_table_formatter_pads_uneven_rows() {
     let input = indoc! {"
         | Name | Value |
@@ -9584,6 +9633,14 @@ fn test_markdown_table_formatter_pads_uneven_rows() {
     assert!(
         project::markdown_table_formatter::align_markdown_tables(&output).is_none(),
         "padded table should be idempotent"
+    );
+}
+
+#[gpui::test]
+fn test_ymd_table_pipe_indices_ignore_multi_backtick_code_spans() {
+    assert_eq!(
+        ymd_table_pipe_indices("| ``a | b`` | ok |"),
+        vec![0, 12, 17]
     );
 }
 
@@ -33768,6 +33825,146 @@ async fn test_ymd_conceals_markdown_syntax_except_cursor_line_and_toggles(
     cx.run_until_parked();
     cx.update_editor(|editor, _, cx| {
         assert_eq!(editor.display_text(cx).replace('\u{2060}', ""), "plain");
+    });
+}
+
+#[gpui::test]
+async fn test_ymd_table_conceals_preserve_cell_width(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    cx.set_state(indoc! {"
+        ˇintro
+        | Status | Item         |
+        | :----- | :----------- |
+        | 🔴     | blocked task |
+        | 🟢     | shipped      |
+        |        | no marker    |
+        | ✅     | verified     |
+    "});
+    cx.run_until_parked();
+
+    cx.update_editor(|editor, _, cx| {
+        assert_eq!(
+            editor.display_text(cx).replace('\u{2060}', ""),
+            indoc! {"
+                intro
+                | Status | Item         |
+                | :----- | :----------- |
+                |        | blocked task |
+                |        | shipped      |
+                |        | no marker    |
+                | ✅     | verified     |
+            "}
+        );
+    });
+
+    cx.update_editor(|editor, window, cx| {
+        editor.move_down(&MoveDown, window, cx);
+        editor.move_down(&MoveDown, window, cx);
+        editor.move_down(&MoveDown, window, cx);
+        assert_eq!(
+            editor.display_text(cx).replace('\u{2060}', ""),
+            indoc! {"
+                intro
+                | Status | Item         |
+                | :----- | :----------- |
+                | 🔴     | blocked task |
+                |        | shipped      |
+                |        | no marker    |
+                | ✅     | verified     |
+            "}
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_ymd_table_conceals_inline_syntax_without_shifting_pipes(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    let fixture = indoc! {"
+        ˇintro
+        | Status      | Description                           | Item |
+        | :---------- | :------------------------------------ | ---- |
+        | **closed**  | concealed **bold** syntax             |      |
+        | *paused*    | concealed *italics* syntax            |      |
+        | _open_      | concealed *underline* syntax          |      |
+        | _cancelled_ | concealed *strikethroughe* syntax     |      |
+        | 🔴stop      | concealed red emoji                   |      |
+        | 🟢🟢start   | concealed green font color emoji      |      |
+        | ==open==    | concealed highlight marker            |      |
+        | ==🟠open==  | concealed highlight marker with emoji |      |
+        | ✅          | non-concealed emoji                   |      |
+        |             | pure text                             |      |
+    "};
+    let raw_text = fixture.replace('ˇ', "");
+    let table_pipe_columns = |text: &str| {
+        let table_lines = text
+            .lines()
+            .filter(|line| line.starts_with('|'))
+            .collect::<Vec<_>>();
+        let pipe_columns = table_lines[0]
+            .match_indices('|')
+            .map(|(index, _)| UnicodeWidthStr::width(&table_lines[0][..index]))
+            .collect::<Vec<_>>();
+        for line in table_lines {
+            let line_pipe_columns = line
+                .match_indices('|')
+                .map(|(index, _)| UnicodeWidthStr::width(&line[..index]))
+                .collect::<Vec<_>>();
+            assert_eq!(line_pipe_columns, pipe_columns, "{line}");
+        }
+        pipe_columns
+    };
+    let raw_pipe_columns = table_pipe_columns(&raw_text);
+
+    cx.set_state(fixture);
+    cx.run_until_parked();
+
+    cx.update_editor(|editor, window, cx| {
+        let display_text = editor.display_text(cx).replace('\u{2060}', "");
+        assert!(!display_text.contains("**closed**"));
+        assert!(!display_text.contains("*paused*"));
+        assert!(!display_text.contains("_open_"));
+        assert!(!display_text.contains("==open=="));
+        assert!(!display_text.contains("|   closed"));
+        assert!(!display_text.contains("|   open"));
+        assert!(display_text.contains("| closed      | concealed bold syntax"));
+        assert!(display_text.contains("| paused      | concealed italics syntax"));
+        assert!(display_text.contains("| open        | concealed underline syntax"));
+        assert!(display_text.contains("| cancelled   | concealed strikethroughe syntax"));
+        assert!(display_text.contains("| stop        | concealed red emoji"));
+        assert!(display_text.contains("| 🟢start     | concealed green font color emoji"));
+        assert!(display_text.contains("| open        | concealed highlight marker"));
+        assert!(display_text.contains("| open        | concealed highlight marker with emoji"));
+        assert!(display_text.contains("| ✅          | non-concealed emoji"));
+        assert_eq!(table_pipe_columns(&display_text), raw_pipe_columns);
+
+        editor.toggle_ymd_conceal(&ToggleYmdConceal, window, cx);
+        let raw_display_text = editor.display_text(cx);
+        assert_eq!(raw_display_text, raw_text);
+        assert_eq!(table_pipe_columns(&raw_display_text), raw_pipe_columns);
     });
 }
 
