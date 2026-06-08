@@ -2798,6 +2798,10 @@ impl EditorElement {
             && snapshot.mode.is_full()
             && self.editor.read(cx).buffer_kind(cx) == ItemBufferKind::Singleton;
         if include_fold_statuses {
+            // While concealed, hide the fold chevron on YMD block-quote rows
+            // (#zed-10) so a quote reads as a clean bar + content, not a foldable
+            // row. Gated on conceal: chevrons behave normally when YMD is off.
+            let hide_block_quote_chevrons = self.editor.read(cx).ymd_concealed;
             row_infos
                 .iter()
                 .enumerate()
@@ -2806,6 +2810,11 @@ impl EditorElement {
                         return None;
                     }
                     let row = info.multibuffer_row?;
+                    if hide_block_quote_chevrons
+                        && self.editor.read(cx).ymd_block_quote_rows.contains(&row)
+                    {
+                        return None;
+                    }
                     let display_row = DisplayRow(rows.start.0 + ix as u32);
                     let active = active_rows.contains_key(&display_row);
 
@@ -5396,7 +5405,10 @@ impl EditorElement {
             self.paint_gutter_diff_hunks(layout, self.split_side, window, cx)
         }
 
-        let highlight_width = 0.275 * layout.position_map.line_height;
+        // Block-quote bar: a thin 3px vertical line (Tom's #zed-10 visual pass).
+        // YmdBlockQuoteBorder is the sole consumer of this gutter-highlight paint,
+        // so this width applies only to the quote bar.
+        let highlight_width = px(3.);
         let highlight_corner_radii = Corners::all(0.05 * layout.position_map.line_height);
         window.paint_layer(layout.gutter_hitbox.bounds, |window| {
             for (range, color) in &layout.highlighted_gutter_ranges {
@@ -5423,9 +5435,16 @@ impl EditorElement {
                             * ScrollPixelOffset::from(layout.position_map.line_height)
                             - layout.position_map.scroll_pixel_position.y,
                     );
+                // YMD block-quote bar: paint at the gutter's RIGHT edge — just left
+                // of the fold chevron / content — for the web-blockquote "content
+                // indent" look, not the far-left gutter edge. Safe to reposition the
+                // whole gutter-highlight paint here because YmdBlockQuoteBorder is the
+                // sole consumer of `highlighted_gutter_ranges` (git diff hunks paint
+                // via the separate `paint_gutter_diff_hunks`).
+                let bar_right = layout.gutter_hitbox.right();
                 let bounds = Bounds::from_corners(
-                    point(layout.gutter_hitbox.left(), start_y),
-                    point(layout.gutter_hitbox.left() + highlight_width, end_y),
+                    point(bar_right - highlight_width, start_y),
+                    point(bar_right, end_y),
                 );
                 window.paint_quad(fill(bounds, *color).corner_radii(highlight_corner_radii));
             }

@@ -2,6 +2,15 @@
 title: "Zed RBF Changelog"
 ---
 
+## 🟠⋯ v0.10.0 — #zed-10
+- Added Markdown block-quote styling: a line that starts with a `>` marker (with up to three leading spaces) reads as quoted material — its content after the markers is muted and a vertical border is drawn in the gutter for the quote row
+- Nested quotes count too: `>> nested` and the spaced `> > nested` both style, and a bare `>` line still gets the gutter border even though it has no content to mute
+- The raw `>` markers stay visible — this version does not conceal them, so quotes read as quotes while remaining editable as Markdown
+- YMD features inside a quote keep working: a `==highlight==`, color emoji, or `[label](url)` on a quote line keeps its own styling composed over the muted quote text
+- Block quotes inside fenced code blocks stay fully raw (the v0.9.0 code-fence exclusion applies), so a `> ...` line in a code example is left literal
+- Known constraints: the border sits in the gutter rather than at the content indent (a smaller first step than a painted content-column border), and continuation lines without an explicit `>` marker are not styled
+- Diff rows stay raw as elsewhere: a changed quote line in an expanded diff hunk shows no muting or border
+
 ## 🟠⋯ v0.9.0 — #zed-09
 - Added code-fence exclusion: fenced code blocks (``` or ~~~) keep their contents fully literal — YMD never colors, conceals, underlines, or rules anything inside a fence, so pasted code with YMD-like syntax (`==text==`, color emoji, `[label](url)`, `---`) stays exactly as written
 - The whole fenced block including its delimiter lines is excluded, and an unclosed fence keeps the rest of the file literal so in-progress code stays raw as you type; ordinary Markdown outside fences still styles normally

@@ -407,6 +407,11 @@ trait InvalidationRegion {
 
 struct YmdConcealFold;
 
+// Marker type keying the block-quote gutter highlights (the vertical border on
+// quote rows). A private type tag, so these gutter highlights are cleared and
+// refreshed independently of any other gutter highlight.
+struct YmdBlockQuoteBorder;
+
 // U+2060 WORD JOINER: a default-ignorable, "zero-width" code point used as the
 // collapsed_text the fold shapes into the display run (`fold_map.rs`). It keeps
 // the placeholder one display column wide, so cursor mapping over a conceal is
@@ -421,6 +426,14 @@ const YMD_CONCEAL_PLACEHOLDER_TEXT: &str = "\u{2060}";
 
 fn ymd_conceal_fold_type_id() -> TypeId {
     TypeId::of::<YmdConcealFold>()
+}
+
+// The block-quote bar color: the prior fork's grey, #706C84 (a muted slate-grey),
+// chosen on Tom's #zed-10 visual pass. A fixed hex (not a theme token) so it
+// matches the prior art exactly; revisit for dark-theme contrast if it ever needs
+// to adapt per appearance.
+fn ymd_block_quote_border_color(_cx: &App) -> Hsla {
+    gpui::rgb(0x706C84).into()
 }
 
 fn is_ymd_conceal_fold(fold: &crate::display_map::Fold) -> bool {
@@ -1227,6 +1240,12 @@ pub struct Editor {
     ymd_concealed: bool,
     ymd_conceal_cache: Option<YmdConcealCache>,
     ymd_revealed_rows: HashSet<MultiBufferRow>,
+    // Multibuffer rows that currently carry a block-quote gutter border. Set and
+    // cleared in lockstep with the `YmdBlockQuoteBorder` gutter highlight (one
+    // write in the highlight refresh, one clear in `clear_ymd_highlights`) so the
+    // gutter can hide the fold chevron on quote rows while concealed (#zed-10),
+    // with no extra staleness vector.
+    ymd_block_quote_rows: HashSet<MultiBufferRow>,
     // Row-keyed (walk Q4): the map is rebuilt when buffer edits shift rows, so a
     // stale key heals on the next refresh. Anchor-keying was considered and PARKED
     // — it touches the verified block mechanism, and the churn is acceptable until
@@ -2434,6 +2453,7 @@ impl Editor {
             ymd_concealed: true,
             ymd_conceal_cache: None,
             ymd_revealed_rows: HashSet::default(),
+            ymd_block_quote_rows: HashSet::default(),
             ymd_thematic_break_blocks: HashMap::default(),
             linked_edit_ranges: Default::default(),
             in_project_search: false,
@@ -9322,12 +9342,23 @@ impl Editor {
                 matches!(
                     key,
                     HighlightKey::YmdBackground(_)
+                        | HighlightKey::YmdBlockQuote
                         | HighlightKey::YmdLineForeground(_)
                         | HighlightKey::YmdLink
                 )
             },
             cx,
         );
+        // The block-quote vertical border is a gutter highlight, cleared alongside
+        // the text highlights so a refresh starts from a clean slate (toggling YMD
+        // off, or a non-Markdown buffer, leaves no stale border).
+        if self
+            .gutter_highlights
+            .contains_key(&TypeId::of::<YmdBlockQuoteBorder>())
+        {
+            self.clear_gutter_highlights::<YmdBlockQuoteBorder>(cx);
+        }
+        self.ymd_block_quote_rows.clear();
     }
 
     // Diff-only conceal sync: remove and insert only the folds whose ranges
@@ -9778,6 +9809,55 @@ impl Editor {
                 cx,
             );
         }
+
+        // Block quotes: mute the content text and paint a vertical border in the
+        // gutter for each quote line. A quote line on a diff row stays fully raw
+        // (no muting, no border), matching every other YMD feature. A bare `>`
+        // line has empty content — it gets the border but contributes no muted
+        // range.
+        let mut block_quote_content_ranges = Vec::new();
+        let mut block_quote_line_ranges = Vec::new();
+        let mut block_quote_rows = HashSet::default();
+        for block_quote in ymd::scan_block_quotes(&text) {
+            let row = MultiBufferRow(
+                MultiBufferOffset(block_quote.line_range.start)
+                    .to_point(&snapshot)
+                    .row,
+            );
+            if diff_rows.contains(&row) {
+                continue;
+            }
+            block_quote_rows.insert(row);
+            if block_quote.content_range.start < block_quote.content_range.end {
+                block_quote_content_ranges.push(
+                    snapshot.anchor_before(MultiBufferOffset(block_quote.content_range.start))
+                        ..snapshot.anchor_after(MultiBufferOffset(block_quote.content_range.end)),
+                );
+            }
+            block_quote_line_ranges.push(
+                snapshot.anchor_before(MultiBufferOffset(block_quote.line_range.start))
+                    ..snapshot.anchor_after(MultiBufferOffset(block_quote.line_range.end)),
+            );
+        }
+        // Sync the chevron-suppression set with the border (empty clears it).
+        self.ymd_block_quote_rows = block_quote_rows;
+
+        if !block_quote_content_ranges.is_empty() {
+            self.highlight_text(
+                HighlightKey::YmdBlockQuote,
+                block_quote_content_ranges,
+                ymd::block_quote_style(cx.theme().colors().text_muted),
+                cx,
+            );
+        }
+
+        if !block_quote_line_ranges.is_empty() {
+            self.highlight_gutter::<YmdBlockQuoteBorder>(
+                block_quote_line_ranges,
+                ymd_block_quote_border_color,
+                cx,
+            );
+        }
     }
 
     fn ymd_singleton_buffer_identity(&self, cx: &App) -> Option<(BufferId, clock::Global)> {
@@ -9814,10 +9894,23 @@ impl Editor {
                 self.ymd_conceal_cache = None;
                 return Vec::new();
             };
-            let conceal_ranges: Vec<Range<usize>> = ymd::scan_conceals(&text)
+            let mut conceal_ranges: Vec<Range<usize>> = ymd::scan_conceals(&text)
                 .into_iter()
                 .map(|conceal| conceal.range)
                 .collect();
+            // Conceal the block-quote `> ` prefix (markers + trailing space). The
+            // scanner puts content_range right after the markers and their space, so
+            // line_start..content_start is exactly that prefix (covers `>`, `> `,
+            // `>>`, `> > `). Folded by the same machinery as every other YMD
+            // conceal: reveals on the cursor line, hides under ToggleYmdConceal, and
+            // inherits #zed-09 fence exclusion (the scanner already skips fenced
+            // `> code`) plus the diff-row filter applied below.
+            for block_quote in ymd::scan_block_quotes(&text) {
+                if block_quote.line_range.start < block_quote.content_range.start {
+                    conceal_ranges
+                        .push(block_quote.line_range.start..block_quote.content_range.start);
+                }
+            }
             let conceal_rows = conceal_ranges
                 .iter()
                 .map(|range| MultiBufferOffset(range.start).to_point(&snapshot).row)

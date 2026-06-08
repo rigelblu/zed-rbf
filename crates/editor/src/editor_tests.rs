@@ -33658,6 +33658,105 @@ async fn test_ymd_heading_conceal_leaves_buffer_text_for_outline(cx: &mut gpui::
 }
 
 #[gpui::test]
+async fn test_ymd_styles_block_quotes(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    // Row 0 a simple quote, rows 1-2 nested quotes (`>>` and `> >`), row 3 a bare
+    // `>` (border only), row 4 a normal line (no styling), rows 5-7 a fenced code
+    // block whose `> code` line stays raw, row 8 a quote containing a YMD highlight.
+    cx.set_state("ˇ> Quote\n>> Nested\n> > Spaced\n>\nNormal\n```md\n> code\n```\n> ==after==");
+    cx.run_until_parked();
+
+    // The content after the `>` markers is muted on every quote line; the bare `>`
+    // has no content, and the `> code` inside the fence is excluded.
+    cx.assert_editor_text_highlights(
+        HighlightKey::YmdBlockQuote,
+        "> «Quote»\n>> «Nested»\n> > «Spaced»\n>\nNormal\n```md\n> code\n```\n> «==after==»",
+    );
+
+    // A YMD highlight inside a quote keeps its own background highlight, composed
+    // over the muted quote foreground — the `==after==` span still highlights.
+    cx.assert_editor_text_highlights(
+        HighlightKey::YmdBackground(0),
+        "> Quote\n>> Nested\n> > Spaced\n>\nNormal\n```md\n> code\n```\n> ==«after»==",
+    );
+
+    // One gutter border per quote line: rows 0, 1, 2, 3, and 8 — five total. The
+    // normal line and the fenced `> code` line get none.
+    cx.update_editor(|editor, _, _| {
+        let (_, gutter_ranges) = editor
+            .gutter_highlights
+            .get(&std::any::TypeId::of::<YmdBlockQuoteBorder>())
+            .expect("block quote gutter highlights should be present");
+        assert_eq!(gutter_ranges.len(), 5);
+        // The chevron-suppression set mirrors the border: quote rows 0,1,2,3,8;
+        // the normal line (4) and the fenced `> code` line (6) are excluded.
+        let mut quote_rows: Vec<u32> =
+            editor.ymd_block_quote_rows.iter().map(|row| row.0).collect();
+        quote_rows.sort();
+        assert_eq!(quote_rows, vec![0, 1, 2, 3, 8]);
+    });
+}
+
+#[gpui::test]
+async fn test_ymd_conceals_block_quote_markers(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    // Cursor parks on the non-quote row 0 so every quote row conceals in the
+    // baseline. Rows: plain, simple quote, nested `>>`, multibyte content, then a
+    // fenced `> code` line that must stay raw (#zed-09 fence exclusion).
+    cx.set_state("Plainˇ\n> Single\n>> Nested\n> café\n```md\n> code\n```");
+    cx.run_until_parked();
+
+    // Off the cursor line, the `> `/`>> ` prefix (marker + trailing space) is
+    // concealed; the multibyte content survives; the fenced `> code` stays raw.
+    cx.update_editor(|editor, _, cx| {
+        assert_eq!(
+            editor.display_text(cx).replace('\u{2060}', ""),
+            "Plain\nSingle\nNested\ncafé\n```md\n> code\n```"
+        );
+    });
+
+    // Cursor onto the simple-quote row reveals its raw `> ` again.
+    cx.update_editor(|editor, window, cx| {
+        editor.move_down(&MoveDown, window, cx);
+        assert_eq!(
+            editor.display_text(cx).replace('\u{2060}', ""),
+            "Plain\n> Single\nNested\ncafé\n```md\n> code\n```"
+        );
+    });
+
+    // The global toggle reveals every concealed prefix at once.
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_ymd_conceal(&ToggleYmdConceal, window, cx);
+        assert_eq!(
+            editor.display_text(cx).replace('\u{2060}', ""),
+            "Plain\n> Single\n>> Nested\n> café\n```md\n> code\n```"
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_ymd_conceals_do_not_apply_to_non_markdown_buffers(cx: &mut gpui::TestAppContext) {
     init_test(cx, |_| {});
 
