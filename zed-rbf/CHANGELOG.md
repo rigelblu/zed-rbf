@@ -2,6 +2,11 @@
 title: "Zed RBF Changelog"
 ---
 
+## 🟠⋯ v0.5.0 — #zed-05
+- Added emoji heading concealment: a Markdown heading whose text carries a YMD color emoji hides its leading `#` run in clean view, so `# 🔵 Blue Heading` reads as `Blue Heading`; plain headings keep their `#`
+- When the color emoji sits right after the `#` prefix, the emoji and its trailing space fold away too, so the revealed heading starts with its first word — a `## 🟠⋯ Heading` keeps its visible `⋯` and reads as `⋯ Heading`
+- Cursor-line reveal and `editor::ToggleYmdConceal` show the raw `#` prefix again, and concealment never touches buffer text, so the outline panel and breadcrumbs still navigate by full heading text
+
 ## 🟠⋯ v0.4.0 — #zed-04
 - Added standalone line-color emoji concealment: the first effective color emoji on a line (its marker) hides in clean view while the line keeps its color; cursor-line reveal brings it back
 - One marker per line: later color emojis are content and stay visible
