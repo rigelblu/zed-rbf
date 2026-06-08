@@ -2,6 +2,13 @@
 title: "Zed RBF Changelog"
 ---
 
+## 🟠⋯ v0.6.0 — #zed-06
+- Added inline Markdown link concealment: a single-line `[label](url)` reads as just its `label` in clean view, with the `[` and `](url)` syntax hidden so links scan like links, not raw markup
+- The label carries a quiet 1px underline in the default text color — calm and professional, deliberately not a loud link-blue — so a link inside a `==highlight==` keeps the highlight's colors and only gains the underline
+- URLs with balanced parentheses fold whole, so `[Rust (film)](https://en.wikipedia.org/wiki/Rust_(film))` reads as `Rust (film)` with no stray `)` left behind
+- Cursor-line reveal and `editor::ToggleYmdConceal` show the raw `[label](url)` again; images `![alt](src)`, empty-URL `[x]()`, and unterminated `[x](url` links stay raw
+- This version trades read-mode link-clicking for clean reading; cursor-row reveal restores the clickable URL until a dedicated cmd-click slice lands
+
 ## 🟠⋯ v0.5.0 — #zed-05
 - Added emoji heading concealment: a Markdown heading whose text carries a YMD color emoji hides its leading `#` run in clean view, so `# 🔵 Blue Heading` reads as `Blue Heading`; plain headings keep their `#`
 - When the color emoji sits right after the `#` prefix, the emoji and its trailing space fold away too, so the revealed heading starts with its first word — a `## 🟠⋯ Heading` keeps its visible `⋯` and reads as `⋯ Heading`

@@ -1,4 +1,4 @@
-use gpui::{HighlightStyle, Hsla, rgba};
+use gpui::{HighlightStyle, Hsla, UnderlineStyle, px, rgba};
 use std::ops::Range;
 use theme::Appearance;
 
@@ -31,6 +31,13 @@ pub(crate) struct YmdHighlight {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct YmdConceal {
     pub range: Range<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct YmdLink {
+    pub open_marker_range: Range<usize>,
+    pub label_range: Range<usize>,
+    pub close_marker_range: Range<usize>,
 }
 
 struct YmdInlineHighlight {
@@ -155,6 +162,23 @@ pub(crate) fn line_foreground_style(color: YmdColor, appearance: Appearance) -> 
     }
 }
 
+// Deliberately quiet: a 1px underline in the YMD default text color, NOT a theme
+// link/accent color. The label should read as a calm, professional YMD link, not
+// a loud web hyperlink. The underline color is pinned to the YMD default
+// foreground (the same color `background_style` reads with) so it stays calm even
+// where Markdown syntax highlighting paints the link label text blue — pinning
+// the color (rather than inheriting) is what keeps the underline off link-blue.
+pub(crate) fn link_style(appearance: Appearance) -> HighlightStyle {
+    HighlightStyle {
+        underline: Some(UnderlineStyle {
+            thickness: px(1.),
+            color: Some(YmdColor::Default.line_foreground(appearance)),
+            ..UnderlineStyle::default()
+        }),
+        ..HighlightStyle::default()
+    }
+}
+
 fn for_each_line(text: &str, mut callback: impl FnMut(&str, usize)) {
     let mut line_start = 0;
 
@@ -190,6 +214,14 @@ pub(crate) fn scan(text: &str) -> Vec<YmdHighlight> {
     highlights
 }
 
+pub(crate) fn scan_links(text: &str) -> Vec<YmdLink> {
+    let mut links = Vec::new();
+    for_each_line(text, |line_content, line_start| {
+        links.extend(scan_line_links(line_content, line_start));
+    });
+    links
+}
+
 pub(crate) fn scan_conceals(text: &str) -> Vec<YmdConceal> {
     let mut conceals = Vec::new();
 
@@ -201,6 +233,15 @@ pub(crate) fn scan_conceals(text: &str) -> Vec<YmdConceal> {
             });
             conceals.push(YmdConceal {
                 range: inline_highlight.close_marker_range.clone(),
+            });
+        }
+
+        for link in scan_line_links(line_content, line_start) {
+            conceals.push(YmdConceal {
+                range: link.open_marker_range,
+            });
+            conceals.push(YmdConceal {
+                range: link.close_marker_range,
             });
         }
 
@@ -320,6 +361,77 @@ fn heading_conceal_range(line: &str, line_start: usize) -> Option<Range<usize>> 
     }
 
     Some(line_start..line_start + conceal_end)
+}
+
+// Single-line inline Markdown links `[label](url)` with a non-empty label and a
+// non-empty URL. Images `![alt](src)` are skipped (the `!` prefix). The URL is
+// scanned with CommonMark link-destination paren semantics: parentheses are
+// depth-counted, so a balanced `(...)` inside the URL — e.g.
+// `…/Rust_(film)` — is part of the destination and the link closes only at the
+// matching top-level `)`. Reference-style links and autolinks are out of scope.
+fn scan_line_links(line: &str, line_start: usize) -> Vec<YmdLink> {
+    let mut links = Vec::new();
+    let mut search_start = 0;
+    let bytes = line.as_bytes();
+
+    while let Some(open_relative) = line[search_start..].find('[') {
+        let open = search_start + open_relative;
+        if open > 0 && bytes.get(open - 1) == Some(&b'!') {
+            search_start = open + 1;
+            continue;
+        }
+
+        let label_start = open + 1;
+        let Some(close_relative) = line[label_start..].find(']') else {
+            break;
+        };
+        let close = label_start + close_relative;
+        if close == label_start || bytes.get(close + 1) != Some(&b'(') {
+            search_start = open + 1;
+            continue;
+        }
+
+        let url_start = close + 2;
+        let Some(url_end_relative) = link_destination_end(&line[url_start..]) else {
+            search_start = open + 1;
+            continue;
+        };
+        let url_end = url_start + url_end_relative;
+        if url_end == url_start {
+            search_start = open + 1;
+            continue;
+        }
+
+        links.push(YmdLink {
+            open_marker_range: line_start + open..line_start + label_start,
+            label_range: line_start + label_start..line_start + close,
+            close_marker_range: line_start + close..line_start + url_end + 1,
+        });
+        search_start = url_end + 1;
+    }
+
+    links
+}
+
+// Byte offset of the closing `)` within `after_open` (the slice that begins right
+// after `](`), or `None` when no balancing top-level `)` exists on the line. A
+// nested `(` raises the depth and its matching `)` lowers it; the destination
+// ends at the first `)` seen while depth is zero.
+fn link_destination_end(after_open: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    for (offset, byte) in after_open.bytes().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => {
+                if depth == 0 {
+                    return Some(offset);
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn scan_line_background_markups(line: &str, line_start: usize) -> Vec<YmdInlineHighlight> {
@@ -754,5 +866,225 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn scans_basic_markdown_link() {
+        assert_eq!(
+            scan_links("[link](url)"),
+            vec![YmdLink {
+                open_marker_range: 0..1,
+                label_range: 1..5,
+                close_marker_range: 5..11,
+            }]
+        );
+        // Only the brackets and the `](url)` tail conceal; the label stays visible.
+        assert_eq!(
+            scan_conceals("[link](url)"),
+            vec![YmdConceal { range: 0..1 }, YmdConceal { range: 5..11 }]
+        );
+    }
+
+    #[test]
+    fn scans_multiple_markdown_links_per_line_and_skips_images() {
+        // The image `![alt](src)` is skipped; the two real links conceal
+        // independently, each leaving its own label visible.
+        assert_eq!(
+            scan_links("![alt](src) [ok](url) and [two](2)"),
+            vec![
+                YmdLink {
+                    open_marker_range: 12..13,
+                    label_range: 13..15,
+                    close_marker_range: 15..21,
+                },
+                YmdLink {
+                    open_marker_range: 26..27,
+                    label_range: 27..30,
+                    close_marker_range: 30..34,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn scans_balanced_paren_url_as_single_link() {
+        // CommonMark link-destination parens are depth-counted: the balanced
+        // `(film)` inside the URL belongs to the destination, so the whole
+        // `](…/Rust_(film))` tail conceals and NO stray `)` is left visible.
+        let line = "[Rust (film)](https://en.wikipedia.org/wiki/Rust_(film))";
+        let close = line.find("](").unwrap();
+        let links = scan_links(line);
+        assert_eq!(
+            links,
+            vec![YmdLink {
+                open_marker_range: 0..1,
+                label_range: 1..close,
+                close_marker_range: close..line.len(),
+            }]
+        );
+        // The close marker reaches the final byte — the trailing `)` is folded,
+        // not orphaned.
+        assert_eq!(links[0].close_marker_range.end, line.len());
+        assert_eq!(
+            scan_conceals(line),
+            vec![
+                YmdConceal { range: 0..1 },
+                YmdConceal {
+                    range: close..line.len()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn link_inside_highlight_folds_without_overlapping_highlight_markers() {
+        // Suite composite `==🔴 [link inside highlight](url)==`: the link folds
+        // live strictly between the `==🔴` open marker and the `==` close marker,
+        // so the link conceals and the highlight conceals never overlap (this is
+        // the exact no-overlap claim the brief makes — bounded to this case).
+        let line = "==🔴 [link inside highlight](url)==";
+        let open_bracket = line.find('[').unwrap();
+        let close_bracket = line.find(']').unwrap();
+        let url_close = line.rfind(')').unwrap();
+        assert_eq!(
+            scan_links(line),
+            vec![YmdLink {
+                open_marker_range: open_bracket..open_bracket + 1,
+                label_range: open_bracket + 1..close_bracket,
+                close_marker_range: close_bracket..url_close + 1,
+            }]
+        );
+
+        let conceals = scan_conceals(line);
+        // Highlight open `==🔴` (0..6) and close `==` conceal; the link `[`
+        // (open_bracket..+1) and `](url)` (close_bracket..url_close+1) conceal.
+        // None of the link ranges intersect the highlight marker ranges.
+        let highlight_open = 0..6;
+        let highlight_close = (line.len() - 2)..line.len();
+        let link_open = open_bracket..open_bracket + 1;
+        let link_close = close_bracket..url_close + 1;
+        for conceal in &conceals {
+            if conceal.range == link_open || conceal.range == link_close {
+                assert!(
+                    !(conceal.range.start < highlight_open.end
+                        && highlight_open.start < conceal.range.end),
+                    "link fold overlaps highlight open marker"
+                );
+                assert!(
+                    !(conceal.range.start < highlight_close.end
+                        && highlight_close.start < conceal.range.end),
+                    "link fold overlaps highlight close marker"
+                );
+            }
+        }
+        assert!(conceals.contains(&YmdConceal {
+            range: link_open.clone()
+        }));
+        assert!(conceals.contains(&YmdConceal {
+            range: link_close.clone()
+        }));
+    }
+
+    #[test]
+    fn nested_highlight_markers_in_url_do_not_break_link_scan() {
+        // A `==` sequence sitting inside the URL is just URL bytes to the link
+        // scanner — the link still scans as one unit and its destination is taken
+        // verbatim up to the balancing `)`.
+        let line = "[label](http://x/==a==)";
+        let close = line.find("](").unwrap();
+        assert_eq!(
+            scan_links(line),
+            vec![YmdLink {
+                open_marker_range: 0..1,
+                label_range: 1..close,
+                close_marker_range: close..line.len(),
+            }]
+        );
+    }
+
+    #[test]
+    fn ignores_invalid_markdown_links() {
+        // In assert order: empty URL `[x]()`, missing closing paren `[x](url`, no
+        // `](` destination at all `[brackets only]`, and an empty label `[](url)`
+        // all stay raw (no conceals, no link).
+        assert!(scan_links("[missing url]()").is_empty());
+        assert!(scan_links("[no closing paren](url").is_empty());
+        assert!(scan_links("[brackets only]").is_empty());
+        assert!(scan_links("[](url)").is_empty());
+        assert!(scan_conceals("[missing url]()").is_empty());
+        assert!(scan_conceals("[no closing paren](url").is_empty());
+    }
+
+    #[test]
+    fn link_destination_stops_at_first_top_level_paren_and_keeps_trailing_text() {
+        // `link_destination_end` ends the URL at the first depth-zero `)` — the
+        // trailing prose after the link is NEVER swallowed into the close marker.
+        // Pins the over-consume boundary so a future depth-rule tweak can't start
+        // eating text past the link.
+        let line = "[a](u) trailing";
+        assert_eq!(
+            scan_links(line),
+            vec![YmdLink {
+                open_marker_range: 0..1,
+                label_range: 1..2,
+                // `](u)` only — ends at byte 6, not the end of the line.
+                close_marker_range: 2..6,
+            }]
+        );
+        // Only the brackets and `](u)` fold; ` trailing` stays visible.
+        assert_eq!(
+            scan_conceals(line),
+            vec![YmdConceal { range: 0..1 }, YmdConceal { range: 2..6 }]
+        );
+
+        // The scan resumes right after the first link's `)`, so a second link
+        // later on the line is found independently (no over-consume across them).
+        assert_eq!(
+            scan_links("[a](u) and [b](v)"),
+            vec![
+                YmdLink {
+                    open_marker_range: 0..1,
+                    label_range: 1..2,
+                    close_marker_range: 2..6,
+                },
+                YmdLink {
+                    open_marker_range: 11..12,
+                    label_range: 12..13,
+                    close_marker_range: 13..17,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn ignores_reference_style_links_and_autolinks() {
+        // Q6 permanent boundary: reference-style links (`[label][ref]`, plus its
+        // `[ref]: url` definition line) and autolinks (`<https://…>`) are a
+        // different grammar — not inline `[label](url)` — so they are never
+        // concealed. Locks the boundary the brief claims.
+        assert!(scan_links("[label][ref]").is_empty());
+        assert!(scan_links("[ref]: https://example.com").is_empty());
+        assert!(scan_links("<https://x.com>").is_empty());
+        assert!(scan_conceals("[label][ref]").is_empty());
+        assert!(scan_conceals("<https://x.com>").is_empty());
+    }
+
+    #[test]
+    fn scans_link_with_query_and_fragment_url() {
+        // Query strings and fragments are just destination bytes (no `?`/`#`/`&`
+        // special-casing), so the whole `](…)` tail folds. Retires the
+        // real-document "query strings, fragments" risk in code.
+        let line = "[x](https://e.com/p?q=1&r=2#frag)";
+        let close = line.find("](").unwrap();
+        let links = scan_links(line);
+        assert_eq!(
+            links,
+            vec![YmdLink {
+                open_marker_range: 0..1,
+                label_range: 1..close,
+                close_marker_range: close..line.len(),
+            }]
+        );
+        assert_eq!(links[0].close_marker_range.end, line.len());
     }
 }
