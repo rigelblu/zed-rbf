@@ -58,6 +58,7 @@ pub fn align_markdown_tables(text: &str) -> Option<String> {
         }
 
         let mut table_rows = vec![header, delimiter];
+        let delimiter_column_count = table_rows[1].cells.len();
         let start_line = line_index;
         line_index += 2;
 
@@ -72,6 +73,15 @@ pub fn align_markdown_tables(text: &str) -> Option<String> {
                     break;
                 }
             };
+            if !is_delimiter_row(&row)
+                && line_index + 1 < lines.len()
+                && !fenced_code_lines[line_index + 1]
+                && let Some(next_row) = parse_table_row(lines[line_index + 1])
+                && is_delimiter_row(&next_row)
+                && next_row.cells.len() != delimiter_column_count
+            {
+                break;
+            }
             table_rows.push(row);
             line_index += 1;
         }
@@ -97,6 +107,10 @@ pub fn align_markdown_tables(text: &str) -> Option<String> {
         }
         new_text
     })
+}
+
+fn is_delimiter_row(row: &TableRow) -> bool {
+    !row.cells.is_empty() && row.cells.iter().all(|cell| parse_alignment(cell).is_some())
 }
 
 fn looks_like_table_row(line: &str) -> bool {

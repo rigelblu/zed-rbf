@@ -1,4 +1,3 @@
-#![expect(clippy::result_large_err)]
 use crate::{
     debugger_panel::DebugPanel,
     session::running::stack_frame_list::{
