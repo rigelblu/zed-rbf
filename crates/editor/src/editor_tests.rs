@@ -34056,6 +34056,343 @@ async fn test_ymd_yank_across_rule_row_yields_raw_dashes(cx: &mut gpui::TestAppC
 }
 
 #[gpui::test]
+async fn test_ymd_syntax_reveals_when_diff_hunk_expanded_after_open(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    // Cursor stays on row 0, so the modified `==new==` row is only ever revealed
+    // because it is a diff row — never because the cursor sits on it.
+    cx.set_state("ˇplain\n==new==\nfooter");
+    cx.set_head_text("plain\n==old==\nfooter");
+    cx.run_until_parked();
+
+    // Opened concealed like any other off-cursor YMD row.
+    let concealed =
+        cx.update_editor(|editor, _, cx| editor.display_text(cx).replace('\u{2060}', ""));
+    assert_eq!(concealed, "plain\nnew\nfooter");
+
+    // Expanding the hunk fires `DiffHunksToggled`; the event contract must turn
+    // the diff rows fully raw — both the added row and the deleted base row.
+    cx.update_editor(|editor, window, cx| {
+        editor.expand_all_diff_hunks(&ExpandAllDiffHunks, window, cx);
+    });
+    cx.run_until_parked();
+    let expanded =
+        cx.update_editor(|editor, _, cx| editor.display_text(cx).replace('\u{2060}', ""));
+    assert!(expanded.contains("==new=="), "added row raw: {expanded}");
+    assert!(expanded.contains("==old=="), "deleted row raw: {expanded}");
+
+    // Collapsing restores concealment.
+    cx.update_editor(|editor, window, cx| {
+        editor.collapse_all_diff_hunks(&CollapseAllDiffHunks, window, cx);
+    });
+    cx.run_until_parked();
+    let restored =
+        cx.update_editor(|editor, _, cx| editor.display_text(cx).replace('\u{2060}', ""));
+    assert_eq!(restored, "plain\nnew\nfooter");
+}
+
+#[gpui::test]
+async fn test_ymd_emoji_conceal_survives_diff_expansion_shifting_its_offset(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    // Two emoji headings (`# 🔵` spacer, `## 🟠⋯ Heading`) on NON-diff rows: both are
+    // concealed off-cursor, and their conceal ranges end right after a multibyte
+    // emoji. The only diff is a pure deletion (`xx`) at the top. The cursor stays on
+    // row 0, off both headings. The deletion is short enough that, after the hunk
+    // expands and shifts every row below it down, a stale cached conceal offset lands
+    // inside a `🟠` in the post-expansion text — the exact char-boundary panic the
+    // crash reported (`byte index N is not a char boundary; it is inside '🟠'`).
+    cx.set_state("ˇintro\n# 🔵 spacer\n## 🟠⋯ Heading\nfooter");
+    cx.set_head_text("intro\nxx\n# 🔵 spacer\n## 🟠⋯ Heading\nfooter");
+    cx.run_until_parked();
+
+    // Collapsed: both headings are concealed (the cache holds their pre-expansion
+    // multibuffer offsets); neither is a diff row.
+    let concealed =
+        cx.update_editor(|editor, _, cx| editor.display_text(cx).replace('\u{2060}', ""));
+    assert_eq!(concealed, "intro\nspacer\n⋯ Heading\nfooter");
+
+    // Expanding the deletion inserts the deleted base row above the headings,
+    // shifting their multibuffer offsets. Reusing the stale cached offsets
+    // re-anchored a conceal-range end inside `🟠`, panicking on the char boundary;
+    // the refresh must invalidate the cache and re-scan against the expanded
+    // multibuffer instead.
+    cx.update_editor(|editor, window, cx| {
+        editor.expand_all_diff_hunks(&ExpandAllDiffHunks, window, cx);
+    });
+    cx.run_until_parked();
+    let expanded =
+        cx.update_editor(|editor, _, cx| editor.display_text(cx).replace('\u{2060}', ""));
+    assert_eq!(
+        expanded, "intro\nxx\nspacer\n⋯ Heading\nfooter",
+        "deleted row renders raw and both headings stay correctly concealed",
+    );
+
+    // Collapsing restores the original concealed view.
+    cx.update_editor(|editor, window, cx| {
+        editor.collapse_all_diff_hunks(&CollapseAllDiffHunks, window, cx);
+    });
+    cx.run_until_parked();
+    let restored =
+        cx.update_editor(|editor, _, cx| editor.display_text(cx).replace('\u{2060}', ""));
+    assert_eq!(restored, "intro\nspacer\n⋯ Heading\nfooter");
+}
+
+#[gpui::test]
+async fn test_ymd_thematic_break_block_survives_diff_expansion_shifting_its_offset(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    // The `---` rule is a thematic break on a NON-diff row, rendered as a Replace
+    // block whose anchors come from the SAME `thematic_break_ranges` cache the
+    // conceal path uses. The only diff is a pure deletion (`xx`) above it. The cursor
+    // stays on row 0, off the rule. Expanding the deletion shifts the rule's
+    // multibuffer offset; reusing the stale cached offset re-anchored the block the
+    // same way the conceal fold panicked, so the cache invalidation must cover the
+    // block path too.
+    cx.set_state("ˇintro\n---\nfooter");
+    cx.set_head_text("intro\nxx\n---\nfooter");
+    cx.run_until_parked();
+
+    // Off-cursor, non-diff: the break renders as one rule block.
+    cx.update_editor(|editor, _, _| {
+        assert_eq!(editor.ymd_thematic_break_blocks.len(), 1);
+    });
+
+    // Expanding the deletion above the rule shifts its offset. The block must
+    // re-anchor against the expanded multibuffer without panicking, and the rule
+    // (still off-cursor, still non-diff) stays a single block.
+    cx.update_editor(|editor, window, cx| {
+        editor.expand_all_diff_hunks(&ExpandAllDiffHunks, window, cx);
+    });
+    cx.run_until_parked();
+    cx.update_editor(|editor, _, _| {
+        assert_eq!(editor.ymd_thematic_break_blocks.len(), 1);
+    });
+
+    // Collapsing leaves the rule block intact.
+    cx.update_editor(|editor, window, cx| {
+        editor.collapse_all_diff_hunks(&CollapseAllDiffHunks, window, cx);
+    });
+    cx.run_until_parked();
+    cx.update_editor(|editor, _, _| {
+        assert_eq!(editor.ymd_thematic_break_blocks.len(), 1);
+    });
+}
+
+#[gpui::test]
+async fn test_ymd_highlights_are_absent_on_diff_rows_and_restored_on_collapse(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    // The only YMD background marker is on the modified diff row, so its
+    // highlight's presence depends solely on the diff-row filter.
+    cx.set_state("ˇplain\n==hot==\nfooter");
+    cx.set_head_text("plain\n==cold==\nfooter");
+    cx.run_until_parked();
+
+    fn has_background(cx: &mut EditorTestContext) -> bool {
+        cx.update_editor(|editor, window, cx| {
+            editor
+                .snapshot(window, cx)
+                .text_highlight_ranges(HighlightKey::YmdBackground(0))
+                .is_some_and(|ranges| !ranges.1.is_empty())
+        })
+    }
+
+    // Off-diff: the `==hot==` background highlight is present.
+    assert!(has_background(&mut cx), "highlight present before expansion");
+
+    // Expanded: a diff row is fully raw, so its color is dropped too — the
+    // contract upgrade that diff review keeps zero YMD styling, both sides.
+    cx.update_editor(|editor, window, cx| {
+        editor.expand_all_diff_hunks(&ExpandAllDiffHunks, window, cx);
+    });
+    cx.run_until_parked();
+    assert!(!has_background(&mut cx), "highlight absent on diff row");
+
+    // Collapsed: the color returns.
+    cx.update_editor(|editor, window, cx| {
+        editor.collapse_all_diff_hunks(&CollapseAllDiffHunks, window, cx);
+    });
+    cx.run_until_parked();
+    assert!(has_background(&mut cx), "highlight restored after collapse");
+}
+
+#[gpui::test]
+async fn test_ymd_thematic_break_block_is_suppressed_in_diff_hunk(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    // Row 1 `---` is a thematic break (off cursor → a rule block). Making it the
+    // modified diff row must suppress the block so the raw dashes stay auditable.
+    cx.set_state("ˇplain\n---\nfooter");
+    cx.set_head_text("plain\nwas text\nfooter");
+    cx.run_until_parked();
+
+    // Off-cursor, non-diff: the break renders as one rule block.
+    cx.update_editor(|editor, _, _| {
+        assert_eq!(editor.ymd_thematic_break_blocks.len(), 1);
+    });
+
+    // Expanded: the `---` row is a diff row, so the block is suppressed.
+    cx.update_editor(|editor, window, cx| {
+        editor.expand_all_diff_hunks(&ExpandAllDiffHunks, window, cx);
+    });
+    cx.run_until_parked();
+    cx.update_editor(|editor, _, _| {
+        assert!(editor.ymd_thematic_break_blocks.is_empty());
+    });
+
+    // Collapsed: the rule block returns.
+    cx.update_editor(|editor, window, cx| {
+        editor.collapse_all_diff_hunks(&CollapseAllDiffHunks, window, cx);
+    });
+    cx.run_until_parked();
+    cx.update_editor(|editor, _, _| {
+        assert_eq!(editor.ymd_thematic_break_blocks.len(), 1);
+    });
+}
+
+#[gpui::test]
+async fn test_ymd_link_underline_is_absent_on_diff_rows(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    // The link's underline highlight is the third diff-filtered consumer added in
+    // #zed-08; on a diff row it must drop like the background/line colors do.
+    cx.set_state("ˇplain\n[label](https://example.com/new)\nfooter");
+    cx.set_head_text("plain\n[label](https://example.com/old)\nfooter");
+    cx.run_until_parked();
+
+    fn has_link_underline(cx: &mut EditorTestContext) -> bool {
+        cx.update_editor(|editor, window, cx| {
+            editor
+                .snapshot(window, cx)
+                .text_highlight_ranges(HighlightKey::YmdLink)
+                .is_some_and(|ranges| !ranges.1.is_empty())
+        })
+    }
+
+    assert!(has_link_underline(&mut cx), "underline present off-diff");
+
+    cx.update_editor(|editor, window, cx| {
+        editor.expand_all_diff_hunks(&ExpandAllDiffHunks, window, cx);
+    });
+    cx.run_until_parked();
+    assert!(!has_link_underline(&mut cx), "underline absent on diff row");
+
+    cx.update_editor(|editor, window, cx| {
+        editor.collapse_all_diff_hunks(&CollapseAllDiffHunks, window, cx);
+    });
+    cx.run_until_parked();
+    assert!(has_link_underline(&mut cx), "underline restored after collapse");
+}
+
+#[gpui::test]
+async fn test_ymd_conceal_fast_path_is_sound_after_diff_expansion(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    // A deletion ABOVE shifts the concealed `==one==`/`==two==` rows when expanded.
+    // The crash repros drive the event (full-refresh) path; this drives the
+    // selection-change FAST PATH (cached-offset reuse) over the rebuilt cache —
+    // the exact offset reuse that panicked when the cache went stale — guarding
+    // that the post-expansion cache is sound on the cursor hot path too.
+    cx.set_state("ˇkeep\n==one==\n==two==");
+    cx.set_head_text("removed one\nremoved two\nkeep\n==one==\n==two==");
+    cx.run_until_parked();
+
+    cx.update_editor(|editor, window, cx| {
+        editor.expand_all_diff_hunks(&ExpandAllDiffHunks, window, cx);
+    });
+    cx.run_until_parked();
+
+    for _ in 0..4 {
+        cx.update_editor(|editor, window, cx| editor.move_down(&MoveDown, window, cx));
+        cx.run_until_parked();
+    }
+
+    // No panic on the fast path over the rebuilt cache, and the concealed content
+    // is intact (the `==` markers were never lost from the buffer).
+    let display = cx.update_editor(|editor, _, cx| editor.display_text(cx).replace('\u{2060}', ""));
+    assert!(display.contains("one") && display.contains("two"), "{display}");
+}
+
+#[gpui::test]
 async fn test_ymd_conceal_select_all_matches_keeps_conceals(cx: &mut gpui::TestAppContext) {
     init_test(cx, |_| {});
 
@@ -39786,7 +40123,7 @@ async fn measure_ymd_row_change_latency(cx: &mut gpui::TestAppContext) {
     cx.update_editor(|editor, _, cx| {
         let timer = std::time::Instant::now();
         for _ in 0..iterations {
-            let _ = editor.ymd_desired_conceal_ranges(None, cx);
+            let _ = editor.ymd_desired_conceal_ranges(None, &HashSet::default(), cx);
         }
         println!("desired_ranges: {:?}/call", timer.elapsed() / iterations);
         let timer = std::time::Instant::now();
@@ -39813,6 +40150,7 @@ async fn measure_ymd_row_change_latency(cx: &mut gpui::TestAppContext) {
             let row = if index % 2 == 0 { 3 } else { 8 };
             editor.refresh_ymd_conceals_with_cursor_rows(
                 HashSet::from_iter([MultiBufferRow(row)]),
+                &HashSet::default(),
                 cx,
             );
         }
@@ -39858,7 +40196,7 @@ async fn measure_ymd_row_change_latency(cx: &mut gpui::TestAppContext) {
         let timer = std::time::Instant::now();
         for _ in 0..cycles {
             editor.sync_ymd_conceal_folds(Vec::new(), cx);
-            editor.refresh_ymd_conceals(cx);
+            editor.refresh_ymd_conceals(&HashSet::default(), cx);
         }
         println!("pre-fix full clear+refold: {:?}/cycle", timer.elapsed() / cycles);
     });
