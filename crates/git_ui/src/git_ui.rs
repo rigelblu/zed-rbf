@@ -666,6 +666,7 @@ impl RefPickerModal {
                                 workspace.weak_handle(),
                                 None,
                                 None,
+                                true,
                                 window,
                                 cx,
                             );
