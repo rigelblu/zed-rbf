@@ -187,11 +187,15 @@ pub enum HighlightKey {
     SyntaxTreeView(usize),
     // Note YmdBackground must sort after YmdLineForeground: on overlap the later
     // key's style wins the fold, which lets a highlight span keep its own readable
-    // foreground over the whole-line color. Both stay before VimExchange so an
-    // active exchange still reads over YMD styling. YmdLink only sets an underline
-    // (no color/background), so it composes cleanly with the color keys regardless
-    // of overlap order — a link label inside a highlight keeps the highlight's
-    // colors and gains the underline.
+    // foreground over the whole-line color. YmdBlockQuote (muted quote-content
+    // foreground) sorts first of the YMD keys so both a line color and a highlight
+    // background win over the muting — a highlight or colored line inside a quote
+    // keeps its own style. All stay before VimExchange so an active exchange still
+    // reads over YMD styling. YmdLink only sets an underline (no color/background),
+    // so it composes cleanly with the color keys regardless of overlap order — a
+    // link label inside a highlight keeps the highlight's colors and gains the
+    // underline.
+    YmdBlockQuote,
     YmdLineForeground(usize),
     YmdBackground(usize),
     YmdLink,

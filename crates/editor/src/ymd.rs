@@ -40,6 +40,16 @@ pub(crate) struct YmdLink {
     pub close_marker_range: Range<usize>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct YmdBlockQuote {
+    // The whole quote line (no trailing newline); the editor paints a vertical
+    // gutter border over its rows.
+    pub line_range: Range<usize>,
+    // The quote text after the `>` markers; muted by the highlight pass. Empty
+    // for a bare `>` line, which still gets the border but no text to mute.
+    pub content_range: Range<usize>,
+}
+
 struct YmdInlineHighlight {
     range: Range<usize>,
     open_marker_range: Range<usize>,
@@ -179,6 +189,18 @@ pub(crate) fn link_style(appearance: Appearance) -> HighlightStyle {
     }
 }
 
+// Mutes the quote content to read as quoted material. The color is the theme's
+// muted text color, resolved by the editor (the gutter border supplies the
+// vertical separator). Only the foreground is set, so a YMD highlight inside the
+// quote keeps its own background and overrides this foreground on overlap (the
+// `YmdBackground`-after-`YmdLineForeground` ordering rule extends here).
+pub(crate) fn block_quote_style(color: Hsla) -> HighlightStyle {
+    HighlightStyle {
+        color: Some(color),
+        ..HighlightStyle::default()
+    }
+}
+
 fn for_each_line(text: &str, mut callback: impl FnMut(&str, usize)) {
     let mut line_start = 0;
 
@@ -305,6 +327,29 @@ pub(crate) fn scan_thematic_breaks(text: &str) -> Vec<Range<usize>> {
     });
 
     ranges
+}
+
+// Markdown block-quote lines (`>` with up to three leading spaces, nesting via
+// `>>` or `> >`). Each result carries the whole line (for the gutter border) and
+// the content after the markers (muted by the highlight pass). The `>` markers
+// stay visible this slice — there is no conceal. Lines inside fenced code blocks
+// are skipped (the #zed-09 fence exclusion): a `> ...` line in a code example is
+// quoted evidence and stays raw. Lazy continuation lines (quote text without a
+// `>`) are deliberately not recognized — only explicit markers qualify.
+pub(crate) fn scan_block_quotes(text: &str) -> Vec<YmdBlockQuote> {
+    let mut block_quotes = Vec::new();
+    let fenced_code_ranges = fenced_code_block_ranges(text);
+
+    for_each_line(text, |line_content, line_start| {
+        if range_overlaps_any(&(line_start..line_start + line_content.len()), &fenced_code_ranges) {
+            return;
+        }
+        if let Some(block_quote) = scan_line_block_quote(line_content, line_start) {
+            block_quotes.push(block_quote);
+        }
+    });
+
+    block_quotes
 }
 
 pub(crate) fn scan_conceals(text: &str) -> Vec<YmdConceal> {
@@ -521,6 +566,31 @@ fn link_destination_end(after_open: &str) -> Option<usize> {
         }
     }
     None
+}
+
+// One block-quote line: up to three leading spaces, then a run of `>` markers
+// (each optionally followed by a single space, so `> > x` nests like `>>x`). The
+// content range begins after the last consumed marker/space and runs to the end
+// of the line — empty when the line is only markers. Returns `None` when no `>`
+// marker is present (the leading-space allowance never matches a plain line). All
+// bytes inspected are ASCII, so indices stay on char boundaries.
+fn scan_line_block_quote(line: &str, line_start: usize) -> Option<YmdBlockQuote> {
+    let bytes = line.as_bytes();
+    let mut index = fence_start_index(bytes)?;
+
+    let mut depth = 0;
+    while bytes.get(index) == Some(&b'>') {
+        depth += 1;
+        index += 1;
+        if bytes.get(index) == Some(&b' ') {
+            index += 1;
+        }
+    }
+
+    (depth > 0).then(|| YmdBlockQuote {
+        line_range: line_start..line_start + line.len(),
+        content_range: line_start + index..line_start + line.len(),
+    })
 }
 
 fn scan_line_background_markups(line: &str, line_start: usize) -> Vec<YmdInlineHighlight> {
@@ -1432,5 +1502,50 @@ mod tests {
         // Up to three leading spaces is still a valid fence.
         let indented_fence = "   ```\n==🔵 hidden==\n   ```";
         assert_eq!(fenced_code_block_ranges(indented_fence).len(), 1);
+    }
+
+    #[test]
+    fn scans_block_quote_lines() {
+        let text = "> one\n>> two\n> > three\n>\nnormal";
+        let block_quotes = scan_block_quotes(text);
+        let content_fragments = block_quotes
+            .iter()
+            .map(|block_quote| &text[block_quote.content_range.clone()])
+            .collect::<Vec<_>>();
+        let line_fragments = block_quotes
+            .iter()
+            .map(|block_quote| &text[block_quote.line_range.clone()])
+            .collect::<Vec<_>>();
+
+        // A bare `>` is a quote line with empty content; `normal` is not a quote.
+        assert_eq!(content_fragments, vec!["one", "two", "three", ""]);
+        assert_eq!(line_fragments, vec!["> one", ">> two", "> > three", ">"]);
+    }
+
+    #[test]
+    fn block_quote_allows_up_to_three_leading_spaces() {
+        // Up to three leading spaces still opens a quote; four spaces is indented
+        // code and is not recognized (mirrors the fence leading-space rule).
+        let text = "   > indented\n    > code";
+        let block_quotes = scan_block_quotes(text);
+        let line_fragments = block_quotes
+            .iter()
+            .map(|block_quote| &text[block_quote.line_range.clone()])
+            .collect::<Vec<_>>();
+
+        assert_eq!(line_fragments, vec!["   > indented"]);
+    }
+
+    #[test]
+    fn skips_block_quote_lines_inside_fenced_code_blocks() {
+        // #zed-09 fence exclusion: a `>` line inside a code block stays raw.
+        let text = "```md\n> not quote\n```\n> quote";
+        let block_quotes = scan_block_quotes(text);
+        let content_fragments = block_quotes
+            .iter()
+            .map(|block_quote| &text[block_quote.content_range.clone()])
+            .collect::<Vec<_>>();
+
+        assert_eq!(content_fragments, vec!["quote"]);
     }
 }
