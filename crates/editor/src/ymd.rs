@@ -245,8 +245,12 @@ fn is_thematic_break_line(line: &str) -> bool {
 
 pub(crate) fn scan(text: &str) -> Vec<YmdHighlight> {
     let mut highlights = Vec::new();
+    let fenced_code_ranges = fenced_code_block_ranges(text);
 
     for_each_line(text, |line_content, line_start| {
+        if range_overlaps_any(&(line_start..line_start + line_content.len()), &fenced_code_ranges) {
+            return;
+        }
         let inline_highlights = scan_line_background_markups(line_content, line_start);
         for inline_highlight in &inline_highlights {
             highlights.push(YmdHighlight {
@@ -269,7 +273,11 @@ pub(crate) fn scan(text: &str) -> Vec<YmdHighlight> {
 
 pub(crate) fn scan_links(text: &str) -> Vec<YmdLink> {
     let mut links = Vec::new();
+    let fenced_code_ranges = fenced_code_block_ranges(text);
     for_each_line(text, |line_content, line_start| {
+        if range_overlaps_any(&(line_start..line_start + line_content.len()), &fenced_code_ranges) {
+            return;
+        }
         links.extend(scan_line_links(line_content, line_start));
     });
     links
@@ -285,8 +293,12 @@ pub(crate) fn scan_links(text: &str) -> Vec<YmdLink> {
 pub(crate) fn scan_thematic_breaks(text: &str) -> Vec<Range<usize>> {
     let mut ranges = Vec::new();
     let frontmatter_skip_end = frontmatter_skip_end(text);
+    let fenced_code_ranges = fenced_code_block_ranges(text);
 
     for_each_line(text, |line_content, line_start| {
+        if range_overlaps_any(&(line_start..line_start + line_content.len()), &fenced_code_ranges) {
+            return;
+        }
         if line_start >= frontmatter_skip_end && is_thematic_break_line(line_content) {
             ranges.push(line_start..line_start + line_content.len());
         }
@@ -297,8 +309,12 @@ pub(crate) fn scan_thematic_breaks(text: &str) -> Vec<Range<usize>> {
 
 pub(crate) fn scan_conceals(text: &str) -> Vec<YmdConceal> {
     let mut conceals = Vec::new();
+    let fenced_code_ranges = fenced_code_block_ranges(text);
 
     for_each_line(text, |line_content, line_start| {
+        if range_overlaps_any(&(line_start..line_start + line_content.len()), &fenced_code_ranges) {
+            return;
+        }
         let inline_highlights = scan_line_background_markups(line_content, line_start);
         for inline_highlight in &inline_highlights {
             conceals.push(YmdConceal {
@@ -538,6 +554,117 @@ fn scan_line_background_markups(line: &str, line_start: usize) -> Vec<YmdInlineH
     }
 
     inline_highlights
+}
+
+#[derive(Clone, Copy)]
+struct CodeFence {
+    marker: u8,
+    length: usize,
+}
+
+// Byte ranges of fenced code blocks (``` or ~~~), delimiter lines included, so YMD
+// styling never applies inside them — code is quoted evidence and its punctuation,
+// emoji, markers, and URLs must stay literal (#zed-09, value-mode CORRECTNESS). A
+// scanner-local CommonMark heuristic, deliberately simpler than tree-sitter: up to
+// three leading spaces, then a run of >=3 backticks or tildes; a backtick opener
+// may not carry a backtick in its info string; the block closes on a same-marker
+// run at least as long, followed only by whitespace, or runs to end-of-buffer while
+// unclosed (so in-progress code stays literal as it is typed). Indented code blocks
+// and inline code spans are out of scope (the live Future item is fences; inline
+// spans are `#zed-310`).
+fn fenced_code_block_ranges(text: &str) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut opening_fence: Option<(usize, CodeFence)> = None;
+    let mut line_start = 0;
+
+    for line in text.split_inclusive('\n') {
+        let line_end = line_start + line.len();
+        let line_content_end = line_end - usize::from(line.ends_with('\n'));
+        let line_content = &text[line_start..line_content_end];
+
+        if let Some((block_start, fence)) = opening_fence {
+            if is_closing_code_fence(line_content, fence) {
+                ranges.push(block_start..line_end);
+                opening_fence = None;
+            }
+        } else if let Some(fence) = opening_code_fence(line_content) {
+            opening_fence = Some((line_start, fence));
+        }
+
+        line_start = line_end;
+    }
+
+    // An unclosed fence excludes the rest of the buffer.
+    if let Some((block_start, _)) = opening_fence {
+        ranges.push(block_start..text.len());
+    }
+
+    ranges
+}
+
+fn range_overlaps_any(range: &Range<usize>, ranges: &[Range<usize>]) -> bool {
+    ranges
+        .iter()
+        .any(|excluded| range.start < excluded.end && range.end > excluded.start)
+}
+
+fn opening_code_fence(line: &str) -> Option<CodeFence> {
+    let bytes = line.as_bytes();
+    let fence_start = fence_start_index(bytes)?;
+    let marker = *bytes.get(fence_start)?;
+    if !matches!(marker, b'`' | b'~') {
+        return None;
+    }
+
+    let length = bytes[fence_start..]
+        .iter()
+        .take_while(|byte| **byte == marker)
+        .count();
+    if length < 3 {
+        return None;
+    }
+
+    // CommonMark: a backtick opener's info string may not contain a backtick, so a
+    // line like ```text with `inline` is not a fence opener.
+    let info_string = &bytes[fence_start + length..];
+    if marker == b'`' && info_string.contains(&b'`') {
+        return None;
+    }
+
+    Some(CodeFence { marker, length })
+}
+
+fn is_closing_code_fence(line: &str, opening_fence: CodeFence) -> bool {
+    let bytes = line.as_bytes();
+    let Some(fence_start) = fence_start_index(bytes) else {
+        return false;
+    };
+    if bytes.get(fence_start) != Some(&opening_fence.marker) {
+        return false;
+    }
+
+    let length = bytes[fence_start..]
+        .iter()
+        .take_while(|byte| **byte == opening_fence.marker)
+        .count();
+    if length < opening_fence.length {
+        return false;
+    }
+
+    bytes[fence_start + length..]
+        .iter()
+        .all(|byte| matches!(*byte, b' ' | b'\t'))
+}
+
+fn fence_start_index(bytes: &[u8]) -> Option<usize> {
+    let mut index = 0;
+    while bytes.get(index) == Some(&b' ') {
+        index += 1;
+        if index > 3 {
+            return None;
+        }
+    }
+    Some(index)
 }
 
 #[cfg(test)]
@@ -1228,5 +1355,82 @@ mod tests {
         // A non-break line 1 means no skip at all — every `---` renders.
         let text = "intro\n---\n---";
         assert_eq!(scan_thematic_breaks(text), vec![6..9, 10..13]);
+    }
+
+    #[test]
+    fn skips_all_ymd_features_inside_fenced_code_blocks() {
+        let text = "==outside==\n```lua\n🔴 code\n==🔵 inside==\n[inside](url)\n---\n```\n==after==\n[after](url)\n---";
+        let fences = fenced_code_block_ranges(text);
+        assert_eq!(fences.len(), 1);
+
+        // Highlights: only the two outside `==...==` spans color.
+        let backgrounds = scan(text)
+            .into_iter()
+            .filter_map(|highlight| match highlight.kind {
+                YmdHighlightKind::Background(_) => Some(text[highlight.range].to_string()),
+                YmdHighlightKind::LineForeground(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(backgrounds, vec!["outside", "after"]);
+
+        // Every scanner entrypoint excludes the fenced lines: highlights, conceals,
+        // link underlines, and thematic-break rules all skip the fence.
+        assert!(scan(text).iter().all(|h| !range_overlaps_any(&h.range, &fences)));
+        assert!(scan_conceals(text).iter().all(|c| !range_overlaps_any(&c.range, &fences)));
+        assert!(scan_links(text).iter().all(|l| !range_overlaps_any(&l.label_range, &fences)));
+        assert_eq!(scan_thematic_breaks(text).len(), 1);
+        assert!(scan_thematic_breaks(text).iter().all(|r| !range_overlaps_any(r, &fences)));
+    }
+
+    #[test]
+    fn tilde_and_unclosed_fences_are_excluded() {
+        let tilde = "~~~\n==🔵 inside==\n~~~\n==outside==";
+        let tilde_fences = fenced_code_block_ranges(tilde);
+        assert_eq!(tilde_fences.len(), 1);
+        assert!(!scan_conceals(tilde).is_empty());
+        assert!(
+            scan_conceals(tilde)
+                .iter()
+                .all(|c| !range_overlaps_any(&c.range, &tilde_fences))
+        );
+
+        // An unclosed fence excludes to end of buffer so in-progress code stays
+        // literal while it is being typed.
+        let unclosed = "==before==\n```\n==🔴 still typing==\n[x](y)";
+        let unclosed_fences = fenced_code_block_ranges(unclosed);
+        assert_eq!(unclosed_fences.len(), 1);
+        assert_eq!(unclosed_fences[0].end, unclosed.len());
+        assert!(
+            scan_conceals(unclosed)
+                .iter()
+                .all(|c| !range_overlaps_any(&c.range, &unclosed_fences))
+        );
+    }
+
+    #[test]
+    fn backtick_fence_with_backtick_info_string_is_not_a_fence() {
+        // CommonMark: a backtick opener whose info string carries a backtick is not a
+        // fence, so the following YMD line still styles.
+        let text = "```text with `inline`\n==🔵 styled==";
+        assert!(fenced_code_block_ranges(text).is_empty());
+        assert!(!scan_conceals(text).is_empty());
+
+        // A tilde info string MAY contain backticks.
+        let tilde = "~~~ `info`\n==🔵 hidden==\n~~~";
+        assert_eq!(fenced_code_block_ranges(tilde).len(), 1);
+    }
+
+    #[test]
+    fn four_space_indent_is_not_a_fence_so_indented_ymd_still_styles() {
+        // 4+ leading spaces is an indented code block in CommonMark, which YMD does
+        // NOT handle — only fenced blocks. So an indented ``` is not a fence opener
+        // (the deliberate tree-sitter gap, #zed-09), and the following YMD line styles.
+        let text = "    ```\n==🔵 styled==";
+        assert!(fenced_code_block_ranges(text).is_empty());
+        assert!(!scan_conceals(text).is_empty());
+
+        // Up to three leading spaces is still a valid fence.
+        let indented_fence = "   ```\n==🔵 hidden==\n   ```";
+        assert_eq!(fenced_code_block_ranges(indented_fence).len(), 1);
     }
 }
