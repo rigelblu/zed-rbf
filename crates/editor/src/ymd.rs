@@ -412,6 +412,10 @@ pub(crate) fn scan_conceals(text: &str) -> Vec<YmdConceal> {
             });
         }
 
+        for range in scan_line_inline_style_markers(line_content, line_start) {
+            conceals.push(YmdConceal { range });
+        }
+
         let heading_range = heading_conceal_range(line_content, line_start);
         if let Some(heading_range) = heading_range.clone() {
             conceals.push(YmdConceal {
@@ -578,6 +582,152 @@ fn scan_line_links(line: &str, line_start: usize) -> Vec<YmdLink> {
     }
 
     links
+}
+
+fn scan_line_inline_style_markers(line: &str, line_start: usize) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut search_start = 0;
+
+    while search_start < line.len() {
+        let Some((open, marker)) = next_inline_style_marker(line, search_start) else {
+            break;
+        };
+        let marker_len = marker.len();
+        let content_start = open + marker_len;
+
+        if !is_inline_style_open_boundary(line, open) {
+            search_start = content_start;
+            continue;
+        }
+        if is_escaped_at(line, open) || is_inside_inline_code_at(line, open) {
+            search_start = content_start;
+            continue;
+        }
+
+        let mut close_search_start = content_start;
+        let mut close = None;
+        while let Some(close_relative) = line[close_search_start..].find(marker) {
+            let candidate = close_search_start + close_relative;
+            let content = &line[content_start..candidate];
+            if !is_escaped_at(line, candidate)
+                && !is_inside_inline_code_at(line, candidate)
+                && is_valid_inline_style_content(content)
+                && is_inline_style_close_boundary(line, candidate + marker_len)
+            {
+                close = Some(candidate);
+                break;
+            }
+            close_search_start = candidate + marker_len;
+        }
+
+        let Some(close) = close else {
+            search_start = content_start;
+            continue;
+        };
+
+        ranges.push(line_start + open..line_start + content_start);
+        ranges.push(line_start + close..line_start + close + marker_len);
+        search_start = close + marker_len;
+    }
+
+    ranges
+}
+
+fn next_inline_style_marker(line: &str, search_start: usize) -> Option<(usize, &'static str)> {
+    let mut next = None;
+    for marker in ["**", "~~", "*", "_"] {
+        let Some(relative_index) = line[search_start..].find(marker) else {
+            continue;
+        };
+        let index = search_start + relative_index;
+        if next.is_none_or(|(next_index, _)| index < next_index) {
+            next = Some((index, marker));
+        }
+    }
+    next
+}
+
+fn is_inline_style_open_boundary(line: &str, open: usize) -> bool {
+    line[..open]
+        .chars()
+        .next_back()
+        .is_none_or(|character| character.is_whitespace() || character.is_ascii_punctuation())
+}
+
+fn is_inline_style_close_boundary(line: &str, close_end: usize) -> bool {
+    line[close_end..]
+        .chars()
+        .next()
+        .is_none_or(|character| character.is_whitespace() || character.is_ascii_punctuation())
+}
+
+fn is_valid_inline_style_content(content: &str) -> bool {
+    !content.is_empty()
+        && content
+            .chars()
+            .next()
+            .is_some_and(|character| !character.is_whitespace())
+        && content
+            .chars()
+            .next_back()
+            .is_some_and(|character| !character.is_whitespace())
+}
+
+pub(crate) fn is_escaped_at(line: &str, index: usize) -> bool {
+    let bytes = line.as_bytes();
+    let mut slash_count = 0;
+    let mut cursor = index;
+    while cursor > 0 && bytes.get(cursor - 1) == Some(&b'\\') {
+        slash_count += 1;
+        cursor -= 1;
+    }
+    slash_count % 2 == 1
+}
+
+pub(crate) fn is_inside_inline_code_at(line: &str, index: usize) -> bool {
+    let bytes = line.as_bytes();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'`' && !is_escaped_at(line, cursor) {
+            let run_len = backtick_run_len(bytes, cursor);
+            let open_end = cursor + run_len;
+            let mut scan = open_end;
+            let mut close = None;
+
+            while scan < bytes.len() {
+                if bytes[scan] == b'`' && !is_escaped_at(line, scan) {
+                    let close_len = backtick_run_len(bytes, scan);
+                    if close_len == run_len {
+                        close = Some((scan, close_len));
+                        break;
+                    }
+                    scan += close_len;
+                } else {
+                    scan += 1;
+                }
+            }
+
+            if let Some((close_start, close_len)) = close {
+                if open_end <= index && index < close_start {
+                    return true;
+                }
+                cursor = close_start + close_len;
+            } else {
+                cursor = open_end;
+            }
+        } else {
+            cursor += 1;
+        }
+    }
+    false
+}
+
+fn backtick_run_len(bytes: &[u8], start: usize) -> usize {
+    let mut len = 0;
+    while start + len < bytes.len() && bytes[start + len] == b'`' {
+        len += 1;
+    }
+    len
 }
 
 // Byte offset of the closing `)` within `after_open` (the slice that begins right
@@ -1214,6 +1364,31 @@ mod tests {
     }
 
     #[test]
+    fn scans_inline_style_marker_conceal_ranges() {
+        assert_eq!(
+            scan_conceals("**closed** *paused* _open_ ~~cancelled~~"),
+            vec![
+                YmdConceal { range: 0..2 },
+                YmdConceal { range: 8..10 },
+                YmdConceal { range: 11..12 },
+                YmdConceal { range: 18..19 },
+                YmdConceal { range: 20..21 },
+                YmdConceal { range: 25..26 },
+                YmdConceal { range: 27..29 },
+                YmdConceal { range: 38..40 },
+            ]
+        );
+        assert!(scan_conceals("snake_case_more").is_empty());
+        assert!(scan_conceals("* missing close").is_empty());
+        assert!(scan_conceals("* untrimmed *").is_empty());
+        assert!(scan_conceals(r"\*literal*").is_empty());
+        assert!(scan_conceals(r"*literal\*").is_empty());
+        assert!(scan_conceals("`*literal*`").is_empty());
+        assert!(scan_conceals("``*literal*``").is_empty());
+        assert!(scan_conceals("```_literal_```").is_empty());
+    }
+
+    #[test]
     fn scans_multiple_markdown_links_per_line_and_skips_images() {
         // The image `![alt](src)` is skipped; the two real links conceal
         // independently, each leaving its own label visible.
@@ -1305,12 +1480,8 @@ mod tests {
                 );
             }
         }
-        assert!(conceals.contains(&YmdConceal {
-            range: link_open.clone()
-        }));
-        assert!(conceals.contains(&YmdConceal {
-            range: link_close.clone()
-        }));
+        assert!(conceals.contains(&YmdConceal { range: link_open }));
+        assert!(conceals.contains(&YmdConceal { range: link_close }));
     }
 
     #[test]

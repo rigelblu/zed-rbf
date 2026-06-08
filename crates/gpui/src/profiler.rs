@@ -21,6 +21,11 @@ use serde::{Deserialize, Serialize};
 use crate::{SharedString, TasksIncluded, WindowId};
 
 #[cfg(feature = "profiler")]
+#[cold]
+#[inline(never)]
+fn cold_path() {}
+
+#[cfg(feature = "profiler")]
 #[doc(hidden)]
 pub fn get_all_timings(included: gpui::TasksIncluded) -> Vec<gpui::ThreadTaskTimings> {
     let global_thread_timings = GLOBAL_THREAD_TIMINGS.lock();

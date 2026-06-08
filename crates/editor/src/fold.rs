@@ -1127,10 +1127,10 @@ impl Editor {
 /// and the `file_folds` DB rows) build from: every fold except YMD conceal
 /// folds, which are display state and must never persist. Tests call this
 /// directly so the filter line itself is load-bearing.
-pub(crate) fn user_folds_for_serialization<'a>(
-    display_snapshot: &'a DisplaySnapshot,
-) -> impl Iterator<Item = &'a crate::display_map::Fold> {
+pub(crate) fn user_folds_for_serialization(
+    display_snapshot: &DisplaySnapshot,
+) -> impl Iterator<Item = &crate::display_map::Fold> {
     display_snapshot
         .folds_in_range(MultiBufferOffset(0)..display_snapshot.buffer_snapshot().len())
-        .filter(|fold| !is_ymd_conceal_fold(*fold))
+        .filter(|fold| !is_ymd_conceal_fold(fold))
 }
