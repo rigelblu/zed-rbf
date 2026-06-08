@@ -82,19 +82,7 @@ pub fn init(cx: &mut App) {
 
     git_ui_core::set_file_history_opener(
         |workspace, project_path, window, cx| {
-            let Some((repo_id, log_source)) =
-                git_graph::resolve_file_history_target_from_project_path(
-                    workspace,
-                    project_path,
-                    cx,
-                )
-            else {
-                return;
-            };
-            let git_store = workspace.project().read(cx).git_store().clone();
-            git_graph::open_or_reuse_graph(
-                workspace, repo_id, git_store, log_source, None, window, cx,
-            );
+            git_panel::open_file_history_for_project_path(workspace, project_path, window, cx);
         },
         cx,
     );

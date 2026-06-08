@@ -563,7 +563,7 @@ pub fn init(cx: &mut App) {
                         let Some(panel) = workspace.panel::<ProjectPanel>(cx) else {
                             return;
                         };
-                        let Some(project_path) = panel.read(cx).selected_entry_project_path(cx)
+                        let Some(project_path) = panel.read(cx).selected_file_project_path(cx)
                         else {
                             return;
                         };
@@ -1102,7 +1102,8 @@ impl ProjectPanel {
                 let has_git_repo = git_store
                     .repository_and_path_for_project_path(&project_path, cx)
                     .is_some();
-                let has_history = has_git_repo
+                let has_history = !is_dir
+                    && has_git_repo
                     && !git_store
                         .project_path_git_status(&project_path, cx)
                         .is_some_and(|status| status.is_created());
@@ -4080,6 +4081,17 @@ impl ProjectPanel {
 
     pub fn selected_entry_project_path(&self, cx: &App) -> Option<ProjectPath> {
         let (worktree, entry) = self.selected_sub_entry(cx)?;
+        Some(ProjectPath {
+            worktree_id: worktree.read(cx).id(),
+            path: entry.path.clone(),
+        })
+    }
+
+    fn selected_file_project_path(&self, cx: &App) -> Option<ProjectPath> {
+        let (worktree, entry) = self.selected_sub_entry(cx)?;
+        if entry.is_dir() {
+            return None;
+        }
         Some(ProjectPath {
             worktree_id: worktree.read(cx).id(),
             path: entry.path.clone(),
