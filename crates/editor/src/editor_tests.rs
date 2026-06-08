@@ -33404,6 +33404,92 @@ async fn test_ymd_conceals_markdown_syntax_except_cursor_line_and_toggles(
 }
 
 #[gpui::test]
+async fn test_ymd_conceals_markdown_links_and_underlines_labels(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    cx.set_state(
+        "ˇ[link text](https://example.com)\nplain [second](url) end\n![alt](image.png)\n[missing url]()",
+    );
+    cx.run_until_parked();
+
+    // Only the link labels carry the underline highlight; the image and the
+    // invalid link do not.
+    cx.assert_editor_text_highlights(
+        HighlightKey::YmdLink,
+        "[«link text»](https://example.com)\nplain [«second»](url) end\n![alt](image.png)\n[missing url]()",
+    );
+
+    // Off the cursor row, the brackets and `](url)` tail fold while the label
+    // stays. The cursor sits on row 0, so that link reveals raw.
+    cx.update_editor(|editor, _, cx| {
+        assert_eq!(
+            editor.display_text(cx).replace('\u{2060}', ""),
+            "[link text](https://example.com)\nplain second end\n![alt](image.png)\n[missing url]()"
+        );
+    });
+
+    // Moving the cursor onto row 1 reveals that link raw and re-conceals row 0.
+    cx.update_editor(|editor, window, cx| {
+        editor.move_down(&MoveDown, window, cx);
+        assert_eq!(
+            editor.display_text(cx).replace('\u{2060}', ""),
+            "link text\nplain [second](url) end\n![alt](image.png)\n[missing url]()"
+        );
+    });
+
+    // The global toggle reveals every concealed link tail at once.
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_ymd_conceal(&ToggleYmdConceal, window, cx);
+        assert_eq!(
+            editor.display_text(cx).replace('\u{2060}', ""),
+            "[link text](https://example.com)\nplain [second](url) end\n![alt](image.png)\n[missing url]()"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_ymd_conceals_balanced_paren_link_with_no_stray_paren(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    // Cursor parked off the link row so the link conceals.
+    cx.set_state(
+        "ˇplain line\n[Rust (film)](https://en.wikipedia.org/wiki/Rust_(film))",
+    );
+    cx.run_until_parked();
+
+    // The whole `](…/Rust_(film))` tail folds — no stray `)` is left visible. The
+    // `(film)` that survives is the label's own text, not the URL's.
+    cx.update_editor(|editor, _, cx| {
+        assert_eq!(
+            editor.display_text(cx).replace('\u{2060}', ""),
+            "plain line\nRust (film)"
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_ymd_reveals_each_multi_cursor_head_row(cx: &mut gpui::TestAppContext) {
     init_test(cx, |_| {});
 

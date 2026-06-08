@@ -9291,7 +9291,9 @@ impl Editor {
             &mut |key| {
                 matches!(
                     key,
-                    HighlightKey::YmdBackground(_) | HighlightKey::YmdLineForeground(_)
+                    HighlightKey::YmdBackground(_)
+                        | HighlightKey::YmdLineForeground(_)
+                        | HighlightKey::YmdLink
                 )
             },
             cx,
@@ -9531,6 +9533,22 @@ impl Editor {
                     cx,
                 );
             }
+        }
+
+        let link_ranges = ymd::scan_links(&text)
+            .into_iter()
+            .map(|link| {
+                snapshot.anchor_before(MultiBufferOffset(link.label_range.start))
+                    ..snapshot.anchor_after(MultiBufferOffset(link.label_range.end))
+            })
+            .collect::<Vec<_>>();
+        if !link_ranges.is_empty() {
+            self.highlight_text(
+                HighlightKey::YmdLink,
+                link_ranges,
+                ymd::link_style(appearance),
+                cx,
+            );
         }
     }
 

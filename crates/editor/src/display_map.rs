@@ -188,9 +188,13 @@ pub enum HighlightKey {
     // Note YmdBackground must sort after YmdLineForeground: on overlap the later
     // key's style wins the fold, which lets a highlight span keep its own readable
     // foreground over the whole-line color. Both stay before VimExchange so an
-    // active exchange still reads over YMD styling.
+    // active exchange still reads over YMD styling. YmdLink only sets an underline
+    // (no color/background), so it composes cleanly with the color keys regardless
+    // of overlap order — a link label inside a highlight keeps the highlight's
+    // colors and gains the underline.
     YmdLineForeground(usize),
     YmdBackground(usize),
+    YmdLink,
     VimExchange,
 }
 
