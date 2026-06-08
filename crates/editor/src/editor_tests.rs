@@ -34393,6 +34393,37 @@ async fn test_ymd_conceal_fast_path_is_sound_after_diff_expansion(cx: &mut gpui:
 }
 
 #[gpui::test]
+async fn test_ymd_skips_styling_inside_fenced_code_blocks(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    // Cursor on the last row, so the fence content is judged off-cursor. Outside the
+    // fence, `==doc==` conceals; inside, the markers, emoji, and `---` stay literal.
+    cx.set_state("==doc==\n```\n==🔵 code==\n---\n```\nˇplain");
+    cx.run_until_parked();
+
+    let display = cx.update_editor(|editor, _, cx| editor.display_text(cx).replace('\u{2060}', ""));
+    // Outside the fence conceals to `doc`.
+    assert!(!display.contains("==doc=="), "outside marker should conceal: {display}");
+    assert!(display.contains("doc"), "{display}");
+    // Inside the fence stays fully raw.
+    assert!(display.contains("==🔵 code=="), "fenced marker should stay raw: {display}");
+    // The fenced `---` is not rendered as a horizontal-rule block.
+    cx.update_editor(|editor, _, _| {
+        assert!(editor.ymd_thematic_break_blocks.is_empty());
+    });
+}
+
+#[gpui::test]
 async fn test_ymd_conceal_select_all_matches_keeps_conceals(cx: &mut gpui::TestAppContext) {
     init_test(cx, |_| {});
 
