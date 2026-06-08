@@ -380,6 +380,7 @@ impl Render for CommitTooltip {
                                                         workspace.clone(),
                                                         None,
                                                         None,
+                                                        true,
                                                         window,
                                                         cx,
                                                     );
