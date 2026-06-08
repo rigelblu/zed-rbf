@@ -447,6 +447,19 @@ enum CommitHistory {
     Error(SharedString),
 }
 
+/// A present HEAD commit whose SHA does not parse is corrupt repository state, not an
+/// empty history, so it surfaces as an error rather than "No Commit History".
+fn commit_history_without_log_source(
+    branch: Option<&Branch>,
+    head_commit: Option<&CommitDetails>,
+) -> CommitHistory {
+    if branch.is_none() && head_commit.is_some() {
+        CommitHistory::Error("could not read HEAD commit".into())
+    } else {
+        CommitHistory::Loaded(Rc::from([]))
+    }
+}
+
 fn commit_history_from_response(
     entries: Rc<[CommitHistoryEntry]>,
     is_loading: bool,
@@ -6325,7 +6338,15 @@ impl GitPanel {
             return;
         };
 
-        let Some(log_source) = Self::commit_history_log_source(active_repository, cx) else {
+        let log_source = {
+            let repository = active_repository.read(cx);
+            Self::commit_history_log_source(
+                repository.branch.as_ref(),
+                repository.head_commit.as_ref(),
+            )
+        };
+
+        let Some(log_source) = log_source else {
             return;
         };
         let log_order = LogOrder::DateOrder;
@@ -6367,9 +6388,34 @@ impl GitPanel {
             return;
         };
 
-        let Some(log_source) = Self::commit_history_log_source(&active_repository, cx) else {
-            // No HEAD commit at all (unborn/empty repository).
-            self.set_commit_history(CommitHistory::Loaded(Rc::from([])), cx);
+        let (log_source, repository_scan_pending) = {
+            let repository = active_repository.read(cx);
+            (
+                Self::commit_history_log_source(
+                    repository.branch.as_ref(),
+                    repository.head_commit.as_ref(),
+                ),
+                repository.scan_id == 0,
+            )
+        };
+
+        // Before the first scan lands an absent HEAD says nothing about the history, so
+        // stay loading rather than reporting an empty one. The git store subscription
+        // refetches once the scan emits `HeadChanged`/`StatusesChanged`.
+        if repository_scan_pending {
+            self.set_commit_history(CommitHistory::Loading, cx);
+            return;
+        }
+
+        let Some(log_source) = log_source else {
+            let history = {
+                let repository = active_repository.read(cx);
+                commit_history_without_log_source(
+                    repository.branch.as_ref(),
+                    repository.head_commit.as_ref(),
+                )
+            };
+            self.set_commit_history(history, cx);
             return;
         };
         let log_order = LogOrder::DateOrder;
@@ -6400,16 +6446,18 @@ impl GitPanel {
     }
 
     fn commit_history_log_source(
-        active_repository: &Entity<Repository>,
-        cx: &App,
+        branch: Option<&Branch>,
+        head_commit: Option<&CommitDetails>,
     ) -> Option<LogSource> {
-        let repository = active_repository.read(cx);
-        let head_commit = repository.head_commit.as_ref()?;
-        if let Some(branch) = repository.branch.as_ref() {
-            Some(LogSource::Branch(branch.name().to_string().into()))
-        } else {
-            Some(LogSource::Sha(head_commit.sha.as_ref().parse().ok()?))
+        // An unborn branch has no commits to log, and `git log <unborn ref>` errors out,
+        // so a missing HEAD commit means there is no source to log from.
+        let head_commit = head_commit?;
+
+        if let Some(branch) = branch {
+            return Some(LogSource::Branch(branch.name().into()));
         }
+
+        head_commit.sha.as_ref().parse().ok().map(LogSource::Sha)
     }
 
     fn git_remote(&self, cx: &mut App) -> Option<GitRemote> {
@@ -9401,6 +9449,73 @@ mod tests {
         panel.read_with(cx, |panel, _| {
             assert_eq!(panel.commit_history, CommitHistory::Loading);
         });
+    }
+
+    fn test_branch(ref_name: &str) -> Branch {
+        Branch {
+            is_head: true,
+            ref_name: ref_name.into(),
+            upstream: None,
+            most_recent_commit: None,
+        }
+    }
+
+    fn test_head_commit(sha: &str) -> CommitDetails {
+        CommitDetails {
+            sha: sha.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_commit_history_log_source() {
+        let branch = test_branch("refs/heads/main");
+        let head_commit = test_head_commit("0123456789abcdef0123456789abcdef01234567");
+
+        // A branch wins over the commit it points at.
+        assert_eq!(
+            GitPanel::commit_history_log_source(Some(&branch), Some(&head_commit)),
+            Some(LogSource::Branch("main".into()))
+        );
+
+        // An unborn branch has nothing to log from, even though the branch exists.
+        assert_eq!(
+            GitPanel::commit_history_log_source(Some(&branch), None),
+            None
+        );
+
+        // A detached HEAD logs from its SHA.
+        assert_eq!(
+            GitPanel::commit_history_log_source(None, Some(&head_commit)),
+            Some(LogSource::Sha(head_commit.sha.as_ref().parse().unwrap()))
+        );
+
+        assert_eq!(
+            GitPanel::commit_history_log_source(None, Some(&test_head_commit("not-a-sha"))),
+            None
+        );
+        assert_eq!(GitPanel::commit_history_log_source(None, None), None);
+    }
+
+    #[test]
+    fn test_commit_history_without_log_source() {
+        let head_commit = test_head_commit("not-a-sha");
+
+        // Unborn repositories have no commits to show, whether or not a branch exists.
+        assert_eq!(
+            commit_history_without_log_source(None, None),
+            CommitHistory::Loaded(Rc::from([]))
+        );
+        assert_eq!(
+            commit_history_without_log_source(Some(&test_branch("refs/heads/main")), None),
+            CommitHistory::Loaded(Rc::from([]))
+        );
+
+        // A detached HEAD whose SHA cannot be read is corrupt state, not an empty history.
+        assert_eq!(
+            commit_history_without_log_source(None, Some(&head_commit)),
+            CommitHistory::Error("could not read HEAD commit".into())
+        );
     }
 
     #[test]
