@@ -1417,6 +1417,8 @@
   // Removes any lines containing only whitespace at the end of the file and
   // ensures just one newline at the end.
   "ensure_final_newline_on_save": true,
+  // Whether or not to align Markdown table columns during format-on-save.
+  "align_markdown_tables_on_save": false,
   // How line endings should be handled for new files and during format and save.
   // This setting can take five values:
   //

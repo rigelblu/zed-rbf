@@ -440,6 +440,10 @@ pub struct LanguageSettingsContent {
     ///
     /// Default: true
     pub ensure_final_newline_on_save: Option<bool>,
+    /// Whether or not to align Markdown table columns during format-on-save.
+    ///
+    /// Default: false
+    pub align_markdown_tables_on_save: Option<bool>,
     /// How line endings should be handled for new files and during format and
     /// save operations.
     ///

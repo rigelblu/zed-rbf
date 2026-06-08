@@ -46,6 +46,7 @@ use crate::{
         LanguageServerTree, LanguageServerTreeNode, LaunchDisposition, ManifestQueryDelegate,
         ManifestTree,
     },
+    markdown_table_formatter,
     prettier_store::{self, PrettierStore, PrettierStoreEvent},
     project_settings::{BinarySettings, LspSettings, ProjectSettings},
     toolchain_store::{LocalToolchainStore, ToolchainStoreEvent},
@@ -1768,6 +1769,31 @@ impl LocalLspStore {
             .await
             {
                 zlog::error!(logger => "Formatter failed, skipping: {err:#}");
+            }
+        }
+
+        if settings.align_markdown_tables_on_save && buffer.ranges.is_none() {
+            zlog::trace!(logger => "aligning markdown tables");
+            let diff = buffer.handle.read_with(cx, |buffer, cx| {
+                if buffer.language().map(|language| language.name()) != Some("Markdown".into()) {
+                    return None;
+                }
+                let text = buffer.as_text_snapshot().as_rope().to_string();
+                markdown_table_formatter::align_markdown_tables(&text)
+                    .map(|new_text| buffer.diff(new_text, cx))
+            });
+            if let Some(diff) = diff {
+                let diff = diff.await;
+                if !diff.edits.is_empty() {
+                    extend_formatting_transaction(
+                        buffer,
+                        formatting_transaction_id,
+                        cx,
+                        |buffer, cx| {
+                            buffer.apply_diff(diff, cx);
+                        },
+                    )?;
+                }
             }
         }
 
