@@ -47,6 +47,7 @@ use workspace::{
 
 use crate::commit_tooltip::CommitAvatar;
 use crate::git_panel::GitPanel;
+use crate::project_diff::ProjectDiff;
 
 actions!(
     git,
@@ -55,6 +56,7 @@ actions!(
         PopCurrentStash,
         DropCurrentStash,
         OpenFileAtHead,
+        CompareSinceCommit,
     ]
 );
 
@@ -549,6 +551,40 @@ impl CommitView {
             return;
         };
         self.open_file_at_head(&file, window, cx);
+    }
+
+    fn compare_since_commit(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let base_ref = self.commit.sha.clone();
+        let project = workspace.read(cx).project().clone();
+        let repository = self.repository.clone();
+        window
+            .spawn(cx, async move |cx| {
+                // Activating an existing ProjectDiff deactivates the current item, which may be
+                // this CommitView. Wait until the action handler releases its CommitView lease.
+                yield_now().await;
+                workspace
+                    .update_in(cx, |workspace, window, cx| {
+                        ProjectDiff::deploy_since_base_ref(
+                            workspace, project, repository, base_ref, window, cx,
+                        );
+                    })
+                    .log_err();
+            })
+            .detach();
+    }
+
+    fn compare_since_commit_action(
+        &mut self,
+        _: &CompareSinceCommit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.stash.is_none() {
+            self.compare_since_commit(window, cx);
+        }
     }
 
     fn render_header(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1239,6 +1275,7 @@ impl Render for CommitView {
         v_flex()
             .key_context(if is_stash { "StashDiff" } else { "CommitDiff" })
             .on_action(cx.listener(Self::open_file_at_head_action))
+            .on_action(cx.listener(Self::compare_since_commit_action))
             .size_full()
             .bg(cx.theme().colors().editor_background)
             .child(self.render_header(window, cx))
@@ -1289,6 +1326,7 @@ impl Render for CommitViewToolbar {
         });
 
         let sha_for_graph = commit_sha.to_string();
+        let commit_view_for_compare = commit_view.downgrade();
 
         h_flex()
             .gap_1()
@@ -1323,6 +1361,18 @@ impl Render for CommitViewToolbar {
             )
             .when(!is_stash, |this| {
                 this.child(
+                    IconButton::new("compare-since-commit", IconName::Diff)
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text("Compare Since"))
+                        .on_click(move |_, window, cx| {
+                            commit_view_for_compare
+                                .update(cx, |commit_view, cx| {
+                                    commit_view.compare_since_commit(window, cx);
+                                })
+                                .log_err();
+                        }),
+                )
+                .child(
                     IconButton::new("show-in-git-graph", IconName::GitGraph)
                         .icon_size(IconSize::Small)
                         .tooltip(Tooltip::text("Show in Git Graph"))
@@ -1377,4 +1427,120 @@ fn stash_matches_index(sha: &str, stash_index: usize, repo: &Repository) -> bool
         .get(stash_index)
         .map(|entry| entry.oid.to_string() == sha)
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::{SharedString, TestAppContext};
+    use project::{FakeFs, git_store::branch_diff::DiffBase};
+    use serde_json::json;
+    use settings::{DiffViewStyle, SettingsStore};
+    use util::path;
+    use workspace::MultiWorkspace;
+
+    use super::*;
+
+    #[ctor::ctor(unsafe)]
+    fn init_logger() {
+        zlog::init_test();
+    }
+
+    fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let store = SettingsStore::test(cx);
+            cx.set_global(store);
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.editor.diff_view_style = Some(DiffViewStyle::Unified);
+                });
+            });
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+            crate::init(cx);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_compare_since_existing_project_diff_does_not_reenter_commit_view_update(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "a.txt": "changed",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        let repository = project.read_with(cx, |project, cx| {
+            project.active_repository(cx).expect("active repository")
+        });
+        let base_ref: SharedString = "0123456789abcdef0123456789abcdef01234567".into();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            ProjectDiff::deploy_since_base_ref(
+                workspace,
+                project.clone(),
+                repository.clone(),
+                base_ref.clone(),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let commit_view = workspace.update_in(cx, |workspace, window, cx| {
+            let workspace_entity = cx.entity();
+            let commit_view = cx.new(|cx| {
+                CommitView::new(
+                    CommitDetails {
+                        sha: base_ref.clone(),
+                        message: "Compare since regression".into(),
+                        ..Default::default()
+                    },
+                    CommitDiff { files: Vec::new() },
+                    repository,
+                    project.clone(),
+                    workspace_entity.clone(),
+                    workspace_entity.downgrade(),
+                    None,
+                    window,
+                    cx,
+                )
+            });
+            workspace.add_item_to_active_pane(
+                Box::new(commit_view.clone()),
+                None,
+                true,
+                window,
+                cx,
+            );
+            commit_view
+        });
+        cx.run_until_parked();
+
+        assert!(workspace.update(cx, |workspace, cx| {
+            workspace.active_item_as::<CommitView>(cx).is_some()
+        }));
+
+        commit_view.update_in(cx, |commit_view, window, cx| {
+            commit_view.compare_since_commit(window, cx);
+        });
+        cx.run_until_parked();
+
+        let active_diff_base = workspace.update(cx, |workspace, cx| {
+            workspace
+                .active_item_as::<ProjectDiff>(cx)
+                .map(|project_diff| project_diff.read(cx).diff_base(cx).clone())
+        });
+        assert_eq!(active_diff_base, Some(DiffBase::Since { base_ref }));
+    }
 }

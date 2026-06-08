@@ -2,6 +2,11 @@
 title: "Zed RBF Changelog"
 ---
 
+## 🟠⋯ v0.20.0 — #zed-20
+- Added Compare Since from commit diffs, opening a read-only workspace comparison against the selected commit without checking out that commit
+- Kept exact commit comparisons separate from branch merge-base comparisons, so `Since` and `Merge` diff tabs with the same ref do not collide
+- Compare Since tabs are fixed to their commit base; to compare from another commit, open that commit and use Compare Since again
+
 ## 🟠⋯ v0.19.0 — #zed-19
 - Fixed Git Panel History in detached checkouts: when there is no active branch, History now loads commit rows from the current `HEAD` commit instead of staying stuck on the loading state
 - Improved History state feedback: unscanned repositories stay in Loading, invalid `HEAD` state shows an error, and genuine empty history shows `No Commit History`
