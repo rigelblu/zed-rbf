@@ -33359,7 +33359,7 @@ async fn test_ymd_conceals_markdown_syntax_except_cursor_line_and_toggles(
     cx.update_editor(|editor, _, cx| {
         assert_eq!(
             editor.display_text(cx).replace('\u{2060}', ""),
-            "==hello==\nurgent\nplain 🔵 line\n====\n==🔴open"
+            "==hello==\nurgent\nplain  line\n====\n==open"
         );
     });
 
@@ -33367,7 +33367,7 @@ async fn test_ymd_conceals_markdown_syntax_except_cursor_line_and_toggles(
         editor.move_down(&MoveDown, window, cx);
         assert_eq!(
             editor.display_text(cx).replace('\u{2060}', ""),
-            "hello\n==🔴urgent==\nplain 🔵 line\n====\n==🔴open"
+            "hello\n==🔴urgent==\nplain  line\n====\n==open"
         );
     });
 
@@ -33383,7 +33383,16 @@ async fn test_ymd_conceals_markdown_syntax_except_cursor_line_and_toggles(
         editor.toggle_ymd_conceal(&ToggleYmdConceal, window, cx);
         assert_eq!(
             editor.display_text(cx).replace('\u{2060}', ""),
-            "hello\n==🔴urgent==\nplain 🔵 line\n====\n==🔴open"
+            "hello\n==🔴urgent==\nplain  line\n====\n==open"
+        );
+    });
+
+    // Cursor onto the emoji row reveals the standalone 🔵 again.
+    cx.update_editor(|editor, window, cx| {
+        editor.move_down(&MoveDown, window, cx);
+        assert_eq!(
+            editor.display_text(cx).replace('\u{2060}', ""),
+            "hello\nurgent\nplain 🔵 line\n====\n==open"
         );
     });
 
@@ -33978,6 +33987,122 @@ async fn test_ymd_selection_guard_is_inert_above_cap(cx: &mut gpui::TestAppConte
 }
 
 #[gpui::test]
+async fn test_display_point_conversions_stay_on_char_boundaries_over_conceals(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    // Suite-shaped multibyte-dense fixture: emoji-led headings, emoji-marker
+    // highlights, standalone mid-line emoji — every conceal fold starts at or
+    // near a multibyte character.
+    let mut fixture = String::from("---\ntitle: \"🧩 Design Suite\"\n---\n");
+    for index in 0..40 {
+        fixture.push_str(&format!("## 🟠⋯ `#zed-{index:02}` Heading {index}\n"));
+        fixture.push_str("- [ ] ==🔴 Red background== sample line\n");
+        fixture.push_str("- [ ] plain 🔵 line with mid emoji\n");
+        fixture.push_str("==🟢 green== and ==🟡 yellow== pairs\n");
+        fixture.push_str("plain filler line\n");
+    }
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    cx.set_state(&format!("ˇ{fixture}"));
+    cx.run_until_parked();
+
+    // Every display position — including fold-placeholder interiors — must map
+    // to a char-boundary buffer point. Pre-fix, placeholder interiors mapped
+    // linearly into concealed emoji bytes (the mouse-drag char-boundary panic).
+    cx.update_editor(|editor, window, cx| {
+        let snapshot = editor.snapshot(window, cx);
+        let buffer = snapshot.buffer_snapshot();
+        let display_text = editor.display_text(cx);
+        // Every reachable display position — the char boundaries of the display
+        // text, which is what mouse hit-testing produces — must map to a
+        // char-boundary buffer point. The placeholder-interior inputs the leak
+        // produced are pinned separately by the drag-selection test below.
+        for (row, line) in display_text.split('\n').enumerate() {
+            for column in line
+                .char_indices()
+                .map(|(index, _)| index as u32)
+                .chain([line.len() as u32])
+            {
+                for bias in [text::Bias::Left, text::Bias::Right] {
+                    let point = snapshot.display_snapshot.display_point_to_point(
+                        DisplayPoint::new(DisplayRow(row as u32), column),
+                        bias,
+                    );
+                    let clipped = buffer.clip_point(point, text::Bias::Left);
+                    assert_eq!(
+                        point, clipped,
+                        "display ({row},{column}) {bias:?} maps to non-boundary {point:?}"
+                    );
+                }
+            }
+        }
+    });
+}
+
+#[gpui::test]
+async fn test_drag_selection_over_concealed_emoji_does_not_panic(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    cx.set_state("## 🟠⋯ Heading line\nsecond line\nˇthird");
+    cx.run_until_parked();
+
+    // The standalone 🟠 conceals, leaving a zero-width placeholder at display
+    // columns 3..6 on row 0. Dragging the selection head onto a placeholder
+    // INTERIOR column is the crash shape Tom hit with a multi-line mouse drag:
+    // the unclipped Character-mode conversion produced a mid-emoji buffer point
+    // and panicked at the char-boundary assert.
+    cx.update_editor(|editor, window, cx| {
+        editor.select(
+            SelectPhase::Begin {
+                position: DisplayPoint::new(DisplayRow(2), 0),
+                add: false,
+                click_count: 1,
+            },
+            window,
+            cx,
+        );
+        editor.select(
+            SelectPhase::Update {
+                position: DisplayPoint::new(DisplayRow(0), 4),
+                goal_column: 4,
+                scroll_delta: gpui::Point::default(),
+            },
+            window,
+            cx,
+        );
+        editor.select(SelectPhase::End, window, cx);
+    });
+
+    // The head clamps to the fold edge (start of the concealed emoji).
+    cx.update_editor(|editor, _, cx| {
+        let snapshot = editor.display_snapshot(cx);
+        let head = editor.selections.newest::<Point>(&snapshot).head();
+        assert_eq!(head, Point::new(0, 3));
+    });
+}
+
+#[gpui::test]
 async fn test_ymd_conceal_cursor_motion_and_boundary_typing(cx: &mut gpui::TestAppContext) {
     init_test(cx, |_| {});
 
@@ -34044,6 +34169,34 @@ async fn test_ymd_conceal_cursor_motion_and_boundary_typing(cx: &mut gpui::TestA
             "hellox\nplain"
         );
     });
+
+    // Q5 (slice-4 merge): a concealed line-color emoji behaves like any conceal —
+    // landing on its row reveals it, and horizontal motion on the revealed row is
+    // plain text motion with no extra stops.
+    cx.set_state("plain 🔵 line\nˇunder");
+    cx.run_until_parked();
+    cx.update_editor(|editor, _, cx| {
+        assert_eq!(
+            editor.display_text(cx).replace('\u{2060}', ""),
+            "plain  line\nunder"
+        );
+    });
+    cx.update_editor(|editor, window, cx| {
+        editor.move_up(&MoveUp, window, cx);
+    });
+    cx.run_until_parked();
+    cx.update_editor(|editor, _, cx| {
+        assert_eq!(
+            editor.display_text(cx).replace('\u{2060}', ""),
+            "plain 🔵 line\nunder"
+        );
+    });
+    cx.update_editor(|editor, window, cx| {
+        for _ in 0..7 {
+            editor.move_right(&MoveRight, window, cx);
+        }
+    });
+    cx.assert_editor_state("plain 🔵ˇ line\nunder");
 }
 
 #[gpui::test]
@@ -39112,4 +39265,175 @@ async fn test_toggle_markdown_block_quote(cx: &mut TestAppContext) {
         third
         fourthˇ»
     "});
+}
+
+#[gpui::test]
+#[ignore]
+async fn measure_ymd_row_change_latency(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut fixture = String::from("---\ntitle: \"🧩 Design Suite\"\n---\n");
+    for index in 0..40 {
+        fixture.push_str(&format!("## 🟠⋯ `#zed-{index:02}` Heading {index}\n"));
+        fixture.push_str("- [ ] ==🔴 Red background== sample line\n");
+        fixture.push_str("- [ ] plain 🔵 line with mid emoji\n");
+        fixture.push_str("==🟢 green== and ==🟡 yellow== pairs\n");
+        fixture.push_str("plain filler line\n");
+    }
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    cx.set_state(&format!("ˇ{fixture}"));
+    cx.run_until_parked();
+
+    // The YMD selection hook runs synchronously inside the move; parking would
+    // drain every other subsystem's deferred work and bury the number.
+    let iterations = 100;
+    let start = std::time::Instant::now();
+    cx.update_editor(|editor, window, cx| {
+        for _ in 0..iterations {
+            editor.move_down(&MoveDown, window, cx);
+        }
+    });
+    let with_ymd = start.elapsed();
+
+    // Non-Markdown control: same motion, the guard exits at the language gate.
+    cx.update_buffer(|buffer, cx| buffer.set_language(None, cx));
+    cx.run_until_parked();
+    cx.update_editor(|editor, window, cx| {
+        for _ in 0..iterations {
+            editor.move_up(&MoveUp, window, cx);
+        }
+    });
+    let start = std::time::Instant::now();
+    cx.update_editor(|editor, window, cx| {
+        for _ in 0..iterations {
+            editor.move_down(&MoveDown, window, cx);
+        }
+    });
+    let control = start.elapsed();
+
+    println!(
+        "marker-dense row-change: {:?}/move with YMD conceals, {:?}/move control (no language) — YMD delta {:?}/move",
+        with_ymd / iterations,
+        control / iterations,
+        (with_ymd.saturating_sub(control)) / iterations
+    );
+
+    // Piece breakdown.
+    cx.update_buffer(|buffer, cx| {
+        buffer.set_language(
+            Some(Arc::new(Language::new(
+                LanguageConfig {
+                    name: "Markdown".into(),
+                    ..LanguageConfig::default()
+                },
+                None,
+            ))),
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    cx.update_editor(|editor, _, cx| {
+        let timer = std::time::Instant::now();
+        for _ in 0..iterations {
+            let _ = editor.ymd_desired_conceal_ranges(None, cx);
+        }
+        println!("desired_ranges: {:?}/call", timer.elapsed() / iterations);
+        let timer = std::time::Instant::now();
+        for _ in 0..iterations {
+            let _ = editor.ymd_existing_conceal_ranges(cx);
+        }
+        println!("existing_ranges: {:?}/call", timer.elapsed() / iterations);
+        let timer = std::time::Instant::now();
+        for _ in 0..iterations {
+            let _ = editor.display_map.update(cx, |map, cx| map.snapshot(cx));
+        }
+        println!("display snapshot: {:?}/call", timer.elapsed() / iterations);
+        let timer = std::time::Instant::now();
+        for _ in 0..iterations {
+            let snapshot = editor.display_map.update(cx, |map, cx| map.snapshot(cx));
+            let _ = editor.ymd_cursor_rows(&snapshot);
+        }
+        println!("snapshot+rows: {:?}/call", timer.elapsed() / iterations);
+
+        // Force a one-row reveal delta through the full impl (desired + diff +
+        // fold apply) per call by alternating the reveal row directly.
+        let timer = std::time::Instant::now();
+        for index in 0..iterations {
+            let row = if index % 2 == 0 { 3 } else { 8 };
+            editor.refresh_ymd_conceals_with_cursor_rows(
+                HashSet::from_iter([MultiBufferRow(row)]),
+                cx,
+            );
+        }
+        println!("impl with 1-row delta: {:?}/call", timer.elapsed() / iterations);
+
+        // Atomic dance costs (probe inside an ASCII filler line).
+        let buffer_snapshot = editor.buffer().read(cx).snapshot(cx);
+        let probe_base = editor
+            .buffer()
+            .read(cx)
+            .snapshot(cx)
+            .text()
+            .find("plain filler line")
+            .expect("fixture filler line");
+        let placeholder = crate::ymd_conceal_fold_placeholder();
+        let timer = std::time::Instant::now();
+        for index in 0..iterations {
+            let offset = probe_base + ((index % 2) * 5) as usize;
+            let crease = Crease::simple(
+                buffer_snapshot.anchor_before(MultiBufferOffset(offset))
+                    ..buffer_snapshot.anchor_after(MultiBufferOffset(offset + 2)),
+                placeholder.clone(),
+            );
+            editor.display_map.update(cx, |map, cx| map.fold(vec![crease], cx));
+        }
+        println!("single fold dance: {:?}/call", timer.elapsed() / iterations);
+        let timer = std::time::Instant::now();
+        for index in 0..iterations {
+            let offset = probe_base + ((index % 2) * 5) as usize;
+            editor.display_map.update(cx, |map, cx| {
+                map.remove_folds_with_type(
+                    [MultiBufferOffset(offset)..MultiBufferOffset(offset + 2)],
+                    std::any::TypeId::of::<i32>(),
+                    cx,
+                )
+            });
+        }
+        println!("single remove dance: {:?}/call", timer.elapsed() / iterations);
+
+        // Pre-fix shape: full clear + full refold per cycle (what every cursor
+        // row-change used to do).
+        let cycles = 10;
+        let timer = std::time::Instant::now();
+        for _ in 0..cycles {
+            editor.sync_ymd_conceal_folds(Vec::new(), cx);
+            editor.refresh_ymd_conceals(cx);
+        }
+        println!("pre-fix full clear+refold: {:?}/cycle", timer.elapsed() / cycles);
+    });
+
+    // Markdown language but zero markers: the YMD guard runs and no-ops; any
+    // remaining cost is language-gated non-YMD per-move work.
+    cx.set_state(&format!("ˇ{}", "plain filler line\n".repeat(200)));
+    cx.run_until_parked();
+    let start = std::time::Instant::now();
+    cx.update_editor(|editor, window, cx| {
+        for _ in 0..iterations {
+            editor.move_down(&MoveDown, window, cx);
+        }
+    });
+    println!(
+        "markdown-no-markers move: {:?}/move",
+        start.elapsed() / iterations
+    );
 }

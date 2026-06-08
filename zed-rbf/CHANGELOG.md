@@ -2,6 +2,10 @@
 title: "Zed RBF Changelog"
 ---
 
+## 🟠⋯ v0.4.0 — #zed-04
+- Added standalone line-color emoji concealment: the first effective color emoji on a line (its marker) hides in clean view while the line keeps its color; cursor-line reveal brings it back
+- One marker per line: later color emojis are content and stay visible
+
 ## 🟠⋯ v0.3.0 — #zed-03
 - Added cursor-line reveal: the line under each cursor head shows its raw YMD markers while every other line stays clean, re-concealing as the cursor leaves
 - Same-row cursor motion does zero fold work; multi-cursor reveals each head row
