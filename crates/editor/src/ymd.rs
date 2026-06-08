@@ -155,53 +155,89 @@ pub(crate) fn line_foreground_style(color: YmdColor, appearance: Appearance) -> 
     }
 }
 
-pub(crate) fn scan(text: &str) -> Vec<YmdHighlight> {
-    let mut highlights = Vec::new();
+fn for_each_line(text: &str, mut callback: impl FnMut(&str, usize)) {
     let mut line_start = 0;
 
     for line in text.split_inclusive('\n') {
         let line_end = line_start + line.len();
         let line_content_end = line_end - usize::from(line.ends_with('\n'));
-        let line_content = &text[line_start..line_content_end];
+        callback(&text[line_start..line_content_end], line_start);
+        line_start = line_end;
+    }
+}
 
-        let marker_ranges = scan_line_backgrounds(line_content, line_start, &mut highlights);
+pub(crate) fn scan(text: &str) -> Vec<YmdHighlight> {
+    let mut highlights = Vec::new();
 
-        if let Some(color) = line_foreground_color(line_content, &marker_ranges)
-            && line_start < line_content_end
-        {
+    for_each_line(text, |line_content, line_start| {
+        let inline_highlights = scan_line_background_markups(line_content, line_start);
+        for inline_highlight in &inline_highlights {
             highlights.push(YmdHighlight {
-                range: line_start..line_content_end,
-                kind: YmdHighlightKind::LineForeground(color),
+                range: inline_highlight.range.clone(),
+                kind: YmdHighlightKind::Background(inline_highlight.color),
             });
         }
 
-        line_start = line_end;
-    }
+        let captures = capture_ranges(&inline_highlights, line_start);
+        if let Some((_, color)) = first_effective_emoji(line_content, &captures) {
+            highlights.push(YmdHighlight {
+                range: line_start..line_start + line_content.len(),
+                kind: YmdHighlightKind::LineForeground(color),
+            });
+        }
+    });
 
     highlights
 }
 
 pub(crate) fn scan_conceals(text: &str) -> Vec<YmdConceal> {
     let mut conceals = Vec::new();
-    let mut line_start = 0;
 
-    for line in text.split_inclusive('\n') {
-        let line_end = line_start + line.len();
-        let line_content_end = line_end - usize::from(line.ends_with('\n'));
-        let line_content = &text[line_start..line_content_end];
+    for_each_line(text, |line_content, line_start| {
+        let inline_highlights = scan_line_background_markups(line_content, line_start);
+        for inline_highlight in &inline_highlights {
+            conceals.push(YmdConceal {
+                range: inline_highlight.open_marker_range.clone(),
+            });
+            conceals.push(YmdConceal {
+                range: inline_highlight.close_marker_range.clone(),
+            });
+        }
 
-        scan_line_conceals(line_content, line_start, &mut conceals);
+        let captures = capture_ranges(&inline_highlights, line_start);
+        if let Some((emoji_range, _)) = first_effective_emoji(line_content, &captures) {
+            conceals.push(YmdConceal {
+                range: line_start + emoji_range.start..line_start + emoji_range.end,
+            });
+        }
+    });
 
-        line_start = line_end;
-    }
-
+    conceals.sort_by_key(|conceal| (conceal.range.start, conceal.range.end));
     conceals
 }
 
-// An emoji captured by a valid `==...==` highlight pair belongs to the background
-// mechanism only; any emoji outside valid pairs is standalone and the first one
-// colors the whole line's foreground.
-fn line_foreground_color(line: &str, marker_ranges: &[Range<usize>]) -> Option<YmdColor> {
+fn capture_ranges(
+    inline_highlights: &[YmdInlineHighlight],
+    line_start: usize,
+) -> Vec<Range<usize>> {
+    inline_highlights
+        .iter()
+        .map(|inline_highlight| {
+            inline_highlight.open_marker_range.start - line_start
+                ..inline_highlight.close_marker_range.end - line_start
+        })
+        .collect()
+}
+
+// The single traversal both the line-foreground color and the line-marker conceal
+// derive from, so the two can never drift: an emoji captured by a valid `==...==`
+// pair belongs to the background mechanism only; the FIRST standalone supported
+// emoji is the line's marker — it colors the whole line and conceals — and every
+// later emoji is content that stays visible.
+fn first_effective_emoji(
+    line: &str,
+    capture_ranges: &[Range<usize>],
+) -> Option<(Range<usize>, YmdColor)> {
     let mut search_start = 0;
 
     while search_start < line.len() {
@@ -209,43 +245,17 @@ fn line_foreground_color(line: &str, marker_ranges: &[Range<usize>]) -> Option<Y
             YmdColor::first_match_in(&line[search_start..])?;
         let emoji_start = search_start + relative_emoji_start;
 
-        if marker_ranges.iter().any(|range| range.contains(&emoji_start)) {
+        if capture_ranges
+            .iter()
+            .any(|range| range.contains(&emoji_start))
+        {
             search_start = emoji_start + emoji_len;
         } else {
-            return Some(color);
+            return Some((emoji_start..emoji_start + emoji_len, color));
         }
     }
 
     None
-}
-
-fn scan_line_backgrounds(
-    line: &str,
-    line_start: usize,
-    highlights: &mut Vec<YmdHighlight>,
-) -> Vec<Range<usize>> {
-    scan_line_background_markups(line, line_start)
-        .into_iter()
-        .map(|inline_highlight| {
-            highlights.push(YmdHighlight {
-                range: inline_highlight.range,
-                kind: YmdHighlightKind::Background(inline_highlight.color),
-            });
-            inline_highlight.open_marker_range.start - line_start
-                ..inline_highlight.close_marker_range.end - line_start
-        })
-        .collect()
-}
-
-fn scan_line_conceals(line: &str, line_start: usize, conceals: &mut Vec<YmdConceal>) {
-    for inline_highlight in scan_line_background_markups(line, line_start) {
-        conceals.push(YmdConceal {
-            range: inline_highlight.open_marker_range,
-        });
-        conceals.push(YmdConceal {
-            range: inline_highlight.close_marker_range,
-        });
-    }
 }
 
 fn scan_line_background_markups(line: &str, line_start: usize) -> Vec<YmdInlineHighlight> {
@@ -324,13 +334,21 @@ mod tests {
     }
 
     #[test]
-    fn ignores_empty_and_unterminated_highlights() {
+    fn invalid_markers_stay_raw_but_their_emoji_still_conceals() {
         assert!(scan("====").is_empty());
         assert!(scan("==missing close").is_empty());
         assert!(scan_conceals("====").is_empty());
         assert!(scan_conceals("==missing close").is_empty());
-        assert!(scan_conceals("==🔴==").is_empty());
-        assert!(scan_conceals("==🔴 open").is_empty());
+        // The invalid markers stay raw, but their emoji is standalone (the line's
+        // marker) and conceals like any other line-color emoji.
+        assert_eq!(
+            scan_conceals("==🔴=="),
+            vec![YmdConceal { range: 2..6 }]
+        );
+        assert_eq!(
+            scan_conceals("==🔴 open"),
+            vec![YmdConceal { range: 2..6 }]
+        );
     }
 
     #[test]
@@ -453,7 +471,82 @@ mod tests {
                 kind: YmdHighlightKind::LineForeground(YmdColor::Blue),
             }]
         );
-        assert!(scan_conceals("==🔵 starts\nends==").is_empty());
+        assert_eq!(
+            scan_conceals("==🔵 starts\nends=="),
+            vec![YmdConceal { range: 2..6 }]
+        );
+    }
+
+    #[test]
+    fn conceal_output_is_sorted_by_range() {
+        // The line-marker emoji precedes the valid pair positionally but is
+        // pushed after the pair's marker conceals; the sort restores range
+        // order, which the editor's diff sync and fold insertion rely on.
+        assert_eq!(
+            scan_conceals("🔴 ==🟡text=="),
+            vec![
+                YmdConceal { range: 0..4 },
+                YmdConceal { range: 5..11 },
+                YmdConceal { range: 15..17 },
+            ]
+        );
+    }
+
+    #[test]
+    fn scans_line_foreground_emoji_conceal_ranges() {
+        assert_eq!(
+            scan_conceals("🔴Emoji hidden\nplain 🔵 line"),
+            vec![YmdConceal { range: 0..4 }, YmdConceal { range: 23..27 }]
+        );
+    }
+
+    #[test]
+    fn does_not_double_conceal_inline_highlight_emoji() {
+        // The captured 🔴 conceals once with its opening marker; the standalone
+        // 🔵 is the line's marker and conceals separately.
+        assert_eq!(
+            scan_conceals("==🔴urgent== and 🔵 line"),
+            vec![
+                YmdConceal { range: 0..6 },
+                YmdConceal { range: 12..14 },
+                YmdConceal { range: 19..23 },
+            ]
+        );
+    }
+
+    #[test]
+    fn one_marker_per_line_conceals_only_the_first_emoji() {
+        // The first effective standalone emoji is the marker (colors + conceals);
+        // every later emoji is content and stays visible.
+        assert_eq!(
+            scan_conceals("🔴 red wins before 🟢 green"),
+            vec![YmdConceal { range: 0..4 }]
+        );
+        assert_eq!(
+            scan("🔴 red wins before 🟢 green"),
+            vec![YmdHighlight {
+                range: 0..31,
+                kind: YmdHighlightKind::LineForeground(YmdColor::Red),
+            }]
+        );
+    }
+
+    #[test]
+    fn invalid_marker_emoji_is_the_line_marker_in_composites() {
+        // `==🔴== 🟢 text`: 🔴 sits in an INVALID (empty-span) marker, so it is
+        // standalone and FIRST — it drives the line color and conceals; 🟢 stays
+        // visible content; the invalid `====` stays raw.
+        assert_eq!(
+            scan("==🔴== 🟢 text"),
+            vec![YmdHighlight {
+                range: 0..18,
+                kind: YmdHighlightKind::LineForeground(YmdColor::Red),
+            }]
+        );
+        assert_eq!(
+            scan_conceals("==🔴== 🟢 text"),
+            vec![YmdConceal { range: 2..6 }]
+        );
     }
 
     #[test]
