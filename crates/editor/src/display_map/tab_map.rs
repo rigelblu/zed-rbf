@@ -842,8 +842,11 @@ impl<'a> TabStopCursor<'a> {
                 if chunk_remaining >= distance_remaining {
                     let end = chunk_position + distance_remaining;
                     self.byte_offset += distance_remaining;
-                    self.char_offset +=
-                        count_chars_in_byte_range(chunk_position..(end - 1), chunk.chars);
+                    self.char_offset += count_chars_in_byte_range(
+                        chunk_position..(end - 1),
+                        chunk.chars,
+                        chunk.text,
+                    );
                     if end < 128 {
                         self.current_chunk = Some((chunk, end));
                     }
@@ -851,8 +854,11 @@ impl<'a> TabStopCursor<'a> {
                 }
 
                 self.byte_offset += chunk_remaining;
-                self.char_offset +=
-                    count_chars_in_byte_range(chunk_position..(chunk_len - 1), chunk.chars);
+                self.char_offset += count_chars_in_byte_range(
+                    chunk_position..(chunk_len - 1),
+                    chunk.chars,
+                    chunk.text,
+                );
                 distance_remaining -= chunk_remaining;
                 continue;
             }
@@ -864,14 +870,14 @@ impl<'a> TabStopCursor<'a> {
                 let end = chunk_position + distance_remaining;
                 self.byte_offset += distance_remaining;
                 self.char_offset +=
-                    count_chars_in_byte_range(chunk_position..(end - 1), chunk.chars);
+                    count_chars_in_byte_range(chunk_position..(end - 1), chunk.chars, chunk.text);
                 self.current_chunk = Some((chunk, end));
                 return None;
             }
 
             self.byte_offset += bytes_to_tab;
             self.char_offset +=
-                count_chars_in_byte_range(chunk_position..(tab_end - 1), chunk.chars);
+                count_chars_in_byte_range(chunk_position..(tab_end - 1), chunk.chars, chunk.text);
 
             let tabstop = TabStop {
                 char_offset: self.char_offset,
@@ -900,7 +906,21 @@ impl<'a> TabStopCursor<'a> {
 }
 
 #[inline(always)]
-fn count_chars_in_byte_range(range: Range<u32>, bitmap: u128) -> u32 {
+fn count_chars_in_byte_range(range: Range<u32>, bitmap: u128, text: &str) -> u32 {
+    if range.start > range.end {
+        return 0;
+    }
+
+    if range.end >= 128 {
+        return text
+            .char_indices()
+            .filter(|(index, _)| {
+                let index = *index as u32;
+                index >= range.start && index <= range.end
+            })
+            .count() as u32;
+    }
+
     let low_mask = u128::MAX << range.start;
     let high_mask = u128::MAX >> (127 - range.end);
     (bitmap & low_mask & high_mask).count_ones()
@@ -1333,6 +1353,30 @@ mod tests {
             .map(|c| c.text)
             .collect();
         assert!(!result.is_empty());
+    }
+
+    #[gpui::test]
+    fn test_long_fold_placeholder_without_tabs(cx: &mut gpui::App) {
+        let text = "folded";
+        let buffer = MultiBuffer::build_simple(text, cx);
+        let buffer_snapshot = buffer.read(cx).snapshot(cx);
+        let (_, inlay_snapshot) = InlayMap::new(buffer_snapshot);
+        let mut fold_map = FoldMap::new(inlay_snapshot.clone()).0;
+        let mut placeholder = FoldPlaceholder::test();
+        placeholder.collapsed_text = Some(" ".repeat(160).into());
+
+        let (mut writer, _, _) = fold_map.write(inlay_snapshot.clone(), vec![]);
+        writer.fold(vec![(
+            MultiBufferOffset(0)..MultiBufferOffset(text.len()),
+            placeholder,
+        )]);
+        let (fold_snapshot, _) = fold_map.read(inlay_snapshot, vec![]);
+        let (_, tab_snapshot) = TabMap::new(fold_snapshot, NonZeroU32::new(4).unwrap());
+
+        assert_eq!(
+            tab_snapshot.fold_point_to_tab_point(FoldPoint::new(0, 150)),
+            TabPoint::new(0, 150)
+        );
     }
 
     #[gpui::test(iterations = 100)]
