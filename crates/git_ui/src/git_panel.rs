@@ -67,6 +67,7 @@ use smallvec::SmallVec;
 use std::future::Future;
 use std::ops::Range;
 use std::path::Path;
+use std::str::FromStr;
 use std::{sync::Arc, time::Duration, usize};
 use strum::{IntoEnumIterator, VariantNames};
 use theme_settings::ThemeSettings;
@@ -683,6 +684,9 @@ pub struct GitPanel {
     active_tab: GitPanelTab,
     commit_history_scroll_handle: UniformListScrollHandle,
     commit_history_shas: Option<Vec<Oid>>,
+    commit_history_error: Option<SharedString>,
+    commit_history_loading: bool,
+    commit_history_scanned: bool,
     focused_history_entry: Option<usize>,
     history_keyboard_nav: bool,
     _repo_subscriptions: Vec<Subscription>,
@@ -881,6 +885,9 @@ impl GitPanel {
                 active_tab: GitPanelTab::Changes,
                 commit_history_scroll_handle: UniformListScrollHandle::new(),
                 commit_history_shas: None,
+                commit_history_error: None,
+                commit_history_loading: false,
+                commit_history_scanned: false,
                 focused_history_entry: None,
                 history_keyboard_nav: false,
                 _repo_subscriptions: Vec::new(),
@@ -5131,38 +5138,45 @@ impl GitPanel {
 
     fn render_history_tab(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex().flex_1().size_full().overflow_hidden().map(|this| {
-            let has_repo = self.active_repository.is_some();
-            let has_commits = self
-                .commit_history_shas
-                .as_ref()
-                .map_or(false, |shas| !shas.is_empty());
-            let is_loading = self.commit_history_shas.is_none() && has_repo;
-            if is_loading {
-                this.child(
-                    h_flex()
-                        .flex_1()
-                        .justify_center()
-                        .child(Label::new("Loading Commit History…").color(Color::Muted)),
-                )
-            } else if !has_repo || !has_commits {
-                this.child(
-                    h_flex()
-                        .flex_1()
-                        .justify_center()
-                        .child(Label::new("No commits yet").color(Color::Muted)),
-                )
+            if let Some(message) = Self::commit_history_status_message(
+                self.commit_history_error.as_ref(),
+                self.commit_history_scanned,
+                self.commit_history_loading,
+                self.commit_history_shas.as_deref(),
+            ) {
+                this.child(Self::render_commit_history_message(message))
+            } else if let Some(history) = self.render_commit_history(window, cx) {
+                this.child(history)
             } else {
-                match self.render_commit_history(window, cx) {
-                    Some(history) => this.child(history),
-                    None => this.child(
-                        h_flex()
-                            .flex_1()
-                            .justify_center()
-                            .child(Label::new("Failed to load commits").color(Color::Muted)),
-                    ),
-                }
+                this.child(Self::render_commit_history_message("Loading Commit History…"))
             }
         })
+    }
+
+    fn commit_history_status_message(
+        commit_history_error: Option<&SharedString>,
+        commit_history_scanned: bool,
+        commit_history_loading: bool,
+        commit_history_shas: Option<&[Oid]>,
+    ) -> Option<SharedString> {
+        if let Some(error) = commit_history_error {
+            Some(format!("Failed to load commit history: {error}").into())
+        } else if !commit_history_scanned || commit_history_loading {
+            Some("Loading Commit History…".into())
+        } else if commit_history_shas.is_some_and(|shas| shas.is_empty()) {
+            Some("No Commit History".into())
+        } else if commit_history_shas.is_some() {
+            None
+        } else {
+            Some("Loading Commit History…".into())
+        }
+    }
+
+    fn render_commit_history_message(message: impl Into<SharedString>) -> impl IntoElement {
+        h_flex()
+            .flex_1()
+            .justify_center()
+            .child(Label::new(message).color(Color::Muted))
     }
 
     fn select_next_history_entry(&mut self, cx: &mut Context<Self>) {
@@ -5245,11 +5259,13 @@ impl GitPanel {
             GitPanelTab::History => {
                 self.focus_handle.focus(window, cx);
                 self.load_commit_history(cx);
-                self.focused_history_entry = Some(0);
             }
             GitPanelTab::Changes => {
                 self.focus_handle.focus(window, cx);
                 self.commit_history_shas.take();
+                self.commit_history_error.take();
+                self.commit_history_loading = false;
+                self.commit_history_scanned = false;
                 self.focused_history_entry = None;
                 self._repo_subscriptions.clear();
             }
@@ -5302,23 +5318,87 @@ impl GitPanel {
         self.fetch_commit_history_shas(cx);
     }
 
+    fn commit_history_log_source(
+        branch: Option<&Branch>,
+        head_commit: Option<&CommitDetails>,
+    ) -> Option<LogSource> {
+        if let Some(branch) = branch {
+            return Some(LogSource::Branch(branch.name().into()));
+        }
+
+        let head_sha = head_commit?.sha.as_ref();
+        Oid::from_str(head_sha).ok().map(LogSource::Sha)
+    }
+
     fn fetch_commit_history_shas(&mut self, cx: &mut Context<Self>) {
         let Some(active_repository) = self.active_repository.as_ref() else {
             return;
         };
 
-        let Some(branch) = active_repository.read(cx).branch.as_ref() else {
+        let (log_source, head_sha_unparseable, repository_scan_pending) = {
+            let repository = active_repository.read(cx);
+            let branch = repository.branch.as_ref();
+            let head_commit = repository.head_commit.as_ref();
+            let log_source = Self::commit_history_log_source(branch, head_commit);
+            // A present HEAD commit whose SHA does not parse is corrupt repository
+            // state, not an empty history, so it surfaces as an error rather than
+            // "No Commit History".
+            let head_sha_unparseable =
+                branch.is_none() && head_commit.is_some() && log_source.is_none();
+            (log_source, head_sha_unparseable, repository.scan_id == 0)
+        };
+
+        if repository_scan_pending {
+            self.commit_history_shas = None;
+            self.commit_history_error = None;
+            self.commit_history_loading = true;
+            self.commit_history_scanned = false;
+            self.focused_history_entry = None;
+            return;
+        }
+
+        self.commit_history_scanned = true;
+
+        let Some(log_source) = log_source else {
+            self.commit_history_shas = Some(Vec::new());
+            self.commit_history_error = if head_sha_unparseable {
+                Some("could not read HEAD commit".into())
+            } else {
+                None
+            };
+            self.commit_history_loading = false;
+            self.focused_history_entry = None;
             return;
         };
 
-        let branch_name = branch.name().to_string();
-        let log_source = LogSource::Branch(branch_name.into());
         let log_order = LogOrder::DateOrder;
 
-        self.commit_history_shas = Some(active_repository.update(cx, |repository, cx| {
+        let (shas, is_loading, error) = active_repository.update(cx, |repository, cx| {
             let response = repository.graph_data(log_source, log_order, 0..usize::MAX, cx);
-            response.commits.iter().map(|commit| commit.sha).collect()
-        }));
+            (
+                response
+                    .commits
+                    .iter()
+                    .map(|commit| commit.sha)
+                    .collect::<Vec<_>>(),
+                response.is_loading,
+                response.error.clone(),
+            )
+        });
+
+        let history_count = shas.len();
+        self.commit_history_loading = is_loading && history_count == 0 && error.is_none();
+        self.commit_history_error = error;
+        self.commit_history_shas = Some(shas);
+        self.focused_history_entry = if self.commit_history_error.is_some() || history_count == 0 {
+            None
+        } else {
+            Some(
+                self.focused_history_entry
+                    .unwrap_or_default()
+                    .min(history_count - 1),
+            )
+        };
     }
 
     fn git_remote(&self, cx: &mut App) -> Option<GitRemote> {
@@ -7591,6 +7671,80 @@ mod tests {
         assert_eq!(
             message,
             "Your local changes to the following files would be overwritten by merge"
+        );
+    }
+
+    #[test]
+    fn commit_history_log_source() {
+        fn branch(ref_name: &str) -> Branch {
+            Branch {
+                is_head: true,
+                ref_name: ref_name.into(),
+                upstream: None,
+                most_recent_commit: None,
+            }
+        }
+
+        fn head_commit(sha: &str) -> CommitDetails {
+            CommitDetails {
+                sha: sha.into(),
+                ..Default::default()
+            }
+        }
+
+        let branch = branch("refs/heads/main");
+        let detached_head_commit = head_commit("0123456789abcdef0123456789abcdef01234567");
+
+        assert_eq!(
+            GitPanel::commit_history_log_source(Some(&branch), Some(&detached_head_commit)),
+            Some(LogSource::Branch("main".into()))
+        );
+
+        assert_eq!(
+            GitPanel::commit_history_log_source(None, Some(&detached_head_commit)),
+            Some(LogSource::Sha(
+                Oid::from_str(detached_head_commit.sha.as_ref()).unwrap()
+            ))
+        );
+
+        let invalid_head_commit = head_commit("not-a-sha");
+        assert_eq!(
+            GitPanel::commit_history_log_source(None, Some(&invalid_head_commit)),
+            None
+        );
+        assert_eq!(GitPanel::commit_history_log_source(None, None), None);
+    }
+
+    #[test]
+    fn commit_history_status_message_prioritizes_error_loading_empty_and_rows() {
+        let message =
+            |error: Option<&str>, scanned, loading, shas: Option<&[Oid]>| -> Option<String> {
+                let error = error.map(SharedString::from);
+                GitPanel::commit_history_status_message(error.as_ref(), scanned, loading, shas)
+                    .map(|message| message.to_string())
+            };
+        let sha = Oid::from_str("0123456789abcdef0123456789abcdef01234567").unwrap();
+
+        assert_eq!(
+            message(Some("boom"), false, true, Some(&[])),
+            Some("Failed to load commit history: boom".to_string())
+        );
+        assert_eq!(
+            message(None, false, false, Some(&[])),
+            Some("Loading Commit History…".to_string())
+        );
+        assert_eq!(
+            message(None, true, true, Some(&[sha])),
+            Some("Loading Commit History…".to_string())
+        );
+        assert_eq!(
+            message(None, true, false, Some(&[])),
+            Some("No Commit History".to_string())
+        );
+        assert_eq!(message(None, true, false, Some(&[sha])), None);
+        assert_eq!(
+            message(None, true, false, None),
+            Some("Loading Commit History…".to_string())
         );
     }
 
