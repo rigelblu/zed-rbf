@@ -699,6 +699,12 @@
     // When set to null, the width scales with the buffer font size.
     "git_gutter_width": null,
   },
+  "ymd": {
+    // Character shown in place of an unchecked Markdown task checkbox (`- [ ] `).
+    "checkbox_unchecked_char": "□",
+    // Character shown in place of a checked Markdown task checkbox (`- [x] `).
+    "checkbox_checked_char": "■",
+  },
   "indent_guides": {
     // Whether to show indent guides in the editor.
     "enabled": true,

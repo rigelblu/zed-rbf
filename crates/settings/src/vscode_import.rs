@@ -274,6 +274,7 @@ impl VsCodeSettings {
             go_to_definition_scroll_strategy: None,
             lsp_results_location: None,
             gutter: self.gutter_content(),
+            ymd: None,
             horizontal_scroll_margin: None,
             hover_popover_delay: self.read_u64("editor.hover.delay").map(Into::into),
             hover_popover_enabled: self.read_bool("editor.hover.enabled"),
