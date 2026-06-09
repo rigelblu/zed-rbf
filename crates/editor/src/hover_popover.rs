@@ -6,19 +6,22 @@ use crate::{
     hover_links::{InlayHighlight, RangeInEditor},
     movement::TextLayoutDetails,
     scroll::ScrollAmount,
+    ymd,
 };
 use anyhow::Context as _;
+use fs::Fs;
 use gpui::{
     AnyElement, App, AsyncWindowContext, Bounds, Context, Entity, Focusable as _, FontWeight, Hsla,
-    InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, ScrollHandle, Size,
+    ImageSource, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, ScrollHandle, Size,
     StatefulInteractiveElement, StyleRefinement, Styled, Subscription, Task, TaskExt,
     TextStyleRefinement, Window, canvas, div, px,
 };
 use itertools::Itertools;
-use language::{DiagnosticEntry, Language, LanguageRegistry};
+use language::{Buffer, DiagnosticEntry, Language, LanguageRegistry};
 use lsp::DiagnosticSeverity;
 use markdown::{CopyButtonVisibility, Markdown, MarkdownElement, MarkdownStyle};
 use multi_buffer::{MultiBufferOffset, ToOffset, ToPoint};
+use percent_encoding::percent_decode_str;
 use project::{HoverBlock, HoverBlockKind, InlayHintLabelPart};
 use settings::Settings;
 use std::{
@@ -26,7 +29,10 @@ use std::{
     cell::{Cell, RefCell},
 };
 use std::{ops::Range, sync::Arc, time::Duration};
-use std::{path::PathBuf, rc::Rc};
+use std::{
+    path::{Path, PathBuf},
+    rc::Rc,
+};
 use theme_settings::ThemeSettings;
 use ui::{CopyButton, Scrollbars, WithScrollbar, prelude::*, theme_is_transparent};
 use url::Url;
@@ -221,6 +227,7 @@ pub fn hover_at_inlay(
                 let hover_popover = InfoPopover {
                     symbol_range: RangeInEditor::Inlay(inlay_hover.range.clone()),
                     parsed_content,
+                    markdown_image_resolver: None,
                     scroll_handle,
                     keyboard_grace: Rc::new(RefCell::new(false)),
                     anchor: None,
@@ -287,11 +294,12 @@ fn show_hover(
         .snapshot(cx)
         .anchor_to_buffer_anchor(anchor)?;
     let buffer = editor.buffer.read(cx).buffer(buffer_position.buffer_id)?;
+    let markdown_image_hover = markdown_image_hover(editor, &buffer, anchor, &snapshot, cx);
 
     let language_registry = editor
         .project()
         .map(|project| project.read(cx).languages().clone());
-    let provider = editor.semantics_provider.clone()?;
+    let provider = editor.semantics_provider.clone();
 
     editor.hover_state.hiding_delay_task = None;
     editor.hover_state.closest_mouse_distance = None;
@@ -334,7 +342,30 @@ fn show_hover(
                 total_delay
             };
 
-            let hover_request = cx.update(|_, cx| provider.hover(&buffer, buffer_position, cx))?;
+            let markdown_image_hover = if let Some(mut markdown_image_hover) = markdown_image_hover {
+                let mut resolved_hover = None;
+                for absolute_path in markdown_image_hover.candidate_paths.clone() {
+                    if markdown_image_hover.fs.is_file(&absolute_path).await {
+                        markdown_image_hover.absolute_path = absolute_path;
+                        resolved_hover = Some(markdown_image_hover);
+                        break;
+                    }
+                }
+                resolved_hover
+            } else {
+                None
+            };
+
+            let hover_request = if markdown_image_hover.is_none() {
+                match provider.as_ref() {
+                    Some(provider) => {
+                        cx.update(|_, cx| provider.hover(&buffer, buffer_position, cx))?
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
 
             if let Some(delay) = delay {
                 delay.await;
@@ -471,8 +502,11 @@ fn show_hover(
             let snapshot = this.update_in(cx, |this, window, cx| this.snapshot(window, cx))?;
             let mut hover_highlights = Vec::with_capacity(hovers_response.len());
             let mut info_popovers = Vec::with_capacity(
-                hovers_response.len() + if invisible_char.is_some() { 1 } else { 0 },
+                hovers_response.len()
+                    + if invisible_char.is_some() { 1 } else { 0 }
+                    + if markdown_image_hover.is_some() { 1 } else { 0 },
             );
+            let has_markdown_image_hover = markdown_image_hover.is_some();
 
             if let Some((invisible, range)) = invisible_char {
                 let blocks = vec![HoverBlock {
@@ -492,6 +526,7 @@ fn show_hover(
                 info_popovers.push(InfoPopover {
                     symbol_range: RangeInEditor::Text(range),
                     parsed_content,
+                    markdown_image_resolver: None,
                     scroll_handle,
                     keyboard_grace: Rc::new(RefCell::new(ignore_timeout)),
                     anchor: Some(anchor),
@@ -500,12 +535,49 @@ fn show_hover(
                 })
             }
 
-            let doc_link_task = this
-                .update(cx, |editor, cx| {
+            if let Some(markdown_image_hover) = markdown_image_hover {
+                let blocks = vec![HoverBlock {
+                    text: markdown_image_hover.markdown_source.clone(),
+                    kind: HoverBlockKind::Markdown,
+                }];
+                let parsed_content = parse_blocks(&blocks, language_registry.as_ref(), None, cx);
+                let scroll_handle = ScrollHandle::new();
+                let subscription = this
+                    .update(cx, |_, cx| {
+                        parsed_content.as_ref().map(|parsed_content| {
+                            cx.observe(parsed_content, |_, _, cx| cx.notify())
+                        })
+                    })
+                    .ok()
+                    .flatten();
+                let markdown_image_resolver = MarkdownImageResolver {
+                    base_directory: markdown_image_hover.base_directory,
+                    root_directory: markdown_image_hover.root_directory,
+                    raw_path: markdown_image_hover.raw_path,
+                    absolute_path: markdown_image_hover.absolute_path,
+                };
+                hover_highlights.push(markdown_image_hover.range.clone());
+                info_popovers.push(InfoPopover {
+                    symbol_range: RangeInEditor::Text(markdown_image_hover.range),
+                    parsed_content,
+                    markdown_image_resolver: Some(markdown_image_resolver),
+                    scroll_handle,
+                    keyboard_grace: Rc::new(RefCell::new(ignore_timeout)),
+                    anchor: Some(anchor),
+                    last_bounds: Rc::new(Cell::new(None)),
+                    _subscription: subscription,
+                });
+            }
+
+            let doc_link_task = if !has_markdown_image_hover {
+                this.update(cx, |editor, cx| {
                     editor.document_links_at(buffer.clone(), buffer_position, cx)
                 })
                 .ok()
-                .flatten();
+                .flatten()
+            } else {
+                None
+            };
             let doc_link_tooltips = match doc_link_task {
                 Some(task) => task
                     .await
@@ -555,6 +627,7 @@ fn show_hover(
                 info_popovers.push(InfoPopover {
                     symbol_range: RangeInEditor::Text(range),
                     parsed_content,
+                    markdown_image_resolver: None,
                     scroll_handle,
                     keyboard_grace: Rc::new(RefCell::new(ignore_timeout)),
                     anchor: Some(anchor),
@@ -581,6 +654,7 @@ fn show_hover(
                 info_popovers.push(InfoPopover {
                     symbol_range: RangeInEditor::Text(multi_buffer_range),
                     parsed_content,
+                    markdown_image_resolver: None,
                     scroll_handle,
                     keyboard_grace: Rc::new(RefCell::new(ignore_timeout)),
                     anchor: Some(anchor),
@@ -652,6 +726,196 @@ fn same_diagnostic_hover(editor: &Editor, snapshot: &EditorSnapshot, anchor: Anc
             (hover_range.start..=hover_range.end).contains(&offset)
         })
         .unwrap_or(false)
+}
+
+struct MarkdownImageHover {
+    fs: Arc<dyn Fs>,
+    absolute_path: PathBuf,
+    candidate_paths: Vec<PathBuf>,
+    base_directory: PathBuf,
+    root_directory: PathBuf,
+    raw_path: String,
+    markdown_source: String,
+    range: Range<Anchor>,
+}
+
+#[derive(Clone)]
+struct MarkdownImageResolver {
+    base_directory: PathBuf,
+    root_directory: PathBuf,
+    raw_path: String,
+    absolute_path: PathBuf,
+}
+
+fn markdown_image_hover(
+    editor: &Editor,
+    buffer: &Entity<Buffer>,
+    anchor: Anchor,
+    snapshot: &EditorSnapshot,
+    cx: &App,
+) -> Option<MarkdownImageHover> {
+    let buffer = buffer.read(cx);
+    let is_markdown = buffer
+        .language()
+        .is_some_and(|language| language.name().as_ref() == "Markdown");
+    if !is_markdown {
+        return None;
+    }
+
+    let file = buffer.file()?.as_local()?;
+    let base_directory = file.abs_path(cx).parent()?.to_path_buf();
+    let worktree_id = file.worktree_id(cx);
+    let text = snapshot.buffer_snapshot().text();
+    if text.len() > ymd::MAX_YMD_HIGHLIGHT_BYTES {
+        return None;
+    }
+
+    let offset = anchor.to_offset(&snapshot.buffer_snapshot()).0;
+    let image = ymd::scan_images(&text)
+        .into_iter()
+        .find(|image| image.reference_range.start <= offset && offset < image.reference_range.end)?;
+    let raw_path = &text[image.path_range.clone()];
+    let project = editor.project()?;
+    let (fs, root_directory) = project.read_with(cx, |project, cx| {
+        let root_directory = project
+            .worktree_for_id(worktree_id, cx)
+            .and_then(|worktree| {
+                worktree
+                    .read(cx)
+                    .root_dir()
+                    .map(|root_dir| root_dir.to_path_buf())
+            })
+            .unwrap_or_else(|| base_directory.clone());
+        (project.fs().clone(), root_directory)
+    });
+    let candidate_paths =
+        resolve_markdown_image_path_candidates(raw_path, &base_directory, &root_directory)?;
+    let absolute_path = candidate_paths.first()?.clone();
+
+    let range = snapshot
+        .buffer_snapshot()
+        .anchor_before(MultiBufferOffset(image.reference_range.start))
+        ..snapshot
+            .buffer_snapshot()
+            .anchor_after(MultiBufferOffset(image.reference_range.end));
+
+    Some(MarkdownImageHover {
+        fs,
+        absolute_path,
+        candidate_paths,
+        base_directory,
+        root_directory,
+        raw_path: raw_path.to_string(),
+        markdown_source: text[image.reference_range].to_string(),
+        range,
+    })
+}
+
+fn resolve_markdown_image_source(
+    dest_url: &str,
+    resolver: &MarkdownImageResolver,
+) -> Option<ImageSource> {
+    let absolute_path = if dest_url == resolver.raw_path {
+        resolver.absolute_path.clone()
+    } else {
+        resolve_markdown_image_path_candidates(
+            dest_url,
+            &resolver.base_directory,
+            &resolver.root_directory,
+        )?
+        .into_iter()
+        .next()?
+    };
+    Some(absolute_path.into())
+}
+
+fn resolve_markdown_image_path_candidates(
+    raw_path: &str,
+    base_directory: &Path,
+    root_directory: &Path,
+) -> Option<Vec<PathBuf>> {
+    let path_without_query_or_fragment = markdown_image_path_without_query_or_fragment(raw_path)?;
+    if let Ok(url) = Url::parse(path_without_query_or_fragment)
+        && url.scheme() == "file"
+    {
+        let absolute_path = url.to_file_path().ok()?;
+        return is_supported_markdown_image_path(&absolute_path).then_some(vec![absolute_path]);
+    }
+
+    let decoded_path = normalize_markdown_image_path(raw_path)?;
+
+    if starts_with_ignore_ascii_case(&decoded_path, "data:")
+        || starts_with_ignore_ascii_case(&decoded_path, "http://")
+        || starts_with_ignore_ascii_case(&decoded_path, "https://")
+    {
+        return None;
+    }
+
+    let path = Path::new(decoded_path.as_str());
+    let mut paths = Vec::new();
+    if decoded_path.starts_with('/') {
+        let root_relative_path = decoded_path.trim_start_matches('/');
+        if !root_relative_path.is_empty() {
+            paths.push(root_directory.join(root_relative_path));
+        }
+        paths.push(path.to_path_buf());
+    } else if path.is_absolute() {
+        paths.push(path.to_path_buf());
+    } else {
+        paths.push(base_directory.join(path));
+    }
+
+    paths.retain(|path| is_supported_markdown_image_path(path));
+    paths.dedup();
+    (!paths.is_empty()).then_some(paths)
+}
+
+fn normalize_markdown_image_path(raw_path: &str) -> Option<String> {
+    let path_without_query_or_fragment = markdown_image_path_without_query_or_fragment(raw_path)?;
+    percent_decode_str(path_without_query_or_fragment)
+        .decode_utf8()
+        .ok()
+        .map(|path| path.into_owned())
+}
+
+fn markdown_image_path_without_query_or_fragment(raw_path: &str) -> Option<&str> {
+    let end = raw_path
+        .find(['?', '#'])
+        .unwrap_or(raw_path.len());
+    let path_without_query_or_fragment = &raw_path[..end];
+    if path_without_query_or_fragment.is_empty() {
+        return None;
+    }
+    Some(path_without_query_or_fragment)
+}
+
+fn starts_with_ignore_ascii_case(text: &str, prefix: &str) -> bool {
+    text.get(..prefix.len())
+        .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+}
+
+fn is_supported_markdown_image_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "png"
+                    | "jpg"
+                    | "jpeg"
+                    | "gif"
+                    | "webp"
+                    | "svg"
+                    | "bmp"
+                    | "tiff"
+                    | "tif"
+                    | "ico"
+                    | "pnm"
+                    | "pbm"
+                    | "pgm"
+                    | "ppm"
+            )
+        })
 }
 
 fn parse_blocks(
@@ -1029,6 +1293,7 @@ impl HoverState {
 pub struct InfoPopover {
     pub symbol_range: RangeInEditor,
     pub parsed_content: Option<Entity<Markdown>>,
+    markdown_image_resolver: Option<MarkdownImageResolver>,
     pub scroll_handle: ScrollHandle,
     pub keyboard_grace: Rc<RefCell<bool>>,
     pub anchor: Option<Anchor>,
@@ -1081,6 +1346,31 @@ impl InfoPopover {
                 cx.stop_propagation();
             })
             .when_some(self.parsed_content.clone(), |this, markdown| {
+                let mut markdown_element =
+                    MarkdownElement::new(markdown, hover_markdown_style(window, cx))
+                        .scroll_handle(self.scroll_handle.clone())
+                        .code_block_renderer(markdown::CodeBlockRenderer::Default {
+                            copy_button_visibility: CopyButtonVisibility::Hidden,
+                            wrap_button_visibility: markdown::WrapButtonVisibility::Hidden,
+                            border: false,
+                        })
+                        .on_url_click(move |link, window, cx| {
+                            open_markdown_url(
+                                this2
+                                    .read_with(cx, |editor, _| editor.workspace())
+                                    .ok()
+                                    .flatten(),
+                                link,
+                                window,
+                                cx,
+                            )
+                        });
+                if let Some(resolver) = self.markdown_image_resolver.clone() {
+                    markdown_element = markdown_element.image_resolver(move |dest_url| {
+                        resolve_markdown_image_source(dest_url, &resolver)
+                    });
+                }
+
                 this.child(
                     div()
                         .id("info-md-container")
@@ -1088,27 +1378,7 @@ impl InfoPopover {
                         .max_w(max_size.width)
                         .max_h(max_size.height)
                         .track_scroll(&self.scroll_handle)
-                        .child(
-                            MarkdownElement::new(markdown, hover_markdown_style(window, cx))
-                                .scroll_handle(self.scroll_handle.clone())
-                                .code_block_renderer(markdown::CodeBlockRenderer::Default {
-                                    copy_button_visibility: CopyButtonVisibility::Hidden,
-                                    wrap_button_visibility: markdown::WrapButtonVisibility::Hidden,
-                                    border: false,
-                                })
-                                .on_url_click(move |link, window, cx| {
-                                    open_markdown_url(
-                                        this2
-                                            .read_with(cx, |editor, _| editor.workspace())
-                                            .ok()
-                                            .flatten(),
-                                        link,
-                                        window,
-                                        cx,
-                                    )
-                                })
-                                .p_2(),
-                        ),
+                        .child(markdown_element.p_2()),
                 )
                 .custom_scrollbars(
                     Scrollbars::for_settings::<EditorSettingsScrollbarProxy>()
@@ -1263,10 +1533,12 @@ mod tests {
     use futures::stream::StreamExt;
     use gpui::App;
     use indoc::indoc;
+    use language::{LanguageConfig, LanguageMatcher};
     use markdown::parser::MarkdownEvent;
     use project::InlayId;
     use settings::InlayHintSettingsContent;
     use settings::{DelayMs, SettingsStore};
+    use std::path::{Path, PathBuf};
     use std::sync::atomic;
     use std::sync::atomic::AtomicUsize;
     use text::Bias;
@@ -1298,6 +1570,58 @@ mod tests {
             }
             rendered_text
         }
+
+        fn markdown_source(&self, cx: &gpui::App) -> Option<String> {
+            self.parsed_content
+                .clone()
+                .map(|markdown| markdown.read(cx).parsed_markdown().source().to_string())
+        }
+    }
+
+    #[test]
+    fn test_markdown_image_path_resolution_normalizes_destinations() {
+        let base_directory = Path::new("/root/dir");
+        let root_directory = Path::new("/root");
+
+        assert_eq!(
+            resolve_markdown_image_path_candidates(
+                "assets/My%20Logo.png?raw=1#preview",
+                base_directory,
+                root_directory,
+            ),
+            Some(vec![PathBuf::from("/root/dir/assets/My Logo.png")])
+        );
+        assert_eq!(
+            resolve_markdown_image_path_candidates(
+                "/assets/root.png",
+                base_directory,
+                root_directory,
+            ),
+            Some(vec![
+                PathBuf::from("/root/assets/root.png"),
+                PathBuf::from("/assets/root.png"),
+            ])
+        );
+        assert_eq!(
+            resolve_markdown_image_path_candidates(
+                "file:///root/dir/assets/My%20Logo.png",
+                base_directory,
+                root_directory,
+            ),
+            Some(vec![PathBuf::from("/root/dir/assets/My Logo.png")])
+        );
+        assert!(resolve_markdown_image_path_candidates(
+            "https://example.com/image.png",
+            base_directory,
+            root_directory,
+        )
+        .is_none());
+        assert!(resolve_markdown_image_path_candidates(
+            "data:image/png;base64,abc",
+            base_directory,
+            root_directory,
+        )
+        .is_none());
     }
 
     #[gpui::test]
@@ -1557,6 +1881,242 @@ mod tests {
         cx.editor(|editor, _, _| {
             assert!(!editor.hover_state.visible());
         });
+    }
+
+    #[gpui::test]
+    async fn test_markdown_image_hover_popover(cx: &mut gpui::TestAppContext) {
+        init_test(cx, |_| {});
+
+        let mut cx = EditorLspTestContext::new(
+            Language::new(
+                LanguageConfig {
+                    name: "Markdown".into(),
+                    matcher: LanguageMatcher {
+                        path_suffixes: vec!["md".into()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                None,
+            ),
+            lsp::ServerCapabilities {
+                hover_provider: Some(lsp::HoverProviderCapability::Simple(true)),
+                ..Default::default()
+            },
+            cx,
+        )
+        .await;
+
+        let fs = cx.update_workspace(|workspace, _, cx| workspace.project().read(cx).fs().clone());
+        fs.create_dir(Path::new("/root/dir/assets"))
+            .await
+            .expect("create Markdown image hover assets directory");
+        fs.as_fake()
+            .insert_file(
+                Path::new("/root/dir/assets/My Logo.png"),
+                b"fake image".to_vec(),
+            )
+            .await;
+        cx.set_state("![Preview](assets/My%20Logo.png)ˇ");
+
+        let request_count = Arc::new(AtomicUsize::new(0));
+        cx.set_request_handler::<lsp::request::HoverRequest, _, _>({
+            let request_count = request_count.clone();
+            move |_, _, _| {
+                let request_count = request_count.clone();
+                async move {
+                    request_count.fetch_add(1, atomic::Ordering::Release);
+                    Ok(Some(lsp::Hover {
+                        contents: lsp::HoverContents::Markup(lsp::MarkupContent {
+                            kind: lsp::MarkupKind::Markdown,
+                            value: "lsp hover should not be requested".to_string(),
+                        }),
+                        range: None,
+                    }))
+                }
+            }
+        });
+
+        let hover_point = cx.display_point("![Preˇview](assets/My%20Logo.png)");
+        cx.update_editor(|editor, window, cx| {
+            let snapshot = editor.snapshot(window, cx);
+            let anchor = snapshot
+                .buffer_snapshot()
+                .anchor_before(hover_point.to_offset(&snapshot, Bias::Left));
+            hover_at(editor, Some(anchor), None, window, cx)
+        });
+        cx.background_executor
+            .advance_clock(Duration::from_millis(get_hover_popover_delay(&cx) + 100));
+        cx.background_executor.run_until_parked();
+        cx.run_until_parked();
+
+        cx.editor(|editor, _, cx| {
+            assert!(editor.hover_state.visible());
+            let [popover] = editor.hover_state.info_popovers.as_slice() else {
+                panic!(
+                    "expected exactly one image hover popover, got {}",
+                    editor.hover_state.info_popovers.len()
+                );
+            };
+            assert_eq!(
+                popover.markdown_source(cx).as_deref(),
+                Some("![Preview](assets/My%20Logo.png)")
+            );
+            let resolver = popover.markdown_image_resolver.as_ref().unwrap();
+            assert_eq!(resolver.base_directory, Path::new("/root/dir"));
+            assert_eq!(resolver.root_directory, Path::new("/root"));
+            assert_eq!(
+                resolver.absolute_path,
+                PathBuf::from("/root/dir/assets/My Logo.png")
+            );
+        });
+        assert_eq!(request_count.load(atomic::Ordering::Acquire), 0);
+    }
+
+    #[gpui::test]
+    async fn test_markdown_image_hover_root_relative_path(cx: &mut gpui::TestAppContext) {
+        init_test(cx, |_| {});
+
+        let mut cx = EditorLspTestContext::new(
+            Language::new(
+                LanguageConfig {
+                    name: "Markdown".into(),
+                    matcher: LanguageMatcher {
+                        path_suffixes: vec!["md".into()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                None,
+            ),
+            lsp::ServerCapabilities {
+                hover_provider: Some(lsp::HoverProviderCapability::Simple(true)),
+                ..Default::default()
+            },
+            cx,
+        )
+        .await;
+
+        let fs = cx.update_workspace(|workspace, _, cx| workspace.project().read(cx).fs().clone());
+        fs.create_dir(Path::new("/root/assets"))
+            .await
+            .expect("create Markdown image hover root assets directory");
+        fs.as_fake()
+            .insert_file(Path::new("/root/assets/root.png"), b"fake image".to_vec())
+            .await;
+        cx.set_state("![Root](/assets/root.png)ˇ");
+
+        let request_count = Arc::new(AtomicUsize::new(0));
+        cx.set_request_handler::<lsp::request::HoverRequest, _, _>({
+            let request_count = request_count.clone();
+            move |_, _, _| {
+                let request_count = request_count.clone();
+                async move {
+                    request_count.fetch_add(1, atomic::Ordering::Release);
+                    Ok(Some(lsp::Hover {
+                        contents: lsp::HoverContents::Markup(lsp::MarkupContent {
+                            kind: lsp::MarkupKind::Markdown,
+                            value: "lsp hover should not be requested".to_string(),
+                        }),
+                        range: None,
+                    }))
+                }
+            }
+        });
+
+        let hover_point = cx.display_point("![Roˇot](/assets/root.png)");
+        cx.update_editor(|editor, window, cx| {
+            let snapshot = editor.snapshot(window, cx);
+            let anchor = snapshot
+                .buffer_snapshot()
+                .anchor_before(hover_point.to_offset(&snapshot, Bias::Left));
+            hover_at(editor, Some(anchor), None, window, cx)
+        });
+        cx.background_executor
+            .advance_clock(Duration::from_millis(get_hover_popover_delay(&cx) + 100));
+        cx.background_executor.run_until_parked();
+        cx.run_until_parked();
+
+        cx.editor(|editor, _, _| {
+            assert!(editor.hover_state.visible());
+            let [popover] = editor.hover_state.info_popovers.as_slice() else {
+                panic!(
+                    "expected exactly one root-relative image hover popover, got {}",
+                    editor.hover_state.info_popovers.len()
+                );
+            };
+            let resolver = popover.markdown_image_resolver.as_ref().unwrap();
+            assert_eq!(resolver.absolute_path, PathBuf::from("/root/assets/root.png"));
+        });
+        assert_eq!(request_count.load(atomic::Ordering::Acquire), 0);
+    }
+
+    #[gpui::test]
+    async fn test_markdown_image_hover_missing_file_uses_lsp(cx: &mut gpui::TestAppContext) {
+        init_test(cx, |_| {});
+
+        let mut cx = EditorLspTestContext::new(
+            Language::new(
+                LanguageConfig {
+                    name: "Markdown".into(),
+                    matcher: LanguageMatcher {
+                        path_suffixes: vec!["md".into()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                None,
+            ),
+            lsp::ServerCapabilities {
+                hover_provider: Some(lsp::HoverProviderCapability::Simple(true)),
+                ..Default::default()
+            },
+            cx,
+        )
+        .await;
+        cx.set_state("![Preview](assets/missing.png)ˇ");
+
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let mut requests = cx.set_request_handler::<lsp::request::HoverRequest, _, _>({
+            let request_count = request_count.clone();
+            move |_, _, _| {
+                let request_count = request_count.clone();
+                async move {
+                    request_count.fetch_add(1, atomic::Ordering::Release);
+                    Ok(Some(lsp::Hover {
+                        contents: lsp::HoverContents::Markup(lsp::MarkupContent {
+                            kind: lsp::MarkupKind::Markdown,
+                            value: "fallback hover".to_string(),
+                        }),
+                        range: None,
+                    }))
+                }
+            }
+        });
+
+        let hover_point = cx.display_point("![Preview](assets/miˇssing.png)");
+        cx.update_editor(|editor, window, cx| {
+            let snapshot = editor.snapshot(window, cx);
+            let anchor = snapshot
+                .buffer_snapshot()
+                .anchor_before(hover_point.to_offset(&snapshot, Bias::Left));
+            hover_at(editor, Some(anchor), None, window, cx)
+        });
+        cx.background_executor
+            .advance_clock(Duration::from_millis(get_hover_popover_delay(&cx) + 100));
+        requests.next().await;
+
+        cx.condition(|editor, _| editor.hover_state.visible()).await;
+        cx.editor(|editor, _, cx| {
+            let [popover] = editor.hover_state.info_popovers.as_slice() else {
+                panic!(
+                    "expected exactly one fallback hover popover, got {}",
+                    editor.hover_state.info_popovers.len()
+                );
+            };
+            assert_eq!(popover.get_rendered_text(cx), "fallback hover");
+        });
+        assert_eq!(request_count.load(atomic::Ordering::Acquire), 1);
     }
 
     #[gpui::test]
