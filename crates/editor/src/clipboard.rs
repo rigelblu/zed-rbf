@@ -3,7 +3,7 @@ use gpui::{Image, ImageFormat};
 use util::rel_path::RelPath;
 
 const MARKDOWN_IMAGE_PASTE_ALT_TEXT: &str = "alt placeholder";
-const MARKDOWN_IMAGE_PASTE_DEFAULT_DIRECTORY: &str = ".assets";
+const DEFAULT_MARKDOWN_IMAGE_PASTE_DIRECTORY: &str = ".assets";
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ClipboardSelection {
@@ -311,6 +311,7 @@ impl Editor {
         let image_bytes = paste.image_bytes;
         let markdown_text = paste.markdown_text;
         let selections = paste.selections;
+        let worktree_root_path = paste.worktree_root_path;
         let previous_paste = self.markdown_image_paste_task.clone();
 
         let task = cx
@@ -320,6 +321,14 @@ impl Editor {
                     if let Err(error) = previous_paste.await {
                         log::error!("previous Markdown image paste failed: {error:#}");
                     }
+
+                    ensure_markdown_image_paste_path_within_worktree(
+                        fs.as_ref(),
+                        &write_path,
+                        &worktree_root_path,
+                    )
+                    .await
+                    .map_err(Arc::new)?;
 
                     fs.write(&write_path, &image_bytes)
                         .await
@@ -397,12 +406,32 @@ impl Editor {
         }
 
         let file_path = file_path.context("markdown image paste missing target file")?;
-        let assets_path = RelPath::unix(MARKDOWN_IMAGE_PASTE_DEFAULT_DIRECTORY)?;
+        let image_paste_directory = snapshot
+            .language_settings_at(selections[0].head(), cx)
+            .markdown_image_paste_directory
+            .clone();
+        let image_paste_directory = markdown_image_paste_directory(&image_paste_directory)?;
         let filename = markdown_image_filename(image);
         let filename_path = RelPath::unix(filename.as_str())?;
-        let markdown_image_path = assets_path.join(filename_path);
+        let markdown_image_path = image_paste_directory.join(filename_path);
+        let worktree_root_path = {
+            let project = project.read(cx);
+            let worktree = project
+                .worktree_for_id(file_path.worktree_id, cx)
+                .context("markdown image paste missing target worktree")?;
+            let worktree = worktree.read(cx);
+            let worktree_root_path = worktree.abs_path();
+            if worktree.is_single_file() {
+                worktree_root_path
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .context("single-file worktree missing parent directory")?
+            } else {
+                worktree_root_path.to_path_buf()
+            }
+        };
         let absolute_path = if let Some(parent_path) = file_path.path.parent() {
-            let image_project_path = parent_path.join(assets_path).join(filename_path);
+            let image_project_path = parent_path.join(image_paste_directory).join(filename_path);
             let image_project_path = ProjectPath {
                 worktree_id: file_path.worktree_id,
                 path: image_project_path,
@@ -430,6 +459,7 @@ impl Editor {
                 markdown_image_path.as_unix_str()
             ),
             selections,
+            worktree_root_path,
         }))
     }
 
@@ -696,6 +726,7 @@ struct MarkdownImagePaste {
     image_bytes: Vec<u8>,
     markdown_text: String,
     selections: Arc<[Selection<Anchor>]>,
+    worktree_root_path: PathBuf,
 }
 
 fn markdown_image_filename(image: &Image) -> String {
@@ -712,6 +743,79 @@ fn markdown_image_filename(image: &Image) -> String {
     };
     let timestamp = time::OffsetDateTime::now_utc().unix_timestamp_nanos();
     format!("pasted-image-{timestamp}-{:x}.{extension}", image.id())
+}
+
+fn markdown_image_paste_directory(directory: &str) -> Result<&RelPath> {
+    let directory = directory.trim();
+    if directory.is_empty()
+        || directory.contains('\\')
+        || directory.contains(':')
+        || std::path::Path::new(directory).is_absolute()
+        || directory.split('/').any(|component| component == "..")
+        || directory
+            .chars()
+            .any(markdown_image_paste_directory_needs_escaping)
+    {
+        return default_markdown_image_paste_directory();
+    }
+
+    RelPath::unix(directory).or_else(|_| default_markdown_image_paste_directory())
+}
+
+fn default_markdown_image_paste_directory() -> Result<&'static RelPath> {
+    RelPath::unix(DEFAULT_MARKDOWN_IMAGE_PASTE_DIRECTORY)
+        .context("default Markdown image paste directory should be valid")
+}
+
+fn markdown_image_paste_directory_needs_escaping(character: char) -> bool {
+    character.is_whitespace()
+        || character.is_control()
+        || matches!(character, '(' | ')' | '<' | '>' | '?' | '#' | '%')
+}
+
+async fn ensure_markdown_image_paste_path_within_worktree(
+    fs: &dyn fs::Fs,
+    write_path: &Path,
+    worktree_root_path: &Path,
+) -> Result<()> {
+    let Some(resolved_write_path) = canonicalize_existing_ancestor(fs, write_path).await else {
+        anyhow::bail!("markdown image paste target has no canonical parent");
+    };
+    let resolved_worktree_root = fs
+        .canonicalize(worktree_root_path)
+        .await
+        .with_context(|| format!("canonicalizing worktree root {worktree_root_path:?}"))?;
+
+    if !resolved_write_path.starts_with(&resolved_worktree_root) {
+        anyhow::bail!(
+            "markdown image paste target {write_path:?} resolves outside worktree root {worktree_root_path:?}"
+        );
+    }
+
+    Ok(())
+}
+
+async fn canonicalize_existing_ancestor(fs: &dyn fs::Fs, path: &Path) -> Option<PathBuf> {
+    let mut current = Some(path);
+    let mut suffix_components = Vec::new();
+    while let Some(ancestor) = current {
+        match fs.canonicalize(ancestor).await {
+            Ok(canonical_path) => {
+                let mut canonical_path = canonical_path;
+                for component in suffix_components.into_iter().rev() {
+                    canonical_path.push(component);
+                }
+                return Some(canonical_path);
+            }
+            Err(_) => {
+                if let Some(file_name) = ancestor.file_name() {
+                    suffix_components.push(file_name.to_os_string());
+                }
+                current = ancestor.parent();
+            }
+        }
+    }
+    None
 }
 
 struct KillRing(ClipboardItem);

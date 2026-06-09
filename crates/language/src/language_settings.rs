@@ -86,6 +86,8 @@ pub struct LanguageSettings {
     pub ensure_final_newline_on_save: bool,
     /// Whether or not to align Markdown table columns during format-on-save.
     pub align_markdown_tables_on_save: bool,
+    /// Relative directory where pasted Markdown images are saved.
+    pub markdown_image_paste_directory: String,
     /// How line endings are initialized for new files and normalized during
     /// format and save.
     pub line_ending: LineEndingSetting,
@@ -740,6 +742,9 @@ impl settings::Settings for AllLanguageSettings {
                     .unwrap(),
                 ensure_final_newline_on_save: settings.ensure_final_newline_on_save.unwrap(),
                 align_markdown_tables_on_save: settings.align_markdown_tables_on_save.unwrap(),
+                markdown_image_paste_directory: settings
+                    .markdown_image_paste_directory
+                    .unwrap(),
                 line_ending: settings.line_ending.unwrap(),
                 formatter: settings.formatter.unwrap(),
                 prettier: PrettierSettings {

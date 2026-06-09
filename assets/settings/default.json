@@ -1419,6 +1419,8 @@
   "ensure_final_newline_on_save": true,
   // Whether or not to align Markdown table columns during format-on-save.
   "align_markdown_tables_on_save": false,
+  // Relative directory where pasted Markdown images are saved.
+  "markdown_image_paste_directory": ".assets",
   // How line endings should be handled for new files and during format and save.
   // This setting can take five values:
   //

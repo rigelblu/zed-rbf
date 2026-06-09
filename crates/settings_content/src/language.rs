@@ -444,6 +444,10 @@ pub struct LanguageSettingsContent {
     ///
     /// Default: false
     pub align_markdown_tables_on_save: Option<bool>,
+    /// Relative directory where pasted Markdown images are saved.
+    ///
+    /// Default: .assets
+    pub markdown_image_paste_directory: Option<String>,
     /// How line endings should be handled for new files and during format and
     /// save operations.
     ///
