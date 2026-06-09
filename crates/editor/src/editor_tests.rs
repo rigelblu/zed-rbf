@@ -33987,32 +33987,43 @@ async fn test_ymd_conceals_markdown_links_and_underlines_labels(cx: &mut gpui::T
     );
     cx.run_until_parked();
 
-    // Only the link labels carry the underline highlight; the image and the
-    // invalid link do not.
+    // Link labels and image alt-text both carry the underline highlight. The
+    // invalid link (empty URL) does not.
     cx.assert_editor_text_highlights(
         HighlightKey::YmdLink,
-        "[«link text»](https://example.com)\nplain [«second»](url) end\n![alt](image.png)\n[missing url]()",
+        "[«link text»](https://example.com)\nplain [«second»](url) end\n![«alt»](image.png)\n[missing url]()",
     );
 
     // Off the cursor row, the brackets and `](url)` tail fold while the label
-    // stays. The cursor sits on row 0, so that link reveals raw.
+    // stays. The cursor sits on row 0, so that link reveals raw. Image syntax on
+    // row 2 is concealed too: `![` and `](image.png)` fold, leaving `alt`.
     cx.update_editor(|editor, _, cx| {
         assert_eq!(
             editor.display_text(cx).replace('\u{2060}', ""),
-            "[link text](https://example.com)\nplain second end\n![alt](image.png)\n[missing url]()"
+            "[link text](https://example.com)\nplain second end\nalt\n[missing url]()"
         );
     });
 
     // Moving the cursor onto row 1 reveals that link raw and re-conceals row 0.
+    // Image on row 2 remains concealed.
     cx.update_editor(|editor, window, cx| {
         editor.move_down(&MoveDown, window, cx);
         assert_eq!(
             editor.display_text(cx).replace('\u{2060}', ""),
-            "link text\nplain [second](url) end\n![alt](image.png)\n[missing url]()"
+            "link text\nplain [second](url) end\nalt\n[missing url]()"
         );
     });
 
-    // The global toggle reveals every concealed link tail at once.
+    // Moving to the image row reveals it raw.
+    cx.update_editor(|editor, window, cx| {
+        editor.move_down(&MoveDown, window, cx);
+        assert_eq!(
+            editor.display_text(cx).replace('\u{2060}', ""),
+            "link text\nplain second end\n![alt](image.png)\n[missing url]()"
+        );
+    });
+
+    // The global toggle reveals every concealed syntax at once.
     cx.update_editor(|editor, window, cx| {
         editor.toggle_ymd_conceal(&ToggleYmdConceal, window, cx);
         assert_eq!(
