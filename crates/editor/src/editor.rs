@@ -1136,6 +1136,7 @@ pub struct Editor {
     soft_wrap_mode_override: Option<language_settings::SoftWrap>,
     hard_wrap: Option<usize>,
     project: Option<Entity<Project>>,
+    markdown_image_paste_task: Shared<Task<Result<(), Arc<anyhow::Error>>>>,
     semantics_provider: Option<Rc<dyn SemanticsProvider>>,
     completion_provider: Option<Rc<dyn CompletionProvider>>,
     collaboration_hub: Option<Box<dyn CollaborationHub>>,
@@ -2375,6 +2376,7 @@ impl Editor {
                 .map(|project| Rc::new(project.downgrade()) as _),
             collaboration_hub: project.clone().map(|project| Box::new(project) as _),
             project,
+            markdown_image_paste_task: Task::ready(Ok(())).shared(),
             blink_manager: blink_manager.clone(),
             show_local_selections: true,
             show_scrollbars: ScrollbarAxes {

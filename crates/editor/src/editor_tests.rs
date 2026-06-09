@@ -18,8 +18,8 @@ use buffer_diff::{BufferDiff, DiffHunkSecondaryStatus, DiffHunkStatus, DiffHunkS
 use collections::HashMap;
 use futures::{StreamExt, channel::oneshot};
 use gpui::{
-    BackgroundExecutor, DismissEvent, Task, TaskExt, TestAppContext, UpdateGlobal,
-    VisualTestContext, WindowBounds, WindowOptions, div,
+    BackgroundExecutor, ClipboardString, DismissEvent, Image, ImageFormat, Task, TaskExt,
+    TestAppContext, UpdateGlobal, VisualTestContext, WindowBounds, WindowOptions, div,
 };
 use indoc::indoc;
 use language::{
@@ -54,7 +54,7 @@ use settings::{
     InlayHintSettingsContent, ProjectSettingsContent, ScrollBeyondLastLine, SearchSettingsContent,
     SettingsContent, SettingsStore,
 };
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, path::PathBuf, sync::Arc};
 use std::{cell::RefCell, future::Future, rc::Rc, sync::atomic::AtomicBool, time::Instant};
 use std::{
     iter,
@@ -35995,6 +35995,458 @@ async fn test_paste_url_from_other_app_without_creating_markdown_link_in_non_mar
     cx.assert_editor_state(&format!(
         "// Hello, {url}ˇ.\n// Zed is {url}ˇ (see this link: {url}ˇ)"
     ));
+}
+
+#[gpui::test]
+async fn test_paste_image_in_markdown_saves_to_dot_assets(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/project"),
+        json!({
+            "notes": {
+                "doc.md": "",
+            },
+        }),
+    )
+    .await;
+    let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/project/notes/doc.md"), cx)
+        })
+        .await
+        .unwrap();
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+    buffer.update(cx, |buffer, cx| {
+        buffer.set_language(Some(markdown_language), cx);
+    });
+
+    let editor = cx.add_window(|window, cx| {
+        let editor = build_editor_with_project(
+            project.clone(),
+            MultiBuffer::build_from_buffer(buffer, cx),
+            window,
+            cx,
+        );
+        window.focus(&editor.focus_handle(cx), cx);
+        editor
+    });
+    let mut cx = EditorTestContext::for_editor(editor, cx).await;
+    cx.set_state("first ˇ\nsecond ˇ");
+
+    let image_bytes = vec![137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3, 4];
+    let image = Image::from_bytes(ImageFormat::Png, image_bytes.clone());
+
+    cx.update_editor(|editor, window, cx| {
+        editor.paste_item(&ClipboardItem::new_image(&image), window, cx);
+    });
+    cx.run_until_parked();
+
+    let state = cx.editor_state();
+    let prefix = "first ![alt placeholder](.assets/";
+    assert!(
+        state.starts_with(prefix),
+        "image paste should insert a relative .assets link, got {state:?}"
+    );
+
+    let first_link_start =
+        state.find("![alt placeholder](").unwrap() + "![alt placeholder](".len();
+    let first_link_end = state[first_link_start..].find(')').unwrap() + first_link_start;
+    let first_link = &state[first_link_start..first_link_end];
+    let second_link_start = state[first_link_end..]
+        .find("![alt placeholder](")
+        .unwrap()
+        + first_link_end
+        + "![alt placeholder](".len();
+    let second_link_end = state[second_link_start..].find(')').unwrap() + second_link_start;
+    let second_link = &state[second_link_start..second_link_end];
+
+    assert_eq!(first_link, second_link);
+    assert!(first_link.starts_with(".assets/pasted-image-"));
+    assert!(first_link.ends_with(".png"));
+    assert_eq!(
+        state,
+        format!("first ![alt placeholder]({first_link})ˇ\nsecond ![alt placeholder]({first_link})ˇ")
+    );
+    assert_eq!(
+        fs.read_file_sync(PathBuf::from(path!("/project/notes")).join(first_link))
+            .unwrap(),
+        image_bytes
+    );
+}
+
+#[gpui::test]
+async fn test_paste_image_write_failure_does_not_insert_broken_markdown_link(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx, |_| {});
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/project"),
+        json!({
+            "notes": {
+                "doc.md": "",
+                ".assets": "not a directory",
+            },
+        }),
+    )
+    .await;
+    let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/project/notes/doc.md"), cx)
+        })
+        .await
+        .unwrap();
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+    buffer.update(cx, |buffer, cx| {
+        buffer.set_language(Some(markdown_language), cx);
+    });
+
+    let editor = cx.add_window(|window, cx| {
+        let editor = build_editor_with_project(
+            project.clone(),
+            MultiBuffer::build_from_buffer(buffer, cx),
+            window,
+            cx,
+        );
+        window.focus(&editor.focus_handle(cx), cx);
+        editor
+    });
+    let mut cx = EditorTestContext::for_editor(editor, cx).await;
+    cx.set_state("before ˇafter");
+
+    let image = Image::from_bytes(ImageFormat::Png, vec![1, 2, 3, 4]);
+
+    cx.update_editor(|editor, window, cx| {
+        editor.paste_item(&ClipboardItem::new_image(&image), window, cx);
+    });
+    cx.run_until_parked();
+
+    cx.assert_editor_state("before ˇafter");
+    assert_eq!(
+        fs.read_file_sync(path!("/project/notes/.assets")).unwrap(),
+        b"not a directory".to_vec(),
+    );
+}
+
+#[gpui::test]
+async fn test_paste_image_in_root_markdown_saves_to_root_dot_assets(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx, |_| {});
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/project"),
+        json!({
+            "doc.md": "",
+        }),
+    )
+    .await;
+    let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/project/doc.md"), cx)
+        })
+        .await
+        .unwrap();
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+    buffer.update(cx, |buffer, cx| {
+        buffer.set_language(Some(markdown_language), cx);
+    });
+
+    let editor = cx.add_window(|window, cx| {
+        let editor = build_editor_with_project(
+            project.clone(),
+            MultiBuffer::build_from_buffer(buffer, cx),
+            window,
+            cx,
+        );
+        window.focus(&editor.focus_handle(cx), cx);
+        editor
+    });
+    let mut cx = EditorTestContext::for_editor(editor, cx).await;
+    cx.set_state("ˇ");
+
+    let image_bytes = vec![1, 2, 3, 4];
+    let image = Image::from_bytes(ImageFormat::Png, image_bytes.clone());
+
+    cx.update_editor(|editor, window, cx| {
+        editor.paste_item(&ClipboardItem::new_image(&image), window, cx);
+    });
+    cx.run_until_parked();
+
+    let state = cx.editor_state();
+    let link_start = state.find("![alt placeholder](").unwrap() + "![alt placeholder](".len();
+    let link_end = state[link_start..].find(')').unwrap() + link_start;
+    let link = &state[link_start..link_end];
+    assert!(link.starts_with(".assets/pasted-image-"));
+    assert_eq!(state, format!("![alt placeholder]({link})ˇ"));
+    assert_eq!(
+        fs.read_file_sync(PathBuf::from(path!("/project")).join(link))
+            .unwrap(),
+        image_bytes
+    );
+}
+
+#[gpui::test]
+async fn test_paste_image_in_single_file_markdown_saves_to_sibling_dot_assets(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx, |_| {});
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_file(path!("/notes.md"), "".into()).await;
+    let project = Project::test(fs.clone(), [path!("/notes.md").as_ref()], cx).await;
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/notes.md"), cx)
+        })
+        .await
+        .unwrap();
+
+    cx.update(|cx| {
+        assert!(
+            buffer.read(cx).file().unwrap().path().is_empty(),
+            "single-file worktree should have an empty worktree-relative path"
+        );
+    });
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+    buffer.update(cx, |buffer, cx| {
+        buffer.set_language(Some(markdown_language), cx);
+    });
+
+    let editor = cx.add_window(|window, cx| {
+        let editor = build_editor_with_project(
+            project.clone(),
+            MultiBuffer::build_from_buffer(buffer, cx),
+            window,
+            cx,
+        );
+        window.focus(&editor.focus_handle(cx), cx);
+        editor
+    });
+    let mut cx = EditorTestContext::for_editor(editor, cx).await;
+    cx.set_state("ˇ");
+
+    let image_bytes = vec![1, 2, 3, 4];
+    let image = Image::from_bytes(ImageFormat::Png, image_bytes.clone());
+
+    cx.update_editor(|editor, window, cx| {
+        editor.paste_item(&ClipboardItem::new_image(&image), window, cx);
+    });
+    cx.run_until_parked();
+
+    let state = cx.editor_state();
+    let link_start = state.find("![alt placeholder](").unwrap() + "![alt placeholder](".len();
+    let link_end = state[link_start..].find(')').unwrap() + link_start;
+    let link = &state[link_start..link_end];
+    assert!(link.starts_with(".assets/pasted-image-"));
+    assert_eq!(state, format!("![alt placeholder]({link})ˇ"));
+    assert_eq!(
+        fs.read_file_sync(PathBuf::from(path!("/")).join(link))
+            .unwrap(),
+        image_bytes
+    );
+}
+
+#[gpui::test]
+async fn test_paste_repeated_images_in_markdown_inserts_in_command_order(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx, |_| {});
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/project"),
+        json!({
+            "notes": {
+                "doc.md": "",
+            },
+        }),
+    )
+    .await;
+    let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/project/notes/doc.md"), cx)
+        })
+        .await
+        .unwrap();
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+    buffer.update(cx, |buffer, cx| {
+        buffer.set_language(Some(markdown_language), cx);
+    });
+
+    let editor = cx.add_window(|window, cx| {
+        let editor = build_editor_with_project(
+            project.clone(),
+            MultiBuffer::build_from_buffer(buffer, cx),
+            window,
+            cx,
+        );
+        window.focus(&editor.focus_handle(cx), cx);
+        editor
+    });
+    let mut cx = EditorTestContext::for_editor(editor, cx).await;
+    cx.set_state("ˇ");
+
+    let first_image_bytes = vec![1, 2, 3];
+    let second_image_bytes = vec![4, 5, 6];
+    let first_image = Image::from_bytes(ImageFormat::Png, first_image_bytes.clone());
+    let second_image = Image::from_bytes(ImageFormat::Png, second_image_bytes.clone());
+
+    cx.update_editor(|editor, window, cx| {
+        editor.paste_item(&ClipboardItem::new_image(&first_image), window, cx);
+        editor.paste_item(&ClipboardItem::new_image(&second_image), window, cx);
+    });
+    cx.run_until_parked();
+
+    let state = cx.editor_state();
+    let first_link_start =
+        state.find("![alt placeholder](").unwrap() + "![alt placeholder](".len();
+    let first_link_end = state[first_link_start..].find(')').unwrap() + first_link_start;
+    let first_link = &state[first_link_start..first_link_end];
+    let second_link_start = state[first_link_end..]
+        .find("![alt placeholder](")
+        .unwrap()
+        + first_link_end
+        + "![alt placeholder](".len();
+    let second_link_end = state[second_link_start..].find(')').unwrap() + second_link_start;
+    let second_link = &state[second_link_start..second_link_end];
+
+    assert_ne!(first_link, second_link);
+    assert_eq!(
+        state,
+        format!("![alt placeholder]({first_link})![alt placeholder]({second_link})ˇ")
+    );
+    assert_eq!(
+        fs.read_file_sync(PathBuf::from(path!("/project/notes")).join(first_link))
+            .unwrap(),
+        first_image_bytes
+    );
+    assert_eq!(
+        fs.read_file_sync(PathBuf::from(path!("/project/notes")).join(second_link))
+            .unwrap(),
+        second_image_bytes
+    );
+}
+
+#[gpui::test]
+async fn test_paste_image_in_non_markdown_is_noop(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.set_state("before ˇafter");
+    let image = Image::from_bytes(ImageFormat::Png, vec![1, 2, 3]);
+
+    cx.update_editor(|editor, window, cx| {
+        editor.paste_item(&ClipboardItem::new_image(&image), window, cx);
+    });
+    cx.run_until_parked();
+
+    cx.assert_editor_state("before ˇafter");
+}
+
+#[gpui::test]
+async fn test_paste_text_takes_priority_over_image_in_markdown(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/project"),
+        json!({
+            "notes": {
+                "doc.md": "",
+            },
+        }),
+    )
+    .await;
+    let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/project/notes/doc.md"), cx)
+        })
+        .await
+        .unwrap();
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+    buffer.update(cx, |buffer, cx| {
+        buffer.set_language(Some(markdown_language), cx);
+    });
+
+    let editor = cx.add_window(|window, cx| {
+        let editor = build_editor_with_project(
+            project.clone(),
+            MultiBuffer::build_from_buffer(buffer, cx),
+            window,
+            cx,
+        );
+        window.focus(&editor.focus_handle(cx), cx);
+        editor
+    });
+    let mut cx = EditorTestContext::for_editor(editor, cx).await;
+    cx.set_state("before ˇafter");
+
+    let image = Image::from_bytes(ImageFormat::Png, vec![1, 2, 3]);
+    let item = ClipboardItem {
+        entries: vec![
+            ClipboardEntry::String(ClipboardString::new("text".to_string())),
+            ClipboardEntry::Image(image),
+        ],
+    };
+
+    cx.update_editor(|editor, window, cx| {
+        editor.paste_item(&item, window, cx);
+    });
+    cx.run_until_parked();
+
+    cx.assert_editor_state("before textˇafter");
 }
 
 #[gpui::test]
