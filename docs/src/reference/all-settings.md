@@ -1713,6 +1713,29 @@ This setting enables integration with macOS’s native window tabbing feature. W
 
 The [`.editorconfig`](https://editorconfig.org) `end_of_line` property overrides this setting and behaves like `enforce_lf` or `enforce_crlf`.
 
+## Markdown Image Paste Directory
+
+- Description: Relative folder where images pasted into Markdown files are saved.
+  This can be specified on a per-language basis.
+- Setting: `markdown_image_paste_directory`
+- Default: `.assets`
+
+**Options**
+
+Set this to a relative folder path. Paths are resolved relative to the Markdown
+file, not the project root. Invalid values, including absolute paths and `..`,
+and Markdown destination hazards, fall back to `.assets`.
+
+```json [settings]
+{
+  "languages": {
+    "Markdown": {
+      "markdown_image_paste_directory": "images/screenshots"
+    }
+  }
+}
+```
+
 ## Expand Excerpt Lines
 
 - Description: The default number of lines to expand excerpts in the multibuffer by
@@ -2941,6 +2964,7 @@ The following settings can be overridden for each specific language:
 - [`enable_language_server`](#enable-language-server)
 - [`ensure_final_newline_on_save`](#ensure-final-newline-on-save)
 - [`line_ending`](#line-ending)
+- [`markdown_image_paste_directory`](#markdown-image-paste-directory)
 - [`format_on_save`](#format-on-save)
 - [`formatter`](#formatter)
 - [`hard_tabs`](#hard-tabs)
@@ -3267,7 +3291,6 @@ Examples:
 - Description:
   Preview tabs allow you to open files in preview mode, where they close automatically when you switch to another file unless you explicitly pin them. This is useful for quickly viewing files without cluttering your workspace. Preview tabs display their file names in italics. \
    There are several ways to convert a preview tab into a regular tab:
-
   - Double-clicking on the file
   - Double-clicking on the tab header
   - Using the {#action project_panel::OpenPermanent} action

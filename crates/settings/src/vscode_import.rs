@@ -547,6 +547,7 @@ impl VsCodeSettings {
             enable_language_server: None,
             ensure_final_newline_on_save: self.read_bool("files.insertFinalNewline"),
             align_markdown_tables_on_save: None,
+            markdown_image_paste_directory: None,
             line_ending: self.read_enum("files.eol", |s| match s {
                 "\n" => Some(LineEndingSetting::PreferLf),
                 "\r\n" => Some(LineEndingSetting::PreferCrlf),

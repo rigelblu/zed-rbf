@@ -16,6 +16,7 @@ use crate::{
 };
 use buffer_diff::{BufferDiff, DiffHunkSecondaryStatus, DiffHunkStatus, DiffHunkStatusKind};
 use collections::HashMap;
+use fs::Fs as _;
 use futures::{StreamExt, channel::oneshot};
 use gpui::{
     BackgroundExecutor, ClipboardString, DismissEvent, Image, ImageFormat, Task, TaskExt,
@@ -36008,9 +36009,51 @@ async fn test_paste_url_from_other_app_without_creating_markdown_link_in_non_mar
     ));
 }
 
-#[gpui::test]
-async fn test_paste_image_in_markdown_saves_to_dot_assets(cx: &mut gpui::TestAppContext) {
-    init_test(cx, |_| {});
+fn set_markdown_image_paste_directory(settings: &mut AllLanguageSettingsContent, directory: &str) {
+    settings.languages.0.insert(
+        "Markdown".into(),
+        LanguageSettingsContent {
+            markdown_image_paste_directory: Some(directory.to_string()),
+            ..Default::default()
+        },
+    );
+}
+
+fn set_markdown_image_paste_directory_to_images_screenshots(
+    settings: &mut AllLanguageSettingsContent,
+) {
+    set_markdown_image_paste_directory(settings, "images/screenshots");
+}
+
+fn set_markdown_image_paste_directory_to_empty(settings: &mut AllLanguageSettingsContent) {
+    set_markdown_image_paste_directory(settings, "");
+}
+
+fn set_markdown_image_paste_directory_to_absolute(settings: &mut AllLanguageSettingsContent) {
+    set_markdown_image_paste_directory(settings, "/tmp/screenshots");
+}
+
+fn set_markdown_image_paste_directory_to_parent(settings: &mut AllLanguageSettingsContent) {
+    set_markdown_image_paste_directory(settings, "../outside");
+}
+
+fn set_markdown_image_paste_directory_to_markdown_unsafe(
+    settings: &mut AllLanguageSettingsContent,
+) {
+    set_markdown_image_paste_directory(settings, "images)/screenshots");
+}
+
+fn set_markdown_image_paste_directory_to_percent_encoded_separator(
+    settings: &mut AllLanguageSettingsContent,
+) {
+    set_markdown_image_paste_directory(settings, "images%2Fscreenshots");
+}
+
+async fn paste_image_in_nested_markdown(
+    cx: &mut gpui::TestAppContext,
+    configure_settings: fn(&mut AllLanguageSettingsContent),
+) -> (String, Arc<FakeFs>, Vec<u8>) {
+    init_test(cx, configure_settings);
 
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree(
@@ -36063,34 +36106,40 @@ async fn test_paste_image_in_markdown_saves_to_dot_assets(cx: &mut gpui::TestApp
     cx.run_until_parked();
 
     let state = cx.editor_state();
-    let prefix = "first ![alt placeholder](.assets/";
-    assert!(
-        state.starts_with(prefix),
-        "image paste should insert a relative .assets link, got {state:?}"
-    );
-
-    let first_link_start =
-        state.find("![alt placeholder](").unwrap() + "![alt placeholder](".len();
-    let first_link_end = state[first_link_start..].find(')').unwrap() + first_link_start;
-    let first_link = &state[first_link_start..first_link_end];
+    let marker = "![alt placeholder](";
+    let first_link_start = state.find(marker).expect("first image link") + marker.len();
+    let first_link_end =
+        state[first_link_start..].find(')').expect("first link end") + first_link_start;
+    let first_link = state[first_link_start..first_link_end].to_string();
     let second_link_start = state[first_link_end..]
-        .find("![alt placeholder](")
-        .unwrap()
+        .find(marker)
+        .expect("second image link")
         + first_link_end
-        + "![alt placeholder](".len();
-    let second_link_end = state[second_link_start..].find(')').unwrap() + second_link_start;
+        + marker.len();
+    let second_link_end = state[second_link_start..]
+        .find(')')
+        .expect("second link end")
+        + second_link_start;
     let second_link = &state[second_link_start..second_link_end];
 
     assert_eq!(first_link, second_link);
-    assert!(first_link.starts_with(".assets/pasted-image-"));
     assert!(first_link.ends_with(".png"));
     assert_eq!(
         state,
         format!("first ![alt placeholder]({first_link})ˇ\nsecond ![alt placeholder]({first_link})ˇ")
     );
+
+    (first_link, fs, image_bytes)
+}
+
+#[gpui::test]
+async fn test_paste_image_in_markdown_saves_to_dot_assets(cx: &mut gpui::TestAppContext) {
+    let (first_link, fs, image_bytes) = paste_image_in_nested_markdown(cx, |_| {}).await;
+
+    assert!(first_link.starts_with(".assets/pasted-image-"));
     assert_eq!(
         fs.read_file_sync(PathBuf::from(path!("/project/notes")).join(first_link))
-            .unwrap(),
+            .expect("pasted image file should be saved"),
         image_bytes
     );
 }
@@ -36159,10 +36208,179 @@ async fn test_paste_image_write_failure_does_not_insert_broken_markdown_link(
 }
 
 #[gpui::test]
-async fn test_paste_image_in_root_markdown_saves_to_root_dot_assets(
+async fn test_paste_image_in_markdown_uses_configured_directory(cx: &mut gpui::TestAppContext) {
+    let (first_link, fs, image_bytes) = paste_image_in_nested_markdown(
+        cx,
+        set_markdown_image_paste_directory_to_images_screenshots,
+    )
+    .await;
+
+    assert!(first_link.starts_with("images/screenshots/pasted-image-"));
+    assert_eq!(
+        fs.read_file_sync(PathBuf::from(path!("/project/notes")).join(first_link))
+            .expect("pasted image file should be saved"),
+        image_bytes
+    );
+}
+
+#[gpui::test]
+async fn test_paste_image_in_markdown_empty_directory_falls_back_to_dot_assets(
     cx: &mut gpui::TestAppContext,
 ) {
-    init_test(cx, |_| {});
+    let (first_link, fs, image_bytes) =
+        paste_image_in_nested_markdown(cx, set_markdown_image_paste_directory_to_empty).await;
+
+    assert!(first_link.starts_with(".assets/pasted-image-"));
+    assert_eq!(
+        fs.read_file_sync(PathBuf::from(path!("/project/notes")).join(first_link))
+            .expect("pasted image file should be saved"),
+        image_bytes
+    );
+}
+
+#[gpui::test]
+async fn test_paste_image_in_markdown_absolute_directory_falls_back_to_dot_assets(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (first_link, fs, image_bytes) =
+        paste_image_in_nested_markdown(cx, set_markdown_image_paste_directory_to_absolute).await;
+
+    assert!(first_link.starts_with(".assets/pasted-image-"));
+    assert_eq!(
+        fs.read_file_sync(PathBuf::from(path!("/project/notes")).join(first_link))
+            .expect("pasted image file should be saved"),
+        image_bytes
+    );
+}
+
+#[gpui::test]
+async fn test_paste_image_in_markdown_parent_directory_falls_back_to_dot_assets(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (first_link, fs, image_bytes) =
+        paste_image_in_nested_markdown(cx, set_markdown_image_paste_directory_to_parent).await;
+
+    assert!(first_link.starts_with(".assets/pasted-image-"));
+    assert_eq!(
+        fs.read_file_sync(PathBuf::from(path!("/project/notes")).join(first_link))
+            .expect("pasted image file should be saved"),
+        image_bytes
+    );
+}
+
+#[gpui::test]
+async fn test_paste_image_in_markdown_markdown_unsafe_directory_falls_back_to_dot_assets(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (first_link, fs, image_bytes) =
+        paste_image_in_nested_markdown(cx, set_markdown_image_paste_directory_to_markdown_unsafe)
+            .await;
+
+    assert!(first_link.starts_with(".assets/pasted-image-"));
+    assert_eq!(
+        fs.read_file_sync(PathBuf::from(path!("/project/notes")).join(first_link))
+            .expect("pasted image file should be saved"),
+        image_bytes
+    );
+}
+
+#[gpui::test]
+async fn test_paste_image_in_markdown_percent_encoded_directory_falls_back_to_dot_assets(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (first_link, fs, image_bytes) = paste_image_in_nested_markdown(
+        cx,
+        set_markdown_image_paste_directory_to_percent_encoded_separator,
+    )
+    .await;
+
+    assert!(first_link.starts_with(".assets/pasted-image-"));
+    assert_eq!(
+        fs.read_file_sync(PathBuf::from(path!("/project/notes")).join(first_link))
+            .expect("pasted image file should be saved"),
+        image_bytes
+    );
+}
+
+#[gpui::test]
+async fn test_paste_image_in_markdown_rejects_symlinked_directory_outside_worktree(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx, set_markdown_image_paste_directory_to_images_screenshots);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/project"),
+        json!({
+            "notes": {
+                "doc.md": "first \nsecond ",
+            },
+        }),
+    )
+    .await;
+    fs.create_dir(PathBuf::from(path!("/outside")).as_path())
+        .await
+        .expect("outside directory should be created");
+    fs.create_symlink(
+        PathBuf::from(path!("/project/notes/images")).as_path(),
+        PathBuf::from(path!("/outside")),
+    )
+    .await
+    .expect("symlinked image directory should be created");
+
+    let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/project/notes/doc.md"), cx)
+        })
+        .await
+        .expect("nested Markdown buffer should open");
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+    buffer.update(cx, |buffer, cx| {
+        buffer.set_language(Some(markdown_language), cx);
+    });
+
+    let editor = cx.add_window(|window, cx| {
+        let editor = build_editor_with_project(
+            project.clone(),
+            MultiBuffer::build_from_buffer(buffer, cx),
+            window,
+            cx,
+        );
+        window.focus(&editor.focus_handle(cx), cx);
+        editor
+    });
+    let mut cx = EditorTestContext::for_editor(editor, cx).await;
+    cx.set_state("first ˇ\nsecond ˇ");
+    let image = Image::from_bytes(ImageFormat::Png, vec![1, 2, 3, 4]);
+
+    cx.update_editor(|editor, window, cx| {
+        editor.paste_item(&ClipboardItem::new_image(&image), window, cx);
+    });
+    cx.run_until_parked();
+
+    cx.assert_editor_state("first ˇ\nsecond ˇ");
+    assert!(
+        fs.metadata(PathBuf::from(path!("/outside/screenshots")).as_path())
+            .await
+            .expect("outside metadata should be readable")
+            .is_none(),
+        "pasting should not create directories through a symlink outside the worktree"
+    );
+}
+
+async fn paste_image_in_root_markdown(
+    cx: &mut gpui::TestAppContext,
+    configure_settings: fn(&mut AllLanguageSettingsContent),
+) -> (String, Arc<FakeFs>, Vec<u8>) {
+    init_test(cx, configure_settings);
 
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree(
@@ -36178,7 +36396,7 @@ async fn test_paste_image_in_root_markdown_saves_to_root_dot_assets(
             project.open_local_buffer(path!("/project/doc.md"), cx)
         })
         .await
-        .unwrap();
+        .expect("root Markdown buffer should open");
 
     let markdown_language = Arc::new(Language::new(
         LanguageConfig {
@@ -36213,23 +36431,50 @@ async fn test_paste_image_in_root_markdown_saves_to_root_dot_assets(
     cx.run_until_parked();
 
     let state = cx.editor_state();
-    let link_start = state.find("![alt placeholder](").unwrap() + "![alt placeholder](".len();
-    let link_end = state[link_start..].find(')').unwrap() + link_start;
-    let link = &state[link_start..link_end];
-    assert!(link.starts_with(".assets/pasted-image-"));
+    let marker = "![alt placeholder](";
+    let link_start = state.find(marker).expect("image link") + marker.len();
+    let link_end = state[link_start..].find(')').expect("link end") + link_start;
+    let link = state[link_start..link_end].to_string();
     assert_eq!(state, format!("![alt placeholder]({link})ˇ"));
+
+    (link, fs, image_bytes)
+}
+
+#[gpui::test]
+async fn test_paste_image_in_root_markdown_saves_to_root_dot_assets(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (link, fs, image_bytes) = paste_image_in_root_markdown(cx, |_| {}).await;
+
+    assert!(link.starts_with(".assets/pasted-image-"));
     assert_eq!(
         fs.read_file_sync(PathBuf::from(path!("/project")).join(link))
-            .unwrap(),
+            .expect("pasted image file should be saved"),
         image_bytes
     );
 }
 
 #[gpui::test]
-async fn test_paste_image_in_single_file_markdown_saves_to_sibling_dot_assets(
+async fn test_paste_image_in_root_markdown_uses_configured_directory(
     cx: &mut gpui::TestAppContext,
 ) {
-    init_test(cx, |_| {});
+    let (link, fs, image_bytes) =
+        paste_image_in_root_markdown(cx, set_markdown_image_paste_directory_to_images_screenshots)
+            .await;
+
+    assert!(link.starts_with("images/screenshots/pasted-image-"));
+    assert_eq!(
+        fs.read_file_sync(PathBuf::from(path!("/project")).join(link))
+            .expect("pasted image file should be saved"),
+        image_bytes
+    );
+}
+
+async fn paste_image_in_single_file_markdown(
+    cx: &mut gpui::TestAppContext,
+    configure_settings: fn(&mut AllLanguageSettingsContent),
+) -> (String, Arc<FakeFs>, Vec<u8>) {
+    init_test(cx, configure_settings);
 
     let fs = FakeFs::new(cx.executor());
     fs.insert_file(path!("/notes.md"), "".into()).await;
@@ -36239,11 +36484,16 @@ async fn test_paste_image_in_single_file_markdown_saves_to_sibling_dot_assets(
             project.open_local_buffer(path!("/notes.md"), cx)
         })
         .await
-        .unwrap();
+        .expect("single-file Markdown buffer should open");
 
     cx.update(|cx| {
         assert!(
-            buffer.read(cx).file().unwrap().path().is_empty(),
+            buffer
+                .read(cx)
+                .file()
+                .expect("single-file Markdown should have a file")
+                .path()
+                .is_empty(),
             "single-file worktree should have an empty worktree-relative path"
         );
     });
@@ -36281,14 +36531,43 @@ async fn test_paste_image_in_single_file_markdown_saves_to_sibling_dot_assets(
     cx.run_until_parked();
 
     let state = cx.editor_state();
-    let link_start = state.find("![alt placeholder](").unwrap() + "![alt placeholder](".len();
-    let link_end = state[link_start..].find(')').unwrap() + link_start;
-    let link = &state[link_start..link_end];
-    assert!(link.starts_with(".assets/pasted-image-"));
+    let marker = "![alt placeholder](";
+    let link_start = state.find(marker).expect("image link") + marker.len();
+    let link_end = state[link_start..].find(')').expect("link end") + link_start;
+    let link = state[link_start..link_end].to_string();
     assert_eq!(state, format!("![alt placeholder]({link})ˇ"));
+
+    (link, fs, image_bytes)
+}
+
+#[gpui::test]
+async fn test_paste_image_in_single_file_markdown_saves_to_sibling_dot_assets(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (link, fs, image_bytes) = paste_image_in_single_file_markdown(cx, |_| {}).await;
+
+    assert!(link.starts_with(".assets/pasted-image-"));
     assert_eq!(
         fs.read_file_sync(PathBuf::from(path!("/")).join(link))
-            .unwrap(),
+            .expect("pasted image file should be saved"),
+        image_bytes
+    );
+}
+
+#[gpui::test]
+async fn test_paste_image_in_single_file_markdown_uses_configured_directory(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (link, fs, image_bytes) = paste_image_in_single_file_markdown(
+        cx,
+        set_markdown_image_paste_directory_to_images_screenshots,
+    )
+    .await;
+
+    assert!(link.starts_with("images/screenshots/pasted-image-"));
+    assert_eq!(
+        fs.read_file_sync(PathBuf::from(path!("/")).join(link))
+            .expect("pasted image file should be saved"),
         image_bytes
     );
 }
