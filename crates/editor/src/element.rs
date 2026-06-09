@@ -574,6 +574,11 @@ impl EditorElement {
             register_action(editor, window, Editor::redo);
             register_action(editor, window, Editor::toggle_comments);
             register_action(editor, window, Editor::toggle_block_comments);
+            register_action(editor, window, Editor::toggle_markdown_heading);
+            register_action(editor, window, Editor::toggle_markdown_bold);
+            register_action(editor, window, Editor::toggle_markdown_italic);
+            register_action(editor, window, Editor::toggle_markdown_bulleted_list);
+            register_action(editor, window, Editor::toggle_markdown_task_list);
             register_action(editor, window, Editor::toggle_markdown_block_quote);
             register_action(editor, window, Editor::unwrap_syntax_node);
             register_action(editor, window, Editor::accept_next_word_edit_prediction);
