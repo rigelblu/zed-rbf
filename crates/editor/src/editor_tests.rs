@@ -40815,6 +40815,165 @@ async fn test_columnar_selection_past_end_of_line(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_markdown_formatting_shortcuts_noop_outside_markdown(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.set_state("«helloˇ» world");
+    cx.update_editor(|editor, window, cx| editor.toggle_markdown_bold(&ToggleBold, window, cx));
+    assert_eq!(cx.buffer_text(), "hello world");
+
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(rust_lang()), cx));
+    cx.set_state("helˇlo world");
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_markdown_heading(&ToggleHeading { level: 2 }, window, cx)
+    });
+    assert_eq!(cx.buffer_text(), "hello world");
+}
+
+#[gpui::test]
+async fn test_markdown_formatting_shortcuts_toggle_headings(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_lang()), cx));
+
+    cx.set_state("helˇlo world");
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_markdown_heading(&ToggleHeading { level: 2 }, window, cx)
+    });
+    assert_eq!(cx.buffer_text(), "## hello world");
+
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_markdown_heading(&ToggleHeading { level: 2 }, window, cx)
+    });
+    assert_eq!(cx.buffer_text(), "hello world");
+
+    cx.set_state("  # helˇlo world");
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_markdown_heading(&ToggleHeading { level: 3 }, window, cx)
+    });
+    assert_eq!(cx.buffer_text(), "  ### hello world");
+}
+
+#[gpui::test]
+async fn test_markdown_formatting_shortcuts_toggle_inline_formatting(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_lang()), cx));
+
+    cx.set_state("Hello «worldˇ»");
+    cx.update_editor(|editor, window, cx| editor.toggle_markdown_bold(&ToggleBold, window, cx));
+    assert_eq!(cx.buffer_text(), "Hello **world**");
+
+    cx.update_editor(|editor, window, cx| editor.toggle_markdown_bold(&ToggleBold, window, cx));
+    assert_eq!(cx.buffer_text(), "Hello world");
+
+    cx.set_state("«oneˇ» and «twoˇ»");
+    cx.update_editor(|editor, window, cx| editor.toggle_markdown_bold(&ToggleBold, window, cx));
+    assert_eq!(cx.buffer_text(), "**one** and **two**");
+
+    cx.update_editor(|editor, window, cx| editor.toggle_markdown_bold(&ToggleBold, window, cx));
+    assert_eq!(cx.buffer_text(), "one and two");
+
+    cx.set_state("Hello woˇrld");
+    cx.update_editor(|editor, window, cx| editor.toggle_markdown_italic(&ToggleItalic, window, cx));
+    assert_eq!(cx.buffer_text(), "Hello *world*");
+
+    cx.update_editor(|editor, window, cx| editor.toggle_markdown_italic(&ToggleItalic, window, cx));
+    assert_eq!(cx.buffer_text(), "Hello world");
+
+    cx.set_state("Hello ˇ");
+    cx.update_editor(|editor, window, cx| editor.toggle_markdown_bold(&ToggleBold, window, cx));
+    cx.assert_editor_state("Hello **ˇ**");
+
+    cx.set_state("«one\ntwoˇ»");
+    cx.update_editor(|editor, window, cx| editor.toggle_markdown_bold(&ToggleBold, window, cx));
+    cx.assert_editor_state("«one\ntwoˇ»");
+
+    cx.set_state("==🔴 woˇrd==");
+    cx.update_editor(|editor, window, cx| editor.toggle_markdown_bold(&ToggleBold, window, cx));
+    assert_eq!(cx.buffer_text(), "==🔴 **word**==");
+}
+
+#[gpui::test]
+async fn test_markdown_formatting_shortcuts_italic_ignores_bold_markers(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_lang()), cx));
+
+    cx.set_state("**boˇld**");
+    cx.update_editor(|editor, window, cx| editor.toggle_markdown_italic(&ToggleItalic, window, cx));
+    assert_eq!(cx.buffer_text(), "***bold***");
+}
+
+#[gpui::test]
+async fn test_markdown_formatting_shortcuts_toggle_line_lists(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_lang()), cx));
+
+    cx.set_state("«one\ntwoˇ»");
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_markdown_bulleted_list(&ToggleBulletedList, window, cx)
+    });
+    assert_eq!(cx.buffer_text(), "- one\n- two");
+
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_markdown_bulleted_list(&ToggleBulletedList, window, cx)
+    });
+    assert_eq!(cx.buffer_text(), "one\ntwo");
+
+    cx.set_state("«- one\nplainˇ»");
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_markdown_task_list(&ToggleTaskList, window, cx)
+    });
+    assert_eq!(cx.buffer_text(), "- [ ] one\n- [ ] plain");
+
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_markdown_task_list(&ToggleTaskList, window, cx)
+    });
+    assert_eq!(cx.buffer_text(), "- [x] one\n- [x] plain");
+
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_markdown_task_list(&ToggleTaskList, window, cx)
+    });
+    assert_eq!(cx.buffer_text(), "- [ ] one\n- [ ] plain");
+
+    cx.set_state("- [ ] doˇne");
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_markdown_task_list(&ToggleTaskList, window, cx)
+    });
+    cx.assert_editor_state("- [x] doˇne");
+
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_markdown_task_list(&ToggleTaskList, window, cx)
+    });
+    cx.assert_editor_state("- [ ] doˇne");
+
+    cx.set_state("- [X] doˇne");
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_markdown_task_list(&ToggleTaskList, window, cx)
+    });
+    cx.assert_editor_state("- [ ] doˇne");
+
+    cx.set_state("«- [ ] one\n- [x] twoˇ»");
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_markdown_task_list(&ToggleTaskList, window, cx)
+    });
+    assert_eq!(cx.buffer_text(), "- [x] one\n- [ ] two");
+
+    cx.set_state("- [X] doˇne");
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_markdown_bulleted_list(&ToggleBulletedList, window, cx)
+    });
+    assert_eq!(cx.buffer_text(), "done");
+}
+
+#[gpui::test]
 async fn test_toggle_markdown_block_quote(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
