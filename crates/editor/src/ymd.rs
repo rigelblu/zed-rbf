@@ -41,6 +41,15 @@ pub(crate) struct YmdLink {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct YmdImage {
+    pub open_marker_range: Range<usize>,
+    pub alt_text_range: Range<usize>,
+    pub close_marker_range: Range<usize>,
+    pub path_range: Range<usize>,
+    pub reference_range: Range<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct YmdBlockQuote {
     // The whole quote line (no trailing newline); the editor paints a vertical
     // gutter border over its rows.
@@ -314,6 +323,18 @@ pub(crate) fn scan_links(text: &str) -> Vec<YmdLink> {
     links
 }
 
+pub(crate) fn scan_images(text: &str) -> Vec<YmdImage> {
+    let mut images = Vec::new();
+    let fenced_code_ranges = fenced_code_block_ranges(text);
+    for_each_line(text, |line_content, line_start| {
+        if range_overlaps_any(&(line_start..line_start + line_content.len()), &fenced_code_ranges) {
+            return;
+        }
+        images.extend(scan_line_images(line_content, line_start));
+    });
+    images
+}
+
 // Byte ranges of Markdown thematic-break lines (`---`, `----`, spaced `- - -`)
 // that should render as a horizontal rule. Permanent dialect rule (walk Q2): only
 // the dash (`-`) family is recognized — `***` and `___` thematic breaks stay raw.
@@ -409,6 +430,15 @@ pub(crate) fn scan_conceals(text: &str) -> Vec<YmdConceal> {
             });
             conceals.push(YmdConceal {
                 range: link.close_marker_range,
+            });
+        }
+
+        for image in scan_line_images(line_content, line_start) {
+            conceals.push(YmdConceal {
+                range: image.open_marker_range,
+            });
+            conceals.push(YmdConceal {
+                range: image.close_marker_range,
             });
         }
 
@@ -582,6 +612,47 @@ fn scan_line_links(line: &str, line_start: usize) -> Vec<YmdLink> {
     }
 
     links
+}
+
+fn scan_line_images(line: &str, line_start: usize) -> Vec<YmdImage> {
+    let mut images = Vec::new();
+    let mut search_start = 0;
+    let bytes = line.as_bytes();
+
+    while let Some(open_relative) = line[search_start..].find("![") {
+        let open = search_start + open_relative;
+        let alt_text_start = open + 2;
+        let Some(close_relative) = line[alt_text_start..].find(']') else {
+            break;
+        };
+        let close = alt_text_start + close_relative;
+        if close == alt_text_start || bytes.get(close + 1) != Some(&b'(') {
+            search_start = open + 2;
+            continue;
+        }
+
+        let path_start = close + 2;
+        let Some(path_end_relative) = link_destination_end(&line[path_start..]) else {
+            search_start = open + 2;
+            continue;
+        };
+        let path_end = path_start + path_end_relative;
+        if path_end == path_start {
+            search_start = open + 2;
+            continue;
+        }
+
+        images.push(YmdImage {
+            open_marker_range: line_start + open..line_start + alt_text_start,
+            alt_text_range: line_start + alt_text_start..line_start + close,
+            close_marker_range: line_start + close..line_start + path_end + 1,
+            path_range: line_start + path_start..line_start + path_end,
+            reference_range: line_start + open..line_start + path_end + 1,
+        });
+        search_start = path_end + 1;
+    }
+
+    images
 }
 
 fn scan_line_inline_style_markers(line: &str, line_start: usize) -> Vec<Range<usize>> {
@@ -1410,6 +1481,59 @@ mod tests {
     }
 
     #[test]
+    fn scans_markdown_images() {
+        assert_eq!(
+            scan_images("![alt](src) text ![two](assets/two.png)"),
+            vec![
+                YmdImage {
+                    open_marker_range: 0..2,
+                    alt_text_range: 2..5,
+                    close_marker_range: 5..11,
+                    path_range: 7..10,
+                    reference_range: 0..11,
+                },
+                YmdImage {
+                    open_marker_range: 17..19,
+                    alt_text_range: 19..22,
+                    close_marker_range: 22..39,
+                    path_range: 24..38,
+                    reference_range: 17..39,
+                },
+            ]
+        );
+        assert_eq!(
+            scan_conceals("![alt](src)"),
+            vec![YmdConceal { range: 0..2 }, YmdConceal { range: 5..11 }]
+        );
+    }
+
+    #[test]
+    fn scans_balanced_paren_image_path_as_single_image() {
+        let line = "![Rust logo](assets/Rust_(logo).png)";
+        let close = line.find("](").unwrap();
+        let images = scan_images(line);
+        assert_eq!(
+            images,
+            vec![YmdImage {
+                open_marker_range: 0..2,
+                alt_text_range: 2..close,
+                close_marker_range: close..line.len(),
+                path_range: close + 2..line.len() - 1,
+                reference_range: 0..line.len(),
+            }]
+        );
+        assert_eq!(images[0].close_marker_range.end, line.len());
+    }
+
+    #[test]
+    fn ignores_invalid_markdown_images() {
+        assert!(scan_images("![](url)").is_empty());
+        assert!(scan_images("![missing url]()").is_empty());
+        assert!(scan_images("![no closing paren](url").is_empty());
+        assert!(scan_images("![brackets only]").is_empty());
+    }
+
+    #[test]
     fn scans_balanced_paren_url_as_single_link() {
         // CommonMark link-destination parens are depth-counted: the balanced
         // `(film)` inside the URL belongs to the destination, so the whole
@@ -1658,7 +1782,7 @@ mod tests {
 
     #[test]
     fn skips_all_ymd_features_inside_fenced_code_blocks() {
-        let text = "==outside==\n```lua\n🔴 code\n==🔵 inside==\n[inside](url)\n---\n```\n==after==\n[after](url)\n---";
+        let text = "==outside==\n```lua\n🔴 code\n==🔵 inside==\n[inside](url)\n![inside](image.png)\n---\n```\n==after==\n[after](url)\n![after](image.png)\n---";
         let fences = fenced_code_block_ranges(text);
         assert_eq!(fences.len(), 1);
 
@@ -1677,6 +1801,11 @@ mod tests {
         assert!(scan(text).iter().all(|h| !range_overlaps_any(&h.range, &fences)));
         assert!(scan_conceals(text).iter().all(|c| !range_overlaps_any(&c.range, &fences)));
         assert!(scan_links(text).iter().all(|l| !range_overlaps_any(&l.label_range, &fences)));
+        assert!(
+            scan_images(text)
+                .iter()
+                .all(|image| !range_overlaps_any(&image.alt_text_range, &fences))
+        );
         assert_eq!(scan_thematic_breaks(text).len(), 1);
         assert!(scan_thematic_breaks(text).iter().all(|r| !range_overlaps_any(r, &fences)));
     }
