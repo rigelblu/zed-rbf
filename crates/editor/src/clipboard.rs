@@ -1,5 +1,9 @@
 use super::*;
+use gpui::{Image, ImageFormat};
 use util::rel_path::RelPath;
+
+const MARKDOWN_IMAGE_PASTE_ALT_TEXT: &str = "alt placeholder";
+const MARKDOWN_IMAGE_PASTE_DEFAULT_DIRECTORY: &str = ".assets";
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ClipboardSelection {
@@ -270,7 +274,25 @@ impl Editor {
             _ => None,
         });
 
-        if let Some(image) = clipboard_image {
+        // `#zed-16`: text clipboard content wins over image content. Both image paths
+        // below would otherwise consume an image that arrived alongside text, which is
+        // upstream's precedence, not ours.
+        let has_clipboard_text = item
+            .entries()
+            .iter()
+            .any(|entry| matches!(entry, ClipboardEntry::String(_)));
+
+        if let Some(image) = clipboard_image.filter(|_| !has_clipboard_text) {
+            // Upstream grew its own Markdown image paste, which writes `image.png`
+            // beside the file. Ours runs first because it is the larger feature:
+            // it honours `markdown_image_paste_directory`, falls back to `.assets`,
+            // validates the configured directory, and resolves through symlinked
+            // directories such as `.rb-drive`. Upstream's block below stays as the
+            // fallback for the cases ours declines.
+            if self.try_paste_markdown_image(image, window, cx) {
+                return;
+            }
+
             let is_markdown = {
                 let display_map = self.display_snapshot(cx);
                 let selections = self.selections.all::<MultiBufferOffset>(&display_map);
@@ -333,8 +355,158 @@ impl Editor {
                 window,
                 cx,
             ),
-            _ => self.do_paste(&item.text().unwrap_or_default(), None, true, window, cx),
+            None => {
+                if let Some(image) = item.entries().iter().find_map(|entry| match entry {
+                    ClipboardEntry::Image(image) => Some(image),
+                    _ => None,
+                }) {
+                    // `try_paste_markdown_image` already ran above for any image with
+                    // bytes, so this branch only decides whether to fall through to a
+                    // text paste.
+                    let _ = image;
+                    if item.text().is_none() {
+                        return;
+                    }
+                }
+                self.do_paste(&item.text().unwrap_or_default(), None, true, window, cx)
+            }
         }
+    }
+
+    fn try_paste_markdown_image(
+        &mut self,
+        image: &Image,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(Some(paste)) = self.prepare_markdown_image_paste(image, cx).log_err() else {
+            return false;
+        };
+        let fs = paste.project.read(cx).fs().clone();
+        let write_path = paste.absolute_path.clone();
+        let image_bytes = paste.image_bytes;
+        let markdown_text = paste.markdown_text;
+        let selections = paste.selections;
+        let previous_paste = self.markdown_image_paste_task.clone();
+
+        let task = cx
+            .spawn_in(
+                window,
+                async move |editor, cx| -> Result<(), Arc<anyhow::Error>> {
+                    if let Err(error) = previous_paste.await {
+                        log::error!("previous Markdown image paste failed: {error:#}");
+                    }
+
+                    fs.write(&write_path, &image_bytes)
+                        .await
+                        .with_context(|| format!("saving pasted image to {write_path:?}"))
+                        .map_err(Arc::new)?;
+
+                    editor
+                        .update_in(cx, |editor, window, cx| {
+                            editor.change_selections(
+                                SelectionEffects::no_scroll(),
+                                window,
+                                cx,
+                                |s| {
+                                    s.select_anchors(selections.to_vec());
+                                },
+                            );
+                            editor.do_paste(&markdown_text, None, true, window, cx);
+                        })
+                        .map_err(Arc::new)?;
+
+                    Ok(())
+                },
+            )
+            .shared();
+        self.markdown_image_paste_task = task.clone();
+
+        let notify_task = cx.spawn_in(window, async move |_, _| -> Result<()> {
+            task.await.map_err(|error| anyhow!("{error:#}"))
+        });
+        self.detach_and_notify_err(notify_task, window, cx);
+        true
+    }
+
+    fn prepare_markdown_image_paste(
+        &self,
+        image: &Image,
+        cx: &mut App,
+    ) -> Result<Option<MarkdownImagePaste>> {
+        let Some(project) = self.project.clone() else {
+            return Ok(None);
+        };
+
+        let selections = self.selections.all_anchors(&self.display_snapshot(cx));
+        if selections.is_empty() {
+            return Ok(None);
+        }
+
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let mut file_path = None;
+        let mut file_absolute_path = None;
+        for selection in selections.iter() {
+            let is_markdown = snapshot
+                .language_at(selection.head())
+                .is_some_and(|language| language.name() == "Markdown");
+            if !is_markdown {
+                return Ok(None);
+            }
+
+            let Some(file) = snapshot.file_at(selection.head()) else {
+                return Ok(None);
+            };
+            let selection_path = ProjectPath {
+                worktree_id: file.worktree_id(cx),
+                path: file.path().clone(),
+            };
+
+            match &file_path {
+                Some(file_path) if file_path != &selection_path => return Ok(None),
+                Some(_) => {}
+                None => {
+                    file_absolute_path = file.as_local().map(|file| file.abs_path(cx));
+                    file_path = Some(selection_path);
+                }
+            }
+        }
+
+        let file_path = file_path.context("markdown image paste missing target file")?;
+        let assets_path = RelPath::unix(MARKDOWN_IMAGE_PASTE_DEFAULT_DIRECTORY)?;
+        let filename = markdown_image_filename(image);
+        let filename_path = RelPath::unix(filename.as_str())?;
+        let markdown_image_path = assets_path.join(filename_path);
+        let absolute_path = if let Some(parent_path) = file_path.path.parent() {
+            let image_project_path = parent_path.join(assets_path).join(filename_path);
+            let image_project_path = ProjectPath {
+                worktree_id: file_path.worktree_id,
+                path: image_project_path,
+            };
+
+            project
+                .read(cx)
+                .absolute_path(&image_project_path, cx)
+                .context("markdown image paste target path is not in this project")?
+        } else {
+            let file_absolute_path =
+                file_absolute_path.context("markdown image paste target file is not local")?;
+            let parent_path = file_absolute_path
+                .parent()
+                .context("markdown image paste target has no parent path")?;
+            parent_path.join(markdown_image_path.as_std_path())
+        };
+
+        Ok(Some(MarkdownImagePaste {
+            project,
+            absolute_path,
+            image_bytes: image.bytes.clone(),
+            markdown_text: format!(
+                "![{MARKDOWN_IMAGE_PASTE_ALT_TEXT}]({})",
+                markdown_image_path.as_unix_str()
+            ),
+            selections,
+        }))
     }
 
     fn insert_image_snippet(
@@ -678,6 +850,30 @@ impl Editor {
             clipboard_selections,
         ));
     }
+}
+
+struct MarkdownImagePaste {
+    project: Entity<Project>,
+    absolute_path: PathBuf,
+    image_bytes: Vec<u8>,
+    markdown_text: String,
+    selections: Arc<[Selection<Anchor>]>,
+}
+
+fn markdown_image_filename(image: &Image) -> String {
+    let extension = match image.format {
+        ImageFormat::Png => "png",
+        ImageFormat::Jpeg => "jpg",
+        ImageFormat::Webp => "webp",
+        ImageFormat::Gif => "gif",
+        ImageFormat::Svg => "svg",
+        ImageFormat::Bmp => "bmp",
+        ImageFormat::Tiff => "tiff",
+        ImageFormat::Ico => "ico",
+        ImageFormat::Pnm => "pnm",
+    };
+    let timestamp = time::OffsetDateTime::now_utc().unix_timestamp_nanos();
+    format!("pasted-image-{timestamp}-{:x}.{extension}", image.id())
 }
 
 struct KillRing {

@@ -2,6 +2,11 @@
 title: "Zed RBF Changelog"
 ---
 
+## 🟠⋯ v0.16.0 — #zed-16
+- Added image-only clipboard paste for saved Markdown files: pasting an image writes bytes to an adjacent `.assets/` directory and inserts `![alt placeholder](.assets/<generated-name>.<ext>)`
+- Text clipboard content continues to win over image content, non-Markdown or fileless buffers no-op, and multiple cursors receive the same generated link
+- The editor writes the image before inserting Markdown, so failed writes leave the buffer unchanged and surface through the existing error notification path
+
 ## 🟠⋯ v0.15.0 — #zed-15
 - Added Markdown formatting shortcuts in saved `.md` editor buffers: bold, italic, heading levels 1 through 6, bullets, and task lists with checked-state toggling
 - Existing task rows now check and uncheck without leaving the whole row selected after the task-list shortcut runs
