@@ -2,6 +2,11 @@
 title: "Zed RBF Changelog"
 ---
 
+## 🟠⋯ v0.17.0 — #zed-17
+- Added clean display for Markdown image references with alt text: off the cursor row, `![alt](assets/image.png)` reads as underlined `alt` while cursor-line reveal shows the raw image syntax for editing
+- Hovering a resolved local Markdown image reference shows the image in the standard hover popover; missing, remote, data, and unsupported paths fall back to normal hover behavior
+- Empty-alt image links such as `![](assets/image.png)` stay raw until alt text exists, and Markdown buffers over the 100KB YMD cap skip this concealment and hover behavior
+
 ## 🟠⋯ v0.16.0 — #zed-16
 - Added image-only clipboard paste for saved Markdown files: pasting an image writes bytes to an adjacent `.assets/` directory and inserts `![alt placeholder](.assets/<generated-name>.<ext>)`
 - Text clipboard content continues to win over image content, non-Markdown or fileless buffers no-op, and multiple cursors receive the same generated link

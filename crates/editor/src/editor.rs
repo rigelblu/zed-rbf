@@ -9948,7 +9948,7 @@ impl Editor {
             }
         }
 
-        let link_ranges = ymd::scan_links(&text)
+        let mut link_ranges = ymd::scan_links(&text)
             .into_iter()
             .filter(|link| {
                 let row = MultiBufferRow(
@@ -9963,6 +9963,22 @@ impl Editor {
                     ..snapshot.anchor_after(MultiBufferOffset(link.label_range.end))
             })
             .collect::<Vec<_>>();
+        link_ranges.extend(
+            ymd::scan_images(&text)
+                .into_iter()
+                .filter(|image| {
+                    let row = MultiBufferRow(
+                        MultiBufferOffset(image.alt_text_range.start)
+                            .to_point(&snapshot)
+                            .row,
+                    );
+                    !diff_rows.contains(&row)
+                })
+                .map(|image| {
+                    snapshot.anchor_before(MultiBufferOffset(image.alt_text_range.start))
+                        ..snapshot.anchor_after(MultiBufferOffset(image.alt_text_range.end))
+                }),
+        );
         if !link_ranges.is_empty() {
             self.highlight_text(
                 HighlightKey::YmdLink,
