@@ -397,9 +397,30 @@ actions!(
     ]
 );
 
+/// Toggles the selected lines or current line to a Markdown heading level.
+#[derive(PartialEq, Clone, Deserialize, Default, JsonSchema, Action)]
+#[action(namespace = markdown)]
+#[serde(deny_unknown_fields)]
+pub struct ToggleHeading {
+    #[serde(default)]
+    pub level: u8,
+}
+
 actions!(
     markdown,
     [
+        /// Toggles bold (`**`) on the selection or word under cursor while in
+        /// Markdown files.
+        ToggleBold,
+        /// Toggles italic (`*`) on the selection or word under cursor while in
+        /// Markdown files.
+        ToggleItalic,
+        /// Toggles a bullet list (`- `) prefix on the selected lines (or the
+        /// current line) while in Markdown files.
+        ToggleBulletedList,
+        /// Toggles a task list (`- [ ] `) prefix on the selected lines (or the
+        /// current line) while in Markdown files.
+        ToggleTaskList,
         /// Toggles a block quote (`> `) prefix on the selected lines (or the
         /// current line) while in Markdown files.
         ToggleBlockQuote,

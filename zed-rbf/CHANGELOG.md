@@ -2,6 +2,12 @@
 title: "Zed RBF Changelog"
 ---
 
+## 🟠⋯ v0.15.0 — #zed-15
+- Added Markdown formatting shortcuts in saved `.md` editor buffers: bold, italic, heading levels 1 through 6, bullets, and task lists with checked-state toggling
+- Existing task rows now check and uncheck without leaving the whole row selected after the task-list shortcut runs
+- Inline formatting wraps a selection or the word under the cursor, toggles existing markers off, inserts an empty marker pair when there is no word at the cursor, and leaves multi-line selections unchanged for row-level commands
+- The shortcuts intentionally reuse common Markdown muscle memory (`Cmd` on macOS, `Ctrl` on Linux/Windows) while the `.md` editor is focused; palette actions still no-op outside Markdown language buffers
+
 ## 🟠⋯ v0.14.0 — #zed-14
 - Fixed table alignment around section dividers: a contiguous pipe block that uses repeated delimiter rows as section breaks now aligns as one table while keeping later delimiter-looking rows as content
 - Stacked tables with different delimiter column counts still split and align independently; no rows are dropped or duplicated
