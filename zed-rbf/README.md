@@ -8,7 +8,9 @@ This is our ~~fork~~ flavour of [Zed](https://github.com/zed-industries/zed) wit
 - file-focused Git history workflows
 - pinned projects
 
-This directory holds this flavour's docs, scripts, and version metadata. See [MAINTENANCE.md](MAINTENANCE.md) for maintenance and upstream-sync guidance.
+This directory holds this flavour's docs, scripts, and version metadata.
+See [MAINTENANCE.md](MAINTENANCE.md) for maintenance and upstream-sync guidance.
+Use `script/install-local` to install the current build, and `zed-rbf/scripts/weekly-build.sh` to rebuild it weekly.
 
 # 🔵⋯ Prerequisites
 - macOS with Xcode selected and the Metal Toolchain installed
@@ -70,6 +72,23 @@ Verify the default installed app identity:
 
 For a custom `--install-dir` or `--name`, run `--system-specs` from that app bundle instead. The output should include a `Zed RBF: v...` line matching `zed-rbf/RBF_VERSION` and preserve the upstream `Zed: ...` line.
 
+## 🟠⋯ Weekly Build
+After the checkout has been synced and conflicts are resolved, build and install it as the weekly app:
+```sh
+zed-rbf/scripts/weekly-build.sh
+```
+
+Preflight without installing:
+```sh
+zed-rbf/scripts/weekly-build.sh --check-only
+```
+
+Notes:
+- Refuses local working-copy changes unless `--allow-dirty` is passed
+- Refuses unresolved conflicts anywhere in the current rbf stack
+- Records provenance, preflight, and install output in `~/Library/Logs/zed-rbf-weekly-build.log` by default
+- Delegates app bundling, signing, and installation to `zed-rbf/scripts/install-local.sh`
+
 # 🔵⋯ YMD Markdown
 - `==text==` renders as a default background highlight
 - `==🔴 text==`, `==🟠 text==`, `==🟡 text==`, `==🟢 text==`, `==🔵 text==`, `==🟣 text==`, and `==⚫ text==` render as colored highlights
@@ -94,12 +113,12 @@ For a custom `--install-dir` or `--name`, run `--system-specs` from that app bun
 # 🔵⋯ Markdown Authoring
 Markdown buffers support common formatting shortcuts:
 
-| Shortcut (macOS)  | Action               |
-| :---------------- | :------------------- |
-| `cmd-b` / `cmd-i` | Toggle bold / italic |
-| `cmd-1`...`cmd-6` | Toggle heading level |
-| `cmd-shift-8`     | Toggle bulleted list |
-| `cmd-shift-9`     | Toggle task list     |
+| Shortcut (macOS)        | Action               |
+| :---------------------- | :------------------- |
+| `cmd-b` / `cmd-i`       | Toggle bold / italic |
+| `cmd-1`...`cmd-6`       | Toggle heading level |
+| `cmd-shift-8` / `cmd-*` | Toggle bulleted list |
+| `cmd-shift-9` / `cmd-(` | Toggle task list     |
 
 Linux and Windows use `ctrl` instead of `cmd`.
 
@@ -167,6 +186,15 @@ Use a distinct bundle id when you want macOS to treat a dogfood build as a separ
 ```sh
 zed-rbf/scripts/install-local.sh --name "Zed RBF Dogfood" --bundle-id dev.zed.Zed-RBF-Dogfood
 ```
+
+# 🔵⋯ Sync From Upstream
+Use MAINTENANCE for the sync flow. The short version:
+```sh
+zed-rbf/scripts/upstream-sync.sh --check-only
+zed-rbf/scripts/upstream-sync.sh
+```
+
+The command fetches `upstream`, reports divergence/classification, rebases the rbf stack onto `main@upstream`, reports conflicts bottom-up with per-file classification, runs the fork regression gates on clean rebases, and prints a `jj op restore` undo command for rebase/local-history changes.
 
 # 🔵⋯ Troubleshooting
 ## 🟠⋯ "cannot execute tool 'metal' due to missing Metal Toolchain" Persists After Installing It
