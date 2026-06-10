@@ -95,6 +95,10 @@ pub struct WorkspaceSettingsContent {
     /// Default: {}
     #[serde(default)]
     pub command_aliases: HashMap<String, ActionName>,
+    /// Local project paths pinned to the top of Open Recent, in display order.
+    ///
+    /// Default: []
+    pub pinned_projects: Option<Vec<String>>,
     /// Maximum open tabs in a pane. Will not close an unsaved
     /// tab. Set to `None` for unlimited tabs.
     ///

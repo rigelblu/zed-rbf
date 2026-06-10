@@ -35,7 +35,7 @@ use picker::{
 use project::{Worktree, git_store::Repository};
 pub use remote_connections::RemoteSettings;
 pub use remote_servers::RemoteServerProjects;
-use settings::{DefaultOpenBehavior, Settings, WorktreeId};
+use settings::{DefaultOpenBehavior, Settings, WorktreeId, update_settings_file_with_completion};
 use ui_input::ErasedEditor;
 use workspace::ProjectGroupKey;
 
@@ -47,14 +47,25 @@ use ui::{
 use util::{ResultExt, paths::PathExt};
 use workspace::{
     HistoryManager, ModalView, MultiWorkspace, OpenMode, OpenOptions, OpenVisible, PathList,
-    RecentWorkspace, SerializedWorkspaceLocation, Workspace, WorkspaceDb, WorkspaceId,
-    notifications::DetachAndPromptErr, with_active_or_new_workspace,
+    RecentWorkspace, SerializedWorkspaceLocation, Toast, Workspace, WorkspaceDb, WorkspaceId,
+    WorkspaceSettings,
+    notifications::{DetachAndPromptErr, NotificationId},
+    with_active_or_new_workspace,
 };
 use zed_actions::{OpenDevContainer, OpenRecent, OpenRemote};
 
 actions!(
     recent_projects,
-    [ToggleActionsMenu, RemoveSelected, AddToWorkspace,]
+    [
+        ToggleActionsMenu,
+        RemoveSelected,
+        AddToWorkspace,
+        PinSelectedRecentProject,
+        PinCurrentProject,
+        UnpinCurrentProject,
+        MovePinnedProjectUp,
+        MovePinnedProjectDown,
+    ]
 );
 
 #[derive(Clone, Debug)]
@@ -77,6 +88,18 @@ struct OpenFolderEntry {
 }
 
 #[derive(Clone, Debug)]
+struct PinnedProjectEntry {
+    setting_path: String,
+    path: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PendingPinnedProjectSelection {
+    PinnedProject(usize),
+    FirstSelectable,
+}
+
+#[derive(Clone, Debug)]
 enum ProjectPickerEntry {
     Header(SharedString),
     /// A currently open folder from the active workspace's "Current Folders" section.
@@ -95,6 +118,10 @@ enum ProjectPickerEntry {
     /// that project group in the current window, while secondary confirm can move local project
     /// groups to a new window when multiple groups are available.
     ProjectGroup(StringMatch),
+    /// A local project from the user-managed pinned project settings list.
+    ///
+    /// The match's `candidate_id` indexes into `RecentProjectsDelegate::pinned_projects`.
+    PinnedProject(StringMatch),
     /// A workspace from the recent-project database's "Recent Projects" section.
     ///
     /// The match's `candidate_id` indexes into `RecentProjectsDelegate::workspaces`. Confirming
@@ -109,6 +136,7 @@ fn is_selectable_entry(entry: &ProjectPickerEntry) -> bool {
         entry,
         ProjectPickerEntry::OpenFolder { .. }
             | ProjectPickerEntry::ProjectGroup(_)
+            | ProjectPickerEntry::PinnedProject(_)
             | ProjectPickerEntry::RecentProject(_)
     )
 }
@@ -117,6 +145,156 @@ fn is_selectable_entry(entry: &ProjectPickerEntry) -> bool {
 enum ProjectPickerStyle {
     Modal,
     Popover,
+}
+
+#[derive(Clone, Copy)]
+enum PinnedProjectMoveDirection {
+    Up,
+    Down,
+}
+
+const PINNED_PROJECT_REQUIRES_LOCAL_SINGLE_ROOT_TOAST: &str =
+    "pinned-project-requires-local-single-root";
+
+fn expand_pinned_project_path(path: &str) -> PathBuf {
+    let env_expanded =
+        shellexpand::env_with_context_no_errors(path, |variable| std::env::var(variable).ok());
+    let tilde_expanded = shellexpand::tilde(env_expanded.as_ref());
+    PathBuf::from(tilde_expanded.as_ref())
+}
+
+fn pinned_project_entry(setting_path: String) -> PinnedProjectEntry {
+    let path = expand_pinned_project_path(&setting_path);
+    PinnedProjectEntry { setting_path, path }
+}
+
+fn pinned_project_entries(cx: &App) -> Vec<PinnedProjectEntry> {
+    WorkspaceSettings::get_global(cx)
+        .pinned_projects
+        .iter()
+        .cloned()
+        .map(pinned_project_entry)
+        .collect()
+}
+
+fn pinned_project_setting_matches(setting_path: &str, project_path: &Path) -> bool {
+    expand_pinned_project_path(setting_path) == project_path
+}
+
+fn path_list_matches_pinned_project(paths: &PathList, pinned_path: &Path) -> bool {
+    let mut paths = paths.paths().iter();
+    matches!((paths.next(), paths.next()), (Some(path), None) if path == pinned_path)
+}
+
+fn recent_workspace_pinnable_project_path(workspace: &RecentWorkspace) -> Option<PathBuf> {
+    if !matches!(workspace.location, SerializedWorkspaceLocation::Local) {
+        return None;
+    }
+
+    let mut paths = workspace.identity_paths.paths().iter();
+    let path = paths.next()?;
+    if paths.next().is_some() {
+        return None;
+    }
+
+    Some(path.clone())
+}
+
+fn set_pinned_project_settings(
+    settings: &mut settings::SettingsContent,
+    pinned_projects: Vec<String>,
+) {
+    settings.workspace.pinned_projects = (!pinned_projects.is_empty()).then_some(pinned_projects);
+}
+
+fn update_pinned_project_settings(
+    fs: Arc<dyn Fs>,
+    window: &mut Window,
+    cx: &mut App,
+    update: impl 'static + Send + FnOnce(&mut settings::SettingsContent, &App),
+) {
+    let update = update_settings_file_with_completion(fs, cx, update);
+    window
+        .spawn(cx, async move |_| match update.await {
+            Ok(Ok(())) => anyhow::Ok(()),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(anyhow::anyhow!("settings update task was canceled")),
+        })
+        .detach_and_prompt_err("Failed to update pinned projects", window, cx, |_, _, _| {
+            None
+        });
+}
+
+fn pin_project_path(pinned_projects: &mut Vec<String>, project_path: &Path) -> bool {
+    if pinned_projects
+        .iter()
+        .any(|setting_path| pinned_project_setting_matches(setting_path, project_path))
+    {
+        return false;
+    }
+
+    pinned_projects.push(project_path.compact().to_string_lossy().to_string());
+    true
+}
+
+fn unpin_project_path(pinned_projects: &mut Vec<String>, project_path: &Path) -> bool {
+    let original_len = pinned_projects.len();
+    pinned_projects.retain(|setting_path| {
+        !pinned_project_setting_matches(setting_path.as_str(), project_path)
+    });
+    pinned_projects.len() != original_len
+}
+
+fn move_pinned_project(
+    pinned_projects: &mut [String],
+    index: usize,
+    direction: PinnedProjectMoveDirection,
+) -> bool {
+    if index >= pinned_projects.len() {
+        return false;
+    }
+
+    let Some(target_index) = (match direction {
+        PinnedProjectMoveDirection::Up => index.checked_sub(1),
+        PinnedProjectMoveDirection::Down => {
+            let next_index = index.saturating_add(1);
+            (next_index < pinned_projects.len()).then_some(next_index)
+        }
+    }) else {
+        return false;
+    };
+
+    pinned_projects.swap(index, target_index);
+    true
+}
+
+fn current_local_single_root_project_path(workspace: &Workspace, cx: &App) -> Option<PathBuf> {
+    let project = workspace.project().read(cx);
+    if !project.is_local() {
+        return None;
+    }
+
+    let mut worktrees = project.visible_worktrees(cx);
+    let worktree = worktrees.next()?;
+    if worktrees.next().is_some() {
+        return None;
+    }
+
+    Some(worktree.read(cx).abs_path().to_path_buf())
+}
+
+fn show_pinned_project_requires_local_single_root_toast(
+    workspace: &mut Workspace,
+    cx: &mut Context<Workspace>,
+) {
+    workspace.show_toast(
+        Toast::new(
+            NotificationId::named(PINNED_PROJECT_REQUIRES_LOCAL_SINGLE_ROOT_TOAST.into()),
+            "Pinned projects require a local single-folder project",
+        )
+        .autohide(),
+        cx,
+    );
 }
 
 pub async fn get_recent_projects(
@@ -504,6 +682,44 @@ pub fn init(cx: &mut App) {
 
     cx.observe_new(DisconnectedOverlay::register).detach();
 
+    cx.on_action(|_: &PinCurrentProject, cx| {
+        with_active_or_new_workspace(cx, move |workspace, window, cx| {
+            let Some(project_path) = current_local_single_root_project_path(workspace, cx) else {
+                show_pinned_project_requires_local_single_root_toast(workspace, cx);
+                return;
+            };
+            let fs = workspace.app_state().fs.clone();
+            update_pinned_project_settings(fs, window, cx, move |settings, _| {
+                let mut pinned_projects = settings
+                    .workspace
+                    .pinned_projects
+                    .clone()
+                    .unwrap_or_default();
+                pin_project_path(&mut pinned_projects, &project_path);
+                set_pinned_project_settings(settings, pinned_projects);
+            });
+        });
+    });
+
+    cx.on_action(|_: &UnpinCurrentProject, cx| {
+        with_active_or_new_workspace(cx, move |workspace, window, cx| {
+            let Some(project_path) = current_local_single_root_project_path(workspace, cx) else {
+                show_pinned_project_requires_local_single_root_toast(workspace, cx);
+                return;
+            };
+            let fs = workspace.app_state().fs.clone();
+            update_pinned_project_settings(fs, window, cx, move |settings, _| {
+                let mut pinned_projects = settings
+                    .workspace
+                    .pinned_projects
+                    .clone()
+                    .unwrap_or_default();
+                unpin_project_path(&mut pinned_projects, &project_path);
+                set_pinned_project_settings(settings, pinned_projects);
+            });
+        });
+    });
+
     cx.on_action(|_: &OpenDevContainer, cx| {
         with_active_or_new_workspace(cx, move |workspace, window, cx| {
             if !workspace.project().read(cx).is_local() {
@@ -704,6 +920,7 @@ impl RecentProjects {
                 open_folders,
                 window_project_groups,
                 ProjectPickerStyle::Modal,
+                cx,
             );
 
             Self::new(delegate, fs, 34., window, cx)
@@ -739,6 +956,7 @@ impl RecentProjects {
                 open_folders,
                 window_project_groups,
                 ProjectPickerStyle::Popover,
+                cx,
             );
             let list = Self::new(delegate, fs, 20., window, cx);
             list.picker.focus_handle(cx).focus(window, cx);
@@ -770,10 +988,11 @@ impl RecentProjects {
     ) {
         self.picker.update(cx, |picker, cx| {
             let ix = picker.delegate.selected_index;
+            let selected_entry = picker.delegate.filtered_entries.get(ix).cloned();
 
-            match picker.delegate.filtered_entries.get(ix) {
+            match selected_entry {
                 Some(ProjectPickerEntry::OpenFolder { index, .. }) => {
-                    if let Some(folder) = picker.delegate.open_folders.get(*index) {
+                    if let Some(folder) = picker.delegate.open_folders.get(index) {
                         let worktree_id = folder.worktree_id;
                         let Some(workspace) = picker.delegate.workspace.upgrade() else {
                             return;
@@ -803,6 +1022,13 @@ impl RecentProjects {
                         let query = picker.query(cx);
                         picker.update_matches(query, window, cx);
                     }
+                }
+                Some(ProjectPickerEntry::PinnedProject(hit)) => {
+                    picker
+                        .delegate
+                        .remove_pinned_project(hit.candidate_id, window, cx);
+                    let query = picker.query(cx);
+                    picker.update_matches(query, window, cx);
                 }
                 Some(ProjectPickerEntry::RecentProject(_)) => {
                     picker.delegate.delete_recent_project(ix, window, cx);
@@ -835,6 +1061,68 @@ impl RecentProjects {
             }
         });
     }
+
+    fn handle_pin_selected_recent_project(
+        &mut self,
+        _: &PinSelectedRecentProject,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.picker.update(cx, |picker, cx| {
+            let ix = picker.delegate.selected_index;
+            let Some(ProjectPickerEntry::RecentProject(hit)) =
+                picker.delegate.filtered_entries.get(ix).cloned()
+            else {
+                return;
+            };
+
+            picker
+                .delegate
+                .pin_recent_project(hit.candidate_id, window, cx);
+            let query = picker.query(cx);
+            picker.update_matches(query, window, cx);
+        });
+    }
+
+    fn handle_move_pinned_project_up(
+        &mut self,
+        _: &MovePinnedProjectUp,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.handle_move_selected_pinned_project(PinnedProjectMoveDirection::Up, window, cx);
+    }
+
+    fn handle_move_pinned_project_down(
+        &mut self,
+        _: &MovePinnedProjectDown,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.handle_move_selected_pinned_project(PinnedProjectMoveDirection::Down, window, cx);
+    }
+
+    fn handle_move_selected_pinned_project(
+        &mut self,
+        direction: PinnedProjectMoveDirection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.picker.update(cx, |picker, cx| {
+            let ix = picker.delegate.selected_index;
+            let Some(ProjectPickerEntry::PinnedProject(hit)) =
+                picker.delegate.filtered_entries.get(ix).cloned()
+            else {
+                return;
+            };
+
+            picker
+                .delegate
+                .move_pinned_project(hit.candidate_id, direction, window, cx);
+            let query = picker.query(cx);
+            picker.update_matches(query, window, cx);
+        });
+    }
 }
 
 impl EventEmitter<DismissEvent> for RecentProjects {}
@@ -852,6 +1140,9 @@ impl Render for RecentProjects {
             .on_action(cx.listener(Self::handle_toggle_open_menu))
             .on_action(cx.listener(Self::handle_remove_selected))
             .on_action(cx.listener(Self::handle_add_to_workspace))
+            .on_action(cx.listener(Self::handle_pin_selected_recent_project))
+            .on_action(cx.listener(Self::handle_move_pinned_project_up))
+            .on_action(cx.listener(Self::handle_move_pinned_project_down))
             .w(rems(self.rem_width))
             .child(self.picker.clone())
     }
@@ -861,12 +1152,14 @@ pub struct RecentProjectsDelegate {
     workspace: WeakEntity<Workspace>,
     open_folders: Vec<OpenFolderEntry>,
     window_project_groups: Vec<ProjectGroupKey>,
+    pinned_projects: Vec<PinnedProjectEntry>,
     workspaces: Vec<RecentWorkspace>,
     filtered_entries: Vec<ProjectPickerEntry>,
     selected_index: usize,
     render_paths: bool,
     create_new_window: bool,
     snap_selection_to_first_non_header_match: bool,
+    pending_pinned_project_selection: Option<PendingPinnedProjectSelection>,
     focus_handle: FocusHandle,
     style: ProjectPickerStyle,
     actions_menu_handle: PopoverMenuHandle<ContextMenu>,
@@ -880,18 +1173,21 @@ impl RecentProjectsDelegate {
         open_folders: Vec<OpenFolderEntry>,
         window_project_groups: Vec<ProjectGroupKey>,
         style: ProjectPickerStyle,
+        cx: &App,
     ) -> Self {
         let render_paths = style == ProjectPickerStyle::Modal;
         Self {
             workspace,
             open_folders,
             window_project_groups,
+            pinned_projects: pinned_project_entries(cx),
             workspaces: Vec::new(),
             filtered_entries: Vec::new(),
             selected_index: 0,
             create_new_window,
             render_paths,
             snap_selection_to_first_non_header_match: true,
+            pending_pinned_project_selection: None,
             focus_handle,
             style,
             actions_menu_handle: PopoverMenuHandle::default(),
@@ -915,6 +1211,7 @@ impl RecentProjectsDelegate {
                 .open_folders
                 .get(*index)
                 .is_some_and(|folder| folder.connection_options.is_some()),
+            ProjectPickerEntry::PinnedProject(_) => false,
             ProjectPickerEntry::ProjectGroup(hit) => self
                 .window_project_groups
                 .get(hit.candidate_id)
@@ -975,6 +1272,7 @@ impl PickerDelegate for RecentProjectsDelegate {
             Some(
                 ProjectPickerEntry::OpenFolder { .. }
                     | ProjectPickerEntry::ProjectGroup(_)
+                    | ProjectPickerEntry::PinnedProject(_)
                     | ProjectPickerEntry::RecentProject(_)
             )
         )
@@ -1032,6 +1330,25 @@ impl PickerDelegate for RecentProjectsDelegate {
             100,
         );
 
+        let pinned_project_candidates: Vec<_> = self
+            .pinned_projects
+            .iter()
+            .enumerate()
+            .map(|(id, pinned_project)| {
+                let path = pinned_project.path.compact().to_string_lossy().into_owned();
+                StringMatchCandidate::new(id, &path)
+            })
+            .collect();
+
+        let mut pinned_project_matches = match_strings(
+            &pinned_project_candidates,
+            query,
+            case,
+            fuzzy_nucleo::LengthPenalty::On,
+            100,
+        );
+        pinned_project_matches.sort_by_key(|pinned_match| pinned_match.candidate_id);
+
         // Build candidates for recent projects (not current, not sibling, not open folder)
         let recent_candidates: Vec<_> = self
             .workspaces
@@ -1058,6 +1375,31 @@ impl PickerDelegate for RecentProjectsDelegate {
         );
 
         let mut entries = Vec::new();
+
+        let has_pinned_projects_to_show = if is_empty_query {
+            !pinned_project_candidates.is_empty()
+        } else {
+            !pinned_project_matches.is_empty()
+        };
+
+        if has_pinned_projects_to_show {
+            entries.push(ProjectPickerEntry::Header("Pinned Projects".into()));
+
+            if is_empty_query {
+                for id in 0..self.pinned_projects.len() {
+                    entries.push(ProjectPickerEntry::PinnedProject(StringMatch {
+                        candidate_id: id,
+                        score: 0.0,
+                        positions: Vec::new(),
+                        string: Default::default(),
+                    }));
+                }
+            } else {
+                for pinned_match in pinned_project_matches {
+                    entries.push(ProjectPickerEntry::PinnedProject(pinned_match));
+                }
+            }
+        }
 
         if !self.open_folders.is_empty() {
             let matched_folders: Vec<_> = if is_empty_query {
@@ -1133,12 +1475,26 @@ impl PickerDelegate for RecentProjectsDelegate {
 
         self.filtered_entries = entries;
 
-        if self.snap_selection_to_first_non_header_match {
-            self.selected_index = self
-                .filtered_entries
-                .iter()
-                .position(|e| !matches!(e, ProjectPickerEntry::Header(_)))
-                .unwrap_or(0);
+        if let Some(selection) = self.pending_pinned_project_selection.take() {
+            self.selected_index = match selection {
+                PendingPinnedProjectSelection::PinnedProject(candidate_id) => self
+                    .filtered_entries
+                    .iter()
+                    .position(|entry| {
+                        matches!(
+                            entry,
+                            ProjectPickerEntry::PinnedProject(hit)
+                                if hit.candidate_id == candidate_id
+                        )
+                    })
+                    .or_else(|| self.first_selectable_entry_index())
+                    .unwrap_or(0),
+                PendingPinnedProjectSelection::FirstSelectable => {
+                    self.first_selectable_entry_index().unwrap_or(0)
+                }
+            };
+        } else if self.snap_selection_to_first_non_header_match {
+            self.selected_index = self.first_selectable_entry_index().unwrap_or(0);
         }
         self.snap_selection_to_first_non_header_match = true;
         Task::ready(())
@@ -1212,6 +1568,10 @@ impl PickerDelegate for RecentProjectsDelegate {
                     });
                 }
                 cx.emit(DismissEvent);
+            }
+            Some(ProjectPickerEntry::PinnedProject(selected_match)) => {
+                let candidate_id = selected_match.candidate_id;
+                self.open_pinned_project(candidate_id, secondary, window, cx);
             }
             Some(ProjectPickerEntry::RecentProject(selected_match)) => {
                 let candidate_id = selected_match.candidate_id;
@@ -1472,12 +1832,149 @@ impl PickerDelegate for RecentProjectsDelegate {
                         .into_any_element(),
                 )
             }
+            ProjectPickerEntry::PinnedProject(hit) => {
+                let pinned_project = self.pinned_projects.get(hit.candidate_id)?;
+                let path = pinned_project.path.compact();
+                let tooltip_path: SharedString = path.to_string_lossy().to_string().into();
+                let (match_label, path_highlight) =
+                    highlights_for_path(path.as_ref(), &hit.positions, 0);
+                let highlighted_match = HighlightedMatchWithPaths {
+                    prefix: None,
+                    match_label: HighlightedMatch::join(match_label.into_iter(), ", "),
+                    paths: vec![path_highlight],
+                    active: false,
+                };
+
+                let focus_handle = self.focus_handle.clone();
+                let candidate_id = hit.candidate_id;
+                let secondary_actions = h_flex()
+                    .gap_px()
+                    .child(
+                        IconButton::new(
+                            ("move_pinned_project_up", candidate_id),
+                            IconName::ArrowUp,
+                        )
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text("Move Up"))
+                        .on_click(cx.listener(
+                            move |picker, _event, window, cx| {
+                                cx.stop_propagation();
+                                window.prevent_default();
+                                picker.delegate.move_pinned_project(
+                                    candidate_id,
+                                    PinnedProjectMoveDirection::Up,
+                                    window,
+                                    cx,
+                                );
+                                let query = picker.query(cx);
+                                picker.update_matches(query, window, cx);
+                            },
+                        )),
+                    )
+                    .child(
+                        IconButton::new(
+                            ("move_pinned_project_down", candidate_id),
+                            IconName::ArrowDown,
+                        )
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text("Move Down"))
+                        .on_click(cx.listener(
+                            move |picker, _event, window, cx| {
+                                cx.stop_propagation();
+                                window.prevent_default();
+                                picker.delegate.move_pinned_project(
+                                    candidate_id,
+                                    PinnedProjectMoveDirection::Down,
+                                    window,
+                                    cx,
+                                );
+                                let query = picker.query(cx);
+                                picker.update_matches(query, window, cx);
+                            },
+                        )),
+                    )
+                    .child(
+                        IconButton::new(
+                            ("open_pinned_new_window", candidate_id),
+                            IconName::ArrowUpRight,
+                        )
+                        .icon_size(IconSize::Small)
+                        .tooltip({
+                            move |_, cx| {
+                                Tooltip::for_action_in(
+                                    "Open Project in New Window",
+                                    &menu::SecondaryConfirm,
+                                    &focus_handle,
+                                    cx,
+                                )
+                            }
+                        })
+                        .on_click(cx.listener(
+                            move |picker, _event, window, cx| {
+                                cx.stop_propagation();
+                                window.prevent_default();
+                                picker.delegate.set_selected_index(ix, window, cx);
+                                picker.delegate.confirm(true, window, cx);
+                            },
+                        )),
+                    )
+                    .child(
+                        IconButton::new(("unpin_project", candidate_id), IconName::Close)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Unpin Project"))
+                            .on_click(cx.listener(move |picker, _event, window, cx| {
+                                cx.stop_propagation();
+                                window.prevent_default();
+                                picker
+                                    .delegate
+                                    .remove_pinned_project(candidate_id, window, cx);
+                                let query = picker.query(cx);
+                                picker.update_matches(query, window, cx);
+                            })),
+                    )
+                    .into_any_element();
+
+                Some(
+                    ListItem::new(ix)
+                        .toggle_state(selected)
+                        .inset(true)
+                        .spacing(ListItemSpacing::Sparse)
+                        .child(
+                            h_flex()
+                                .id("pinned_project_info_container")
+                                .w_full()
+                                .min_w_0()
+                                .gap_2p5()
+                                .flex_grow_1()
+                                .child(Icon::new(IconName::Pin).color(Color::Muted))
+                                .child({
+                                    let mut highlighted = highlighted_match;
+                                    if !self.render_paths {
+                                        highlighted.paths.clear();
+                                    }
+                                    highlighted.render(window, cx)
+                                })
+                                .tooltip(move |_, cx| {
+                                    Tooltip::with_meta(
+                                        "Open Pinned Project in This Window",
+                                        None,
+                                        tooltip_path.clone(),
+                                        cx,
+                                    )
+                                }),
+                        )
+                        .end_slot(secondary_actions)
+                        .show_end_slot_on_hover()
+                        .into_any_element(),
+                )
+            }
             ProjectPickerEntry::RecentProject(hit) => {
                 let workspace = self.workspaces.get(hit.candidate_id)?;
                 let location = &workspace.location;
                 let raw_paths = &workspace.paths;
                 let identity_paths = &workspace.identity_paths;
                 let is_local = matches!(location, SerializedWorkspaceLocation::Local);
+                let can_pin_project = recent_workspace_pinnable_project_path(workspace).is_some();
                 let paths_to_add = raw_paths.paths().to_vec();
                 let ordered_paths: Vec<_> = identity_paths
                     .ordered_paths()
@@ -1528,6 +2025,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                 };
 
                 let focus_handle = self.focus_handle.clone();
+                let candidate_id = hit.candidate_id;
                 let secondary_confirm_tooltip = if self.create_new_window {
                     "Open Project in This Window"
                 } else {
@@ -1546,6 +2044,20 @@ impl PickerDelegate for RecentProjectsDelegate {
 
                 let secondary_actions = h_flex()
                     .gap_px()
+                    .when(can_pin_project, |this| {
+                        this.child(
+                            IconButton::new(("pin_project", candidate_id), IconName::Pin)
+                                .icon_size(IconSize::Small)
+                                .tooltip(Tooltip::text("Pin Project"))
+                                .on_click(cx.listener(move |picker, _event, window, cx| {
+                                    cx.stop_propagation();
+                                    window.prevent_default();
+                                    picker.delegate.pin_recent_project(candidate_id, window, cx);
+                                    let query = picker.query(cx);
+                                    picker.update_matches(query, window, cx);
+                                })),
+                        )
+                    })
                     .when(is_local, |this| {
                         this.child(
                             IconButton::new("add_to_workspace", IconName::FolderOpenAdd)
@@ -1788,6 +2300,18 @@ impl PickerDelegate for RecentProjectsDelegate {
                     })
                     .into_any_element(),
             ),
+            Some(ProjectPickerEntry::PinnedProject(_)) => Some(
+                Button::new("unpin_project", "Unpin")
+                    .key_binding(KeyBinding::for_action_in(
+                        &RemoveSelected,
+                        &focus_handle,
+                        cx,
+                    ))
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(RemoveSelected.boxed_clone(), cx)
+                    })
+                    .into_any_element(),
+            ),
             _ => None,
         };
 
@@ -1912,6 +2436,19 @@ impl PickerDelegate for RecentProjectsDelegate {
                             let open_action = workspace::Open {
                                 create_new_window: Some(create_new_window),
                             };
+                            let show_pinned_actions = matches!(
+                                selected_entry,
+                                Some(ProjectPickerEntry::PinnedProject(_))
+                            );
+                            let show_pin_recent_project = match selected_entry {
+                                Some(ProjectPickerEntry::RecentProject(hit)) => self
+                                    .workspaces
+                                    .get(hit.candidate_id)
+                                    .is_some_and(|workspace| {
+                                        recent_workspace_pinnable_project_path(workspace).is_some()
+                                    }),
+                                _ => false,
+                            };
                             let show_add_to_workspace = match selected_entry {
                                 Some(ProjectPickerEntry::RecentProject(hit)) => self
                                     .workspaces
@@ -1933,6 +2470,28 @@ impl PickerDelegate for RecentProjectsDelegate {
                                     let open_action = open_action.clone();
                                     move |menu, _, _| {
                                         menu.context(focus_handle)
+                                            .when(show_pinned_actions, |menu| {
+                                                menu.action(
+                                                    "Move Pinned Project Up",
+                                                    MovePinnedProjectUp.boxed_clone(),
+                                                )
+                                                .action(
+                                                    "Move Pinned Project Down",
+                                                    MovePinnedProjectDown.boxed_clone(),
+                                                )
+                                                .action(
+                                                    "Unpin Project",
+                                                    RemoveSelected.boxed_clone(),
+                                                )
+                                                .separator()
+                                            })
+                                            .when(show_pin_recent_project, |menu| {
+                                                menu.action(
+                                                    "Pin Project",
+                                                    PinSelectedRecentProject.boxed_clone(),
+                                                )
+                                                .separator()
+                                            })
                                             .when(show_add_to_workspace, |menu| {
                                                 menu.action(
                                                     "Add Folder to this Project",
@@ -2116,6 +2675,160 @@ fn open_local_project(
 }
 
 impl RecentProjectsDelegate {
+    fn first_selectable_entry_index(&self) -> Option<usize> {
+        self.filtered_entries.iter().position(is_selectable_entry)
+    }
+
+    fn replace_pinned_projects(
+        &mut self,
+        pinned_projects: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) {
+        self.pinned_projects = pinned_projects
+            .iter()
+            .cloned()
+            .map(pinned_project_entry)
+            .collect();
+
+        if let Some(workspace) = self.workspace.upgrade() {
+            let fs = workspace.read(cx).app_state().fs.clone();
+            update_pinned_project_settings(fs, window, cx, move |settings, _| {
+                set_pinned_project_settings(settings, pinned_projects);
+            });
+        }
+    }
+
+    fn remove_pinned_project(
+        &mut self,
+        candidate_id: usize,
+        window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) {
+        if candidate_id >= self.pinned_projects.len() {
+            return;
+        }
+
+        let mut pinned_projects = self
+            .pinned_projects
+            .iter()
+            .map(|pinned_project| pinned_project.setting_path.clone())
+            .collect::<Vec<_>>();
+        pinned_projects.remove(candidate_id);
+        self.pending_pinned_project_selection = if pinned_projects.is_empty() {
+            Some(PendingPinnedProjectSelection::FirstSelectable)
+        } else {
+            Some(PendingPinnedProjectSelection::PinnedProject(
+                candidate_id.min(pinned_projects.len() - 1),
+            ))
+        };
+        self.replace_pinned_projects(pinned_projects, window, cx);
+        self.snap_selection_to_first_non_header_match = false;
+    }
+
+    fn pin_recent_project(
+        &mut self,
+        candidate_id: usize,
+        window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) {
+        let Some(project_path) = self
+            .workspaces
+            .get(candidate_id)
+            .and_then(recent_workspace_pinnable_project_path)
+        else {
+            return;
+        };
+
+        let mut pinned_projects = self
+            .pinned_projects
+            .iter()
+            .map(|pinned_project| pinned_project.setting_path.clone())
+            .collect::<Vec<_>>();
+        if !pin_project_path(&mut pinned_projects, &project_path) {
+            return;
+        }
+
+        self.pending_pinned_project_selection = Some(PendingPinnedProjectSelection::PinnedProject(
+            pinned_projects.len() - 1,
+        ));
+        self.replace_pinned_projects(pinned_projects, window, cx);
+        self.snap_selection_to_first_non_header_match = false;
+    }
+
+    fn move_pinned_project(
+        &mut self,
+        candidate_id: usize,
+        direction: PinnedProjectMoveDirection,
+        window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) {
+        let mut pinned_projects = self
+            .pinned_projects
+            .iter()
+            .map(|pinned_project| pinned_project.setting_path.clone())
+            .collect::<Vec<_>>();
+        let target_candidate_id = match direction {
+            PinnedProjectMoveDirection::Up => candidate_id.checked_sub(1),
+            PinnedProjectMoveDirection::Down => {
+                let next_candidate_id = candidate_id.saturating_add(1);
+                (next_candidate_id < pinned_projects.len()).then_some(next_candidate_id)
+            }
+        };
+        if !move_pinned_project(&mut pinned_projects, candidate_id, direction) {
+            return;
+        }
+
+        self.pending_pinned_project_selection =
+            target_candidate_id.map(PendingPinnedProjectSelection::PinnedProject);
+        self.replace_pinned_projects(pinned_projects, window, cx);
+        self.snap_selection_to_first_non_header_match = false;
+    }
+
+    fn open_pinned_project(
+        &mut self,
+        candidate_id: usize,
+        secondary: bool,
+        window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let Some(candidate_project) = self.pinned_projects.get(candidate_id) else {
+            return;
+        };
+
+        let replace_current_window = self.create_new_window == secondary;
+        let paths = vec![candidate_project.path.clone()];
+
+        workspace.update(cx, |workspace, cx| {
+            if replace_current_window {
+                if let Some(handle) = window.window_handle().downcast::<MultiWorkspace>() {
+                    cx.defer(move |cx| {
+                        handle
+                            .update(cx, |multi_workspace, window, cx| {
+                                multi_workspace
+                                    .open_project(paths, OpenMode::Activate, window, cx)
+                                    .detach_and_prompt_err(
+                                        "Failed to open project",
+                                        window,
+                                        cx,
+                                        |_, _, _| None,
+                                    );
+                            })
+                            .log_err();
+                    });
+                }
+            } else {
+                workspace
+                    .open_workspace_for_paths(OpenMode::NewWindow, paths, window, cx)
+                    .detach_and_prompt_err("Failed to open project", window, cx, |_, _, _| None);
+            }
+        });
+        cx.emit(DismissEvent);
+    }
+
     fn open_recent_projects(
         &mut self,
         candidate_id: usize,
@@ -2419,6 +3132,12 @@ impl RecentProjectsDelegate {
         false
     }
 
+    fn is_pinned_project(&self, paths: &PathList) -> bool {
+        self.pinned_projects
+            .iter()
+            .any(|pinned_project| path_list_matches_pinned_project(paths, &pinned_project.path))
+    }
+
     fn is_valid_recent_candidate(
         &self,
         workspace: &RecentWorkspace,
@@ -2427,6 +3146,7 @@ impl RecentProjectsDelegate {
         !self.is_current_workspace(workspace.workspace_id, cx)
             && !self.is_in_current_window_groups(workspace)
             && !self.is_open_folder(&workspace.paths)
+            && !self.is_pinned_project(&workspace.identity_paths)
     }
 }
 
@@ -2519,6 +3239,7 @@ mod tests {
                 vec![open_folder(0), open_folder(1)],
                 vec![project_group(0), project_group(1)],
                 ProjectPickerStyle::Modal,
+                cx,
             );
             delegate.set_workspaces(recent_workspaces());
             Picker::list(delegate, window, cx)
@@ -2609,18 +3330,308 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn pinned_project_setting_mutations_are_idempotent_and_bounded() {
+        let project_a = Path::new("/project/a");
+        let project_b = Path::new("/project/b");
+        let mut pinned_projects = vec![project_b.to_string_lossy().to_string()];
+
+        assert!(pin_project_path(&mut pinned_projects, project_a));
+        assert!(!pin_project_path(&mut pinned_projects, project_a));
+        assert_eq!(
+            pinned_projects,
+            vec![
+                project_b.to_string_lossy().to_string(),
+                project_a.to_string_lossy().to_string()
+            ]
+        );
+
+        assert!(move_pinned_project(
+            &mut pinned_projects,
+            1,
+            PinnedProjectMoveDirection::Up
+        ));
+        assert_eq!(
+            pinned_projects,
+            vec![
+                project_a.to_string_lossy().to_string(),
+                project_b.to_string_lossy().to_string()
+            ]
+        );
+
+        assert!(!move_pinned_project(
+            &mut pinned_projects,
+            0,
+            PinnedProjectMoveDirection::Up
+        ));
+        assert!(!move_pinned_project(
+            &mut pinned_projects,
+            1,
+            PinnedProjectMoveDirection::Down
+        ));
+        assert!(!move_pinned_project(
+            &mut pinned_projects,
+            99,
+            PinnedProjectMoveDirection::Up
+        ));
+        assert!(!move_pinned_project(
+            &mut pinned_projects,
+            99,
+            PinnedProjectMoveDirection::Down
+        ));
+
+        assert!(unpin_project_path(&mut pinned_projects, project_a));
+        assert!(!unpin_project_path(&mut pinned_projects, project_a));
+        assert_eq!(
+            pinned_projects,
+            vec![project_b.to_string_lossy().to_string()]
+        );
+    }
+
+    #[test]
+    fn pin_recent_project_eligibility_requires_local_single_folder() {
+        let local_single_folder = recent_workspace(1);
+        assert_eq!(
+            recent_workspace_pinnable_project_path(&local_single_folder),
+            Some(PathBuf::from("/recent/project-01"))
+        );
+
+        let remote_paths = PathList::new(&[PathBuf::from("/recent/remote-project")]);
+        let remote_workspace = RecentWorkspace {
+            workspace_id: WorkspaceId::from_i64(100),
+            location: SerializedWorkspaceLocation::Remote(RemoteConnectionOptions::Mock(
+                remote::MockConnectionOptions { id: 100 },
+            )),
+            paths: remote_paths.clone(),
+            identity_paths: remote_paths,
+            timestamp: Utc::now(),
+        };
+        assert!(recent_workspace_pinnable_project_path(&remote_workspace).is_none());
+
+        let multi_root_paths = PathList::new(&[
+            PathBuf::from("/recent/multi-root-a"),
+            PathBuf::from("/recent/multi-root-b"),
+        ]);
+        let multi_root_workspace = RecentWorkspace {
+            workspace_id: WorkspaceId::from_i64(101),
+            location: SerializedWorkspaceLocation::Local,
+            paths: multi_root_paths.clone(),
+            identity_paths: multi_root_paths,
+            timestamp: Utc::now(),
+        };
+        assert!(recent_workspace_pinnable_project_path(&multi_root_workspace).is_none());
+    }
+
+    #[gpui::test]
+    fn pin_recent_project_row_moves_it_to_pinned_projects(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (picker, cx) = cx.add_window_view(|window, cx| {
+            let mut delegate = RecentProjectsDelegate::new(
+                WeakEntity::new_invalid(),
+                false,
+                cx.focus_handle(),
+                Vec::new(),
+                Vec::new(),
+                ProjectPickerStyle::Modal,
+                cx,
+            );
+            delegate.set_workspaces(recent_workspaces());
+            Picker::list(delegate, window, cx)
+                .list_measure_all()
+                .show_scrollbar(true)
+        });
+
+        const RECENT_CANDIDATE_ID: usize = 2;
+        picker.update_in(cx, |picker, window, cx| {
+            picker.update_matches(String::new(), window, cx);
+            picker
+                .delegate
+                .pin_recent_project(RECENT_CANDIDATE_ID, window, cx);
+            picker.update_matches(String::new(), window, cx);
+        });
+
+        picker.update(cx, |picker, _| {
+            let entries = &picker.delegate.filtered_entries;
+            assert!(matches!(
+                entries.first(),
+                Some(ProjectPickerEntry::Header(title)) if title.as_ref() == "Pinned Projects"
+            ));
+
+            let Some(ProjectPickerEntry::PinnedProject(hit)) = entries.get(1) else {
+                panic!("expected newly pinned recent project to render first");
+            };
+            assert_eq!(
+                picker.delegate.pinned_projects[hit.candidate_id].setting_path,
+                "/recent/project-02"
+            );
+            assert_eq!(
+                picker.delegate.selected_index, 1,
+                "newly pinned project should remain selected after matches refresh"
+            );
+            assert!(
+                !entries.iter().any(|entry| matches!(
+                    entry,
+                    ProjectPickerEntry::RecentProject(hit)
+                        if hit.candidate_id == RECENT_CANDIDATE_ID
+                )),
+                "newly pinned project should not also render as a recent project"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn pinned_projects_render_before_recents_and_dedup(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.workspace.pinned_projects = Some(vec![
+                        "/recent/project-03".to_string(),
+                        "/pinned/project-only".to_string(),
+                    ]);
+                });
+            });
+        });
+
+        let (picker, cx) = cx.add_window_view(|window, cx| {
+            let mut delegate = RecentProjectsDelegate::new(
+                WeakEntity::new_invalid(),
+                false,
+                cx.focus_handle(),
+                Vec::new(),
+                Vec::new(),
+                ProjectPickerStyle::Modal,
+                cx,
+            );
+            delegate.set_workspaces(recent_workspaces());
+            Picker::list(delegate, window, cx)
+                .list_measure_all()
+                .show_scrollbar(true)
+        });
+        picker.update_in(cx, |picker, window, cx| {
+            picker.update_matches(String::new(), window, cx);
+        });
+
+        picker.update(cx, |picker, _| {
+            let entries = &picker.delegate.filtered_entries;
+            assert!(matches!(
+                entries.first(),
+                Some(ProjectPickerEntry::Header(title)) if title.as_ref() == "Pinned Projects"
+            ));
+            assert!(matches!(
+                entries.get(1),
+                Some(ProjectPickerEntry::PinnedProject(hit)) if hit.candidate_id == 0
+            ));
+            assert!(matches!(
+                entries.get(2),
+                Some(ProjectPickerEntry::PinnedProject(hit)) if hit.candidate_id == 1
+            ));
+            assert!(
+                !entries.iter().any(|entry| matches!(
+                    entry,
+                    ProjectPickerEntry::RecentProject(hit) if hit.candidate_id == 3
+                )),
+                "pinned recent project should not also render as a recent"
+            );
+        });
+
+        picker.update_in(cx, |picker, window, cx| {
+            picker.update_matches("project".to_string(), window, cx);
+        });
+
+        picker.update(cx, |picker, _| {
+            let entries = &picker.delegate.filtered_entries;
+            assert!(matches!(
+                entries.first(),
+                Some(ProjectPickerEntry::Header(title)) if title.as_ref() == "Pinned Projects"
+            ));
+            assert!(matches!(
+                entries.get(1),
+                Some(ProjectPickerEntry::PinnedProject(hit)) if hit.candidate_id == 0
+            ));
+            assert!(matches!(
+                entries.get(2),
+                Some(ProjectPickerEntry::PinnedProject(hit)) if hit.candidate_id == 1
+            ));
+            assert!(
+                !entries.iter().any(|entry| matches!(
+                    entry,
+                    ProjectPickerEntry::RecentProject(hit) if hit.candidate_id == 3
+                )),
+                "pinned recent project should not also render as a recent while filtering"
+            );
+        });
+
+        picker.update_in(cx, |picker, window, cx| {
+            picker.update_matches(String::new(), window, cx);
+            picker.set_selected_index(1, None, false, window, cx);
+            picker
+                .delegate
+                .move_pinned_project(0, PinnedProjectMoveDirection::Down, window, cx);
+            picker.update_matches(String::new(), window, cx);
+        });
+
+        picker.update(cx, |picker, _| {
+            let Some(ProjectPickerEntry::PinnedProject(hit)) = picker
+                .delegate
+                .filtered_entries
+                .get(picker.delegate.selected_index)
+            else {
+                panic!("expected moved pinned project to remain selected");
+            };
+            assert_eq!(
+                picker.delegate.pinned_projects[hit.candidate_id].setting_path,
+                "/recent/project-03"
+            );
+        });
+
+        picker.update_in(cx, |picker, window, cx| {
+            let candidate_id = match picker
+                .delegate
+                .filtered_entries
+                .get(picker.delegate.selected_index)
+            {
+                Some(ProjectPickerEntry::PinnedProject(hit)) => hit.candidate_id,
+                _ => panic!("expected pinned project selection before removal"),
+            };
+            picker
+                .delegate
+                .remove_pinned_project(candidate_id, window, cx);
+            picker.update_matches(String::new(), window, cx);
+        });
+
+        picker.update(cx, |picker, _| {
+            let Some(ProjectPickerEntry::PinnedProject(hit)) = picker
+                .delegate
+                .filtered_entries
+                .get(picker.delegate.selected_index)
+            else {
+                panic!("expected replacement pinned project to remain selected");
+            };
+            assert_eq!(
+                picker.delegate.pinned_projects[hit.candidate_id].setting_path,
+                "/pinned/project-only"
+            );
+        });
+    }
+
     #[gpui::test]
     fn this_window_project_icons_use_each_project_group_host(cx: &mut TestAppContext) {
         init_test(cx);
 
-        let mut delegate = RecentProjectsDelegate::new(
-            WeakEntity::new_invalid(),
-            false,
-            cx.update(|cx| cx.focus_handle()),
-            Vec::new(),
-            vec![project_group(0), remote_project_group(1)],
-            ProjectPickerStyle::Modal,
-        );
+        let mut delegate = cx.update(|cx| {
+            RecentProjectsDelegate::new(
+                WeakEntity::new_invalid(),
+                false,
+                cx.focus_handle(),
+                Vec::new(),
+                vec![project_group(0), remote_project_group(1)],
+                ProjectPickerStyle::Modal,
+                cx,
+            )
+        });
         delegate.filtered_entries = vec![
             ProjectPickerEntry::ProjectGroup(StringMatch {
                 candidate_id: 0,
