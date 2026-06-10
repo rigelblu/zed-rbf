@@ -2,6 +2,12 @@
 title: "Zed RBF Changelog"
 ---
 
+## 🟠⋯ v0.28.0 — #zed-30
+- Added a fork-owned `zed-rbf/README.md` entry point for installing and using the fork
+- Added `zed-rbf/MAINTENANCE.md` for manual upstream sync notes, fork version handling, and the divergence inventory
+- Improved fork docs to use `zed-rbf/scripts/install-local.sh` as the real installer path, with `script/install-local` documented only as a compatibility wrapper
+- Kept daily-build and upstream-sync run commands out of this slice until `#zed-28` lands them
+
 ## 🟠⋯ v0.27.0 — #zed-27
 - Added `zed-rbf/scripts/install-local.sh` to build and install the local checkout as a fork-named macOS app under `$HOME/Applications/Zed RBF.app` by default
 - Added a compatibility wrapper at `script/install-local`
