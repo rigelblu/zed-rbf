@@ -2,6 +2,12 @@
 title: "Zed RBF Changelog"
 ---
 
+## 🟠⋯ v0.27.0 — #zed-27
+- Added `zed-rbf/scripts/install-local.sh` to build and install the local checkout as a fork-named macOS app under `$HOME/Applications/Zed RBF.app` by default
+- Added a compatibility wrapper at `script/install-local`
+- Added dogfood install options for debug builds, custom install directories, app names, bundle identifiers, and optional launch
+- Improved installer safety by restoring temporary `Cargo.toml` edits on failure, using the active `CARGO_TARGET_DIR`, verifying the downloaded dugite `git` binary, pinning `cargo-bundle`, and replacing existing app bundles through a backup/restore path
+
 ## 🟠⋯ v0.26.0 — #zed-26
 - Added visible zed-rbf version information to the window title, About window, and System Specs
 - Build identity comes from the fork-owned `zed-rbf/RBF_VERSION` file while preserving upstream Zed version information
