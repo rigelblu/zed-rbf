@@ -3286,6 +3286,27 @@ Examples:
 }
 ```
 
+## Pinned Projects
+
+- Description: Local project paths pinned to the top of Open Recent and the title-bar project picker, in display order.
+- Setting: `pinned_projects`
+- Default: `[]`
+
+**Options**
+
+An array of path strings. Paths may use `~` and environment variables.
+
+Examples:
+
+```json [settings]
+{
+  "pinned_projects": [
+    "~/src/zed",
+    "/Users/example/work/project"
+  ]
+}
+```
+
 ## Preview tabs
 
 - Description:

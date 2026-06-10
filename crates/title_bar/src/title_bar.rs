@@ -765,8 +765,6 @@ impl TitleBar {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let workspace = self.workspace.clone();
-
         let is_project_selected = name.is_some();
 
         let display_name = if let Some(ref name) = name {
@@ -790,11 +788,24 @@ impl TitleBar {
             .map(|mw| mw.read(cx).is_threads_list_view_active(cx))
             .unwrap_or(false);
 
-        if is_sidebar_open && is_threads_list_view_active {
-            return self
-                .render_recent_projects_popover(display_name, is_project_selected, cx)
-                .into_any_element();
-        }
+        let menu_id = if is_sidebar_open && is_threads_list_view_active {
+            "sidebar-title-recent-projects-menu"
+        } else {
+            "recent-projects-menu"
+        };
+
+        self.render_recent_projects_menu(menu_id, display_name, is_project_selected, cx)
+            .into_any_element()
+    }
+
+    fn render_recent_projects_menu(
+        &self,
+        menu_id: &'static str,
+        display_name: String,
+        is_project_selected: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let workspace = self.workspace.clone();
 
         let focus_handle = workspace
             .upgrade()
@@ -808,7 +819,7 @@ impl TitleBar {
             .map(|mw| mw.read(cx).project_group_keys())
             .unwrap_or_default();
 
-        PopoverMenu::new("recent-projects-menu")
+        PopoverMenu::new(menu_id)
             .menu(move |window, cx| {
                 Some(recent_projects::RecentProjects::popover(
                     workspace.clone(),
@@ -837,56 +848,6 @@ impl TitleBar {
             )
             .anchor(gpui::Anchor::TopLeft)
             .into_any_element()
-    }
-
-    fn render_recent_projects_popover(
-        &self,
-        display_name: String,
-        is_project_selected: bool,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let workspace = self.workspace.clone();
-
-        let focus_handle = workspace
-            .upgrade()
-            .map(|w| w.read(cx).focus_handle(cx))
-            .unwrap_or_else(|| cx.focus_handle());
-
-        let window_project_groups: Vec<_> = self
-            .multi_workspace
-            .as_ref()
-            .and_then(|mw| mw.upgrade())
-            .map(|mw| mw.read(cx).project_group_keys())
-            .unwrap_or_default();
-
-        PopoverMenu::new("sidebar-title-recent-projects-menu")
-            .menu(move |window, cx| {
-                Some(recent_projects::RecentProjects::popover(
-                    workspace.clone(),
-                    window_project_groups.clone(),
-                    None,
-                    focus_handle.clone(),
-                    window,
-                    cx,
-                ))
-            })
-            .trigger_with_tooltip(
-                Button::new("project_name_trigger", display_name)
-                    .label_size(LabelSize::Small)
-                    .when(self.worktree_count(cx) > 1, |this| {
-                        this.end_icon(
-                            Icon::new(IconName::ChevronDown)
-                                .size(IconSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                    })
-                    .selected_style(ButtonStyle::Tinted(TintColor::Accent))
-                    .when(!is_project_selected, |s| s.color(Color::Muted)),
-                move |_window, cx| {
-                    Tooltip::for_action("Recent Projects", &zed_actions::OpenRecent::default(), cx)
-                },
-            )
-            .anchor(gpui::Anchor::TopLeft)
     }
 
     fn render_worktree_and_branch(
