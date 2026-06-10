@@ -61,7 +61,7 @@ use project::{DirectoryLister, DisableAiSettings, ProjectItem};
 use project_panel::ProjectPanel;
 use quick_action_bar::QuickActionBar;
 use recent_projects::open_remote_project;
-use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
+use release_channel::{AppCommitSha, AppVersion, RbfVersion, ReleaseChannel};
 use rope::Rope;
 use search::project_search::ProjectSearchBar;
 use settings::{
@@ -1422,6 +1422,25 @@ fn initialize_pane(
     });
 }
 
+fn about_version_message(
+    release_channel_name: &str,
+    version: &str,
+    debug: &str,
+    rbf_version: Option<&str>,
+) -> String {
+    if let Some(rbf_version) = rbf_version {
+        if debug.is_empty() {
+            format!("Zed RBF v{rbf_version} (upstream: {release_channel_name} {version})")
+        } else {
+            format!("Zed RBF v{rbf_version} (upstream: {release_channel_name} {version}) {debug}")
+        }
+    } else if debug.is_empty() {
+        format!("{release_channel_name} {version}")
+    } else {
+        format!("{release_channel_name} {version} {debug}")
+    }
+}
+
 fn open_about_window(cx: &mut App) {
     fn about_window_icon(release_channel: ReleaseChannel) -> Arc<Image> {
         let bytes = match release_channel {
@@ -1460,7 +1479,10 @@ fn open_about_window(cx: &mut App) {
             } else {
                 ""
             };
-            let message: SharedString = format!("{release_channel_name} {version} {debug}").into();
+            let rbf_version = RbfVersion::try_global(cx);
+            let message =
+                about_version_message(release_channel_name, version, debug, rbf_version.as_deref());
+            let message: SharedString = message.into();
             let commit = AppCommitSha::try_global(cx)
                 .map(|sha| sha.full())
                 .filter(|commit| !commit.is_empty())
@@ -2655,6 +2677,23 @@ mod tests {
         item::{Item, ItemHandle},
         open_new, open_paths, pane,
     };
+
+    #[test]
+    fn about_version_message_identifies_rbf_and_upstream_versions() {
+        assert_eq!(
+            about_version_message("Zed Dev", "1.7.0", "(debug)", Some("0.26.0")),
+            "Zed RBF v0.26.0 (upstream: Zed Dev 1.7.0) (debug)"
+        );
+    }
+
+    #[test]
+    fn about_version_message_preserves_upstream_format_without_rbf_version() {
+        assert_eq!(
+            about_version_message("Zed Dev", "1.7.0", "(debug)", None),
+            "Zed Dev 1.7.0 (debug)"
+        );
+        assert_eq!(about_version_message("Zed", "1.7.0", "", None), "Zed 1.7.0");
+    }
 
     async fn flush_workspace_serialization(
         window: &WindowHandle<MultiWorkspace>,

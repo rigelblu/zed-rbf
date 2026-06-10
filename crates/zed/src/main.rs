@@ -51,7 +51,7 @@ use parking_lot::Mutex;
 use project::{project_settings::ProjectSettings, trusted_worktrees};
 use proto;
 use recent_projects::{RemoteSettings, open_remote_project};
-use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
+use release_channel::{AppCommitSha, AppVersion, RbfVersion, ReleaseChannel};
 use session::{AppSession, Session};
 use settings::{BaseKeymap, Settings, SettingsStore, watch_config_file};
 use smol::future::poll_once;
@@ -303,11 +303,13 @@ fn main() {
     let app_commit_sha =
         option_env!("ZED_COMMIT_SHA").map(|commit_sha| AppCommitSha::new(commit_sha.to_string()));
     let app_version = AppVersion::load(env!("CARGO_PKG_VERSION"), version, app_commit_sha.clone());
+    let rbf_version = RbfVersion::load(option_env!("ZED_RBF_VERSION"));
 
     if args.system_specs {
         let system_specs = system_specs::SystemSpecs::new_stateless(
             app_version,
             app_commit_sha,
+            rbf_version,
             *release_channel::RELEASE_CHANNEL,
             client::telemetry::os_name(),
             client::telemetry::os_version(),
@@ -488,6 +490,9 @@ fn main() {
         zed_actions::init();
 
         release_channel::init(app_version, cx);
+        if let Some(rbf_version) = rbf_version {
+            RbfVersion::set_global(rbf_version, cx);
+        }
         gpui_tokio::init(cx);
         if let Some(app_commit_sha) = app_commit_sha {
             AppCommitSha::set_global(app_commit_sha, cx);

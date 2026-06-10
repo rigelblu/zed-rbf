@@ -103,6 +103,7 @@ use project::{
     toolchain_store::ToolchainStoreEvent,
     trusted_worktrees::{RemoteHostLocation, TrustedWorktrees, TrustedWorktreesEvent},
 };
+use release_channel::RbfVersion;
 use remote::{
     RemoteClientDelegate, RemoteConnection, RemoteConnectionOptions,
     remote_client::ConnectionIdentifier,
@@ -6173,6 +6174,12 @@ impl Workspace {
             title.push_str(" ↙");
         } else if project.is_shared() {
             title.push_str(" ↗");
+        }
+
+        if let Some(rbf_version) = RbfVersion::try_global(cx) {
+            title.push_str(" (rbf v");
+            title.push_str(&rbf_version);
+            title.push(')');
         }
 
         let document_path = active_project_path
@@ -15946,6 +15953,23 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
         assert_eq!(cx.window_title().as_deref(), Some("root1"));
+    }
+
+    #[gpui::test]
+    async fn test_window_title_includes_rbf_version(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| RbfVersion::set_global("0.26.0".to_string(), cx));
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root1"), json!({ "a.txt": "" }))
+            .await;
+
+        let project = Project::test(fs, [path!("/root1").as_ref()], cx).await;
+        let (_workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        cx.run_until_parked();
+
+        assert_eq!(cx.window_title().as_deref(), Some("root1 (rbf v0.26.0)"));
     }
 
     #[gpui::test]

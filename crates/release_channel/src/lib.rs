@@ -77,6 +77,10 @@ struct GlobalAppVersion(Version);
 
 impl Global for GlobalAppVersion {}
 
+struct GlobalRbfVersion(String);
+
+impl Global for GlobalRbfVersion {}
+
 /// The version of Zed.
 pub struct AppVersion;
 
@@ -117,6 +121,30 @@ impl AppVersion {
         } else {
             Version::new(0, 0, 0)
         }
+    }
+}
+
+/// The version of the zed-rbf fork.
+pub struct RbfVersion;
+
+impl RbfVersion {
+    /// Loads a fork version from an optional build-time value.
+    pub fn load(version: Option<&str>) -> Option<String> {
+        version
+            .map(str::trim)
+            .filter(|version| !version.is_empty())
+            .map(ToOwned::to_owned)
+    }
+
+    /// Returns the global zed-rbf fork version, if one is set.
+    pub fn try_global(cx: &App) -> Option<String> {
+        cx.try_global::<GlobalRbfVersion>()
+            .map(|version| version.0.clone())
+    }
+
+    /// Sets the global zed-rbf fork version.
+    pub fn set_global(version: String, cx: &mut App) {
+        cx.set_global(GlobalRbfVersion(version));
     }
 }
 
@@ -268,7 +296,7 @@ impl FromStr for ReleaseChannel {
 
 #[cfg(test)]
 mod tests {
-    use super::ReleaseChannel;
+    use super::{RbfVersion, ReleaseChannel};
 
     #[test]
     fn test_docs_url_for_release_channel() {
@@ -287,6 +315,16 @@ mod tests {
         assert_eq!(
             ReleaseChannel::Stable.docs_url("settings"),
             "https://zed.dev/docs/settings"
+        );
+    }
+
+    #[test]
+    fn rbf_version_loads_trimmed_non_empty_values() {
+        assert_eq!(RbfVersion::load(None), None);
+        assert_eq!(RbfVersion::load(Some(" \n\t ")), None);
+        assert_eq!(
+            RbfVersion::load(Some(" 0.26.0\n")),
+            Some("0.26.0".to_string())
         );
     }
 }
