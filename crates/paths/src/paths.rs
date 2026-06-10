@@ -15,36 +15,75 @@ pub const EDITORCONFIG_NAME: &str = ".editorconfig";
 /// and state directory paths.
 ///
 /// Forks should change this to avoid colliding with Zed's user data.
-pub const APP_NAME: &str = "Zed";
+pub const APP_NAME: &str = "Zed RBF";
 
 /// Lowercased form of [`APP_NAME`], for use in XDG-style paths on
 /// Linux/FreeBSD and the macOS `~/.config` fallback.
-pub const APP_NAME_LOWERCASE: &str = {
-    assert!(!APP_NAME.is_empty(), "APP_NAME must not be empty");
-    assert!(APP_NAME.as_bytes().is_ascii(), "APP_NAME must be ASCII");
-    const BYTES: [u8; APP_NAME.len()] = {
-        let mut bytes = [0u8; APP_NAME.len()];
-        let mut i = 0;
-        while i < APP_NAME.len() {
-            assert!(
-                APP_NAME.as_bytes()[i] != b'/' && APP_NAME.as_bytes()[i] != b'\\',
-                "APP_NAME must not contain path separators",
-            );
-            assert!(
-                APP_NAME.as_bytes()[i] >= 0x20,
-                "APP_NAME must not contain control characters"
-            );
-            bytes[i] = APP_NAME.as_bytes()[i];
-            i += 1;
-        }
-        bytes.make_ascii_lowercase();
-        bytes
-    };
-    match std::str::from_utf8(&BYTES) {
-        Ok(s) => s,
-        Err(_) => unreachable!(),
-    }
+pub const APP_NAME_LOWERCASE: &str = "zed-rbf";
+
+const _: () = {
+    validate_app_path_component(APP_NAME);
+    validate_app_path_component(APP_NAME_LOWERCASE);
+    validate_xdg_app_name(APP_NAME_LOWERCASE);
 };
+
+const fn validate_app_path_component(value: &str) {
+    assert!(
+        !value.is_empty(),
+        "application path names must not be empty"
+    );
+    assert!(
+        value.as_bytes().is_ascii(),
+        "application path names must be ASCII"
+    );
+
+    let mut i = 0;
+    while i < value.len() {
+        assert!(
+            value.as_bytes()[i] != b'/' && value.as_bytes()[i] != b'\\',
+            "application path names must not contain path separators",
+        );
+        assert!(
+            value.as_bytes()[i] >= 0x20,
+            "application path names must not contain control characters"
+        );
+        i += 1;
+    }
+}
+
+const fn validate_xdg_app_name(value: &str) {
+    let mut i = 0;
+    while i < value.len() {
+        let byte = value.as_bytes()[i];
+        assert!(
+            (byte >= b'a' && byte <= b'z')
+                || (byte >= b'0' && byte <= b'9')
+                || byte == b'-'
+                || byte == b'_'
+                || byte == b'.',
+            "APP_NAME_LOWERCASE must use lowercase XDG-safe characters"
+        );
+        i += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_paths_do_not_collide_with_upstream_zed() {
+        assert_eq!(APP_NAME, "Zed RBF");
+        assert_eq!(APP_NAME_LOWERCASE, "zed-rbf");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_session_database_uses_fork_data_dir() {
+        assert!(data_dir().ends_with("Library/Application Support/Zed RBF"));
+        assert!(database_dir().ends_with("Library/Application Support/Zed RBF/db"));
+    }
+}
 
 /// A custom data directory override, set only by `set_custom_data_dir`.
 /// This is used to override the default data directory location.
@@ -53,16 +92,16 @@ static CUSTOM_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// The resolved data directory, combining custom override or platform defaults.
 /// This is set once and cached for subsequent calls.
-/// On macOS, this is `~/Library/Application Support/Zed`.
-/// On Linux/FreeBSD, this is `$XDG_DATA_HOME/zed`.
-/// On Windows, this is `%LOCALAPPDATA%\Zed`.
+/// On macOS, this is `~/Library/Application Support/<APP_NAME>`.
+/// On Linux/FreeBSD, this is `$XDG_DATA_HOME/<APP_NAME_LOWERCASE>`.
+/// On Windows, this is `%LOCALAPPDATA%\<APP_NAME>`.
 static CURRENT_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// The resolved config directory, combining custom override or platform defaults.
 /// This is set once and cached for subsequent calls.
-/// On macOS, this is `~/.config/zed`.
-/// On Linux/FreeBSD, this is `$XDG_CONFIG_HOME/zed`.
-/// On Windows, this is `%APPDATA%\Zed`.
+/// On macOS, this is `~/.config/<APP_NAME_LOWERCASE>`.
+/// On Linux/FreeBSD, this is `$XDG_CONFIG_HOME/<APP_NAME_LOWERCASE>`.
+/// On Windows, this is `%APPDATA%\<APP_NAME>`.
 static CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Returns the relative path to the zed_server directory on the ssh host.
@@ -242,13 +281,13 @@ pub fn remote_server_state_dir() -> &'static PathBuf {
     REMOTE_SERVER_STATE.get_or_init(|| data_dir().join("server_state"))
 }
 
-/// Returns the path to the `Zed.log` file.
+/// Returns the path to the application log file.
 pub fn log_file() -> &'static PathBuf {
     static LOG_FILE: OnceLock<PathBuf> = OnceLock::new();
     LOG_FILE.get_or_init(|| logs_dir().join(format!("{}.log", APP_NAME)))
 }
 
-/// Returns the path to the `Zed.log.old` file.
+/// Returns the path to the old application log file.
 pub fn old_log_file() -> &'static PathBuf {
     static OLD_LOG_FILE: OnceLock<PathBuf> = OnceLock::new();
     OLD_LOG_FILE.get_or_init(|| logs_dir().join(format!("{}.log.old", APP_NAME)))

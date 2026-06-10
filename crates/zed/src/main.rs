@@ -13,7 +13,6 @@ const _: () = assert!(
     "paths::APP_NAME_LOWERCASE must match the binary name. \
      Forks: update APP_NAME in crates/paths/src/paths.rs when renaming the binary.",
 );
-
 use agent_ui::AgentPanel;
 use anyhow::{Context as _, Result};
 use clap::Parser;
