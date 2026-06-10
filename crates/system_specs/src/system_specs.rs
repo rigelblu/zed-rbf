@@ -1,7 +1,7 @@
 pub use gpui::GpuSpecs;
 use gpui::{App, AppContext as _, Task, Window, actions};
 use human_bytes::human_bytes;
-use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
+use release_channel::{AppCommitSha, AppVersion, RbfVersion, ReleaseChannel};
 use semver::Version;
 use serde::Serialize;
 use std::{env, fmt::Display};
@@ -18,6 +18,8 @@ actions!(
 #[derive(Clone, Debug, Serialize)]
 pub struct SystemSpecs {
     app_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rbf_version: Option<String>,
     release_channel: &'static str,
     os_name: String,
     os_version: String,
@@ -36,6 +38,7 @@ impl SystemSpecs {
         os_version: String,
     ) -> Task<Self> {
         let app_version = AppVersion::global(cx).to_string();
+        let rbf_version = RbfVersion::try_global(cx);
         let release_channel = ReleaseChannel::global(cx);
         let system = System::new_with_specifics(
             RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
@@ -60,6 +63,7 @@ impl SystemSpecs {
         cx.background_spawn(async move {
             SystemSpecs {
                 app_version,
+                rbf_version,
                 release_channel: release_channel.display_name(),
                 bundle_type,
                 os_name,
@@ -75,6 +79,7 @@ impl SystemSpecs {
     pub fn new_stateless(
         app_version: Version,
         app_commit_sha: Option<AppCommitSha>,
+        rbf_version: Option<String>,
         release_channel: ReleaseChannel,
         os_name: String,
         os_version: String,
@@ -92,6 +97,7 @@ impl SystemSpecs {
 
         Self {
             app_version: app_version.to_string(),
+            rbf_version,
             release_channel: release_channel.display_name(),
             os_name,
             os_version,
@@ -125,22 +131,46 @@ impl Display for SystemSpecs {
                 ""
             },
         );
-        let system_specs = [
-            app_version_information,
+        let mut system_specs = vec![app_version_information];
+        if let Some(rbf_version) = &self.rbf_version {
+            system_specs.push(format!("Zed RBF: v{rbf_version}"));
+        }
+        system_specs.extend([
             os_information,
             format!("Memory: {}", human_bytes(self.memory as f64)),
             format!("Architecture: {}", self.architecture),
-        ]
-        .into_iter()
-        .chain(
+        ]);
+        system_specs.extend(
             self.gpu_specs
                 .as_ref()
                 .map(|specs| format!("GPU: {}", specs)),
-        )
-        .collect::<Vec<String>>()
-        .join("\n");
+        );
+        let system_specs = system_specs.join("\n");
 
         write!(f, "{system_specs}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SystemSpecs;
+
+    #[test]
+    fn system_specs_includes_rbf_version_when_present() {
+        let specs = SystemSpecs {
+            app_version: "1.7.0".to_string(),
+            rbf_version: Some("0.26.0".to_string()),
+            release_channel: "Zed Dev",
+            os_name: "macOS".to_string(),
+            os_version: "15.0".to_string(),
+            memory: 1024,
+            architecture: "aarch64",
+            commit_sha: None,
+            bundle_type: None,
+            gpu_specs: None,
+        };
+
+        assert!(specs.to_string().contains("Zed RBF: v0.26.0"));
     }
 }
 

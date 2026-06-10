@@ -2,6 +2,10 @@
 title: "Zed RBF Changelog"
 ---
 
+## 🟠⋯ v0.26.0 — #zed-26
+- Added visible zed-rbf version information to the window title, About window, and System Specs
+- Build identity comes from the fork-owned `zed-rbf/RBF_VERSION` file while preserving upstream Zed version information
+
 ## 🟠⋯ v0.25.0 — #zed-24
 - Added pinned projects to Open Recent and the title-bar project picker so important local projects stay visible above automatic recents in user-controlled order
 - Added `pinned_projects` plus pin, unpin, move up, and move down actions for managing the pinned list
