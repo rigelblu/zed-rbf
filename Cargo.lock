@@ -15156,6 +15156,7 @@ dependencies = [
  "serde",
  "serde_json",
  "settings",
+ "shellexpand",
  "task",
  "telemetry",
  "ui",

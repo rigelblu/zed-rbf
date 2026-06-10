@@ -2,6 +2,12 @@
 title: "Zed RBF Changelog"
 ---
 
+## 🟠⋯ v0.25.0 — #zed-24
+- Added pinned projects to Open Recent and the title-bar project picker so important local projects stay visible above automatic recents in user-controlled order
+- Added `pinned_projects` plus pin, unpin, move up, and move down actions for managing the pinned list
+- Pinned paths stay visible even when stale, and unpinning removes only the pinned entry without deleting automatic recents
+- The title-bar project picker uses the same curated project list as Open Recent, without a separate title-bar list or setting
+
 ## 🟠⋯ v0.24.0 — #zed-29
 - Fixed Git Panel changed-file status refresh for file changes inside unloaded Project Panel directories without requiring directory expansion
 
