@@ -82,6 +82,19 @@ fn main() {
         }
     }
 
+    if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
+        let rbf_version_path =
+            std::path::Path::new(&manifest_dir).join("../../zed-rbf/RBF_VERSION");
+        println!("cargo:rerun-if-changed={}", rbf_version_path.display());
+
+        if let Ok(rbf_version) = std::fs::read_to_string(&rbf_version_path) {
+            let rbf_version = rbf_version.trim();
+            if !rbf_version.is_empty() {
+                println!("cargo:rustc-env=ZED_RBF_VERSION={rbf_version}");
+            }
+        }
+    }
+
     if cfg!(windows) {
         if cfg!(target_env = "msvc") {
             // todo(windows): This is to avoid stack overflow. Remove it when solved.
