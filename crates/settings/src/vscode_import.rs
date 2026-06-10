@@ -1018,6 +1018,7 @@ impl VsCodeSettings {
             close_on_file_delete: None,
             close_panel_on_toggle: None,
             command_aliases: Default::default(),
+            pinned_projects: None,
             confirm_quit: self.read_enum("window.confirmBeforeClose", |s| match s {
                 "always" | "keyboardOnly" => Some(true),
                 "never" => Some(false),
