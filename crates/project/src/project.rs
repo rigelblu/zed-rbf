@@ -3792,7 +3792,8 @@ impl Project {
                 cx.emit(Event::DeletedEntry(*worktree_id, *id))
             }
             // Listen to the GitStore instead.
-            WorktreeStoreEvent::WorktreeUpdatedGitRepositories(_, _) => {}
+            WorktreeStoreEvent::WorktreeUpdatedGitRepositories(_, _)
+            | WorktreeStoreEvent::WorktreeUpdatedGitStatusPaths(_, _) => {}
             WorktreeStoreEvent::WorktreeUpdatedRootRepoCommonDir(worktree_id) => {
                 cx.emit(Event::WorktreeUpdatedRootRepoCommonDir(*worktree_id));
                 self.emit_group_key_changed_if_needed(cx);

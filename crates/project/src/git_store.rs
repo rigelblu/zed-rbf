@@ -1670,18 +1670,18 @@ impl GitStore {
                 {
                     let paths_by_git_repo =
                         self.process_updated_entries(&worktree, updated_entries, cx);
-                    let downstream = downstream
-                        .as_ref()
-                        .map(|downstream| downstream.updates_tx.clone());
-                    cx.spawn(async move |_, cx| {
-                        let paths_by_git_repo = paths_by_git_repo.await;
-                        for (repo, paths) in paths_by_git_repo {
-                            repo.update(cx, |repo, cx| {
-                                repo.paths_changed(paths, downstream.clone(), cx);
-                            });
-                        }
-                    })
-                    .detach();
+                    Self::update_repository_statuses(paths_by_git_repo, downstream, cx);
+                }
+            }
+            WorktreeStoreEvent::WorktreeUpdatedGitStatusPaths(worktree_id, paths) => {
+                if let Some(worktree) = self
+                    .worktree_store
+                    .read(cx)
+                    .worktree_for_id(*worktree_id, cx)
+                {
+                    let paths_by_git_repo =
+                        self.process_updated_paths(&worktree, paths.iter().cloned(), cx);
+                    Self::update_repository_statuses(paths_by_git_repo, downstream, cx);
                 }
             }
             WorktreeStoreEvent::WorktreeUpdatedGitRepositories(worktree_id, changed_repos) => {
@@ -1744,6 +1744,25 @@ impl GitStore {
             }
             _ => {}
         }
+    }
+
+    fn update_repository_statuses(
+        paths_by_git_repo: Task<HashMap<Entity<Repository>, Vec<RepoPath>>>,
+        downstream: &Option<LocalDownstreamState>,
+        cx: &mut Context<Self>,
+    ) {
+        let downstream = downstream
+            .as_ref()
+            .map(|downstream| downstream.updates_tx.clone());
+        cx.spawn(async move |_, cx| {
+            let paths_by_git_repo = paths_by_git_repo.await;
+            for (repo, paths) in paths_by_git_repo {
+                repo.update(cx, |repo, cx| {
+                    repo.paths_changed(paths, downstream.clone(), cx);
+                });
+            }
+        })
+        .detach();
     }
     fn on_repository_event(
         &mut self,
@@ -3847,16 +3866,26 @@ impl GitStore {
         updated_entries: &[(Arc<RelPath>, ProjectEntryId, PathChange)],
         cx: &mut App,
     ) -> Task<HashMap<Entity<Repository>, Vec<RepoPath>>> {
+        self.process_updated_paths(
+            worktree,
+            updated_entries.iter().map(|(path, _, _)| path.clone()),
+            cx,
+        )
+    }
+
+    fn process_updated_paths(
+        &self,
+        worktree: &Entity<Worktree>,
+        updated_paths: impl IntoIterator<Item = Arc<RelPath>>,
+        cx: &mut App,
+    ) -> Task<HashMap<Entity<Repository>, Vec<RepoPath>>> {
         let path_style = worktree.read(cx).path_style();
         let mut repo_paths = self
             .repositories
             .values()
             .map(|repo| (repo.read(cx).work_directory_abs_path.clone(), repo.clone()))
             .collect::<Vec<_>>();
-        let mut entries: Vec<_> = updated_entries
-            .iter()
-            .map(|(path, _, _)| path.clone())
-            .collect();
+        let mut entries: Vec<_> = updated_paths.into_iter().collect();
         entries.sort();
         let worktree = worktree.read(cx);
 

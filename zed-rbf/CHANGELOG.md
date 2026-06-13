@@ -2,6 +2,9 @@
 title: "Zed RBF Changelog"
 ---
 
+## 🟠⋯ v0.24.0 — #zed-29
+- Fixed Git Panel changed-file status refresh for file changes inside unloaded Project Panel directories without requiring directory expansion
+
 ## 🟠⋯ v0.23.0 — #zed-23
 - Improved File History so it opens a file-scoped History view in the Git Panel instead of a separate graph tab
 - File-scoped History lists only commits whose loaded diff includes the selected path, renders those rows without expand/collapse controls, and shows the full path in the scope-label tooltip
