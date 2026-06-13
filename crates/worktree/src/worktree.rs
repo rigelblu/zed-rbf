@@ -359,6 +359,7 @@ enum ScanState {
     Updated {
         snapshot: LocalSnapshot,
         changes: UpdatedEntriesSet,
+        git_status_paths: Arc<[Arc<RelPath>]>,
         barrier: SmallVec<[barrier::Sender; 1]>,
         scanning: bool,
     },
@@ -377,6 +378,7 @@ struct UpdateObservationState {
 #[derive(Debug, Clone)]
 pub enum Event {
     UpdatedEntries(UpdatedEntriesSet),
+    UpdatedGitStatusPaths(Arc<[Arc<RelPath>]>),
     UpdatedGitRepositories(UpdatedGitRepositoriesSet),
     UpdatedRootRepoCommonDir {
         old: Option<Arc<SanitizedPath>>,
@@ -1218,11 +1220,12 @@ impl LocalWorktree {
                         ScanState::Updated {
                             snapshot,
                             changes,
+                            git_status_paths,
                             barrier,
                             scanning,
                         } => {
                             *this.is_scanning.0.borrow_mut() = scanning;
-                            this.set_snapshot(snapshot, changes, cx);
+                            this.set_snapshot(snapshot, changes, git_status_paths, cx);
                             drop(barrier);
                         }
                         ScanState::RootUpdated { new_path } => {
@@ -1247,6 +1250,7 @@ impl LocalWorktree {
         &mut self,
         mut new_snapshot: LocalSnapshot,
         entry_changes: UpdatedEntriesSet,
+        git_status_paths: Arc<[Arc<RelPath>]>,
         cx: &mut Context<Worktree>,
     ) {
         let repo_changes = self.changed_repos(&self.snapshot, &mut new_snapshot);
@@ -1269,6 +1273,9 @@ impl LocalWorktree {
 
         if !entry_changes.is_empty() {
             cx.emit(Event::UpdatedEntries(entry_changes));
+        }
+        if !git_status_paths.is_empty() {
+            cx.emit(Event::UpdatedGitStatusPaths(git_status_paths));
         }
         if !repo_changes.is_empty() {
             cx.emit(Event::UpdatedGitRepositories(repo_changes));
@@ -4121,7 +4128,8 @@ impl BackgroundScanner {
             state.snapshot.completed_scan_id = state.snapshot.scan_id;
         }
 
-        self.send_status_update(false, SmallVec::new(), &[]).await;
+        self.send_status_update(false, SmallVec::new(), &[], &[])
+            .await;
 
         if self.defer_watch {
             let (events, watcher) = self
@@ -4196,7 +4204,7 @@ impl BackgroundScanner {
                     let Ok(request) = path_prefix_request else { break };
 
                     if self.state.lock().await.path_prefixes_to_scan.contains(&request.path) {
-                        self.send_status_update(false, request.done, &[]).await;
+                        self.send_status_update(false, request.done, &[], &[]).await;
                         continue;
                     }
 
@@ -4219,7 +4227,7 @@ impl BackgroundScanner {
                             .await;
                         }
                     }
-                    self.send_status_update(false, request.done, &[]).await;
+                    self.send_status_update(false, request.done, &[], &[]).await;
                 }
 
                 paths = fs_events_rx.next().fuse() => {
@@ -4284,7 +4292,8 @@ impl BackgroundScanner {
         )
         .await;
 
-        self.send_status_update(scanning, request.done, &[]).await
+        self.send_status_update(scanning, request.done, &[], &[])
+            .await
     }
 
     fn normalized_events_for_worktree(
@@ -4521,6 +4530,7 @@ impl BackgroundScanner {
         });
 
         let mut relative_paths = Vec::with_capacity(events.len());
+        let mut git_status_paths = Vec::new();
 
         {
             let snapshot = &self.state.lock().await.snapshot;
@@ -4560,6 +4570,8 @@ impl BackgroundScanner {
                     continue;
                 };
 
+                let relative_path = relative_path.into_arc();
+
                 if self.track_git_repositories
                     && abs_path.file_name() == Some(OsStr::new(GITIGNORE))
                 {
@@ -4582,6 +4594,10 @@ impl BackgroundScanner {
                         .is_some_and(|entry| entry.kind == EntryKind::Dir)
                 });
                 if !parent_dir_is_loaded {
+                    if self.track_git_repositories && !self.settings.is_path_excluded(&relative_path)
+                    {
+                        git_status_paths.push(relative_path.clone());
+                    }
                     log::debug!("filtering event {relative_path:?} within unloaded directory");
                     skip_ix(&mut ranges_to_drop, ix);
                     continue;
@@ -4593,7 +4609,7 @@ impl BackgroundScanner {
                 }
 
                 relative_paths.push(EventRoot {
-                    path: relative_path.into_arc(),
+                    path: relative_path,
                     was_rescanned: matches!(event.kind, Some(fs::PathEventKind::Rescan)),
                 });
             }
@@ -4603,7 +4619,8 @@ impl BackgroundScanner {
             }
         }
 
-        if relative_paths.is_empty() && dot_git_abs_paths.is_empty() {
+        if relative_paths.is_empty() && dot_git_abs_paths.is_empty() && git_status_paths.is_empty()
+        {
             return;
         }
 
@@ -4670,7 +4687,7 @@ impl BackgroundScanner {
                 state.scanned_dirs.remove(&entry.id);
             }
         }
-        self.send_status_update(false, SmallVec::new(), &relative_paths)
+        self.send_status_update(false, SmallVec::new(), &relative_paths, &git_status_paths)
             .await;
     }
 
@@ -4697,7 +4714,8 @@ impl BackgroundScanner {
         )
         .await;
         self.scan_dirs(false, scan_job_rx).await;
-        self.send_status_update(false, SmallVec::new(), &[]).await;
+        self.send_status_update(false, SmallVec::new(), &[], &[])
+            .await;
     }
 
     async fn forcibly_load_paths(&self, paths: &[Arc<RelPath>]) -> bool {
@@ -4786,7 +4804,7 @@ impl BackgroundScanner {
                                     ) {
                                         Ok(_) => {
                                             last_progress_update_count += 1;
-                                            self.send_status_update(true, SmallVec::new(), &[])
+                                            self.send_status_update(true, SmallVec::new(), &[], &[])
                                                 .await;
                                         }
                                         Err(count) => {
@@ -4817,9 +4835,14 @@ impl BackgroundScanner {
         scanning: bool,
         barrier: SmallVec<[barrier::Sender; 1]>,
         event_roots: &[EventRoot],
+        git_status_paths: &[Arc<RelPath>],
     ) -> bool {
         let mut state = self.state.lock().await;
-        if state.changed_paths.is_empty() && event_roots.is_empty() && scanning {
+        if state.changed_paths.is_empty()
+            && event_roots.is_empty()
+            && git_status_paths.is_empty()
+            && scanning
+        {
             return true;
         }
 
@@ -4839,6 +4862,7 @@ impl BackgroundScanner {
             .unbounded_send(ScanState::Updated {
                 snapshot: new_snapshot,
                 changes,
+                git_status_paths: git_status_paths.into(),
                 scanning,
                 barrier,
             })

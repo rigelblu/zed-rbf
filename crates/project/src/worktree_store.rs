@@ -204,6 +204,7 @@ pub enum WorktreeStoreEvent {
     WorktreeOrderChanged,
     WorktreeUpdateSent(Entity<Worktree>),
     WorktreeUpdatedEntries(WorktreeId, UpdatedEntriesSet),
+    WorktreeUpdatedGitStatusPaths(WorktreeId, Arc<[Arc<RelPath>]>),
     WorktreeUpdatedGitRepositories(WorktreeId, UpdatedGitRepositoriesSet),
     WorktreeDeletedEntry(WorktreeId, ProjectEntryId),
     WorktreeUpdatedRootRepoCommonDir(WorktreeId),
@@ -901,6 +902,12 @@ impl WorktreeStore {
                     cx.emit(WorktreeStoreEvent::WorktreeUpdatedEntries(
                         worktree_id,
                         changes.clone(),
+                    ));
+                }
+                worktree::Event::UpdatedGitStatusPaths(paths) => {
+                    cx.emit(WorktreeStoreEvent::WorktreeUpdatedGitStatusPaths(
+                        worktree_id,
+                        paths.clone(),
                     ));
                 }
                 worktree::Event::UpdatedGitRepositories(set) => {
