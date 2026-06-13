@@ -11764,6 +11764,95 @@ async fn test_repository_subfolder_git_status(
     });
 }
 
+#[gpui::test]
+async fn test_git_status_refreshes_for_unloaded_directory_events(
+    executor: gpui::BackgroundExecutor,
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor);
+    fs.insert_tree(
+        path!("/root"),
+        json!({
+            ".git": {},
+            ".gitignore": "plan-execute\n",
+            "foundation": {
+                "brief.md": "brief"
+            },
+            "plan-execute": {
+                "review.md": "old"
+            }
+        }),
+    )
+    .await;
+    fs.set_head_and_index_for_repo(
+        path!("/root/.git").as_ref(),
+        &[
+            (".gitignore", "plan-execute\n".into()),
+            ("foundation/brief.md", "brief".into()),
+            ("plan-execute/review.md", "old".into()),
+        ],
+    );
+
+    let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+
+    let tree = project.read_with(cx, |project, cx| project.worktrees(cx).next().unwrap());
+    tree.flush_fs_events(cx).await;
+    project
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+    cx.run_until_parked();
+
+    let repository = project.read_with(cx, |project, cx| {
+        project.repositories(cx).values().next().unwrap().clone()
+    });
+
+    tree.read_with(cx, |tree, _cx| {
+        let plan_execute = tree
+            .entry_for_path(rel_path("plan-execute"))
+            .expect("plan-execute directory should be present");
+        assert!(
+            plan_execute.kind.is_unloaded(),
+            "ignored directory should remain unloaded until expanded"
+        );
+        assert_eq!(
+            tree.entry_for_path(rel_path("plan-execute/review.md")),
+            None
+        );
+    });
+    repository.read_with(cx, |repository, _cx| {
+        assert_eq!(
+            repository.status_for_path(&repo_path("plan-execute/review.md")),
+            None
+        );
+    });
+
+    fs.atomic_write(path!("/root/plan-execute/review.md").into(), "new".into())
+        .await
+        .unwrap();
+    tree.flush_fs_events(cx).await;
+    project
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+    cx.run_until_parked();
+
+    repository.read_with(cx, |repository, _cx| {
+        assert_eq!(
+            repository
+                .status_for_path(&repo_path("plan-execute/review.md"))
+                .map(|entry| entry.status),
+            Some(StatusCode::Modified.worktree())
+        );
+    });
+    tree.read_with(cx, |tree, _cx| {
+        assert_eq!(
+            tree.entry_for_path(rel_path("plan-execute/review.md")),
+            None
+        );
+    });
+}
+
 // TODO: this test is flaky (especially on Windows but at least sometimes on all platforms).
 #[cfg(any())]
 #[gpui::test]
