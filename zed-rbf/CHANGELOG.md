@@ -2,6 +2,16 @@
 title: "Zed RBF Changelog"
 ---
 
+# 🔵⋯ [Unreleased]
+
+---
+
+# 🔵⋯ v0.30.0 (2026-06-17)
+## 🟠⋯ Added
+- 2026-06-17 - doc (user need) | see what Zed RBF is, why it exists, and what it does, from the README [@zed-rbf]
+- 2026-06-17 - doc (user need) | browse the shared product ship plan, feature design briefs, and agent traces on Google Drive [@zed-rbf]
+- 2026-06-17 - feat (technical) | mirror .rb-drive to Google Drive — private backup and a credential-safe public share [@zed-rbf]
+
 ## 🟠⋯ v0.29.0 — #zed-28
 - Added `zed-rbf/scripts/weekly-build.sh` to preflight the current checkout and build/install it as the weekly macOS app
 - Added `zed-rbf/scripts/upstream-sync.sh` to fetch upstream, classify fork divergence, rebase the rbf stack, report conflicts with an undo command, and gate clean syncs

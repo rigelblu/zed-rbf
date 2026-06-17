@@ -1,5 +1,8 @@
+See [Zed RBF](zed-rbf/README.md)
+
+---
+
 # Zed
-![alt placeholder](assets/pasted-image-1781123988824191000-26e7106055f6a875.png)
 
 [![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)
 [![CI](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml/badge.svg)](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml)
