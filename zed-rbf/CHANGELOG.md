@@ -3,6 +3,8 @@ title: "Zed RBF Changelog"
 ---
 
 # 🔵⋯ [Unreleased]
+## 🟠⋯ Fixed
+- 2026-06-17 - fix (ux) | Zed RBF uses the regular Zed settings, keymaps, tasks, AGENTS.md, and installed extension themes while keeping session restore data separate [@zed-rbf]
 
 ---
 

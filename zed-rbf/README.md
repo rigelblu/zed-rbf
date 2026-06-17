@@ -109,6 +109,16 @@ The configured order is the display order. `~` and `$VAR` expand. Missing paths 
 - `crates/zed/build.rs` injects it at build time as `ZED_RBF_VERSION`
 - Window titles show `(rbf v...)`, About identifies `Zed RBF v...`, and the bundled app binary's `--system-specs` output includes `Zed RBF: v...` alongside the upstream Zed version
 
+## 🟠⋯ Settings, Themes, And Data
+Zed RBF uses the regular Zed settings and extension locations:
+- Settings, keymaps, tasks, snippets, prompts, custom themes, and `AGENTS.md`: `~/.config/zed/`
+- Installed extensions, including extension-provided themes such as Rosé Pine: `~/Library/Application Support/Zed/extensions`
+
+Because extensions are shared with upstream Zed, an extension built for a very different Zed version may not load in both; Zed RBF skips extensions it cannot load rather than removing them.
+
+Zed RBF keeps session restore data separate so it does not collide with upstream Zed:
+- Session/window restore database: `~/Library/Application Support/Zed RBF/db`
+
 ---
 
 # 🔵⋯ Prerequisites

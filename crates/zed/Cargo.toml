@@ -6,7 +6,7 @@ version = "1.16.0"
 publish.workspace = true
 license = "GPL-3.0-or-later"
 authors = ["Zed Team <hi@zed.dev>"]
-default-run = "zed"
+default-run = "zed-rbf"
 
 [lints]
 workspace = true
@@ -53,8 +53,11 @@ visual-tests = [
     "title_bar/test-support",
 ]
 
+# The binary name must equal `paths::APP_NAME_LOWERCASE`; upstream asserts it at
+# compile time in `crates/zed/src/main.rs`. The package stays `zed` so `-p zed`
+# and every dependency edge keep working.
 [[bin]]
-name = "zed"
+name = "zed-rbf"
 path = "src/main.rs"
 
 [[bin]]

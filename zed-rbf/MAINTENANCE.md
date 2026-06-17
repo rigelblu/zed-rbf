@@ -44,6 +44,7 @@ Core fork hooks outside this directory:
 Upstream files carrying rbf hooks:
 - `assets/keymaps/*` - Markdown shortcuts and vim `space c y`
 - `assets/settings/default.json` - YMD defaults, Markdown defaults, and pinned projects
+- `crates/paths` - Zed RBF path identity: regular Zed settings/extensions are shared while session data stays fork-specific
 - `docs/src/reference/all-settings.md` - RBF settings documentation
 - `crates/editor` - actions, clipboard, display map, editor settings, folds, hover, Markdown actions, selection
 - `crates/git` and `crates/git_ui` - History, commit/ref comparison, file history, and file-scoped patch previews

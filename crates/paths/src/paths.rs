@@ -18,13 +18,30 @@ pub const EDITORCONFIG_NAME: &str = ".editorconfig";
 pub const APP_NAME: &str = "Zed RBF";
 
 /// Lowercased form of [`APP_NAME`], for use in XDG-style paths on
-/// Linux/FreeBSD and the macOS `~/.config` fallback.
+/// Linux/FreeBSD data, state, and cache paths.
 pub const APP_NAME_LOWERCASE: &str = "zed-rbf";
+
+/// User configuration keeps using upstream Zed's config directory so existing
+/// settings, keymaps, tasks, and AGENTS.md continue to apply to Zed RBF.
+pub const CONFIG_DIR_NAME: &str = "Zed";
+pub const CONFIG_DIR_NAME_LOWERCASE: &str = "zed";
+
+/// Installed extensions keep using upstream Zed's extension directory so
+/// extension-provided themes, icon themes, languages, and adapters continue to
+/// apply to Zed RBF without sharing the session database.
+pub const EXTENSIONS_DIR_NAME: &str = "Zed";
+pub const EXTENSIONS_DIR_NAME_LOWERCASE: &str = "zed";
 
 const _: () = {
     validate_app_path_component(APP_NAME);
     validate_app_path_component(APP_NAME_LOWERCASE);
+    validate_app_path_component(CONFIG_DIR_NAME);
+    validate_app_path_component(CONFIG_DIR_NAME_LOWERCASE);
+    validate_app_path_component(EXTENSIONS_DIR_NAME);
+    validate_app_path_component(EXTENSIONS_DIR_NAME_LOWERCASE);
     validate_xdg_app_name(APP_NAME_LOWERCASE);
+    validate_xdg_app_name(CONFIG_DIR_NAME_LOWERCASE);
+    validate_xdg_app_name(EXTENSIONS_DIR_NAME_LOWERCASE);
 };
 
 const fn validate_app_path_component(value: &str) {
@@ -75,6 +92,10 @@ mod tests {
     fn app_paths_do_not_collide_with_upstream_zed() {
         assert_eq!(APP_NAME, "Zed RBF");
         assert_eq!(APP_NAME_LOWERCASE, "zed-rbf");
+        assert_eq!(CONFIG_DIR_NAME, "Zed");
+        assert_eq!(CONFIG_DIR_NAME_LOWERCASE, "zed");
+        assert_eq!(EXTENSIONS_DIR_NAME, "Zed");
+        assert_eq!(EXTENSIONS_DIR_NAME_LOWERCASE, "zed");
     }
 
     #[cfg(target_os = "macos")]
@@ -82,6 +103,20 @@ mod tests {
     fn macos_session_database_uses_fork_data_dir() {
         assert!(data_dir().ends_with("Library/Application Support/Zed RBF"));
         assert!(database_dir().ends_with("Library/Application Support/Zed RBF/db"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn user_config_uses_upstream_zed_dir() {
+        assert!(config_dir().ends_with(".config/zed"));
+        assert!(agents_file().ends_with(".config/zed/AGENTS.md"));
+        assert_eq!(GLOBAL_AGENTS_FILE_DISPLAY, "~/.config/zed/AGENTS.md");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn installed_extensions_use_upstream_zed_dir() {
+        assert!(extensions_dir().ends_with("Library/Application Support/Zed/extensions"));
     }
 }
 
@@ -99,9 +134,9 @@ static CURRENT_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// The resolved config directory, combining custom override or platform defaults.
 /// This is set once and cached for subsequent calls.
-/// On macOS, this is `~/.config/<APP_NAME_LOWERCASE>`.
-/// On Linux/FreeBSD, this is `$XDG_CONFIG_HOME/<APP_NAME_LOWERCASE>`.
-/// On Windows, this is `%APPDATA%\<APP_NAME>`.
+/// On macOS, this is `~/.config/<CONFIG_DIR_NAME_LOWERCASE>`.
+/// On Linux/FreeBSD, this is `$XDG_CONFIG_HOME/<CONFIG_DIR_NAME_LOWERCASE>`.
+/// On Windows, this is `%APPDATA%\<CONFIG_DIR_NAME>`.
 static CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Returns the relative path to the zed_server directory on the ssh host.
@@ -165,44 +200,53 @@ pub fn config_dir() -> &'static PathBuf {
         } else if cfg!(target_os = "windows") {
             dirs::config_dir()
                 .expect("failed to determine RoamingAppData directory")
-                .join(APP_NAME)
+                .join(CONFIG_DIR_NAME)
         } else if cfg!(any(target_os = "linux", target_os = "freebsd")) {
             if let Ok(flatpak_xdg_config) = std::env::var("FLATPAK_XDG_CONFIG_HOME") {
                 flatpak_xdg_config.into()
             } else {
                 dirs::config_dir().expect("failed to determine XDG_CONFIG_HOME directory")
             }
-            .join(APP_NAME_LOWERCASE)
+            .join(CONFIG_DIR_NAME_LOWERCASE)
         } else {
-            home_dir().join(".config").join(APP_NAME_LOWERCASE)
+            home_dir().join(".config").join(CONFIG_DIR_NAME_LOWERCASE)
         }
     })
 }
 
 /// Returns the path to the data directory used by Zed.
 pub fn data_dir() -> &'static PathBuf {
-    CURRENT_DATA_DIR.get_or_init(|| {
-        if let Some(custom_dir) = CUSTOM_DATA_DIR.get() {
-            custom_dir.clone()
-        } else if cfg!(target_os = "macos") {
-            home_dir()
-                .join("Library/Application Support")
-                .join(APP_NAME)
-        } else if cfg!(any(target_os = "linux", target_os = "freebsd")) {
-            if let Ok(flatpak_xdg_data) = std::env::var("FLATPAK_XDG_DATA_HOME") {
-                flatpak_xdg_data.into()
-            } else {
-                dirs::data_local_dir().expect("failed to determine XDG_DATA_HOME directory")
-            }
-            .join(APP_NAME_LOWERCASE)
-        } else if cfg!(target_os = "windows") {
-            dirs::data_local_dir()
-                .expect("failed to determine LocalAppData directory")
-                .join(APP_NAME)
+    CURRENT_DATA_DIR.get_or_init(|| platform_data_dir(APP_NAME, APP_NAME_LOWERCASE))
+}
+
+/// Resolves a platform data directory for the given application identity.
+///
+/// Both Zed RBF's own data dir (the fork identity) and the upstream Zed data
+/// dir that installed extensions are shared from (the upstream identity) are
+/// derived here, so the two can never drift apart — an upstream sync that
+/// changes this derivation updates both at once instead of silently breaking
+/// extension sharing. A custom data dir override (`--user-data-dir`) always
+/// wins first, so isolated/dogfood profiles stay fully self-contained
+/// regardless of identity.
+fn platform_data_dir(name: &str, name_lowercase: &str) -> PathBuf {
+    if let Some(custom_dir) = CUSTOM_DATA_DIR.get() {
+        custom_dir.clone()
+    } else if cfg!(target_os = "macos") {
+        home_dir().join("Library/Application Support").join(name)
+    } else if cfg!(any(target_os = "linux", target_os = "freebsd")) {
+        if let Ok(flatpak_xdg_data) = std::env::var("FLATPAK_XDG_DATA_HOME") {
+            flatpak_xdg_data.into()
         } else {
-            config_dir().clone() // Fallback
+            dirs::data_local_dir().expect("failed to determine XDG_DATA_HOME directory")
         }
-    })
+        .join(name_lowercase)
+    } else if cfg!(target_os = "windows") {
+        dirs::data_local_dir()
+            .expect("failed to determine LocalAppData directory")
+            .join(name)
+    } else {
+        config_dir().clone() // Fallback
+    }
 }
 
 pub fn state_dir() -> &'static PathBuf {
@@ -376,17 +420,19 @@ pub fn agents_file() -> &'static PathBuf {
 /// readability in announcement copy.
 #[cfg(target_os = "windows")]
 pub const GLOBAL_AGENTS_FILE_DISPLAY: &str =
-    const_format::concatcp!("%APPDATA%\\", APP_NAME, "\\AGENTS.md");
+    const_format::concatcp!("%APPDATA%\\", CONFIG_DIR_NAME, "\\AGENTS.md");
 #[cfg(not(target_os = "windows"))]
 pub const GLOBAL_AGENTS_FILE_DISPLAY: &str =
-    const_format::concatcp!("~/.config/", APP_NAME_LOWERCASE, "/AGENTS.md");
+    const_format::concatcp!("~/.config/", CONFIG_DIR_NAME_LOWERCASE, "/AGENTS.md");
 
 /// Returns the path to the extensions directory.
 ///
 /// This is where installed extensions are stored.
 pub fn extensions_dir() -> &'static PathBuf {
     static EXTENSIONS_DIR: OnceLock<PathBuf> = OnceLock::new();
-    EXTENSIONS_DIR.get_or_init(|| data_dir().join("extensions"))
+    EXTENSIONS_DIR.get_or_init(|| {
+        platform_data_dir(EXTENSIONS_DIR_NAME, EXTENSIONS_DIR_NAME_LOWERCASE).join("extensions")
+    })
 }
 
 /// Returns the path to the extensions directory.
