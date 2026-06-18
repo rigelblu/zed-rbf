@@ -152,14 +152,77 @@ impl FoldPoint {
         let mut offset = start.1.output.len;
         if !overshoot.is_zero() {
             let transform = item.expect("display point out of range");
-            assert!(transform.placeholder.is_none());
-            let end_inlay_offset = snapshot
-                .inlay_snapshot
-                .to_offset(InlayPoint(start.1.input.lines + overshoot));
-            offset += end_inlay_offset.0 - start.1.input.len;
+            if let Some(placeholder) = transform.placeholder.as_ref() {
+                offset += placeholder_text_offset_for_point(
+                    placeholder.text.as_ref(),
+                    overshoot,
+                    Bias::Right,
+                );
+            } else {
+                let end_inlay_offset = snapshot
+                    .inlay_snapshot
+                    .to_offset(InlayPoint(start.1.input.lines + overshoot));
+                offset += end_inlay_offset.0 - start.1.input.len;
+            }
         }
         FoldOffset(offset)
     }
+}
+
+fn placeholder_text_offset_for_point(text: &str, point: Point, bias: Bias) -> usize {
+    let Some((row_start, row_end)) = placeholder_text_row_range(text, point.row) else {
+        return text.len();
+    };
+    let column = point.column as usize;
+    let target = row_start + column.min(row_end - row_start);
+    placeholder_text_boundary_for_offset(text, target, bias)
+}
+
+fn placeholder_text_row_range(text: &str, target_row: u32) -> Option<(usize, usize)> {
+    let mut row = 0;
+    let mut row_start = 0;
+
+    for (offset, character) in text.char_indices() {
+        if character == '\n' {
+            if row == target_row {
+                return Some((row_start, offset));
+            }
+
+            row += 1;
+            row_start = offset + character.len_utf8();
+        }
+    }
+
+    (row == target_row).then_some((row_start, text.len()))
+}
+
+fn placeholder_text_boundary_for_offset(text: &str, offset: usize, bias: Bias) -> usize {
+    let offset = offset.min(text.len());
+    if text.is_char_boundary(offset) {
+        return offset;
+    }
+
+    let mut previous_boundary = 0;
+    for (boundary, _) in text.char_indices() {
+        if boundary > offset {
+            return match bias {
+                Bias::Left => previous_boundary,
+                Bias::Right => boundary,
+            };
+        }
+        previous_boundary = boundary;
+    }
+
+    match bias {
+        Bias::Left => previous_boundary,
+        Bias::Right => text.len(),
+    }
+}
+
+fn chars_bitmap_for_text(text: &str) -> u128 {
+    text.char_indices().fold(0u128, |bitmap, (idx, _)| {
+        bitmap | 1u128.unbounded_shl(idx as u32)
+    })
 }
 
 impl<'a> sum_tree::Dimension<'a, TransformSummary> for FoldPoint {
@@ -590,12 +653,6 @@ impl FoldMap {
                             .collapsed_text
                             .clone()
                             .unwrap_or_else(|| ELLIPSIS.into());
-                        let chars_bitmap = placeholder_text
-                            .char_indices()
-                            .fold(0u128, |bitmap, (idx, _)| {
-                                bitmap | 1u128.unbounded_shl(idx as u32)
-                            });
-
                         let fold_id = fold.id;
                         new_transforms.push(
                             Transform {
@@ -606,7 +663,6 @@ impl FoldMap {
                                 },
                                 placeholder: Some(TransformPlaceholder {
                                     text: placeholder_text,
-                                    chars: chars_bitmap,
                                     renderer: ChunkRenderer {
                                         id: ChunkRendererId::Fold(fold.id),
                                         render: Arc::new(move |cx| {
@@ -757,10 +813,20 @@ impl FoldSnapshot {
             let start_in_transform = range.start.0 - cursor.start().0.0;
             let end_in_transform = cmp::min(range.end, cursor.end().0).0 - cursor.start().0.0;
             if let Some(placeholder) = transform.placeholder.as_ref() {
-                summary = MBTextSummary::from(
-                    &placeholder.text.as_ref()
-                        [start_in_transform.column as usize..end_in_transform.column as usize],
+                let placeholder_text = placeholder.text.as_ref();
+                let start_offset = placeholder_text_offset_for_point(
+                    placeholder_text,
+                    start_in_transform,
+                    Bias::Right,
                 );
+                let end_offset = placeholder_text_offset_for_point(
+                    placeholder_text,
+                    end_in_transform,
+                    Bias::Right,
+                );
+                if start_offset < end_offset {
+                    summary = MBTextSummary::from(&placeholder_text[start_offset..end_offset]);
+                }
             } else {
                 let inlay_start = self
                     .inlay_snapshot
@@ -782,9 +848,13 @@ impl FoldSnapshot {
             if let Some(transform) = cursor.item() {
                 let end_in_transform = range.end.0 - cursor.start().0.0;
                 if let Some(placeholder) = transform.placeholder.as_ref() {
-                    summary += MBTextSummary::from(
-                        &placeholder.text.as_ref()[..end_in_transform.column as usize],
+                    let placeholder_text = placeholder.text.as_ref();
+                    let end_offset = placeholder_text_offset_for_point(
+                        placeholder_text,
+                        end_in_transform,
+                        Bias::Right,
                     );
+                    summary += MBTextSummary::from(&placeholder_text[..end_offset]);
                 } else {
                     let inlay_start = self.inlay_snapshot.to_offset(cursor.start().1);
                     let inlay_end = self
@@ -1190,7 +1260,6 @@ struct Transform {
 #[derive(Clone, Debug)]
 struct TransformPlaceholder {
     text: SharedString,
-    chars: u128,
     renderer: ChunkRenderer,
 }
 
@@ -1503,8 +1572,16 @@ impl FoldChunks<'_> {
         self.transform_cursor.seek(&range.start, Bias::Right);
 
         let inlay_start = {
-            let overshoot = range.start - self.transform_cursor.start().0;
-            self.transform_cursor.start().1 + overshoot
+            if self
+                .transform_cursor
+                .item()
+                .is_some_and(|transform| transform.is_fold())
+            {
+                self.transform_cursor.start().1
+            } else {
+                let overshoot = range.start - self.transform_cursor.start().0;
+                self.transform_cursor.start().1 + overshoot
+            }
         };
 
         let transform_end = self.transform_cursor.end();
@@ -1544,20 +1621,39 @@ impl<'a> Iterator for FoldChunks<'a> {
         // If we're in a fold, then return the fold's display text and
         // advance the transform and buffer cursors to the end of the fold.
         if let Some(placeholder) = transform.placeholder.as_ref() {
-            self.inlay_chunk.take();
-            self.inlay_offset += InlayOffset(transform.summary.input.len);
+            let transform_start = self.transform_cursor.start();
+            let transform_end = self.transform_cursor.end();
+            let placeholder_text = placeholder.text.as_ref();
+            let output_start = self.output_offset - transform_start.0;
+            let output_end = self.max_output_offset.min(transform_end.0) - transform_start.0;
+            let text_start =
+                placeholder_text_boundary_for_offset(placeholder_text, output_start, Bias::Right);
+            let text_end =
+                placeholder_text_boundary_for_offset(placeholder_text, output_end, Bias::Right);
 
-            while self.inlay_offset >= self.transform_cursor.end().1
-                && self.transform_cursor.item().is_some()
-            {
-                self.transform_cursor.next();
+            self.inlay_chunk.take();
+            self.output_offset = transform_start.0 + text_end;
+
+            if text_end >= placeholder_text.len() {
+                self.inlay_offset = transform_end.1;
+                while self.inlay_offset >= self.transform_cursor.end().1
+                    && self.transform_cursor.item().is_some()
+                {
+                    self.transform_cursor.next();
+                }
             }
 
-            self.output_offset.0 += placeholder.text.len();
+            if text_start >= text_end {
+                return self.next();
+            }
+
+            let text = &placeholder_text[text_start..text_end];
+            let renderer = (text_start == 0 && text_end >= placeholder_text.len())
+                .then(|| placeholder.renderer.clone());
             return Some(Chunk {
-                text: &placeholder.text,
-                chars: placeholder.chars,
-                renderer: Some(placeholder.renderer.clone()),
+                text,
+                chars: chars_bitmap_for_text(text),
+                renderer,
                 ..Default::default()
             });
         }
@@ -1834,6 +1930,95 @@ mod tests {
         writer.unfold_intersecting(Some(Point::new(0, 4)..Point::new(0, 4)), true);
         let (snapshot6, _) = map.read(inlay_snapshot, vec![]);
         assert_eq!(snapshot6.text(), "123aaaaa\nbbbbbb\nccc123456eee");
+    }
+
+    #[gpui::test]
+    fn test_fold_point_to_offset_handles_multibyte_placeholder_interiors(cx: &mut gpui::App) {
+        init_test(cx);
+        let buffer = MultiBuffer::build_simple("abcdef", cx);
+        let buffer_snapshot = buffer.read(cx).snapshot(cx);
+        let (_, inlay_snapshot) = InlayMap::new(buffer_snapshot);
+        let mut map = FoldMap::new(inlay_snapshot.clone()).0;
+        let mut placeholder = FoldPlaceholder::test();
+        placeholder.collapsed_text = Some("\u{2060}".into());
+
+        let (mut writer, _, _) = map.write(inlay_snapshot.clone(), vec![]);
+        writer.fold(vec![(
+            MultiBufferOffset(1)..MultiBufferOffset(5),
+            placeholder,
+        )]);
+        let (snapshot, _) = map.read(inlay_snapshot, vec![]);
+
+        assert_eq!(snapshot.text(), "a\u{2060}f");
+        assert_eq!(
+            FoldPoint::new(0, 1).to_offset(&snapshot),
+            FoldOffset(MultiBufferOffset(1))
+        );
+        assert_eq!(
+            FoldPoint::new(0, 2).to_offset(&snapshot),
+            FoldOffset(MultiBufferOffset(4))
+        );
+        assert_eq!(
+            FoldPoint::new(0, 3).to_offset(&snapshot),
+            FoldOffset(MultiBufferOffset(4))
+        );
+        assert_eq!(
+            FoldPoint::new(0, 4).to_offset(&snapshot),
+            FoldOffset(MultiBufferOffset(4))
+        );
+    }
+
+    #[gpui::test]
+    fn test_placeholder_summary_and_chunks_handle_multibyte_interiors(cx: &mut gpui::App) {
+        init_test(cx);
+        let buffer = MultiBuffer::build_simple("abcdef", cx);
+        let buffer_snapshot = buffer.read(cx).snapshot(cx);
+        let (_, inlay_snapshot) = InlayMap::new(buffer_snapshot);
+        let mut map = FoldMap::new(inlay_snapshot.clone()).0;
+        let mut placeholder = FoldPlaceholder::test();
+        placeholder.collapsed_text = Some("🟠x".into());
+
+        let (mut writer, _, _) = map.write(inlay_snapshot.clone(), vec![]);
+        writer.fold(vec![(
+            MultiBufferOffset(1)..MultiBufferOffset(5),
+            placeholder,
+        )]);
+        let (snapshot, _) = map.read(inlay_snapshot, vec![]);
+
+        assert_eq!(snapshot.text(), "a🟠xf");
+        assert_eq!(
+            snapshot.text_summary_for_range(FoldPoint::new(0, 1)..FoldPoint::new(0, 2)),
+            MBTextSummary::from("🟠")
+        );
+
+        let partial_chunks = snapshot
+            .chunks(
+                FoldPoint::new(0, 2).to_offset(&snapshot)
+                    ..FoldPoint::new(0, 6).to_offset(&snapshot),
+                LanguageAwareStyling {
+                    tree_sitter: false,
+                    diagnostics: false,
+                },
+                Highlights::default(),
+            )
+            .collect::<Vec<_>>();
+        assert_eq!(partial_chunks.len(), 1);
+        assert_eq!(partial_chunks[0].text, "x");
+        assert!(partial_chunks[0].renderer.is_none());
+
+        let full_chunks = snapshot
+            .chunks(
+                FoldOffset(MultiBufferOffset(1))..FoldOffset(MultiBufferOffset(6)),
+                LanguageAwareStyling {
+                    tree_sitter: false,
+                    diagnostics: false,
+                },
+                Highlights::default(),
+            )
+            .collect::<Vec<_>>();
+        assert_eq!(full_chunks.len(), 1);
+        assert_eq!(full_chunks[0].text, "🟠x");
+        assert!(full_chunks[0].renderer.is_some());
     }
 
     #[gpui::test]

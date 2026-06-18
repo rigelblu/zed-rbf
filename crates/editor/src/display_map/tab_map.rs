@@ -713,7 +713,7 @@ impl<'a> Iterator for TabChunks<'a> {
                     bytes_after_last_newline,
                 );
             } else {
-                let char_count = chunk.chars.count_ones();
+                let char_count = chunk_char_count(chunk.text, chunk.chars);
                 self.column += char_count;
                 if !self.inside_leading_tab {
                     self.input_column += chunk_len;
@@ -751,7 +751,7 @@ impl<'a> Iterator for TabChunks<'a> {
                 bytes_after_last_newline,
             );
         } else {
-            let char_count = prefix_chars.count_ones();
+            let char_count = chunk_char_count(prefix, prefix_chars);
             self.column += char_count;
             if !self.inside_leading_tab {
                 self.input_column += prefix_len as u32;
@@ -924,6 +924,14 @@ fn count_chars_in_byte_range(range: Range<u32>, bitmap: u128, text: &str) -> u32
     let low_mask = u128::MAX << range.start;
     let high_mask = u128::MAX >> (127 - range.end);
     (bitmap & low_mask & high_mask).count_ones()
+}
+
+fn chunk_char_count(text: &str, bitmap: u128) -> u32 {
+    if text.len() >= 128 {
+        text.chars().count() as u32
+    } else {
+        bitmap.count_ones()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1376,6 +1384,109 @@ mod tests {
         assert_eq!(
             tab_snapshot.fold_point_to_tab_point(FoldPoint::new(0, 150)),
             TabPoint::new(0, 150)
+        );
+    }
+
+    #[gpui::test]
+    fn test_sliced_long_fold_placeholder_preserves_tab_column(cx: &mut gpui::App) {
+        let text = "folded\tz";
+        let buffer = MultiBuffer::build_simple(text, cx);
+        let buffer_snapshot = buffer.read(cx).snapshot(cx);
+        let (_, inlay_snapshot) = InlayMap::new(buffer_snapshot);
+        let mut fold_map = FoldMap::new(inlay_snapshot.clone()).0;
+        let mut placeholder = FoldPlaceholder::test();
+        placeholder.collapsed_text = Some("x".repeat(160).into());
+
+        let (mut writer, _, _) = fold_map.write(inlay_snapshot.clone(), vec![]);
+        writer.fold(vec![(
+            MultiBufferOffset(0)..MultiBufferOffset("folded".len()),
+            placeholder,
+        )]);
+        let (fold_snapshot, _) = fold_map.read(inlay_snapshot, vec![]);
+        let (_, tab_snapshot) = TabMap::new(fold_snapshot, NonZeroU32::new(7).unwrap());
+
+        let chunks_text = |range: Range<TabPoint>| {
+            tab_snapshot
+                .chunks(
+                    range,
+                    LanguageAwareStyling {
+                        tree_sitter: false,
+                        diagnostics: false,
+                    },
+                    Highlights::default(),
+                )
+                .map(|chunk| chunk.text)
+                .collect::<String>()
+        };
+
+        let sliced_text = chunks_text(TabPoint::new(0, 150)..TabPoint::new(0, 162));
+        assert_eq!(sliced_text, format!("{} z", "x".repeat(10)));
+
+        let full_text = chunks_text(TabPoint::new(0, 0)..TabPoint::new(0, 162));
+        assert_eq!(full_text, format!("{} z", "x".repeat(160)));
+    }
+
+    // Regression for the drag-to-open crash (zed-33): a wrap/block summary point
+    // landing inside a multibyte fold placeholder reached `FoldPoint::to_offset`
+    // through `TabSnapshot::{text_summary_for_range, chunks}` and panicked on
+    // `assert!(transform.placeholder.is_none())`. The fold-layer unit tests call
+    // `to_offset` directly; this drives the same interior point through the tab
+    // layer named in the reported stack, which a wrap-level repro can only reach
+    // non-deterministically (it needs a soft-wrap boundary inside the placeholder).
+    #[gpui::test]
+    fn test_tab_summary_and_chunks_handle_multibyte_placeholder_interior(cx: &mut gpui::App) {
+        let buffer = MultiBuffer::build_simple("abcdef", cx);
+        let buffer_snapshot = buffer.read(cx).snapshot(cx);
+        let (_, inlay_snapshot) = InlayMap::new(buffer_snapshot);
+        let mut fold_map = FoldMap::new(inlay_snapshot.clone()).0;
+        let mut placeholder = FoldPlaceholder::test();
+        placeholder.collapsed_text = Some("\u{2060}".into());
+
+        let (mut writer, _, _) = fold_map.write(inlay_snapshot.clone(), vec![]);
+        writer.fold(vec![(
+            MultiBufferOffset(1)..MultiBufferOffset(5),
+            placeholder,
+        )]);
+        let (fold_snapshot, _) = fold_map.read(inlay_snapshot, vec![]);
+        let (_, tab_snapshot) = TabMap::new(fold_snapshot, NonZeroU32::new(4).unwrap());
+
+        // "bcde" is replaced by the 3-byte placeholder, so the placeholder occupies
+        // display byte-columns 1..4 and any column in 2..4 lands in its interior.
+        assert_eq!(tab_snapshot.text(), "a\u{2060}f");
+
+        let styling = LanguageAwareStyling {
+            tree_sitter: false,
+            diagnostics: false,
+        };
+        let chunks_text = |range: Range<TabPoint>| {
+            tab_snapshot
+                .chunks(range, styling, Highlights::default())
+                .map(|chunk| chunk.text)
+                .collect::<String>()
+        };
+
+        // A range ending inside the placeholder is the crash repro: it converts a
+        // placeholder-interior point via `to_offset`. The atomic placeholder is
+        // returned whole (the interior column rounds up to the placeholder end).
+        assert_eq!(
+            chunks_text(TabPoint::new(0, 0)..TabPoint::new(0, 2)),
+            "a\u{2060}"
+        );
+        assert_eq!(
+            chunks_text(TabPoint::new(0, 0)..TabPoint::new(0, 5)),
+            "a\u{2060}f"
+        );
+
+        // `text_summary_for_range` walks the same interior boundary through `chunks`.
+        assert_eq!(
+            tab_snapshot
+                .text_summary_for_range(TabPoint::new(0, 0)..TabPoint::new(0, 2))
+                .first_line_chars,
+            2
+        );
+        assert_eq!(
+            tab_snapshot.text_summary_for_range(TabPoint::new(0, 0)..TabPoint::new(0, 5)),
+            TextSummary::from("a\u{2060}f")
         );
     }
 
