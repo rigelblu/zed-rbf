@@ -37,7 +37,7 @@ I don't commit these to the repo, but I sync the latest versions to [Google Driv
 - `==🔴 text==`, `==🟠 text==`, `==🟡 text==`, `==🟢 text==`, `==🔵 text==`, `==🟣 text==`, and `==⚫ text==` render as coloured highlights
 - A standalone supported colour emoji outside highlight markers colours the whole line foreground; the supported line-colour set is 🔴 🟠 🟡 🟢 🔵 🟣 ⚫
 
-- `[label](url)` shows as a clickable underlined label
+- `[label](url)` shows as an underlined label with the brackets and URL hidden; Cmd-click the label to open its destination in read mode — a web URL (a bare `google.com` works too), a relative file (opens as a buffer), or a directory (revealed in the project panel) — or move the cursor onto the line to reveal the raw link
 - `---` renders as a horizontal rule
 
 > Block quotes get muted text plus a gutter border

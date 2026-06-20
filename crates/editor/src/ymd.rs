@@ -40,6 +40,17 @@ pub(crate) struct YmdLink {
     pub close_marker_range: Range<usize>,
 }
 
+impl YmdLink {
+    // The URL byte range inside the `](url)` close marker — the destination
+    // bytes after the leading `](` and before the trailing `)`. The markers are
+    // always single ASCII bytes (`]`, `(`, `)`), so this stays on char
+    // boundaries. Used by the cmd-click hover path (#zed-35) to recover the
+    // concealed URL the conceal fold hides from the display.
+    pub(crate) fn url_range(&self) -> Range<usize> {
+        self.close_marker_range.start + 2..self.close_marker_range.end - 1
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct YmdImage {
     pub open_marker_range: Range<usize>,
@@ -190,17 +201,19 @@ pub(crate) fn line_foreground_style(color: YmdColor, appearance: Appearance) -> 
     }
 }
 
-// Deliberately quiet: a 1px underline in the YMD default text color, NOT a theme
-// link/accent color. The label should read as a calm, professional YMD link, not
-// a loud web hyperlink. The underline color is pinned to the YMD default
-// foreground (the same color `background_style` reads with) so it stays calm even
-// where Markdown syntax highlighting paints the link label text blue — pinning
-// the color (rather than inheriting) is what keeps the underline off link-blue.
-pub(crate) fn link_style(appearance: Appearance) -> HighlightStyle {
+// A 1px underline that INHERITS the label text color (no color override), so it
+// always matches the blue Zed's Markdown grammar (`@link_text.markup`) paints the
+// label — the same blue the raw `[label](url)` shows when revealed — instead of a
+// separate pinned color. Matching the text reads as one coherent link in every
+// theme; an earlier revision (#zed-06 Q4) pinned this to the YMD default
+// foreground for calm, but that left blue text under a near-black underline
+// (#zed-35 dogfood, 2026-06-20). The style sets only the underline, so a label
+// inside a `==…==` highlight keeps that highlight's color and gains this line.
+pub(crate) fn link_style() -> HighlightStyle {
     HighlightStyle {
         underline: Some(UnderlineStyle {
             thickness: px(1.),
-            color: Some(YmdColor::Default.line_foreground(appearance)),
+            color: None,
             ..UnderlineStyle::default()
         }),
         ..HighlightStyle::default()
@@ -321,6 +334,28 @@ pub(crate) fn scan_links(text: &str) -> Vec<YmdLink> {
         links.extend(scan_line_links(line_content, line_start));
     });
     links
+}
+
+// Resolve the concealed URL of the Markdown link whose visible label contains
+// `offset` (an absolute byte offset into `text`). Returns the label's byte range
+// — the hover underline target — and the URL string, or `None` when `offset` is
+// not inside any concealed link label (it is in the brackets, the URL, plain
+// text, or a fenced code block). Backs the cmd-click hover path (#zed-35): the
+// buffer still holds the full `[label](url)` because conceal is display-only, so
+// a click on the visible label can open the hidden URL. Reusing `scan_links`
+// keeps the clickable label set identical to the concealed label set (same
+// fenced-code exclusion), so reading and clicking never disagree.
+pub(crate) fn markdown_link_url_at_offset(
+    text: &str,
+    offset: usize,
+) -> Option<(Range<usize>, String)> {
+    scan_links(text).into_iter().find_map(|link| {
+        if !link.label_range.contains(&offset) {
+            return None;
+        }
+        let url = text.get(link.url_range())?.to_string();
+        Some((link.label_range, url))
+    })
 }
 
 pub(crate) fn scan_images(text: &str) -> Vec<YmdImage> {
@@ -1622,6 +1657,102 @@ mod tests {
                 label_range: 1..close,
                 close_marker_range: close..line.len(),
             }]
+        );
+    }
+
+    #[test]
+    fn link_style_underline_inherits_the_label_color() {
+        // The link underline sets NO color override, so it inherits the label
+        // text color (the Markdown link blue) and matches the revealed link
+        // instead of a pinned color. #zed-35 dogfood reversed #zed-06's Q4
+        // pinned-default-foreground choice (blue text under a near-black line).
+        let underline = link_style().underline.expect("link style sets an underline");
+        assert_eq!(
+            underline.color, None,
+            "underline must inherit the text color, not pin its own"
+        );
+    }
+
+    #[test]
+    fn url_range_excludes_the_close_markers() {
+        // `url_range()` is the destination bytes only — the leading `](` and the
+        // trailing `)` stripped. Markers are single ASCII bytes, so it stays on
+        // char boundaries. Backs #zed-35's URL recovery.
+        let line = "[label](https://example.com)";
+        let link = scan_links(line).remove(0);
+        assert_eq!(&line[link.url_range()], "https://example.com");
+    }
+
+    #[test]
+    fn markdown_link_url_at_offset_resolves_label_to_url() {
+        // A click anywhere inside the visible label resolves to the concealed URL
+        // plus the label range (the hover underline target). #zed-35.
+        let line = "[Zed RBF](https://zed.dev)";
+        let label_start = 1;
+        let label_end = line.find("](").unwrap();
+        for offset in [label_start, label_start + 2, label_end - 1] {
+            assert_eq!(
+                markdown_link_url_at_offset(line, offset),
+                Some((label_start..label_end, "https://zed.dev".to_string())),
+                "offset {offset} inside the label should resolve to the URL"
+            );
+        }
+    }
+
+    #[test]
+    fn markdown_link_url_at_offset_takes_whole_balanced_paren_url() {
+        // The depth-counted destination is recovered whole — the inner `(film)`
+        // is part of the URL, not a truncation point.
+        let line = "[Rust (film)](https://en.wikipedia.org/wiki/Rust_(film))";
+        let label_end = line.find("](").unwrap();
+        let (label_range, url) = markdown_link_url_at_offset(line, 3).unwrap();
+        assert_eq!(label_range, 1..label_end);
+        assert_eq!(url, "https://en.wikipedia.org/wiki/Rust_(film)");
+    }
+
+    #[test]
+    fn markdown_link_url_at_offset_picks_the_label_under_the_offset() {
+        // Two links on one line: each label resolves only to its own URL.
+        let line = "[first](url-1) and [second](url-2)";
+        assert_eq!(
+            markdown_link_url_at_offset(line, line.find("first").unwrap()).map(|(_, url)| url),
+            Some("url-1".to_string())
+        );
+        assert_eq!(
+            markdown_link_url_at_offset(line, line.find("second").unwrap()).map(|(_, url)| url),
+            Some("url-2".to_string())
+        );
+    }
+
+    #[test]
+    fn markdown_link_url_at_offset_rejects_non_label_offsets() {
+        let line = "[label](https://example.com)";
+        // The `[` open bracket (offset 0) is a conceal marker, not the label.
+        assert_eq!(markdown_link_url_at_offset(line, 0), None);
+        // Inside the URL — the raw URL is `find_url`'s job, not this path.
+        assert_eq!(
+            markdown_link_url_at_offset(line, line.find("example").unwrap()),
+            None
+        );
+        // Plain text with no link at all.
+        assert_eq!(markdown_link_url_at_offset("just prose", 3), None);
+    }
+
+    #[test]
+    fn markdown_link_url_at_offset_skips_fenced_code_and_images() {
+        // A link inside a fenced code block is NOT concealed (#zed-09), so its
+        // label is not specially clickable — reusing `scan_links` keeps the
+        // clickable set identical to the concealed set. An image label is not a
+        // text link.
+        let fenced = "```\n[x](https://example.com)\n```";
+        assert_eq!(
+            markdown_link_url_at_offset(fenced, fenced.find('x').unwrap()),
+            None
+        );
+        let image = "![alt](https://example.com/i.png)";
+        assert_eq!(
+            markdown_link_url_at_offset(image, image.find("alt").unwrap()),
+            None
         );
     }
 

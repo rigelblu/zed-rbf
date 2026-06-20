@@ -6,6 +6,10 @@ title: "Zed RBF Changelog"
 
 ---
 
+# 🔵⋯ v0.33.0 — #zed-35
+- 2026-06-20 - feat (ux) | Cmd-click a concealed Markdown link's label to open its destination without revealing the raw `[label](url)` syntax — a web URL (with or without a scheme), a relative file (opened as a buffer), or a directory (revealed in the project panel) — restoring the read-mode link-following `#zed-06` traded for clean reading [@zed-rbf]
+- 2026-06-20 - improve (ux) | the concealed-link underline now matches the link text color instead of a pinned near-black, so the label reads as one coherent link [@zed-rbf]
+
 # 🔵⋯ v0.32.0 — #zed-34
 - 2026-06-20 - fix (ux) | paste an image into a Markdown file under a symlinked directory (such as a `.rb-drive` store) without the paste failing for resolving outside the worktree [@zed-rbf]
 
