@@ -399,11 +399,9 @@ impl Editor {
                     }
 
                     ensure_markdown_image_paste_path_within_worktree(
-                        fs.as_ref(),
                         &write_path,
                         &worktree_root_path,
                     )
-                    .await
                     .map_err(Arc::new)?;
 
                     fs.write(&write_path, &image_bytes)
@@ -488,7 +486,7 @@ impl Editor {
             .clone();
         let image_paste_directory = markdown_image_paste_directory(&image_paste_directory)?;
         let filename = markdown_image_filename(image);
-        let filename_path = RelPath::unix(filename.as_str())?;
+        let filename_path = RelPath::from_unix_str(filename.as_str())?;
         let markdown_image_path = image_paste_directory.join(filename_path);
         let worktree_root_path = {
             let project = project.read(cx);
@@ -510,7 +508,7 @@ impl Editor {
             let image_project_path = parent_path.join(image_paste_directory).join(filename_path);
             let image_project_path = ProjectPath {
                 worktree_id: file_path.worktree_id,
-                path: image_project_path,
+                path: image_project_path.into(),
             };
 
             project
@@ -921,11 +919,11 @@ fn markdown_image_paste_directory(directory: &str) -> Result<&RelPath> {
         return default_markdown_image_paste_directory();
     }
 
-    RelPath::unix(directory).or_else(|_| default_markdown_image_paste_directory())
+    RelPath::from_unix_str(directory).or_else(|_| default_markdown_image_paste_directory())
 }
 
 fn default_markdown_image_paste_directory() -> Result<&'static RelPath> {
-    RelPath::unix(DEFAULT_MARKDOWN_IMAGE_PASTE_DIRECTORY)
+    RelPath::from_unix_str(DEFAULT_MARKDOWN_IMAGE_PASTE_DIRECTORY)
         .context("default Markdown image paste directory should be valid")
 }
 
@@ -935,49 +933,28 @@ fn markdown_image_paste_directory_needs_escaping(character: char) -> bool {
         || matches!(character, '(' | ')' | '<' | '>' | '?' | '#' | '%')
 }
 
-async fn ensure_markdown_image_paste_path_within_worktree(
-    fs: &dyn fs::Fs,
+fn ensure_markdown_image_paste_path_within_worktree(
     write_path: &Path,
     worktree_root_path: &Path,
 ) -> Result<()> {
-    let Some(resolved_write_path) = canonicalize_existing_ancestor(fs, write_path).await else {
-        anyhow::bail!("markdown image paste target has no canonical parent");
-    };
-    let resolved_worktree_root = fs
-        .canonicalize(worktree_root_path)
-        .await
-        .with_context(|| format!("canonicalizing worktree root {worktree_root_path:?}"))?;
+    // Containment is checked lexically rather than by canonicalizing through the
+    // filesystem, so a paste target reached via a symlinked subdirectory (for
+    // example a `.rb-drive` store symlinked into the worktree) is not rejected for
+    // resolving to its real location outside the worktree. `..` and absolute paste
+    // directories are already rejected when the configured directory is parsed, so
+    // a normalized write path can only leave the worktree through such a symlink.
+    let normalized_write_path = util::paths::normalize_lexically(write_path)
+        .with_context(|| format!("normalizing markdown image paste target {write_path:?}"))?;
+    let normalized_worktree_root = util::paths::normalize_lexically(worktree_root_path)
+        .with_context(|| format!("normalizing worktree root {worktree_root_path:?}"))?;
 
-    if !resolved_write_path.starts_with(&resolved_worktree_root) {
+    if !normalized_write_path.starts_with(&normalized_worktree_root) {
         anyhow::bail!(
-            "markdown image paste target {write_path:?} resolves outside worktree root {worktree_root_path:?}"
+            "markdown image paste target {write_path:?} is outside worktree root {worktree_root_path:?}"
         );
     }
 
     Ok(())
-}
-
-async fn canonicalize_existing_ancestor(fs: &dyn fs::Fs, path: &Path) -> Option<PathBuf> {
-    let mut current = Some(path);
-    let mut suffix_components = Vec::new();
-    while let Some(ancestor) = current {
-        match fs.canonicalize(ancestor).await {
-            Ok(canonical_path) => {
-                let mut canonical_path = canonical_path;
-                for component in suffix_components.into_iter().rev() {
-                    canonical_path.push(component);
-                }
-                return Some(canonical_path);
-            }
-            Err(_) => {
-                if let Some(file_name) = ancestor.file_name() {
-                    suffix_components.push(file_name.to_os_string());
-                }
-                current = ancestor.parent();
-            }
-        }
-    }
-    None
 }
 
 struct KillRing {
