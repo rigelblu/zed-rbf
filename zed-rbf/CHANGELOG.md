@@ -6,6 +6,9 @@ title: "Zed RBF Changelog"
 
 ---
 
+# 🔵⋯ v0.32.0 — #zed-34
+- 2026-06-20 - fix (ux) | paste an image into a Markdown file under a symlinked directory (such as a `.rb-drive` store) without the paste failing for resolving outside the worktree [@zed-rbf]
+
 # 🔵⋯ v0.31.0 (2026-06-17)
 - 2026-06-19 - fix (ux) | drag files from the Project Panel into an editor buffer without crashing [@zed-rbf]
 
