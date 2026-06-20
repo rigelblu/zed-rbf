@@ -36303,7 +36303,7 @@ async fn test_paste_image_in_markdown_percent_encoded_directory_falls_back_to_do
 }
 
 #[gpui::test]
-async fn test_paste_image_in_markdown_rejects_symlinked_directory_outside_worktree(
+async fn test_paste_image_in_markdown_writes_through_symlinked_directory(
     cx: &mut gpui::TestAppContext,
 ) {
     init_test(cx, set_markdown_image_paste_directory_to_images_screenshots);
@@ -36321,6 +36321,10 @@ async fn test_paste_image_in_markdown_rejects_symlinked_directory_outside_worktr
     fs.create_dir(PathBuf::from(path!("/outside")).as_path())
         .await
         .expect("outside directory should be created");
+    // The configured image directory `images` is a symlink whose real target lives
+    // outside the worktree. This mirrors a `.rb-drive` store symlinked into a
+    // project: the paste target stays lexically inside the worktree, so it must be
+    // written through the symlink rather than rejected.
     fs.create_symlink(
         PathBuf::from(path!("/project/notes/images")).as_path(),
         PathBuf::from(path!("/outside")),
@@ -36366,13 +36370,26 @@ async fn test_paste_image_in_markdown_rejects_symlinked_directory_outside_worktr
     });
     cx.run_until_parked();
 
-    cx.assert_editor_state("first ˇ\nsecond ˇ");
+    let state = cx.editor_state();
+    let marker = "![alt placeholder](images/screenshots/pasted-image-";
+    assert!(
+        state.contains(marker),
+        "pasting should insert a Markdown link through the symlinked directory, got {state:?}"
+    );
+    let link_start = state.find("](").expect("image link start") + 2;
+    let link_end = state[link_start..].find(')').expect("link end") + link_start;
+    let link = &state[link_start..link_end];
+    assert_eq!(
+        fs.read_file_sync(PathBuf::from(path!("/project/notes")).join(link))
+            .expect("pasted image should be readable through the symlinked directory"),
+        vec![1, 2, 3, 4],
+    );
     assert!(
         fs.metadata(PathBuf::from(path!("/outside/screenshots")).as_path())
             .await
             .expect("outside metadata should be readable")
-            .is_none(),
-        "pasting should not create directories through a symlink outside the worktree"
+            .is_some(),
+        "the image bytes should be written through the symlink to its real location"
     );
 }
 
