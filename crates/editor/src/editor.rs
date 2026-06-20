@@ -9615,6 +9615,17 @@ impl Editor {
             })
     }
 
+    // Whether a cmd-click over a concealed Markdown link label should resolve to
+    // its hidden URL (#zed-35). Matches the conceal scope exactly: a Markdown
+    // singleton, within the YMD size cap, with concealment active. Off the
+    // cursor row the label is concealed; on the cursor row it is revealed —
+    // both resolve, since the URL is read from the buffer, not the display.
+    fn ymd_cmd_click_enabled(&self, cx: &App) -> bool {
+        self.ymd_concealed
+            && self.is_ymd_markdown_singleton(cx)
+            && self.buffer.read(cx).snapshot(cx).len().0 <= ymd::MAX_YMD_HIGHLIGHT_BYTES
+    }
+
     fn ymd_markdown_snapshot_and_text(
         &self,
         cx: &mut Context<Self>,
@@ -9983,7 +9994,7 @@ impl Editor {
             self.highlight_text(
                 HighlightKey::YmdLink,
                 link_ranges,
-                ymd::link_style(appearance),
+                ymd::link_style(),
                 cx,
             );
         }
