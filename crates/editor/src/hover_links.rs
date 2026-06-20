@@ -295,7 +295,7 @@ impl Editor {
                 else {
                     return Task::ready(Ok(Navigated::No));
                 };
-                let links = hovered_link_state
+                let links: Vec<HoverLink> = hovered_link_state
                     .links
                     .into_iter()
                     .filter(|link| {
@@ -306,6 +306,12 @@ impl Editor {
                         }
                     })
                     .collect();
+                // #zed-35: a concealed Markdown link to a directory reveals it in
+                // the project panel — a folder cannot open as a buffer.
+                if let Some(navigated) = self.reveal_directory_hover_link(&links, cx) {
+                    self.select(SelectPhase::End, window, cx);
+                    return Task::ready(Ok(navigated));
+                }
                 let nav_entry = self.navigation_entry(multi_buffer_anchor, cx);
                 let split = Self::is_alt_pressed(&modifiers, cx);
                 let navigate_task =
@@ -342,6 +348,41 @@ impl Editor {
         };
         self.select(SelectPhase::End, window, cx);
         navigate_task
+    }
+
+    // #zed-35: reveal a concealed Markdown directory link in the project panel.
+    // A folder cannot open as a buffer, so a `HoverLink::File` whose resolved
+    // path is a directory is intercepted at click time and turned into the
+    // reveal event the project panel listens for. Returns `None` (so normal
+    // navigation proceeds) unless the first link is an in-project directory.
+    fn reveal_directory_hover_link(
+        &mut self,
+        links: &[HoverLink],
+        cx: &mut Context<Editor>,
+    ) -> Option<Navigated> {
+        let Some(HoverLink::File(file_target)) = links.first() else {
+            return None;
+        };
+        if !file_target.resolved_path.is_dir() {
+            return None;
+        }
+        // It IS a directory: a folder cannot open as a buffer, so ALWAYS consume
+        // the click here (return Some). Reveal it in the project panel when it
+        // maps to a worktree entry; otherwise do nothing — never fall through to
+        // `open_resolved_path`, which would error (open-folder-as-buffer) or add
+        // the folder as a stray worktree for an absolute/out-of-project path.
+        if let Some(project) = self.project.clone()
+            && let Some(project_path) = file_target.resolved_path.project_path()
+            && let Some(entry_id) = project
+                .read(cx)
+                .entry_for_path(project_path, cx)
+                .map(|entry| entry.id)
+        {
+            project.update(cx, |_, cx| {
+                cx.emit(project::Event::RevealInProjectPanel(entry_id))
+            });
+        }
+        Some(Navigated::Yes)
     }
 }
 
@@ -444,6 +485,13 @@ pub fn show_link_definition(
                     });
             drop(snapshot);
 
+            // #zed-35: when the conceal scope is active, a hover over a
+            // concealed Markdown link label resolves to its hidden URL. Read
+            // once here so the source-chain branch below stays a cheap check.
+            let ymd_cmd_click_enabled = this
+                .read_with(cx, |editor, cx| editor.ymd_cmd_click_enabled(cx))
+                .unwrap_or(false);
+
             let result = match &trigger_point {
                 TriggerPoint::Text(_) => {
                     let mut links = Vec::new();
@@ -458,6 +506,46 @@ pub fn show_link_definition(
                     {
                         symbol_range = Some(RangeInEditor::Text(multi_buffer_range));
                         links.push(document_link_target_to_hover_link(&target, server_id));
+                    } else if let Some((label_range, target)) = ymd_cmd_click_enabled
+                        .then(|| find_markdown_link_url(&buffer, anchor, cx))
+                        .flatten()
+                    {
+                        // A concealed link label sits BEFORE the destination
+                        // bytes, so `find_url`/`find_file` never match it (both
+                        // scan outward from the hovered offset and the label has
+                        // no destination text around it); this branch resolves
+                        // the link the label belongs to. A web URL opens via
+                        // `open_url`; a relative path resolves to a project file
+                        // (the ship-plan slice links). A hover over the raw
+                        // destination (cursor on row) returns `None` here and
+                        // falls through to `find_url` unchanged.
+                        let hover_link = if markdown_target_is_url(&target) {
+                            Some(HoverLink::Url(target))
+                        } else if let Some(file_target) =
+                            resolve_markdown_link_path(&buffer, project.clone(), &target, cx).await
+                        {
+                            // A file opens as a buffer (at any `:row:col`); a
+                            // directory reveals in the project panel (handled at
+                            // click time in `cmd_click_reveal_task`). Both carry
+                            // the hover affordance via `HoverLink::File`.
+                            Some(HoverLink::File(file_target))
+                        } else {
+                            // A scheme-less web host (e.g. `google.com`) that is
+                            // not a project path opens as `https://…` (#zed-35
+                            // ruling): an existing relative file/dir wins over
+                            // the web reading, a bare domain wins otherwise.
+                            markdown_scheme_less_url(&target).map(HoverLink::Url)
+                        };
+                        if let Some(hover_link) = hover_link {
+                            let snapshot = this
+                                .read_with(cx, |editor, cx| editor.buffer.read(cx).snapshot(cx))?;
+                            if let Some(range) =
+                                snapshot.buffer_anchor_range_to_anchor_range(label_range)
+                            {
+                                symbol_range = Some(RangeInEditor::Text(range));
+                            }
+                            links.push(hover_link);
+                        }
                     } else if let Some((url_range, url)) = find_url(&buffer, anchor, cx) {
                         let snapshot =
                             this.read_with(cx, |editor, cx| editor.buffer.read(cx).snapshot(cx))?;
@@ -690,6 +778,107 @@ pub(crate) fn find_url(
         }
     }
     None
+}
+
+// Resolve a cmd-hover over a concealed Markdown link label (#zed-35) to its
+// hidden URL. `find_url` cannot do this: it linkifies the whole `[label](url)`
+// token and finds the URL range, but the hovered offset sits in `label` BEFORE
+// that range, so it returns `None`. This maps the label offset to its link's
+// concealed URL instead, returning the label's anchor range (the underline
+// target) and the URL string. Caller gates this on the conceal scope; the URL
+// is read from the buffer, so it works whether the label is concealed (off
+// cursor row) or revealed (on cursor row).
+pub(crate) fn find_markdown_link_url(
+    buffer: &Entity<language::Buffer>,
+    position: text::Anchor,
+    cx: &AsyncWindowContext,
+) -> Option<(Range<text::Anchor>, String)> {
+    let snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot());
+    let offset = position.to_offset(&snapshot);
+    let (label_range, url) = crate::ymd::markdown_link_url_at_offset(&snapshot.text(), offset)?;
+    let range = snapshot.anchor_before(label_range.start)..snapshot.anchor_after(label_range.end);
+    Some((range, url))
+}
+
+// Whether a Markdown link destination is a web URL (opens via `open_url`) rather
+// than a path to resolve as a project file. Mirrors `find_file`'s whole-string
+// URL test: the destination must be exactly one URL with no surrounding bytes.
+fn markdown_target_is_url(target: &str) -> bool {
+    let mut finder = LinkFinder::new();
+    finder.kinds(&[LinkKind::Url]);
+    finder
+        .links(target)
+        .next()
+        .is_some_and(|link| link.start() == 0 && link.end() == target.len())
+}
+
+// Common code/doc file extensions a scheme-less Markdown destination reads as a
+// (possibly not-yet-created) local file rather than a web host. Needed because
+// `.md`/`.rs`/`.io`/… are also real ccTLDs, so linkify alone cannot tell
+// `google.com` (website) from `notes.md` (a file). Lowercase; compared
+// case-insensitively.
+const MARKDOWN_LINK_FILE_EXTENSIONS: &[&str] = &[
+    "md", "markdown", "mdx", "txt", "rs", "toml", "json", "jsonc", "yaml", "yml", "lock", "sh",
+    "bash", "zsh", "fish", "py", "rb", "js", "jsx", "ts", "tsx", "go", "c", "h", "cc", "cpp",
+    "hpp", "java", "kt", "swift", "css", "scss", "html", "htm", "xml", "svg", "ini", "cfg", "conf",
+    "env", "log", "csv", "sql", "graphql", "proto",
+];
+
+// A scheme-less web host (e.g. `google.com`, `www.x.org`) used as a Markdown
+// link destination, returned as an `https://` URL so `open_url` can open it.
+// Relaxing linkify's scheme requirement recognizes the bare host; the
+// whole-string match keeps a path-shaped destination (no host) non-clickable.
+// Tried only AFTER file resolution, so an existing relative file/dir still opens
+// locally. A `:row:col` suffix or a known code/doc file extension marks the
+// target as a (perhaps not-yet-created) local file, NOT a website, so it stays
+// non-clickable rather than leaking to `https://notes.md` (#zed-35 ruling:
+// reject known file extensions). Backs the "open bare domains" ruling.
+fn markdown_scheme_less_url(target: &str) -> Option<String> {
+    if PathWithPosition::parse_str(target).row.is_some() {
+        return None;
+    }
+    let last_segment = target.rsplit('/').next().unwrap_or(target);
+    if let Some((_, extension)) = last_segment.rsplit_once('.')
+        && MARKDOWN_LINK_FILE_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+    {
+        return None;
+    }
+    let mut finder = LinkFinder::new();
+    finder.kinds(&[LinkKind::Url]);
+    finder.url_must_have_scheme(false);
+    let link = finder.links(target).next()?;
+    (link.start() == 0 && link.end() == target.len()).then(|| format!("https://{target}"))
+}
+
+// Resolve a relative Markdown link destination (e.g. `zed-06-….md`, `docs/`, or
+// `file.rs:83:1`) to an EXISTING project path — a file or a directory — mirroring
+// `find_file`'s `resolve_path_in_buffer` but without the file-only filter (a
+// cmd-click on a file opens it as a buffer; on a directory reveals it in the
+// project panel, #zed-35). A trailing `:row:col` is stripped before resolving
+// and carried on the target, matching the unconcealed `find_file` path, so
+// `[x](file.rs:3:2)` opens `file.rs` at that position rather than failing to
+// resolve the literal suffixed path (which would leak to the web fallback).
+// `resolve_path_in_buffer` returns `Some` only for paths that exist, so a broken
+// link stays non-clickable. `None` when there is no project.
+async fn resolve_markdown_link_path(
+    buffer: &Entity<language::Buffer>,
+    project: Option<Entity<Project>>,
+    target: &str,
+    cx: &mut AsyncWindowContext,
+) -> Option<ResolvedFileTarget> {
+    let project = project?;
+    let parsed = PathWithPosition::parse_str(target);
+    let path = parsed.path.to_string_lossy().into_owned();
+    let resolved_path = project
+        .update(cx, |project, cx| {
+            project.resolve_path_in_buffer(&path, buffer, cx)
+        })
+        .await?;
+    Some(ResolvedFileTarget {
+        resolved_path,
+        row: parsed.row,
+        column: parsed.column,
+    })
 }
 
 pub(crate) fn find_url_from_range(
@@ -1972,6 +2161,275 @@ mod tests {
 
         cx.simulate_click(screen_coord, Modifiers::secondary_key());
         assert_eq!(cx.opened_url(), Some("https://zed.dev/releases".into()));
+    }
+
+    #[gpui::test]
+    async fn test_cmd_click_concealed_markdown_link_opens_url(cx: &mut gpui::TestAppContext) {
+        // #zed-35: off the cursor row a concealed Markdown link shows only its
+        // underlined label. Cmd-hover underlines the label as a live link and
+        // Cmd-click opens the concealed URL — without revealing the raw syntax.
+        // The path is gated on the conceal scope, so toggling conceal off closes
+        // it (the raw URL is then visible and `find_url` owns it).
+        init_test(cx, |_| {});
+        let mut cx = EditorLspTestContext::new_markdown_with_rust(cx).await;
+
+        // Cursor on row 0 keeps row 1's link concealed (only the label shows).
+        cx.set_state(indoc! {"
+            plainˇ line
+            [Zed RBF](https://zed.dev)
+        "});
+        cx.run_until_parked();
+
+        // The label conceals to just `Zed RBF`; the brackets and URL fold away.
+        cx.update_editor(|editor, _, cx| {
+            assert_eq!(
+                editor.display_text(cx).replace('\u{2060}', ""),
+                "plain line\nZed RBF\n"
+            );
+        });
+
+        // Cmd-hover over the concealed label underlines exactly the label range.
+        let label_coord = cx.pixel_position(indoc! {"
+            plain line
+            [Zed RˇBF](https://zed.dev)
+        "});
+        cx.simulate_mouse_move(label_coord, None, Modifiers::secondary_key());
+        cx.run_until_parked();
+        cx.assert_editor_text_highlights(
+            HighlightKey::HoveredLinkState,
+            indoc! {"
+                plain line
+                [«Zed RBF»](https://zed.dev)
+            "},
+        );
+
+        // Cmd-click opens the concealed URL.
+        cx.simulate_click(label_coord, Modifiers::secondary_key());
+        assert_eq!(cx.opened_url(), Some("https://zed.dev".into()));
+
+        // Gate: toggling conceal off closes the path — a hover over the LABEL no
+        // longer produces a hovered link (the label sits before the now-visible
+        // URL, so `find_url` does not match it either).
+        cx.update_editor(|editor, window, cx| {
+            editor.toggle_ymd_conceal(&crate::actions::ToggleYmdConceal, window, cx);
+        });
+        cx.run_until_parked();
+        let label_coord = cx.pixel_position(indoc! {"
+            plain line
+            [Zed RˇBF](https://zed.dev)
+        "});
+        cx.simulate_mouse_move(label_coord, None, Modifiers::secondary_key());
+        cx.run_until_parked();
+        cx.assert_editor_text_highlights(
+            HighlightKey::HoveredLinkState,
+            indoc! {"
+                plain line
+                [Zed RBF](https://zed.dev)
+            "},
+        );
+    }
+
+    #[gpui::test]
+    async fn test_cmd_click_concealed_markdown_link_without_dwell(cx: &mut gpui::TestAppContext) {
+        // A real cmd-click is a single gesture: the async cmd-hover resolution
+        // (it awaits LSP document-links/definitions before caching) may not have
+        // cached the link before the click fires. The click must still open the
+        // URL. #zed-35 — reproduces the "not clickable" dogfood report.
+        init_test(cx, |_| {});
+        let mut cx = EditorLspTestContext::new_markdown_with_rust(cx).await;
+        cx.set_state(indoc! {"
+            plainˇ line
+            [Zed RBF](https://zed.dev)
+        "});
+        cx.run_until_parked();
+
+        let label_coord = cx.pixel_position(indoc! {"
+            plain line
+            [Zed RˇBF](https://zed.dev)
+        "});
+        // Cmd-move then Cmd-click WITHOUT letting the hover resolution settle.
+        cx.simulate_mouse_move(label_coord, None, Modifiers::secondary_key());
+        cx.simulate_click(label_coord, Modifiers::secondary_key());
+        cx.run_until_parked();
+        assert_eq!(cx.opened_url(), Some("https://zed.dev".into()));
+    }
+
+    #[gpui::test]
+    async fn test_cmd_click_concealed_markdown_link_opens_scheme_less_host(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // #zed-35 ruling: a scheme-less web host (`google.com`) that is not a
+        // project file opens as `https://google.com` — the common case where a
+        // writer omits the scheme.
+        init_test(cx, |_| {});
+        let mut cx = EditorLspTestContext::new_markdown_with_rust(cx).await;
+        cx.set_state(indoc! {"
+            plainˇ line
+            [Google](google.com)
+        "});
+        cx.run_until_parked();
+
+        let label_coord = cx.pixel_position(indoc! {"
+            plain line
+            [Goˇogle](google.com)
+        "});
+        cx.simulate_mouse_move(label_coord, None, Modifiers::secondary_key());
+        cx.run_until_parked();
+        cx.simulate_click(label_coord, Modifiers::secondary_key());
+        assert_eq!(cx.opened_url(), Some("https://google.com".into()));
+    }
+
+    #[gpui::test]
+    async fn test_cmd_click_concealed_markdown_directory_link_reveals_in_panel(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // #zed-35: a directory link reveals the folder in the project panel
+        // rather than trying (and failing) to open it as a buffer. The test file
+        // lives at `<root>/dir/file.md`, so `.` resolves to the existing `dir`.
+        init_test(cx, |_| {});
+        let mut cx = EditorLspTestContext::new_markdown_with_rust(cx).await;
+        cx.set_state(indoc! {"
+            plainˇ line
+            [Here](.)
+        "});
+        cx.run_until_parked();
+
+        let revealed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _subscription = cx.update_editor(|editor, _window, cx| {
+            let project = editor.project.clone().expect("test editor has a project");
+            let revealed = revealed.clone();
+            cx.subscribe(&project, move |_editor, _project, event, _cx| {
+                if matches!(event, project::Event::RevealInProjectPanel(_)) {
+                    revealed.store(true, Ordering::SeqCst);
+                }
+            })
+        });
+
+        let label_coord = cx.pixel_position(indoc! {"
+            plain line
+            [Heˇre](.)
+        "});
+        cx.simulate_mouse_move(label_coord, None, Modifiers::secondary_key());
+        cx.run_until_parked();
+        cx.simulate_click(label_coord, Modifiers::secondary_key());
+        cx.run_until_parked();
+        assert!(
+            revealed.load(Ordering::SeqCst),
+            "cmd-clicking a directory link should emit RevealInProjectPanel"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_cmd_click_concealed_markdown_link_strips_row_col_not_leaks_to_web(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // #zed-35 fix (#1): a `:row:col` suffix is stripped and the file resolved
+        // (mirroring the unconcealed find_file path). Without the fix the literal
+        // `file.md:2:3` fails to resolve and the scheme-less fallback opens
+        // `https://file.md:2:3`. The test file is `<root>/dir/file.md`, so
+        // `file.md` resolves to itself.
+        init_test(cx, |_| {});
+        let mut cx = EditorLspTestContext::new_markdown_with_rust(cx).await;
+        cx.set_state(indoc! {"
+            plainˇ line
+            [Self](file.md:2:3)
+        "});
+        cx.run_until_parked();
+
+        let label_coord = cx.pixel_position(indoc! {"
+            plain line
+            [Seˇlf](file.md:2:3)
+        "});
+        cx.simulate_mouse_move(label_coord, None, Modifiers::secondary_key());
+        cx.run_until_parked();
+        cx.simulate_click(label_coord, Modifiers::secondary_key());
+        cx.run_until_parked();
+        // Resolves as a FILE (opened as a buffer) — never leaks to the web.
+        assert_eq!(cx.opened_url(), None);
+    }
+
+    #[gpui::test]
+    async fn test_cmd_click_concealed_markdown_directory_outside_project_is_a_noop(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // #zed-35 fix (#2): a directory link must never fall through to
+        // open-as-buffer. An absolute directory OUTSIDE the project previously
+        // reached open_abs_path, adding the folder as a stray worktree; it must
+        // now be a consumed no-op (revealed only when it maps to a worktree).
+        init_test(cx, |_| {});
+        let mut cx = EditorLspTestContext::new_markdown_with_rust(cx).await;
+        let (fs, worktrees_before) = cx.update_editor(|editor, _, cx| {
+            let project = editor.project.as_ref().unwrap().read(cx);
+            (project.fs().clone(), project.worktrees(cx).count())
+        });
+        fs.as_fake()
+            .insert_tree("/outside_dir", serde_json::json!({}))
+            .await;
+
+        cx.set_state(indoc! {"
+            plainˇ line
+            [Outside](/outside_dir)
+        "});
+        cx.run_until_parked();
+
+        let label_coord = cx.pixel_position(indoc! {"
+            plain line
+            [Outˇside](/outside_dir)
+        "});
+        cx.simulate_mouse_move(label_coord, None, Modifiers::secondary_key());
+        cx.run_until_parked();
+        cx.simulate_click(label_coord, Modifiers::secondary_key());
+        cx.run_until_parked();
+
+        let worktrees_after = cx.update_editor(|editor, _, cx| {
+            editor
+                .project
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .worktrees(cx)
+                .count()
+        });
+        assert_eq!(
+            worktrees_after, worktrees_before,
+            "an out-of-project directory link must not add a worktree"
+        );
+        assert_eq!(cx.opened_url(), None);
+    }
+
+    #[test]
+    fn markdown_target_url_classification() {
+        // Scheme'd URLs are opened as-is; bare hosts are not URLs here (they take
+        // the scheme-less path); paths with no host shape are neither.
+        assert!(markdown_target_is_url("https://google.com"));
+        assert!(markdown_target_is_url("http://x.com/a?b=1#c"));
+        assert!(!markdown_target_is_url("google.com"));
+        assert!(!markdown_target_is_url("zed-06.md"));
+
+        // Scheme-less hosts gain `https://`; path-shaped destinations stay None so
+        // file resolution (tried first) owns them.
+        assert_eq!(
+            markdown_scheme_less_url("google.com").as_deref(),
+            Some("https://google.com")
+        );
+        assert_eq!(
+            markdown_scheme_less_url("www.example.org").as_deref(),
+            Some("https://www.example.org")
+        );
+        assert_eq!(markdown_scheme_less_url("folder/page"), None);
+
+        // A known file extension or a `:row:col` suffix marks a local file, not a
+        // website — these stay None so a typo'd / not-yet-created link does not
+        // leak to the web (#zed-35 #3 fix), even though `.md`/`.rs` are real TLDs.
+        assert_eq!(markdown_scheme_less_url("notes.md"), None);
+        assert_eq!(markdown_scheme_less_url("config.toml"), None);
+        assert_eq!(markdown_scheme_less_url("src/main.rs"), None);
+        assert_eq!(markdown_scheme_less_url("file.rs:83:1"), None);
+        // A real web TLD that is not a code/doc extension still opens.
+        assert_eq!(
+            markdown_scheme_less_url("example.dev").as_deref(),
+            Some("https://example.dev")
+        );
     }
 
     #[test]
