@@ -6,6 +6,15 @@ title: "Zed RBF Changelog"
 
 ---
 
+# 🔵⋯ v0.36.0 — #zed-36
+- 2026-06-22 - fix (ux) | open a git-panel diff for a file in a nested repo (such as a `.rb-drive` store under the project) and see only the changed hunks against its committed version, instead of the whole file rendered as added [@zed-rbf]
+
+# 🔵⋯ v0.35.0 — #zed-40
+- 2026-06-22 - fix (ux) | refresh a git-panel diff (for example after a file rename) without the app crashing while it folds buffers [@zed-rbf]
+
+# 🔵⋯ v0.34.0 — #zed-39
+- 2026-06-22 - fix (ux) | open or scroll a diff containing a line of 129 bytes or more without the app crashing [@zed-rbf]
+
 # 🔵⋯ v0.33.0 — #zed-35
 - 2026-06-20 - feat (ux) | Cmd-click a concealed Markdown link's label to open its destination without revealing the raw `[label](url)` syntax — a web URL (with or without a scheme), a relative file (opened as a buffer), or a directory (revealed in the project panel) — restoring the read-mode link-following `#zed-06` traded for clean reading [@zed-rbf]
 - 2026-06-20 - improve (ux) | the concealed-link underline now matches the link text color instead of a pinned near-black, so the label reads as one coherent link [@zed-rbf]
