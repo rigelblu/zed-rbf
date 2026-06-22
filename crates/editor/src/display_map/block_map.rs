@@ -2660,9 +2660,13 @@ impl<'a> Iterator for BlockChunks<'a> {
 
         let (mut prefix, suffix) = self.input_chunk.text.split_at(prefix_bytes);
         self.input_chunk.text = suffix;
-        self.input_chunk.tabs >>= prefix_bytes.saturating_sub(1);
-        self.input_chunk.chars >>= prefix_bytes.saturating_sub(1);
-        self.input_chunk.newlines >>= prefix_bytes.saturating_sub(1);
+        // These are 128-bit bitmaps, but a chunk can exceed 128 bytes (a long unwrapped
+        // line or tab-expanded text), so a plain `>>` overflows. Guard it the same way
+        // `wrap_map` does for the identical shift (`wrap_map.rs` WrapChunks::next).
+        let shift = prefix_bytes.saturating_sub(1) as u32;
+        self.input_chunk.tabs = self.input_chunk.tabs.unbounded_shr(shift);
+        self.input_chunk.chars = self.input_chunk.chars.unbounded_shr(shift);
+        self.input_chunk.newlines = self.input_chunk.newlines.unbounded_shr(shift);
 
         let mut tabs = self.input_chunk.tabs;
         let mut chars = self.input_chunk.chars;
