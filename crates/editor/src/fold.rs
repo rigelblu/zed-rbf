@@ -675,6 +675,10 @@ impl Editor {
             for buffer_id in ids_to_fold.iter().copied() {
                 selections.remove_selections_from_buffer(buffer_id);
             }
+            // A diff refresh can remove excerpts mid-fold, stranding selections in
+            // buffers we're not folding; drop the now-unresolvable ones so the
+            // `change_with` invariant check can't panic.
+            selections.remove_unresolvable_selections();
         });
 
         cx.emit(EditorEvent::BufferFoldToggled {
