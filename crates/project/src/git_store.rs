@@ -67,7 +67,7 @@ use settings::{Settings, WorktreeId};
 use smallvec::SmallVec;
 use smol::future::yield_now;
 use std::{
-    cmp::Ordering,
+    cmp::{Ordering, Reverse},
     collections::{BTreeSet, HashSet, VecDeque, hash_map::Entry},
     future::Future,
     mem,
@@ -2220,14 +2220,51 @@ impl GitStore {
         path: &ProjectPath,
         cx: &App,
     ) -> Option<(Entity<Repository>, RepoPath)> {
-        let abs_path = self.worktree_store.read(cx).absolutize(path, cx)?;
-        self.repositories
-            .values()
-            .filter_map(|repo| {
-                let repo_path = repo.read(cx).abs_path_to_repo_path(&abs_path)?;
-                Some((repo.clone(), repo_path))
+        self.git_abs_paths_for_project_path(path, cx)?
+            .into_iter()
+            .enumerate()
+            .flat_map(|(candidate_index, abs_path)| {
+                self.repositories.values().filter_map(move |repo| {
+                    let repository = repo.read(cx);
+                    let repo_path = repository.abs_path_to_repo_path(&abs_path)?;
+                    Some((
+                        repo.clone(),
+                        repo_path,
+                        repository.work_directory_abs_path.clone(),
+                        Reverse(candidate_index),
+                    ))
+                })
             })
-            .max_by_key(|(repo, _)| repo.read(cx).work_directory_abs_path.clone())
+            .max_by_key(|(_, _, work_directory_abs_path, candidate_priority)| {
+                (work_directory_abs_path.clone(), *candidate_priority)
+            })
+            .map(|(repo, repo_path, _, _)| (repo, repo_path))
+    }
+
+    fn git_abs_paths_for_project_path(&self, path: &ProjectPath, cx: &App) -> Option<Vec<PathBuf>> {
+        let worktree = self
+            .worktree_store
+            .read(cx)
+            .worktree_for_id(path.worktree_id, cx)?;
+        let worktree = worktree.read(cx);
+        let visible_abs_path = worktree.absolutize(&path.path);
+        let mut abs_paths = Vec::with_capacity(2);
+
+        let mut ancestor_path = path.path.parent();
+        while let Some(ancestor) = ancestor_path {
+            if let Some(entry) = worktree.entry_for_path(ancestor)
+                && let Some(canonical_path) = entry.canonical_path.as_ref()
+                && let Ok(relative_path) = path.path.strip_prefix(ancestor)
+            {
+                abs_paths.push(canonical_path.join(relative_path.as_std_path()));
+                break;
+            }
+
+            ancestor_path = ancestor.parent();
+        }
+
+        abs_paths.push(visible_abs_path);
+        Some(abs_paths)
     }
 
     pub fn git_init(
@@ -5138,50 +5175,60 @@ impl Repository {
                 let Some(this) = this.upgrade() else {
                     return Ok(());
                 };
+                // This reload runs for `this` repo; identify it by entity handle so the loop
+                // below can skip buffers owned by a different (e.g. nested) repo.
+                let this_entity_id = this.entity_id();
 
-                let repo_diff_state_updates = this.update(&mut cx, |this, cx| {
-                    git_store.update(cx, |git_store, cx| {
-                        git_store
-                            .diffs
-                            .iter()
-                            .filter_map(|(buffer_id, diff_state)| {
-                                let buffer_store = git_store.buffer_store.read(cx);
-                                let buffer = buffer_store.get(*buffer_id)?;
-                                let file = File::from_dyn(buffer.read(cx).file())?;
-                                let abs_path = file.worktree.read(cx).absolutize(&file.path);
-                                let repo_path = this.abs_path_to_repo_path(&abs_path)?;
-                                let is_symlink = GitStore::file_is_symlink(file, cx);
-                                log::debug!(
-                                    "start reload diff bases for repo path {}",
-                                    repo_path.as_unix_str()
-                                );
-                                diff_state.update(cx, |diff_state, _| {
-                                    let has_unstaged_diff = diff_state
-                                        .unstaged_diff
-                                        .as_ref()
-                                        .is_some_and(|diff| diff.is_upgradable());
-                                    let has_staged_diff = diff_state
-                                        .staged_diff
-                                        .as_ref()
-                                        .is_some_and(|(diff, _)| diff.is_upgradable());
-                                    let has_uncommitted_diff = diff_state
-                                        .uncommitted_diff
-                                        .as_ref()
-                                        .is_some_and(|set| set.is_upgradable());
+                let repo_diff_state_updates = git_store.update(&mut cx, |git_store, cx| {
+                    git_store
+                        .diffs
+                        .iter()
+                        .filter_map(|(buffer_id, diff_state)| {
+                            // Only the repo that OWNS a buffer (its innermost repo) may reload
+                            // that buffer's base. Stripping the path naively against `this` repo
+                            // lets a parent claim a file in a nested repo (e.g. a `.rb-drive`
+                            // repo under the project): the path strips to a wrong
+                            // `.rb-drive/…`-prefixed value whose git read fails and clobbers the
+                            // base with `None`. Reuse the innermost-repo resolution used on open.
+                            let (owning_repo, repo_path) =
+                                git_store.repository_and_path_for_buffer_id(*buffer_id, cx)?;
+                            if owning_repo.entity_id() != this_entity_id {
+                                return None;
+                            }
+                            let buffer_store = git_store.buffer_store.read(cx);
+                            let buffer = buffer_store.get(*buffer_id)?;
+                            let file = File::from_dyn(buffer.read(cx).file())?;
+                            let is_symlink = GitStore::file_is_symlink(file, cx);
+                            log::debug!(
+                                "start reload diff bases for repo path {}",
+                                repo_path.as_unix_str()
+                            );
+                            diff_state.update(cx, |diff_state, _| {
+                                let has_unstaged_diff = diff_state
+                                    .unstaged_diff
+                                    .as_ref()
+                                    .is_some_and(|diff| diff.is_upgradable());
+                                let has_staged_diff = diff_state
+                                    .staged_diff
+                                    .as_ref()
+                                    .is_some_and(|(diff, _)| diff.is_upgradable());
+                                let has_uncommitted_diff = diff_state
+                                    .uncommitted_diff
+                                    .as_ref()
+                                    .is_some_and(|set| set.is_upgradable());
 
-                                    Some((
-                                        buffer,
-                                        repo_path,
-                                        is_symlink,
-                                        (has_unstaged_diff || has_staged_diff)
-                                            .then(|| diff_state.index_text.clone()),
-                                        (has_staged_diff || has_uncommitted_diff)
-                                            .then(|| diff_state.head_text.clone()),
-                                    ))
-                                })
+                                Some((
+                                    buffer,
+                                    repo_path,
+                                    is_symlink,
+                                    (has_unstaged_diff || has_staged_diff)
+                                        .then(|| diff_state.index_text.clone()),
+                                    (has_staged_diff || has_uncommitted_diff)
+                                        .then(|| diff_state.head_text.clone()),
+                                ))
                             })
-                            .collect::<Vec<_>>()
-                    })
+                        })
+                        .collect::<Vec<_>>()
                 })?;
 
                 let buffer_diff_base_changes = cx
@@ -9483,6 +9530,140 @@ mod tests {
             assert!(
                 diff.base_text_exists(),
                 "regular file should have a git diff base"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_open_uncommitted_diff_uses_tracked_path_for_symlinked_ancestor(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/project",
+            json!({
+                ".git": {},
+                "rb-agents": {
+                    "skills": {
+                        "how-you-write": {
+                            "SKILL.md": "working\n",
+                        },
+                    },
+                },
+                "agents": {
+                    ".agents": {},
+                },
+            }),
+        )
+        .await;
+        fs.insert_symlink(
+            "/project/agents/.agents/skills",
+            PathBuf::from("../../rb-agents/skills"),
+        )
+        .await;
+
+        fs.set_head_and_index_for_repo(
+            Path::new("/project/.git"),
+            &[("rb-agents/skills/how-you-write/SKILL.md", "base\n".into())],
+        );
+
+        let project = Project::test(fs.clone(), ["/project".as_ref()], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+
+        let buffer = project
+            .update(cx, |project, cx| {
+                project
+                    .open_local_buffer("/project/agents/.agents/skills/how-you-write/SKILL.md", cx)
+            })
+            .await
+            .unwrap();
+        let diff = project
+            .update(cx, |project, cx| project.open_uncommitted_diff(buffer, cx))
+            .await
+            .unwrap();
+
+        diff.read_with(cx, |diff, cx| {
+            assert_eq!(
+                diff.base_text_string(cx).as_deref(),
+                Some("base\n"),
+                "a regular tracked file opened through a symlinked ancestor should use its tracked repo path for the diff base"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_nested_repo_diff_base_not_clobbered_by_parent_reload(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/outer",
+            json!({
+                ".git": {},
+                "outer.txt": "outer working\n",
+                "inner": {
+                    ".git": {},
+                    "inner.txt": "inner working\n",
+                },
+            }),
+        )
+        .await;
+        // Both repos have staged content; only the inner repo tracks inner.txt.
+        fs.set_index_for_repo(
+            Path::new("/outer/.git"),
+            &[("outer.txt", "outer staged\n".into())],
+        );
+        fs.set_index_for_repo(
+            Path::new("/outer/inner/.git"),
+            &[("inner.txt", "inner staged\n".into())],
+        );
+
+        let project = Project::test(fs.clone(), ["/outer".as_ref()], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+
+        let inner_buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer("/outer/inner/inner.txt", cx)
+            })
+            .await
+            .unwrap();
+        let inner_diff = project
+            .update(cx, |project, cx| {
+                project.open_unstaged_diff(inner_buffer.clone(), cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        inner_diff.read_with(cx, |diff, cx| {
+            assert_eq!(
+                diff.base_text_string(cx).as_deref(),
+                Some("inner staged\n"),
+                "the inner file's base should come from the inner repo"
+            );
+        });
+
+        // Fire the OUTER repo's reload by changing its index. Before the fix the
+        // outer repo's reload claimed inner/inner.txt (its path strips to
+        // `inner/inner.txt` against the outer repo), read it against the outer
+        // repo, got `None`, and clobbered the inner file's base. (#zed-36)
+        fs.set_index_for_repo(
+            Path::new("/outer/.git"),
+            &[("outer.txt", "outer staged again\n".into())],
+        );
+        cx.run_until_parked();
+
+        inner_diff.read_with(cx, |diff, cx| {
+            assert_eq!(
+                diff.base_text_string(cx).as_deref(),
+                Some("inner staged\n"),
+                "the outer repo's reload must not clobber the inner repo file's base"
             );
         });
     }
