@@ -28016,6 +28016,94 @@ async fn test_folded_buffers_cleared_on_excerpts_removed(cx: &mut TestAppContext
     assert!(!editor.update(cx, |editor, cx| editor.has_any_buffer_folded(cx)));
 }
 
+// Regression for #zed-40: a diff refresh removes an excerpt while a selection is
+// anchored in it, then folds another buffer. `fold_buffers` -> `change_with` used to
+// panic on the now-unresolvable selection; it must drop it instead and keep ≥1 cursor.
+#[gpui::test]
+async fn test_fold_buffers_after_excerpt_removal_drops_stale_selection(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/root"),
+        json!({
+            "file_a.txt": "File A\nFile A\nFile A",
+            "file_b.txt": "File B\nFile B\nFile B",
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let cx = &mut VisualTestContext::from_window(*window, cx);
+    let worktree_id = project.update(cx, |project, cx| {
+        project.worktrees(cx).next().unwrap().read(cx).id()
+    });
+
+    let buffer_a = project
+        .update(cx, |project, cx| {
+            project.open_buffer((worktree_id, rel_path("file_a.txt")), cx)
+        })
+        .await
+        .unwrap();
+    let buffer_b = project
+        .update(cx, |project, cx| {
+            project.open_buffer((worktree_id, rel_path("file_b.txt")), cx)
+        })
+        .await
+        .unwrap();
+
+    let multi_buffer = cx.new(|cx| {
+        let mut multi_buffer = MultiBuffer::new(ReadWrite);
+        multi_buffer.set_excerpts_for_path(
+            PathKey::sorted(0),
+            buffer_a.clone(),
+            [Point::new(0, 0)..Point::new(2, 4)],
+            0,
+            cx,
+        );
+        multi_buffer.set_excerpts_for_path(
+            PathKey::sorted(1),
+            buffer_b.clone(),
+            [Point::new(0, 0)..Point::new(2, 4)],
+            0,
+            cx,
+        );
+        multi_buffer
+    });
+
+    let editor = cx.new_window_entity(|window, cx| {
+        Editor::new(
+            EditorMode::full(),
+            multi_buffer.clone(),
+            Some(project.clone()),
+            window,
+            cx,
+        )
+    });
+
+    // Put the cursor inside buffer_a's excerpt (the first excerpt).
+    editor.update_in(cx, |editor, window, cx| {
+        editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
+            s.select_ranges([MultiBufferOffset(0)..MultiBufferOffset(0)])
+        });
+    });
+
+    // Removing buffer_a's excerpts strands that selection's anchor in a removed excerpt.
+    multi_buffer.update(cx, |multi_buffer, cx| {
+        multi_buffer.remove_excerpts(PathKey::sorted(0), cx)
+    });
+
+    // Folding buffer_b runs `fold_buffers` -> `change_with`, whose debug invariant
+    // (before the fix) panicked on the stranded, unresolvable selection.
+    editor.update(cx, |editor, cx| {
+        editor.fold_buffer(buffer_b.read(cx).remote_id(), cx);
+    });
+
+    // No panic, and the "at least one selection" invariant is preserved.
+    assert!(editor.update(cx, |editor, _| editor.selections.count()) >= 1);
+}
+
 #[gpui::test]
 async fn test_folding_buffers_with_one_excerpt(cx: &mut TestAppContext) {
     init_test(cx, |_| {});

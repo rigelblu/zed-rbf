@@ -691,6 +691,41 @@ impl<'snap, 'a> MutableSelectionsCollection<'snap, 'a> {
         self.selections_changed |= changed;
     }
 
+    /// Drop any selections whose anchors no longer resolve against the current
+    /// snapshot — e.g. their excerpt was removed by a diff refresh — so a later
+    /// `change_with` resolvability check can't panic on them. Falls back to a
+    /// single start cursor to preserve the "at least one selection" invariant.
+    pub fn remove_unresolvable_selections(&mut self) {
+        let mut changed = false;
+        let filtered_selections: Arc<[Selection<Anchor>]> = self
+            .disjoint
+            .iter()
+            .filter(|selection| {
+                let resolvable = self.snapshot.can_resolve(&selection.start)
+                    && self.snapshot.can_resolve(&selection.end);
+                changed |= !resolvable;
+                resolvable
+            })
+            .cloned()
+            .collect();
+
+        if filtered_selections.is_empty() {
+            let anchor = self.snapshot.anchor_before(MultiBufferOffset(0));
+            self.collection.disjoint = Arc::from([Selection {
+                id: post_inc(&mut self.collection.next_selection_id),
+                start: anchor,
+                end: anchor,
+                reversed: false,
+                goal: SelectionGoal::None,
+            }]);
+            changed = true;
+        } else {
+            self.collection.disjoint = filtered_selections;
+        }
+
+        self.selections_changed |= changed;
+    }
+
     pub fn clear_pending(&mut self) {
         if self.collection.pending.is_some() {
             self.collection.pending = None;
