@@ -1996,7 +1996,7 @@ impl Sidebar {
         let Some(multi_workspace) = self.multi_workspace.upgrade() else {
             return;
         };
-        if !multi_workspace.read(cx).multi_workspace_enabled(cx) {
+        if !multi_workspace.read(cx).sidebar_ui_enabled(cx) {
             return;
         }
 

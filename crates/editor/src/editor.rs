@@ -9817,22 +9817,22 @@ impl Editor {
         // refresh primes the cache; the scan is the cold-path fallback. The cached
         // byte offsets stay valid because the cache key includes the buffer version.
         let is_markdown = self.is_ymd_markdown_singleton(cx);
-        let cached_breaks = self
-            .ymd_singleton_buffer_identity(cx)
-            .and_then(|(buffer_id, buffer_version)| {
-                let cache = self.ymd_conceal_cache.as_ref()?;
-                (is_markdown
-                    && cache.buffer_id == buffer_id
-                    && cache.buffer_version == buffer_version)
-                    .then(|| {
-                        cache
-                            .thematic_break_ranges
-                            .iter()
-                            .cloned()
-                            .zip(cache.thematic_break_rows.iter().copied())
-                            .collect::<Vec<(Range<usize>, u32)>>()
-                    })
-            });
+        let cached_breaks =
+            self.ymd_singleton_buffer_identity(cx)
+                .and_then(|(buffer_id, buffer_version)| {
+                    let cache = self.ymd_conceal_cache.as_ref()?;
+                    (is_markdown
+                        && cache.buffer_id == buffer_id
+                        && cache.buffer_version == buffer_version)
+                        .then(|| {
+                            cache
+                                .thematic_break_ranges
+                                .iter()
+                                .cloned()
+                                .zip(cache.thematic_break_rows.iter().copied())
+                                .collect::<Vec<(Range<usize>, u32)>>()
+                        })
+                });
 
         let (snapshot, breaks) = match cached_breaks {
             Some(breaks) => (self.buffer.read(cx).snapshot(cx), breaks),
@@ -9856,8 +9856,7 @@ impl Editor {
             .into_iter()
             .filter_map(|(range, row)| {
                 let row = MultiBufferRow(row);
-                (!cursor_rows.contains(&row) && !diff_rows.contains(&row))
-                    .then_some((row, range))
+                (!cursor_rows.contains(&row) && !diff_rows.contains(&row)).then_some((row, range))
             })
             .collect::<Vec<_>>();
         desired_breaks.sort_by_key(|(row, _)| *row);
@@ -9922,7 +9921,11 @@ impl Editor {
 
         for highlight in ymd::scan(&text) {
             // Diff rows stay fully raw: their syntax keeps no YMD color either.
-            let row = MultiBufferRow(MultiBufferOffset(highlight.range.start).to_point(&snapshot).row);
+            let row = MultiBufferRow(
+                MultiBufferOffset(highlight.range.start)
+                    .to_point(&snapshot)
+                    .row,
+            );
             if diff_rows.contains(&row) {
                 continue;
             }
@@ -9991,12 +9994,7 @@ impl Editor {
                 }),
         );
         if !link_ranges.is_empty() {
-            self.highlight_text(
-                HighlightKey::YmdLink,
-                link_ranges,
-                ymd::link_style(),
-                cx,
-            );
+            self.highlight_text(HighlightKey::YmdLink, link_ranges, ymd::link_style(), cx);
         }
 
         // Block quotes: mute the content text and paint a vertical border in the

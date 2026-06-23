@@ -890,7 +890,9 @@ impl<T: Item> ItemHandle for Entity<T> {
                         }
 
                         ItemEvent::UpdateTab => {
-                            workspace.update_item_dirty_state(item, window, cx);
+                            if workspace.update_item_dirty_state(item, window, cx) {
+                                cx.emit(crate::Event::ItemDirtyStateChanged);
+                            }
 
                             if item.has_deleted_file(cx)
                                 && !item.is_dirty(cx)
@@ -998,7 +1000,9 @@ impl<T: Item> ItemHandle for Entity<T> {
             .detach();
 
             let item_id = self.item_id();
-            workspace.update_item_dirty_state(self, window, cx);
+            if workspace.update_item_dirty_state(self, window, cx) {
+                cx.emit(crate::Event::ItemDirtyStateChanged);
+            }
             cx.observe_release_in(self, window, move |workspace, _, _, _| {
                 workspace.panes_by_item.remove(&item_id);
                 event_subscription.take();
