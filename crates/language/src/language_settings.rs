@@ -742,9 +742,7 @@ impl settings::Settings for AllLanguageSettings {
                     .unwrap(),
                 ensure_final_newline_on_save: settings.ensure_final_newline_on_save.unwrap(),
                 align_markdown_tables_on_save: settings.align_markdown_tables_on_save.unwrap(),
-                markdown_image_paste_directory: settings
-                    .markdown_image_paste_directory
-                    .unwrap(),
+                markdown_image_paste_directory: settings.markdown_image_paste_directory.unwrap(),
                 line_ending: settings.line_ending.unwrap(),
                 formatter: settings.formatter.unwrap(),
                 prettier: PrettierSettings {

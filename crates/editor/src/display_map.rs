@@ -4276,17 +4276,18 @@ pub mod tests {
         };
 
         let chunks: Vec<_> = chunk.highlight_invisibles(&editor_style).collect();
-        assert_eq!(chunks.len(), 1, "the fold chunk passes through as one chunk");
+        assert_eq!(
+            chunks.len(),
+            1,
+            "the fold chunk passes through as one chunk"
+        );
         assert_eq!(chunks[0].text, "\u{2060}", "placeholder text is unchanged");
         assert!(
             chunks[0].style.is_none(),
             "no invisible-char hint style is applied to a fold render element"
         );
         assert!(
-            matches!(
-                chunks[0].replacement,
-                Some(ChunkReplacement::Renderer(_))
-            ),
+            matches!(chunks[0].replacement, Some(ChunkReplacement::Renderer(_))),
             "the fold render element is preserved, not overridden by a Str"
         );
     }
