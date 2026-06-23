@@ -28,6 +28,7 @@ mod toolbar;
 pub mod welcome;
 pub mod workspace_error;
 mod workspace_settings;
+mod workspace_tabs;
 
 pub use dock::Panel;
 pub use multi_workspace::{
@@ -172,6 +173,13 @@ use crate::{
 };
 
 pub const SERIALIZATION_THROTTLE_TIME: Duration = Duration::from_millis(200);
+
+#[derive(Clone)]
+pub(crate) struct ShutdownSerializationSnapshot {
+    window_bounds: SerializedWindowBounds,
+    display: Option<Uuid>,
+    docks: DockStructure,
+}
 
 static ZED_WINDOW_SIZE: LazyLock<Option<Size<Pixels>>> = LazyLock::new(|| {
     env::var("ZED_WINDOW_SIZE")
@@ -1296,6 +1304,7 @@ pub enum Event {
     ItemRemoved {
         item_id: EntityId,
     },
+    ItemDirtyStateChanged,
     UserSavedItem {
         pane: WeakEntity<Pane>,
         item: Box<dyn WeakItemHandle>,
@@ -2031,7 +2040,7 @@ impl Workspace {
                                 multi_workspace.activate(workspace.clone(), None, window, cx);
                             }
                             OpenMode::Add => {
-                                multi_workspace.add(workspace.clone(), &*window, cx);
+                                multi_workspace.add(workspace.clone(), window, cx);
                             }
                             OpenMode::NewWindow => {
                                 unreachable!()
@@ -2150,6 +2159,14 @@ impl Workspace {
                         this.update_history(cx);
                     });
                 })
+                .log_err();
+            window
+                .update(cx, |_, window, cx| {
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.flush_serialization(window, cx)
+                    })
+                })
+                .map(|task| task.detach())
                 .log_err();
 
             if open_mode == OpenMode::NewWindow || open_mode == OpenMode::Activate {
@@ -6303,22 +6320,22 @@ impl Workspace {
         item: &dyn ItemHandle,
         window: &mut Window,
         cx: &mut App,
-    ) {
+    ) -> bool {
         let is_dirty = item.is_dirty(cx);
         let item_id = item.item_id();
         let was_dirty = self.dirty_items.contains_key(&item_id);
         if is_dirty == was_dirty {
-            return;
+            return false;
         }
         if was_dirty {
             self.dirty_items.remove(&item_id);
             self.update_window_edited(window, cx);
-            return;
+            return true;
         }
 
         let workspace = self.weak_handle();
         let Some(window_handle) = window.window_handle().downcast::<MultiWorkspace>() else {
-            return;
+            return false;
         };
         let on_release_callback = Box::new(move |cx: &mut App| {
             window_handle
@@ -6336,6 +6353,7 @@ impl Workspace {
         let s = item.on_release(cx, on_release_callback);
         self.dirty_items.insert(item_id, s);
         self.update_window_edited(window, cx);
+        true
     }
 
     fn render_notifications(&self, _window: &mut Window, _cx: &mut Context<Self>) -> Option<Div> {
@@ -7007,6 +7025,148 @@ impl Workspace {
             bounds_task.await;
             serialize_task.await;
         })
+    }
+
+    pub(crate) fn flush_session_serialization_for_shutdown(
+        &mut self,
+        window_id: WindowId,
+        snapshot: Option<ShutdownSerializationSnapshot>,
+        cx: &mut App,
+    ) -> Task<()> {
+        self._schedule_serialize_workspace.take();
+        self._serialize_workspace_task.take();
+        self.bounds_save_task_queued.take();
+
+        let Some(database_id) = self.database_id() else {
+            return Task::ready(());
+        };
+
+        fn serialize_pane_handle(
+            pane_handle: &Entity<Pane>,
+            active_pane: &Entity<Pane>,
+            cx: &mut App,
+        ) -> SerializedPane {
+            let pane = pane_handle.read(cx);
+            let active_item_id = pane.active_item().map(|item| item.item_id());
+            SerializedPane::new(
+                pane.items()
+                    .filter_map(|handle| {
+                        let handle = handle.to_serializable_item_handle(cx)?;
+
+                        Some(SerializedItem {
+                            kind: Arc::from(handle.serialized_item_kind()),
+                            item_id: handle.item_id().as_u64(),
+                            active: Some(handle.item_id()) == active_item_id,
+                            preview: pane.is_active_preview_item(handle.item_id()),
+                        })
+                    })
+                    .collect(),
+                pane_handle == active_pane,
+                pane.pinned_count(),
+            )
+        }
+
+        fn build_serialized_pane_group(
+            pane_group: &Member,
+            active_pane: &Entity<Pane>,
+            cx: &mut App,
+        ) -> SerializedPaneGroup {
+            match pane_group {
+                Member::Axis(PaneAxis {
+                    axis,
+                    members,
+                    flexes,
+                    bounding_boxes: _,
+                }) => SerializedPaneGroup::Group {
+                    axis: SerializedAxis(*axis),
+                    children: members
+                        .iter()
+                        .map(|member| build_serialized_pane_group(member, active_pane, cx))
+                        .collect(),
+                    flexes: Some(flexes.lock().clone()),
+                },
+                Member::Pane(pane_handle) => {
+                    SerializedPaneGroup::Pane(serialize_pane_handle(pane_handle, active_pane, cx))
+                }
+            }
+        }
+
+        match self.workspace_location(cx) {
+            WorkspaceLocation::Location(location, paths) => {
+                let bookmarks = self.project.update(cx, |project, cx| {
+                    project
+                        .bookmark_store()
+                        .read(cx)
+                        .all_serialized_bookmarks(cx)
+                });
+
+                let breakpoints = self.project.update(cx, |project, cx| {
+                    project
+                        .breakpoint_store()
+                        .read(cx)
+                        .all_source_breakpoints(cx)
+                });
+                let user_toolchains = self
+                    .project
+                    .read(cx)
+                    .user_toolchains(cx)
+                    .unwrap_or_default();
+                let center_group =
+                    build_serialized_pane_group(&self.center.root, &self.active_pane(), cx);
+                let identity_paths_hint = self.project_group_key(cx).path_list().clone();
+                let (window_bounds, display, docks, preserve_existing_docks) =
+                    if let Some(snapshot) = snapshot {
+                        (
+                            Some(snapshot.window_bounds),
+                            snapshot.display,
+                            snapshot.docks,
+                            false,
+                        )
+                    } else {
+                        (None, Default::default(), Default::default(), true)
+                    };
+
+                let mut serialized_workspace = SerializedWorkspace {
+                    id: database_id,
+                    location,
+                    paths,
+                    identity_paths: Some(identity_paths_hint),
+                    center_group,
+                    window_bounds,
+                    display,
+                    docks,
+                    centered_layout: self.centered_layout,
+                    session_id: self.session_id.clone(),
+                    bookmarks,
+                    breakpoints,
+                    window_id: Some(window_id.as_u64()),
+                    user_toolchains,
+                };
+
+                let db = WorkspaceDb::global(cx);
+                cx.background_spawn(async move {
+                    if preserve_existing_docks
+                        && let Some(existing) = db.workspace_for_id(database_id)
+                    {
+                        serialized_workspace.docks = existing.docks;
+                    }
+                    db.save_workspace(serialized_workspace).await;
+                })
+            }
+            WorkspaceLocation::DetachFromSession | WorkspaceLocation::None => Task::ready(()),
+        }
+    }
+
+    pub(crate) fn shutdown_serialization_snapshot(
+        &self,
+        window: &Window,
+        cx: &App,
+    ) -> ShutdownSerializationSnapshot {
+        ShutdownSerializationSnapshot {
+            window_bounds: SerializedWindowBounds(window.window_bounds()),
+            display: window.display(cx).and_then(|display| display.uuid().ok()),
+            docks: self.capture_dock_state(window, cx),
+        }
     }
 
     pub fn root_paths(&self, cx: &App) -> Vec<Arc<Path>> {
@@ -9662,6 +9822,7 @@ pub async fn restore_multiworkspace(
 ) -> anyhow::Result<WindowHandle<MultiWorkspace>> {
     let SerializedMultiWorkspace {
         active_workspace,
+        workspaces,
         state,
     } = multi_workspace;
 
@@ -9723,6 +9884,15 @@ pub async fn restore_multiworkspace(
         }
     };
 
+    restore_inactive_multiworkspace_members(
+        window_handle.clone(),
+        &active_workspace,
+        workspaces,
+        app_state.clone(),
+        cx,
+    )
+    .await;
+
     apply_restored_multiworkspace_state(window_handle, &state, app_state.fs.clone(), cx).await;
 
     window_handle
@@ -9732,6 +9902,57 @@ pub async fn restore_multiworkspace(
         .ok();
 
     Ok(window_handle)
+}
+
+async fn restore_inactive_multiworkspace_members(
+    window_handle: WindowHandle<MultiWorkspace>,
+    active_workspace: &SessionWorkspace,
+    workspaces: Vec<SessionWorkspace>,
+    app_state: Arc<AppState>,
+    cx: &mut AsyncApp,
+) {
+    let restore_workspace_membership =
+        cx.update(|cx| MultiWorkspace::retention_enabled_from_settings(cx));
+    if !restore_workspace_membership {
+        return;
+    }
+
+    for workspace in workspaces {
+        if workspace.workspace_id == active_workspace.workspace_id || workspace.paths.is_empty() {
+            continue;
+        }
+
+        match workspace.location {
+            SerializedWorkspaceLocation::Local => {
+                let window_handle = window_handle.clone();
+                if let Err(err) = cx
+                    .update(|cx| {
+                        Workspace::new_local(
+                            workspace.paths.paths().to_vec(),
+                            app_state.clone(),
+                            Some(window_handle),
+                            None,
+                            None,
+                            OpenMode::Add,
+                            cx,
+                        )
+                    })
+                    .await
+                {
+                    log::error!(
+                        "Failed to restore inactive workspace {:?}: {err:#}",
+                        workspace.paths
+                    );
+                }
+            }
+            SerializedWorkspaceLocation::Remote(_) => {
+                log::warn!(
+                    "Skipping inactive remote workspace restore for {:?}",
+                    workspace.paths
+                );
+            }
+        }
+    }
 }
 
 pub async fn apply_restored_multiworkspace_state(
@@ -9746,8 +9967,11 @@ pub async fn apply_restored_multiworkspace_state(
         sidebar_state,
         ..
     } = state;
+    let restore_workspace_membership =
+        cx.update(|cx| MultiWorkspace::retention_enabled_from_settings(cx));
+    let restore_sidebar_ui = cx.update(|cx| MultiWorkspace::sidebar_ui_enabled_from_settings(cx));
 
-    if !project_groups.is_empty() {
+    if restore_workspace_membership {
         // Resolve linked worktree paths to their main repo paths so
         // stale keys from previous sessions get normalized and deduped.
         let mut resolved_groups: Vec<SerializedProjectGroupState> = Vec::new();
@@ -9785,7 +10009,7 @@ pub async fn apply_restored_multiworkspace_state(
             .ok();
     }
 
-    if *sidebar_open {
+    if restore_sidebar_ui && *sidebar_open {
         window_handle
             .update(cx, |multi_workspace, _, cx| {
                 multi_workspace.restore_open_sidebar(cx);
@@ -9793,15 +10017,17 @@ pub async fn apply_restored_multiworkspace_state(
             .ok();
     }
 
-    if let Some(sidebar_state) = sidebar_state {
-        window_handle
-            .update(cx, |multi_workspace, window, cx| {
-                if let Some(sidebar) = multi_workspace.sidebar() {
-                    sidebar.restore_serialized_state(sidebar_state, window, cx);
-                }
-                multi_workspace.serialize(cx);
-            })
-            .ok();
+    if restore_sidebar_ui {
+        if let Some(sidebar_state) = sidebar_state {
+            window_handle
+                .update(cx, |multi_workspace, window, cx| {
+                    if let Some(sidebar) = multi_workspace.sidebar() {
+                        sidebar.restore_serialized_state(sidebar_state, window, cx);
+                    }
+                    multi_workspace.serialize(cx);
+                })
+                .ok();
+        }
     }
 }
 
@@ -10390,7 +10616,7 @@ pub fn open_workspace_by_id(
                     workspace.centered_layout = centered_layout;
                     workspace
                 });
-                multi_workspace.add(workspace.clone(), &*window, cx);
+                multi_workspace.add(workspace.clone(), window, cx);
                 workspace
             })?;
             (window, workspace)
@@ -10540,9 +10766,7 @@ pub fn open_paths(
                         .filter(|window| windows.contains(window))
                         .or_else(|| windows.into_iter().next());
                     window.filter(|window| {
-                        window
-                            .read(cx)
-                            .is_ok_and(|mw| mw.multi_workspace_enabled(cx))
+                        window.read(cx).is_ok_and(|mw| mw.retention_enabled(cx))
                     })
                 });
 
@@ -10550,7 +10774,9 @@ pub fn open_paths(
                     open_options.requesting_window = Some(window);
                     window
                         .update(cx, |multi_workspace, _, cx| {
-                            multi_workspace.open_sidebar(cx);
+                            if multi_workspace.sidebar_ui_enabled(cx) {
+                                multi_workspace.open_sidebar(cx);
+                            }
                         })
                         .log_err();
                 }

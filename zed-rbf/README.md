@@ -104,6 +104,12 @@ Use `recent_projects::PinCurrentProject` and `recent_projects::UnpinCurrentProje
 
 The configured order is the display order. `~` and `$VAR` expand. Missing paths stay visible until removed from settings.
 
+## 🟠⋯ Workspace Tabs
+- Decouples workspace tab retention from the AI sidebar so you can retain multiple live project workspaces in a single window with AI disabled
+- Cycle workspaces with keyboard shortcuts (`cmd-alt-]` and `cmd-alt-[`)
+- Restores open workspace tabs, layout, and edit states stably across app restarts
+- Grouped tab management and close controls directly on the tab strip
+
 ## 🟠⋯ Versions
 - The fork version lives in `zed-rbf/RBF_VERSION`
 - `crates/zed/build.rs` injects it at build time as `ZED_RBF_VERSION`

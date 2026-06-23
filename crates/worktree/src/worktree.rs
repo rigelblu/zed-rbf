@@ -5026,7 +5026,8 @@ impl BackgroundScanner {
                         .is_some_and(|entry| entry.kind == EntryKind::Dir)
                 });
                 if !parent_dir_is_loaded {
-                    if self.track_git_repositories && !self.settings.is_path_excluded(&relative_path)
+                    if self.track_git_repositories
+                        && !self.settings.is_path_excluded(&relative_path)
                     {
                         git_status_paths.push(relative_path.clone());
                     }

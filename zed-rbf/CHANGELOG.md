@@ -6,6 +6,11 @@ title: "Zed RBF Changelog"
 
 ---
 
+# 🔵⋯ v0.37.0 — #zed-37
+- 2026-07-01 - feat (ux) | switch between open projects from a vertical workspace-tab strip with each project's state preserved, available without enabling the AI agent [@zed-rbf]
+
+---
+
 # 🔵⋯ v0.36.0 — #zed-36
 - 2026-06-22 - fix (ux) | open a git-panel diff for a file in a nested repo (such as a `.rb-drive` store under the project) and see only the changed hunks against its committed version, instead of the whole file rendered as added [@zed-rbf]
 

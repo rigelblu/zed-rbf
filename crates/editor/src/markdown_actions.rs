@@ -65,8 +65,7 @@ impl Editor {
             return;
         }
 
-        let cursor_restoration_selections =
-            self.task_toggle_cursor_restoration_selections(cx);
+        let cursor_restoration_selections = self.task_toggle_cursor_restoration_selections(cx);
 
         self.manipulate_mutable_lines(window, cx, |lines| {
             let all_lines_task_items = lines.iter().all(|line| {
