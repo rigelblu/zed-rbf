@@ -3154,6 +3154,7 @@ impl RecentProjectsDelegate {
 mod tests {
     use gpui::{TestAppContext, UpdateGlobal, VisualTestContext};
 
+    use project::DisableAiSettings;
     use serde_json::json;
     use settings::SettingsStore;
     use util::path;
@@ -3850,6 +3851,8 @@ mod tests {
                     settings.workspace.use_system_path_prompts = Some(false);
                 });
             });
+            DisableAiSettings::override_global(DisableAiSettings { disable_ai: true }, cx);
+            assert!(DisableAiSettings::get_global(cx).disable_ai);
         });
 
         app_state
@@ -3913,6 +3916,15 @@ mod tests {
             final_window_count, initial_window_count,
             "open_local_project with create_new_window=false should reuse the current multi-workspace window"
         );
+
+        multi_workspace
+            .read_with(cx, |mw, cx| {
+                assert!(!mw.sidebar_ui_enabled(cx));
+                assert!(!mw.sidebar_open());
+                assert_eq!(mw.workspaces().count(), 2);
+                assert_eq!(mw.project_group_keys().len(), 2);
+            })
+            .unwrap();
     }
 
     #[gpui::test]
@@ -3997,6 +4009,7 @@ mod tests {
             let state = AppState::test(cx);
             crate::init(cx);
             editor::init(cx);
+            DisableAiSettings::register(cx);
             state
         })
     }

@@ -34123,9 +34123,7 @@ async fn test_ymd_conceals_markdown_links_and_underlines_labels(cx: &mut gpui::T
 }
 
 #[gpui::test]
-async fn test_ymd_conceals_balanced_paren_link_with_no_stray_paren(
-    cx: &mut gpui::TestAppContext,
-) {
+async fn test_ymd_conceals_balanced_paren_link_with_no_stray_paren(cx: &mut gpui::TestAppContext) {
     init_test(cx, |_| {});
 
     let markdown_language = Arc::new(Language::new(
@@ -34139,9 +34137,7 @@ async fn test_ymd_conceals_balanced_paren_link_with_no_stray_paren(
     let mut cx = EditorTestContext::new(cx).await;
     cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
     // Cursor parked off the link row so the link conceals.
-    cx.set_state(
-        "ˇplain line\n[Rust (film)](https://en.wikipedia.org/wiki/Rust_(film))",
-    );
+    cx.set_state("ˇplain line\n[Rust (film)](https://en.wikipedia.org/wiki/Rust_(film))");
     cx.run_until_parked();
 
     // The whole `](…/Rust_(film))` tail folds — no stray `)` is left visible. The
@@ -34366,8 +34362,11 @@ async fn test_ymd_styles_block_quotes(cx: &mut gpui::TestAppContext) {
         assert_eq!(gutter_ranges.len(), 5);
         // The chevron-suppression set mirrors the border: quote rows 0,1,2,3,8;
         // the normal line (4) and the fenced `> code` line (6) are excluded.
-        let mut quote_rows: Vec<u32> =
-            editor.ymd_block_quote_rows.iter().map(|row| row.0).collect();
+        let mut quote_rows: Vec<u32> = editor
+            .ymd_block_quote_rows
+            .iter()
+            .map(|row| row.0)
+            .collect();
         quote_rows.sort();
         assert_eq!(quote_rows, vec![0, 1, 2, 3, 8]);
     });
@@ -34807,7 +34806,11 @@ async fn test_ymd_thematic_break_blocks_only_churn_changed_rows(cx: &mut gpui::T
         ids.sort_by_key(|(row, _)| *row);
         ids
     });
-    assert_eq!(ids_before.len(), 2, "both off-cursor breaks render as rules");
+    assert_eq!(
+        ids_before.len(),
+        2,
+        "both off-cursor breaks render as rules"
+    );
 
     // Move the cursor onto the first rule row only. Its block is removed; the
     // second rule row's block survives untouched (diff-only churn, not a rebuild).
@@ -34824,7 +34827,10 @@ async fn test_ymd_thematic_break_blocks_only_churn_changed_rows(cx: &mut gpui::T
     });
     assert_eq!(ids_after.len(), 1);
     let (surviving_row, surviving_id) = ids_after[0];
-    assert_eq!(surviving_row, 3, "the cursor row (1) revealed, row 3 stays a rule");
+    assert_eq!(
+        surviving_row, 3,
+        "the cursor row (1) revealed, row 3 stays a rule"
+    );
     assert_eq!(
         surviving_id,
         ids_before
@@ -34984,15 +34990,15 @@ async fn test_ymd_yank_across_rule_row_yields_raw_dashes(cx: &mut gpui::TestAppC
         .and_then(|item| item.text().as_deref().map(str::to_string));
     assert_eq!(copied, Some("intro\n---\noutro".to_string()));
     assert!(
-        copied.as_deref().is_some_and(|text| text.contains("\n---\n")),
+        copied
+            .as_deref()
+            .is_some_and(|text| text.contains("\n---\n")),
         "the raw `---` line is present in the yanked text, not a rendered rule",
     );
 }
 
 #[gpui::test]
-async fn test_ymd_syntax_reveals_when_diff_hunk_expanded_after_open(
-    cx: &mut gpui::TestAppContext,
-) {
+async fn test_ymd_syntax_reveals_when_diff_hunk_expanded_after_open(cx: &mut gpui::TestAppContext) {
     init_test(cx, |_| {});
 
     let markdown_language = Arc::new(Language::new(
@@ -35181,7 +35187,10 @@ async fn test_ymd_highlights_are_absent_on_diff_rows_and_restored_on_collapse(
     }
 
     // Off-diff: the `==hot==` background highlight is present.
-    assert!(has_background(&mut cx), "highlight present before expansion");
+    assert!(
+        has_background(&mut cx),
+        "highlight present before expansion"
+    );
 
     // Expanded: a diff row is fully raw, so its color is dropped too — the
     // contract upgrade that diff review keeps zero YMD styling, both sides.
@@ -35284,7 +35293,10 @@ async fn test_ymd_link_underline_is_absent_on_diff_rows(cx: &mut gpui::TestAppCo
         editor.collapse_all_diff_hunks(&CollapseAllDiffHunks, window, cx);
     });
     cx.run_until_parked();
-    assert!(has_link_underline(&mut cx), "underline restored after collapse");
+    assert!(
+        has_link_underline(&mut cx),
+        "underline restored after collapse"
+    );
 }
 
 #[gpui::test]
@@ -35323,7 +35335,10 @@ async fn test_ymd_conceal_fast_path_is_sound_after_diff_expansion(cx: &mut gpui:
     // No panic on the fast path over the rebuilt cache, and the concealed content
     // is intact (the `==` markers were never lost from the buffer).
     let display = cx.update_editor(|editor, _, cx| editor.display_text(cx).replace('\u{2060}', ""));
-    assert!(display.contains("one") && display.contains("two"), "{display}");
+    assert!(
+        display.contains("one") && display.contains("two"),
+        "{display}"
+    );
 }
 
 #[gpui::test]
@@ -35347,10 +35362,16 @@ async fn test_ymd_skips_styling_inside_fenced_code_blocks(cx: &mut gpui::TestApp
 
     let display = cx.update_editor(|editor, _, cx| editor.display_text(cx).replace('\u{2060}', ""));
     // Outside the fence conceals to `doc`.
-    assert!(!display.contains("==doc=="), "outside marker should conceal: {display}");
+    assert!(
+        !display.contains("==doc=="),
+        "outside marker should conceal: {display}"
+    );
     assert!(display.contains("doc"), "{display}");
     // Inside the fence stays fully raw.
-    assert!(display.contains("==🔵 code=="), "fenced marker should stay raw: {display}");
+    assert!(
+        display.contains("==🔵 code=="),
+        "fenced marker should stay raw: {display}"
+    );
     // The fenced `---` is not rendered as a horizontal-rule block.
     cx.update_editor(|editor, _, _| {
         assert!(editor.ymd_thematic_break_blocks.is_empty());
@@ -35589,7 +35610,10 @@ async fn test_ymd_toggle_is_never_a_dead_press_with_all_marker_rows_revealed(
     cx.run_until_parked();
 
     cx.update_editor(|editor, _, cx| {
-        assert_eq!(editor.display_text(cx).replace('\u{2060}', ""), "==hello==\nplain");
+        assert_eq!(
+            editor.display_text(cx).replace('\u{2060}', ""),
+            "==hello==\nplain"
+        );
         assert!(editor.ymd_concealed);
     });
 
@@ -35616,7 +35640,10 @@ async fn test_ymd_toggle_is_never_a_dead_press_with_all_marker_rows_revealed(
     cx.update_editor(|editor, window, cx| {
         editor.toggle_ymd_conceal(&ToggleYmdConceal, window, cx);
         assert!(editor.ymd_concealed);
-        assert_eq!(editor.display_text(cx).replace('\u{2060}', ""), "hello\nplain");
+        assert_eq!(
+            editor.display_text(cx).replace('\u{2060}', ""),
+            "hello\nplain"
+        );
     });
 }
 
@@ -35867,7 +35894,10 @@ async fn test_ymd_conceal_cursor_motion_and_boundary_typing(cx: &mut gpui::TestA
     cx.set_state("==hello==\nˇplain");
     cx.run_until_parked();
     cx.update_editor(|editor, _, cx| {
-        assert_eq!(editor.display_text(cx).replace('\u{2060}', ""), "hello\nplain");
+        assert_eq!(
+            editor.display_text(cx).replace('\u{2060}', ""),
+            "hello\nplain"
+        );
     });
 
     cx.update_editor(|editor, window, cx| {
@@ -35890,7 +35920,10 @@ async fn test_ymd_conceal_cursor_motion_and_boundary_typing(cx: &mut gpui::TestA
     });
     cx.run_until_parked();
     cx.update_editor(|editor, _, cx| {
-        assert_eq!(editor.display_text(cx).replace('\u{2060}', ""), "hello\nplain");
+        assert_eq!(
+            editor.display_text(cx).replace('\u{2060}', ""),
+            "hello\nplain"
+        );
     });
 
     // Typing on the revealed row at the closing-marker boundary swallows
@@ -36214,7 +36247,9 @@ async fn paste_image_in_nested_markdown(
     assert!(first_link.ends_with(".png"));
     assert_eq!(
         state,
-        format!("first ![alt placeholder]({first_link})ˇ\nsecond ![alt placeholder]({first_link})ˇ")
+        format!(
+            "first ![alt placeholder]({first_link})ˇ\nsecond ![alt placeholder]({first_link})ˇ"
+        )
     );
 
     (first_link, fs, image_bytes)
@@ -36546,9 +36581,7 @@ async fn paste_image_in_root_markdown(
 }
 
 #[gpui::test]
-async fn test_paste_image_in_root_markdown_saves_to_root_dot_assets(
-    cx: &mut gpui::TestAppContext,
-) {
+async fn test_paste_image_in_root_markdown_saves_to_root_dot_assets(cx: &mut gpui::TestAppContext) {
     let (link, fs, image_bytes) = paste_image_in_root_markdown(cx, |_| {}).await;
 
     assert!(link.starts_with(".assets/pasted-image-"));
@@ -36737,13 +36770,10 @@ async fn test_paste_repeated_images_in_markdown_inserts_in_command_order(
     cx.run_until_parked();
 
     let state = cx.editor_state();
-    let first_link_start =
-        state.find("![alt placeholder](").unwrap() + "![alt placeholder](".len();
+    let first_link_start = state.find("![alt placeholder](").unwrap() + "![alt placeholder](".len();
     let first_link_end = state[first_link_start..].find(')').unwrap() + first_link_start;
     let first_link = &state[first_link_start..first_link_end];
-    let second_link_start = state[first_link_end..]
-        .find("![alt placeholder](")
-        .unwrap()
+    let second_link_start = state[first_link_end..].find("![alt placeholder](").unwrap()
         + first_link_end
         + "![alt placeholder](".len();
     let second_link_end = state[second_link_start..].find(')').unwrap() + second_link_start;
@@ -42025,7 +42055,10 @@ async fn measure_ymd_row_change_latency(cx: &mut gpui::TestAppContext) {
                 cx,
             );
         }
-        println!("impl with 1-row delta: {:?}/call", timer.elapsed() / iterations);
+        println!(
+            "impl with 1-row delta: {:?}/call",
+            timer.elapsed() / iterations
+        );
 
         // Atomic dance costs (probe inside an ASCII filler line).
         let buffer_snapshot = editor.buffer().read(cx).snapshot(cx);
@@ -42045,7 +42078,9 @@ async fn measure_ymd_row_change_latency(cx: &mut gpui::TestAppContext) {
                     ..buffer_snapshot.anchor_after(MultiBufferOffset(offset + 2)),
                 placeholder.clone(),
             );
-            editor.display_map.update(cx, |map, cx| map.fold(vec![crease], cx));
+            editor
+                .display_map
+                .update(cx, |map, cx| map.fold(vec![crease], cx));
         }
         println!("single fold dance: {:?}/call", timer.elapsed() / iterations);
         let timer = std::time::Instant::now();
@@ -42059,7 +42094,10 @@ async fn measure_ymd_row_change_latency(cx: &mut gpui::TestAppContext) {
                 )
             });
         }
-        println!("single remove dance: {:?}/call", timer.elapsed() / iterations);
+        println!(
+            "single remove dance: {:?}/call",
+            timer.elapsed() / iterations
+        );
 
         // Pre-fix shape: full clear + full refold per cycle (what every cursor
         // row-change used to do).
@@ -42069,7 +42107,10 @@ async fn measure_ymd_row_change_latency(cx: &mut gpui::TestAppContext) {
             editor.sync_ymd_conceal_folds(Vec::new(), cx);
             editor.refresh_ymd_conceals(&HashSet::default(), cx);
         }
-        println!("pre-fix full clear+refold: {:?}/cycle", timer.elapsed() / cycles);
+        println!(
+            "pre-fix full clear+refold: {:?}/cycle",
+            timer.elapsed() / cycles
+        );
     });
 
     // Markdown language but zero markers: the YMD guard runs and no-ops; any

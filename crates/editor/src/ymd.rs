@@ -301,7 +301,10 @@ pub(crate) fn scan(text: &str) -> Vec<YmdHighlight> {
     let fenced_code_ranges = fenced_code_block_ranges(text);
 
     for_each_line(text, |line_content, line_start| {
-        if range_overlaps_any(&(line_start..line_start + line_content.len()), &fenced_code_ranges) {
+        if range_overlaps_any(
+            &(line_start..line_start + line_content.len()),
+            &fenced_code_ranges,
+        ) {
             return;
         }
         let inline_highlights = scan_line_background_markups(line_content, line_start);
@@ -328,7 +331,10 @@ pub(crate) fn scan_links(text: &str) -> Vec<YmdLink> {
     let mut links = Vec::new();
     let fenced_code_ranges = fenced_code_block_ranges(text);
     for_each_line(text, |line_content, line_start| {
-        if range_overlaps_any(&(line_start..line_start + line_content.len()), &fenced_code_ranges) {
+        if range_overlaps_any(
+            &(line_start..line_start + line_content.len()),
+            &fenced_code_ranges,
+        ) {
             return;
         }
         links.extend(scan_line_links(line_content, line_start));
@@ -362,7 +368,10 @@ pub(crate) fn scan_images(text: &str) -> Vec<YmdImage> {
     let mut images = Vec::new();
     let fenced_code_ranges = fenced_code_block_ranges(text);
     for_each_line(text, |line_content, line_start| {
-        if range_overlaps_any(&(line_start..line_start + line_content.len()), &fenced_code_ranges) {
+        if range_overlaps_any(
+            &(line_start..line_start + line_content.len()),
+            &fenced_code_ranges,
+        ) {
             return;
         }
         images.extend(scan_line_images(line_content, line_start));
@@ -383,7 +392,10 @@ pub(crate) fn scan_thematic_breaks(text: &str) -> Vec<Range<usize>> {
     let fenced_code_ranges = fenced_code_block_ranges(text);
 
     for_each_line(text, |line_content, line_start| {
-        if range_overlaps_any(&(line_start..line_start + line_content.len()), &fenced_code_ranges) {
+        if range_overlaps_any(
+            &(line_start..line_start + line_content.len()),
+            &fenced_code_ranges,
+        ) {
             return;
         }
         if line_start >= frontmatter_skip_end && is_thematic_break_line(line_content) {
@@ -406,7 +418,10 @@ pub(crate) fn scan_block_quotes(text: &str) -> Vec<YmdBlockQuote> {
     let fenced_code_ranges = fenced_code_block_ranges(text);
 
     for_each_line(text, |line_content, line_start| {
-        if range_overlaps_any(&(line_start..line_start + line_content.len()), &fenced_code_ranges) {
+        if range_overlaps_any(
+            &(line_start..line_start + line_content.len()),
+            &fenced_code_ranges,
+        ) {
             return;
         }
         if let Some(block_quote) = scan_line_block_quote(line_content, line_start) {
@@ -430,7 +445,10 @@ pub(crate) fn scan_checkboxes(text: &str) -> Vec<YmdCheckbox> {
     let fenced_code_ranges = fenced_code_block_ranges(text);
 
     for_each_line(text, |line_content, line_start| {
-        if range_overlaps_any(&(line_start..line_start + line_content.len()), &fenced_code_ranges) {
+        if range_overlaps_any(
+            &(line_start..line_start + line_content.len()),
+            &fenced_code_ranges,
+        ) {
             return;
         }
         if let Some(checkbox) = scan_line_checkbox(line_content, line_start) {
@@ -446,7 +464,10 @@ pub(crate) fn scan_conceals(text: &str) -> Vec<YmdConceal> {
     let fenced_code_ranges = fenced_code_block_ranges(text);
 
     for_each_line(text, |line_content, line_start| {
-        if range_overlaps_any(&(line_start..line_start + line_content.len()), &fenced_code_ranges) {
+        if range_overlaps_any(
+            &(line_start..line_start + line_content.len()),
+            &fenced_code_ranges,
+        ) {
             return;
         }
         let inline_highlights = scan_line_background_markups(line_content, line_start);
@@ -490,8 +511,7 @@ pub(crate) fn scan_conceals(text: &str) -> Vec<YmdConceal> {
 
         let captures = capture_ranges(&inline_highlights, line_start);
         if let Some((emoji_range, _)) = first_effective_emoji(line_content, &captures) {
-            let absolute_emoji_range =
-                line_start + emoji_range.start..line_start + emoji_range.end;
+            let absolute_emoji_range = line_start + emoji_range.start..line_start + emoji_range.end;
             // When the heading fold has already absorbed the color marker (it sits
             // right after the `#` prefix), the line-marker emoji must not conceal a
             // second time over the same bytes.
@@ -1101,14 +1121,8 @@ mod tests {
         assert!(scan_conceals("==missing close").is_empty());
         // The invalid markers stay raw, but their emoji is standalone (the line's
         // marker) and conceals like any other line-color emoji.
-        assert_eq!(
-            scan_conceals("==🔴=="),
-            vec![YmdConceal { range: 2..6 }]
-        );
-        assert_eq!(
-            scan_conceals("==🔴 open"),
-            vec![YmdConceal { range: 2..6 }]
-        );
+        assert_eq!(scan_conceals("==🔴=="), vec![YmdConceal { range: 2..6 }]);
+        assert_eq!(scan_conceals("==🔴 open"), vec![YmdConceal { range: 2..6 }]);
     }
 
     #[test]
@@ -1397,7 +1411,10 @@ mod tests {
         // line-color conceals); seven `#` is too deep; an empty heading has no
         // content.
         assert!(scan_conceals("# Plain Heading").is_empty());
-        assert_eq!(scan_conceals("#heading 🔵"), vec![YmdConceal { range: 9..13 }]);
+        assert_eq!(
+            scan_conceals("#heading 🔵"),
+            vec![YmdConceal { range: 9..13 }]
+        );
         assert_eq!(
             scan_conceals("####### 🔵 Too Deep"),
             vec![YmdConceal { range: 8..12 }]
@@ -1666,7 +1683,9 @@ mod tests {
         // text color (the Markdown link blue) and matches the revealed link
         // instead of a pinned color. #zed-35 dogfood reversed #zed-06's Q4
         // pinned-default-foreground choice (blue text under a near-black line).
-        let underline = link_style().underline.expect("link style sets an underline");
+        let underline = link_style()
+            .underline
+            .expect("link style sets an underline");
         assert_eq!(
             underline.color, None,
             "underline must inherit the text color, not pin its own"
@@ -1929,16 +1948,32 @@ mod tests {
 
         // Every scanner entrypoint excludes the fenced lines: highlights, conceals,
         // link underlines, and thematic-break rules all skip the fence.
-        assert!(scan(text).iter().all(|h| !range_overlaps_any(&h.range, &fences)));
-        assert!(scan_conceals(text).iter().all(|c| !range_overlaps_any(&c.range, &fences)));
-        assert!(scan_links(text).iter().all(|l| !range_overlaps_any(&l.label_range, &fences)));
+        assert!(
+            scan(text)
+                .iter()
+                .all(|h| !range_overlaps_any(&h.range, &fences))
+        );
+        assert!(
+            scan_conceals(text)
+                .iter()
+                .all(|c| !range_overlaps_any(&c.range, &fences))
+        );
+        assert!(
+            scan_links(text)
+                .iter()
+                .all(|l| !range_overlaps_any(&l.label_range, &fences))
+        );
         assert!(
             scan_images(text)
                 .iter()
                 .all(|image| !range_overlaps_any(&image.alt_text_range, &fences))
         );
         assert_eq!(scan_thematic_breaks(text).len(), 1);
-        assert!(scan_thematic_breaks(text).iter().all(|r| !range_overlaps_any(r, &fences)));
+        assert!(
+            scan_thematic_breaks(text)
+                .iter()
+                .all(|r| !range_overlaps_any(r, &fences))
+        );
     }
 
     #[test]
