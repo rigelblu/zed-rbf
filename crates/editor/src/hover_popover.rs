@@ -12,8 +12,8 @@ use anyhow::Context as _;
 use fs::Fs;
 use gpui::{
     AnyElement, App, AsyncWindowContext, Bounds, Context, Entity, Focusable as _, FontWeight, Hsla,
-    ImageSource, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, ScrollHandle, Size,
-    StatefulInteractiveElement, StyleRefinement, Styled, Subscription, Task, TaskExt,
+    ImageSource, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, ScrollHandle,
+    Size, StatefulInteractiveElement, StyleRefinement, Styled, Subscription, Task, TaskExt,
     TextStyleRefinement, Window, canvas, div, px,
 };
 use itertools::Itertools;
@@ -342,7 +342,8 @@ fn show_hover(
                 total_delay
             };
 
-            let markdown_image_hover = if let Some(mut markdown_image_hover) = markdown_image_hover {
+            let markdown_image_hover = if let Some(mut markdown_image_hover) = markdown_image_hover
+            {
                 let mut resolved_hover = None;
                 for absolute_path in markdown_image_hover.candidate_paths.clone() {
                     if markdown_image_hover.fs.is_file(&absolute_path).await {
@@ -771,9 +772,9 @@ fn markdown_image_hover(
     }
 
     let offset = anchor.to_offset(&snapshot.buffer_snapshot()).0;
-    let image = ymd::scan_images(&text)
-        .into_iter()
-        .find(|image| image.reference_range.start <= offset && offset < image.reference_range.end)?;
+    let image = ymd::scan_images(&text).into_iter().find(|image| {
+        image.reference_range.start <= offset && offset < image.reference_range.end
+    })?;
     let raw_path = &text[image.path_range.clone()];
     let project = editor.project()?;
     let (fs, root_directory) = project.read_with(cx, |project, cx| {
@@ -879,9 +880,7 @@ fn normalize_markdown_image_path(raw_path: &str) -> Option<String> {
 }
 
 fn markdown_image_path_without_query_or_fragment(raw_path: &str) -> Option<&str> {
-    let end = raw_path
-        .find(['?', '#'])
-        .unwrap_or(raw_path.len());
+    let end = raw_path.find(['?', '#']).unwrap_or(raw_path.len());
     let path_without_query_or_fragment = &raw_path[..end];
     if path_without_query_or_fragment.is_empty() {
         return None;
@@ -1610,18 +1609,22 @@ mod tests {
             ),
             Some(vec![PathBuf::from("/root/dir/assets/My Logo.png")])
         );
-        assert!(resolve_markdown_image_path_candidates(
-            "https://example.com/image.png",
-            base_directory,
-            root_directory,
-        )
-        .is_none());
-        assert!(resolve_markdown_image_path_candidates(
-            "data:image/png;base64,abc",
-            base_directory,
-            root_directory,
-        )
-        .is_none());
+        assert!(
+            resolve_markdown_image_path_candidates(
+                "https://example.com/image.png",
+                base_directory,
+                root_directory,
+            )
+            .is_none()
+        );
+        assert!(
+            resolve_markdown_image_path_candidates(
+                "data:image/png;base64,abc",
+                base_directory,
+                root_directory,
+            )
+            .is_none()
+        );
     }
 
     #[gpui::test]
@@ -2046,7 +2049,10 @@ mod tests {
                 );
             };
             let resolver = popover.markdown_image_resolver.as_ref().unwrap();
-            assert_eq!(resolver.absolute_path, PathBuf::from("/root/assets/root.png"));
+            assert_eq!(
+                resolver.absolute_path,
+                PathBuf::from("/root/assets/root.png")
+            );
         });
         assert_eq!(request_count.load(atomic::Ordering::Acquire), 0);
     }
