@@ -1019,6 +1019,80 @@ impl MultiWorkspace {
         true
     }
 
+    pub fn move_workspace_tab_to_index(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        target_index: usize,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mut ordered_workspaces = self.ordered_workspaces(cx);
+        let Some(current_index) = ordered_workspaces
+            .iter()
+            .position(|candidate| candidate == workspace)
+        else {
+            return false;
+        };
+        if current_index == target_index {
+            return false;
+        }
+
+        let workspace = ordered_workspaces.remove(current_index);
+        let target_index = target_index.min(ordered_workspaces.len());
+        ordered_workspaces.insert(target_index, workspace);
+
+        let mut desired_group_keys = Vec::new();
+        for workspace in &ordered_workspaces {
+            let key = self.project_group_key_for_workspace(workspace, cx);
+            if !desired_group_keys
+                .iter()
+                .any(|existing_key| *existing_key == key)
+            {
+                desired_group_keys.push(key);
+            }
+        }
+
+        let mut remaining_project_groups = std::mem::take(&mut self.project_groups);
+        let mut reordered_project_groups = Vec::with_capacity(remaining_project_groups.len());
+        for desired_key in desired_group_keys {
+            if let Some(index) = remaining_project_groups
+                .iter()
+                .position(|group| group.key == desired_key)
+            {
+                reordered_project_groups.push(remaining_project_groups.remove(index));
+            }
+        }
+        reordered_project_groups.extend(remaining_project_groups);
+        self.project_groups = reordered_project_groups;
+
+        let old_retained_workspaces = std::mem::take(&mut self.retained_workspaces);
+        let mut retained_workspaces = Vec::with_capacity(old_retained_workspaces.len());
+        for workspace in ordered_workspaces {
+            if old_retained_workspaces
+                .iter()
+                .any(|retained_workspace| retained_workspace == &workspace)
+                && !retained_workspaces
+                    .iter()
+                    .any(|retained_workspace| retained_workspace == &workspace)
+            {
+                retained_workspaces.push(workspace);
+            }
+        }
+        for workspace in old_retained_workspaces {
+            if !retained_workspaces
+                .iter()
+                .any(|retained_workspace| retained_workspace == &workspace)
+            {
+                retained_workspaces.push(workspace);
+            }
+        }
+        self.retained_workspaces = retained_workspaces;
+
+        cx.emit(MultiWorkspaceEvent::ProjectGroupsChanged);
+        self.serialize(cx);
+        cx.notify();
+        true
+    }
+
     pub fn workspaces_for_project_group(
         &self,
         key: &ProjectGroupKey,
