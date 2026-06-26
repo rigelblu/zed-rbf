@@ -541,6 +541,83 @@ async fn test_workspace_tabs_drag_reorder_project_groups(cx: &mut TestAppContext
 }
 
 #[gpui::test]
+async fn test_workspace_tabs_drag_reorder_with_multiple_tabs_in_project_group(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/repo/root_a", json!({ "file.txt": "" }))
+        .await;
+    fs.insert_tree("/repo/root_b", json!({ "file.txt": "" }))
+        .await;
+    let project_a = Project::test(fs.clone(), ["/repo/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs, ["/repo/root_b".as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b, window, cx);
+    });
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.restore_project_groups(
+            vec![SerializedProjectGroupState {
+                key: ProjectGroupKey::new(None, PathList::new(&[path!("/repo")])),
+                expanded: true,
+            }],
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(
+            multi_workspace.test_workspace_tab_labels(cx),
+            vec!["root_a", "root_b"],
+        );
+    });
+
+    cx.draw(
+        gpui::point(gpui::px(0.), gpui::px(0.)),
+        gpui::size(gpui::px(800.), gpui::px(600.)),
+        |_, _| multi_workspace.clone().into_any_element(),
+    );
+    let source_bounds = cx
+        .debug_bounds("WORKSPACE-TAB-0")
+        .expect("source workspace tab should render with debug bounds");
+    let target_bounds = cx
+        .debug_bounds("WORKSPACE-TAB-1")
+        .expect("target workspace tab should render with debug bounds");
+
+    cx.simulate_mouse_down(
+        source_bounds.center(),
+        MouseButton::Left,
+        gpui::Modifiers::none(),
+    );
+    cx.simulate_mouse_move(
+        target_bounds.center(),
+        Some(MouseButton::Left),
+        gpui::Modifiers::none(),
+    );
+    cx.simulate_mouse_up(
+        target_bounds.center(),
+        MouseButton::Left,
+        gpui::Modifiers::none(),
+    );
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(
+            multi_workspace.test_workspace_tab_labels(cx),
+            vec!["root_b", "root_a"],
+        );
+        assert_eq!(
+            multi_workspace.project_group_keys(),
+            vec![ProjectGroupKey::new(None, PathList::new(&[path!("/repo")]))],
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_workspace_tabs_drag_reorder_target_index(cx: &mut TestAppContext) {
     init_test(cx);
     let fs = FakeFs::new(cx.executor());

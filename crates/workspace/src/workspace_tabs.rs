@@ -5,8 +5,8 @@ use std::{
 };
 
 use gpui::{
-    Anchor, App, Context, Pixels, ScrollHandle, SharedString, TaskExt, Window, WindowControlArea,
-    px,
+    Anchor, App, Context, Entity, Pixels, ScrollHandle, SharedString, TaskExt, Window,
+    WindowControlArea, px,
 };
 use project::ProjectGroupKey;
 use ui::{
@@ -19,7 +19,7 @@ use crate::{MultiWorkspace, Workspace};
 #[derive(Clone)]
 struct DraggedWorkspaceTab {
     ix: usize,
-    project_group_key: ProjectGroupKey,
+    workspace: Entity<Workspace>,
     label: SharedString,
     is_active: bool,
 }
@@ -161,7 +161,7 @@ impl MultiWorkspace {
                                         self.project_group_key_for_workspace(&workspace, cx);
                                     let dragged_tab = DraggedWorkspaceTab {
                                         ix,
-                                        project_group_key: project_group_key.clone(),
+                                        workspace: workspace.clone(),
                                         label: label.clone(),
                                         is_active,
                                     };
@@ -218,8 +218,8 @@ impl MultiWorkspace {
                                             let tab_ix = ix;
                                             cx.listener(
                                                 move |this, dragged_tab: &DraggedWorkspaceTab, _, cx| {
-                                                    this.move_project_group_to_index(
-                                                        &dragged_tab.project_group_key,
+                                                    this.move_workspace_tab_to_index(
+                                                        &dragged_tab.workspace,
                                                         tab_ix,
                                                         cx,
                                                     );
