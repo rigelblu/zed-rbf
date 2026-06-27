@@ -5511,6 +5511,15 @@ impl EditorElement {
                         CursorStyle::PointingHand,
                         &layout.position_map.text_hitbox,
                     );
+                } else if editor.is_ymd_checkbox_at_display_point(
+                    layout
+                        .position_map
+                        .point_for_position(window.mouse_position())
+                        .exact_unclipped,
+                    &layout.position_map.snapshot,
+                    cx,
+                ) {
+                    window.set_cursor_style(CursorStyle::Arrow, &layout.position_map.text_hitbox);
                 } else {
                     window.set_cursor_style(CursorStyle::IBeam, &layout.position_map.text_hitbox);
                 };
