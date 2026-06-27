@@ -38,13 +38,15 @@ I don't commit these to the repo, but I sync the latest versions to [Google Driv
 - A standalone supported colour emoji outside highlight markers colours the whole line foreground; the supported line-colour set is 🔴 🟠 🟡 🟢 🔵 🟣 ⚫
 
 - `[label](url)` shows as an underlined label with the brackets and URL hidden; Cmd-click the label to open its destination in read mode — a web URL (a bare `google.com` works too), a relative file (opens as a buffer), or a directory (revealed in the project panel) — or move the cursor onto the line to reveal the raw link
+- `~~text~~` renders as struck-through text with the double-tilde markers concealed
 - `---` renders as a horizontal rule
 
 > Block quotes get muted text plus a gutter border
 
 - ![Paste Images and Preview on mouse over](.assets/pasted-image.png) rendered as underlined alt text
 
-- [ ] Task checkboxes display as `□`/`■`
+- [ ] Task checkboxes display as `□`/`■`; completed task items are visually complete by greying the checked task row with a fixed `#9893A5` color
+- Rendered task checkboxes can be clicked directly in the editor buffer to toggle their checked state
 - Configure checkbox display characters in your Zed settings (`~/.config/zed/settings.json`, open with `cmd-,`) using the top-level `ymd` key:
 ```jsonc
 {
