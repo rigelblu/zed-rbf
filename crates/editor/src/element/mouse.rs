@@ -627,6 +627,21 @@ impl EditorElement {
             return;
         }
 
+        if click_count == 1
+            && !modifiers.shift
+            && !modifiers.control
+            && !modifiers.alt
+            && !modifiers.secondary()
+            && editor.toggle_ymd_checkbox_at_display_point(
+                point_for_position.exact_unclipped,
+                window,
+                cx,
+            )
+        {
+            cx.stop_propagation();
+            return;
+        }
+
         if EditorSettings::get_global(cx)
             .drag_and_drop_selection
             .enabled
