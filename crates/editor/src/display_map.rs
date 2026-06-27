@@ -190,15 +190,21 @@ pub enum HighlightKey {
     // foreground over the whole-line color. YmdBlockQuote (muted quote-content
     // foreground) sorts first of the YMD keys so both a line color and a highlight
     // background win over the muting — a highlight or colored line inside a quote
-    // keeps its own style. All stay before VimExchange so an active exchange still
-    // reads over YMD styling. YmdLink only sets an underline (no color/background),
-    // so it composes cleanly with the color keys regardless of overlap order — a
-    // link label inside a highlight keeps the highlight's colors and gains the
-    // underline.
+    // keeps its own style. YmdCompletedTask sorts after those color keys so a
+    // checked task's muted foreground wins even if the row has a color marker.
+    // All stay before VimExchange so an active exchange still reads over YMD
+    // styling. YmdLink, YmdItalic, and YmdStrikethrough only set non-color text
+    // styling, so they compose cleanly with the color keys regardless of overlap
+    // order — a link label inside a highlight keeps the highlight's colors and
+    // gains the underline; emphasized content keeps those colors and gains its
+    // font style.
     YmdBlockQuote,
     YmdLineForeground(usize),
     YmdBackground(usize),
+    YmdCompletedTask,
+    YmdItalic,
     YmdLink,
+    YmdStrikethrough,
     VimExchange,
 }
 
