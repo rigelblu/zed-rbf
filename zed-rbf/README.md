@@ -112,6 +112,12 @@ The configured order is the display order. `~` and `$VAR` expand. Missing paths 
 - Restores open workspace tabs, layout, and edit states stably across app restarts
 - Grouped tab management and close controls directly on the tab strip
 
+## 🟠⋯ File Tags
+- Mark important files with lightweight Zed-local color tags from the Project Panel file-row workflow, visible as markers on file rows
+- View and manage tagged files in a dedicated Tags section at the top of the Project Panel, grouped by color with path context and drag/keyboard support
+- Toggle the Tags section between Tree View and Flat View via an ellipsis menu, with expandable/collapsible categories and context-menu controls to change/clear tags
+- Handle missing/unresolved tagged paths by showing them as explicit missing rows in the Tags section so they can be easily cleared
+
 ## 🟠⋯ Versions
 - The fork version lives in `zed-rbf/RBF_VERSION`
 - `crates/zed/build.rs` injects it at build time as `ZED_RBF_VERSION`

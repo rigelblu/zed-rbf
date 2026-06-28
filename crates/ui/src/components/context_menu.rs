@@ -1283,6 +1283,41 @@ impl ContextMenu {
         cx.notify();
     }
 
+    fn submenu_safety_threshold_x(flip_left: bool, mouse_x: Pixels, padding: Pixels) -> Pixels {
+        if flip_left {
+            mouse_x + padding
+        } else {
+            mouse_x - padding
+        }
+    }
+
+    fn should_close_submenu_for_mouse_x(&self, mouse_x: Pixels) -> bool {
+        let Some(threshold_x) = self.submenu_safety_threshold_x else {
+            return true;
+        };
+
+        match &self.submenu_state {
+            SubmenuState::Open(open_submenu) => Self::is_mouse_past_submenu_safety_threshold(
+                open_submenu.flip_left,
+                threshold_x,
+                mouse_x,
+            ),
+            SubmenuState::Closed => false,
+        }
+    }
+
+    fn is_mouse_past_submenu_safety_threshold(
+        flip_left: bool,
+        threshold_x: Pixels,
+        mouse_x: Pixels,
+    ) -> bool {
+        if flip_left {
+            mouse_x > threshold_x
+        } else {
+            mouse_x < threshold_x
+        }
+    }
+
     fn open_submenu(
         &mut self,
         item_index: usize,
@@ -1533,9 +1568,13 @@ impl ContextMenu {
                 }
             }))
             .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
-                if matches!(&this.submenu_state, SubmenuState::Open(_))
-                    || this.selected_index == Some(ix)
-                {
+                if let SubmenuState::Open(open_submenu) = &this.submenu_state {
+                    this.submenu_safety_threshold_x = Some(Self::submenu_safety_threshold_x(
+                        open_submenu.flip_left,
+                        event.position.x,
+                        px(100.0),
+                    ));
+                } else if this.selected_index == Some(ix) {
                     this.submenu_safety_threshold_x = Some(event.position.x - px(100.0));
                 }
 
@@ -1569,7 +1608,6 @@ impl ContextMenu {
                             this.clear_selected();
                             window.focus(&this.focus_handle.clone(), cx);
                             this.hover_target = HoverTarget::MainMenu;
-                            this.submenu_safety_threshold_x = Some(mouse_pos.x - px(50.0));
 
                             if let Some(ContextMenuItem::Submenu { builder, .. }) =
                                 this.items.get(ix)
@@ -1581,6 +1619,15 @@ impl ContextMenu {
                                     window,
                                     cx,
                                 );
+                            }
+
+                            if let SubmenuState::Open(open_submenu) = &this.submenu_state {
+                                this.submenu_safety_threshold_x =
+                                    Some(Self::submenu_safety_threshold_x(
+                                        open_submenu.flip_left,
+                                        mouse_pos.x,
+                                        px(50.0),
+                                    ));
                             }
 
                             cx.notify();
@@ -1601,6 +1648,7 @@ impl ContextMenu {
                             if is_open_for_this_item
                                 && this.hover_target != HoverTarget::Submenu
                                 && !mouse_in_submenu_zone
+                                && this.should_close_submenu_for_mouse_x(mouse_pos.x)
                             {
                                 this.close_submenu(false, cx);
                                 this.clear_selected();
@@ -1870,7 +1918,11 @@ impl ContextMenu {
                                 window.focus(&this.focus_handle.clone(), cx);
 
                                 if let SubmenuState::Open(open_submenu) = &this.submenu_state {
-                                    if open_submenu.item_index != ix {
+                                    if open_submenu.item_index != ix
+                                        && this.should_close_submenu_for_mouse_x(
+                                            window.mouse_position().x,
+                                        )
+                                    {
                                         this.close_submenu(false, cx);
                                         cx.notify();
                                     }
@@ -1921,14 +1973,9 @@ impl ContextMenu {
                                                 &parent.submenu_state,
                                                 SubmenuState::Open(_)
                                             ) {
-                                                // Only close if mouse is to the left of the safety threshold
-                                                // (prevents accidental close when moving diagonally toward submenu)
-                                                let should_close = parent
-                                                    .submenu_safety_threshold_x
-                                                    .map(|threshold_x| mouse_pos.x < threshold_x)
-                                                    .unwrap_or(true);
-
-                                                if should_close {
+                                                if parent
+                                                    .should_close_submenu_for_mouse_x(mouse_pos.x)
+                                                {
                                                     parent.close_submenu(true, cx);
                                                 }
                                             }
@@ -2312,6 +2359,42 @@ mod tests {
     use gpui::TestAppContext;
 
     use super::*;
+
+    #[test]
+    fn submenu_safety_threshold_tracks_open_direction() {
+        assert_eq!(
+            ContextMenu::submenu_safety_threshold_x(false, px(200.0), px(50.0)),
+            px(150.0)
+        );
+        assert_eq!(
+            ContextMenu::submenu_safety_threshold_x(true, px(200.0), px(50.0)),
+            px(250.0)
+        );
+    }
+
+    #[test]
+    fn submenu_close_threshold_respects_flipped_direction() {
+        assert!(!ContextMenu::is_mouse_past_submenu_safety_threshold(
+            false,
+            px(150.0),
+            px(200.0)
+        ));
+        assert!(ContextMenu::is_mouse_past_submenu_safety_threshold(
+            false,
+            px(150.0),
+            px(100.0)
+        ));
+        assert!(!ContextMenu::is_mouse_past_submenu_safety_threshold(
+            true,
+            px(250.0),
+            px(200.0)
+        ));
+        assert!(ContextMenu::is_mouse_past_submenu_safety_threshold(
+            true,
+            px(250.0),
+            px(300.0)
+        ));
+    }
 
     #[gpui::test]
     fn can_navigate_back_over_headers(cx: &mut TestAppContext) {

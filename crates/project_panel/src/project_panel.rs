@@ -15,19 +15,21 @@ use editor::{
 };
 use feature_flags::{FeatureFlagAppExt, ProjectPanelUndoRedoFeatureFlag};
 use file_icons::FileIcons;
+use futures::{FutureExt as _, future::Shared};
 use git;
 use git::status::GitSummary;
 use git_ui;
 use git_ui::file_diff_view::FileDiffView;
 use gpui::{
-    Action, AnyElement, App, AsyncWindowContext, Bounds, ClipboardEntry as GpuiClipboardEntry,
-    ClipboardItem, Context, CursorStyle, DismissEvent, Div, DragMoveEvent, Entity, EventEmitter,
-    ExternalPaths, FocusHandle, Focusable, FontWeight, Hsla, InteractiveElement, KeyContext,
-    ListHorizontalSizingBehavior, ListSizingBehavior, Modifiers, ModifiersChangedEvent,
-    MouseButton, MouseDownEvent, ParentElement, PathPromptOptions, Pixels, Point, PromptLevel,
-    Render, ScrollStrategy, Stateful, Styled, Subscription, Task, UniformListScrollHandle,
-    WeakEntity, Window, actions, anchored, deferred, div, hsla, linear_color_stop, linear_gradient,
-    point, px, size, transparent_white, uniform_list,
+    Action, Anchor, AnyElement, App, AsyncWindowContext, Bounds,
+    ClipboardEntry as GpuiClipboardEntry, ClipboardItem, Context, CursorStyle, DismissEvent, Div,
+    DragMoveEvent, ElementId, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable,
+    FontWeight, Hsla, InteractiveElement, KeyContext, ListHorizontalSizingBehavior,
+    ListSizingBehavior, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent,
+    ParentElement, PathPromptOptions, Pixels, Point, PromptLevel, Render, ScrollStrategy, Stateful,
+    Styled, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, actions, anchored,
+    deferred, div, hsla, linear_color_stop, linear_gradient, point, px, size, transparent_white,
+    uniform_list,
 };
 use language::DiagnosticSeverity;
 use menu::{Confirm, SelectFirst, SelectLast, SelectNext, SelectPrevious};
@@ -41,7 +43,7 @@ use project::{
 use project_panel_settings::ProjectPanelSettings;
 use rayon::slice::ParallelSliceMut;
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use settings::{
     DockSide, ProjectPanelEntrySpacing, Settings, SettingsStore, ShowDiagnostics, ShowIndentGuides,
     update_settings_file,
@@ -60,10 +62,11 @@ use std::{
 };
 use theme_settings::ThemeSettings;
 use ui::{
-    Color, ContextMenu, ContextMenuEntry, DecoratedIcon, Icon, IconDecoration, IconDecorationKind,
-    IndentGuideColors, IndentGuideLayout, Indicator, KeyBinding, Label, LabelSize, ListItem,
-    ListItemSpacing, ProjectEmptyState, ScrollAxes, ScrollableHandle, Scrollbars, StickyCandidate,
-    Tooltip, WithScrollbar, prelude::*, v_flex,
+    Color, ContextMenu, ContextMenuEntry, DecoratedIcon, Disclosure, Icon, IconButton,
+    IconDecoration, IconDecorationKind, IndentGuideColors, IndentGuideLayout, Indicator,
+    KeyBinding, Label, LabelSize, ListHeader, ListItem, ListItemSpacing, PopoverMenu,
+    ProjectEmptyState, ScrollAxes, ScrollableHandle, Scrollbars, StickyCandidate, Tooltip,
+    WithScrollbar, prelude::*, v_flex,
 };
 use util::{
     ResultExt, TakeUntilExt, TryFutureExt,
@@ -147,6 +150,7 @@ pub struct ProjectPanel {
     drag_target_entry: Option<DragTarget>,
     marked_entries: Vec<SelectedEntry>,
     selection: Option<SelectedEntry>,
+    file_tag_selection: Option<FileTagKey>,
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     filename_editor: Entity<Editor>,
     clipboard: Option<ClipboardEntry>,
@@ -155,6 +159,11 @@ pub struct ProjectPanel {
     diagnostics: HashMap<(WorktreeId, Arc<RelPath>), DiagnosticSeverity>,
     diagnostic_counts: HashMap<(WorktreeId, Arc<RelPath>), DiagnosticCount>,
     diagnostic_summary_update: Task<()>,
+    file_tags: FileTagStore,
+    pending_file_tags: Option<FileTagStore>,
+    file_tag_view_mode: FileTagViewMode,
+    collapsed_file_tag_groups: HashSet<FileTagColor>,
+    file_tag_update_task: Shared<Task<()>>,
     // We keep track of the mouse down state on entries so we don't flash the UI
     // in case a user clicks to open a file.
     mouse_down: bool,
@@ -165,6 +174,235 @@ pub struct ProjectPanel {
     update_visible_entries_task: UpdateVisibleEntriesTask,
     undo_manager: UndoManager,
     state: State,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct FileTagStore {
+    tags: HashMap<FileTagKey, FileTagColor>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+struct FileTagKey {
+    worktree_root: String,
+    path: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum FileTagColor {
+    Red,
+    Orange,
+    Yellow,
+    Green,
+    Blue,
+    Purple,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TaggedFileGroup {
+    color: FileTagColor,
+    rows: Vec<TaggedFileRow>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TaggedFileRow {
+    worktree_id: WorktreeId,
+    entry_id: Option<ProjectEntryId>,
+    file_tag_key: FileTagKey,
+    file_name: String,
+    path_label: String,
+    tooltip_label: String,
+}
+
+impl TaggedFileRow {
+    fn status_label(&self) -> Option<&'static str> {
+        self.entry_id.is_none().then_some("⚠ Missing")
+    }
+}
+
+#[derive(Clone)]
+enum FileTagListItem {
+    TagsHeader {
+        tagged_file_count: usize,
+    },
+    GroupHeader {
+        color: FileTagColor,
+        is_expanded: bool,
+    },
+    TaggedFileRow {
+        color: FileTagColor,
+        row: TaggedFileRow,
+    },
+    ProjectFilesHeader,
+}
+
+#[derive(Clone, Debug)]
+enum FileTagOperation {
+    Set {
+        key: FileTagKey,
+        color: FileTagColor,
+    },
+    Clear {
+        key: FileTagKey,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum FileTagViewMode {
+    Flat,
+    #[default]
+    Tree,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SerializedFileTag {
+    worktree_root: String,
+    path: String,
+    color: FileTagColor,
+}
+
+impl FileTagStore {
+    const KVP_NAMESPACE: &'static str = "project_panel_file_tags";
+    const KVP_KEY: &'static str = "file_tags_v0";
+
+    fn load(db: &db::kvp::KeyValueStore) -> Self {
+        db.scoped(Self::KVP_NAMESPACE)
+            .read(Self::KVP_KEY)
+            .log_err()
+            .flatten()
+            .and_then(|json| serde_json::from_str::<Vec<SerializedFileTag>>(&json).log_err())
+            .map(Self::from_serialized)
+            .unwrap_or_default()
+    }
+
+    async fn persist(&self, db: &db::kvp::KeyValueStore) -> Result<()> {
+        db.scoped(Self::KVP_NAMESPACE)
+            .write(Self::KVP_KEY.to_string(), self.to_json()?)
+            .await
+    }
+
+    async fn persist_operation(
+        db: &db::kvp::KeyValueStore,
+        operation: FileTagOperation,
+    ) -> Result<Self> {
+        db.write(move |connection| -> Result<Self> {
+            let serialized = connection
+                .select_row_bound::<(&str, &str), String>(
+                    "SELECT value FROM scoped_kv_store WHERE namespace = (?) AND key = (?)",
+                )?((Self::KVP_NAMESPACE, Self::KVP_KEY))
+                .context("Failed to read from scoped_kv_store")?;
+            let mut file_tags = serialized
+                .and_then(|json| serde_json::from_str::<Vec<SerializedFileTag>>(&json).log_err())
+                .map(Self::from_serialized)
+                .unwrap_or_default();
+            operation.apply(&mut file_tags);
+            let json = file_tags.to_json()?;
+            connection
+                .exec_bound::<(&str, &str, &str)>(
+                    "INSERT OR REPLACE INTO scoped_kv_store(namespace, key, value) VALUES ((?), (?), (?))",
+                )?((Self::KVP_NAMESPACE, Self::KVP_KEY, &json))
+                .context("Failed to write to scoped_kv_store")?;
+            Ok(file_tags)
+        })
+        .await
+    }
+
+    fn to_json(&self) -> Result<String> {
+        Ok(serde_json::to_string(&self.to_serialized())?)
+    }
+
+    fn from_serialized(serialized: Vec<SerializedFileTag>) -> Self {
+        Self {
+            tags: serialized
+                .into_iter()
+                .map(|tag| {
+                    (
+                        FileTagKey {
+                            worktree_root: tag.worktree_root,
+                            path: tag.path,
+                        },
+                        tag.color,
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn to_serialized(&self) -> Vec<SerializedFileTag> {
+        let mut serialized = self
+            .tags
+            .iter()
+            .map(|(key, color)| SerializedFileTag {
+                worktree_root: key.worktree_root.clone(),
+                path: key.path.clone(),
+                color: *color,
+            })
+            .collect::<Vec<_>>();
+        serialized.sort_by(|left, right| {
+            left.worktree_root
+                .cmp(&right.worktree_root)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        serialized
+    }
+
+    fn color_for(&self, key: &FileTagKey) -> Option<FileTagColor> {
+        self.tags.get(key).copied()
+    }
+
+    fn set_color(&mut self, key: FileTagKey, color: FileTagColor) {
+        self.tags.insert(key, color);
+    }
+
+    fn clear_color(&mut self, key: &FileTagKey) {
+        self.tags.remove(key);
+    }
+}
+
+impl FileTagOperation {
+    fn apply(&self, file_tags: &mut FileTagStore) {
+        match self {
+            Self::Set { key, color } => {
+                file_tags.set_color(key.clone(), *color);
+            }
+            Self::Clear { key } => {
+                file_tags.clear_color(key);
+            }
+        }
+    }
+}
+
+impl FileTagColor {
+    const ALL: [Self; 6] = [
+        Self::Red,
+        Self::Orange,
+        Self::Yellow,
+        Self::Green,
+        Self::Blue,
+        Self::Purple,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Red => "Red",
+            Self::Orange => "Orange",
+            Self::Yellow => "Yellow",
+            Self::Green => "Green",
+            Self::Blue => "Blue",
+            Self::Purple => "Purple",
+        }
+    }
+
+    fn color(self) -> Hsla {
+        match self {
+            Self::Red => hsla(0.0 / 360.0, 0.74, 0.58, 1.0),
+            Self::Orange => hsla(30.0 / 360.0, 0.88, 0.56, 1.0),
+            Self::Yellow => hsla(48.0 / 360.0, 0.90, 0.58, 1.0),
+            Self::Green => hsla(145.0 / 360.0, 0.58, 0.48, 1.0),
+            Self::Blue => hsla(210.0 / 360.0, 0.82, 0.58, 1.0),
+            Self::Purple => hsla(270.0 / 360.0, 0.66, 0.64, 1.0),
+        }
+    }
 }
 
 struct UpdateVisibleEntriesTask {
@@ -847,6 +1085,7 @@ impl ProjectPanel {
                 drag_target_entry: None,
                 marked_entries: Default::default(),
                 selection: None,
+                file_tag_selection: None,
                 context_menu: None,
                 filename_editor,
                 clipboard: None,
@@ -855,6 +1094,11 @@ impl ProjectPanel {
                 diagnostics: Default::default(),
                 diagnostic_counts: Default::default(),
                 diagnostic_summary_update: Task::ready(()),
+                file_tags: FileTagStore::load(&db::kvp::KeyValueStore::global(cx)),
+                pending_file_tags: None,
+                file_tag_view_mode: FileTagViewMode::default(),
+                collapsed_file_tag_groups: HashSet::default(),
+                file_tag_update_task: Task::ready(()).shared(),
                 scroll_handle,
                 mouse_down: false,
                 hover_expand_task: None,
@@ -1084,6 +1328,12 @@ impl ProjectPanel {
             let is_remote = project.is_remote();
             let is_collab = project.is_via_collab();
             let is_local = project.is_local() || project.is_via_wsl_with_host_interop(cx);
+            let file_tag_key = is_local
+                .then(|| Self::file_tag_key_for_worktree_entry(worktree, entry))
+                .flatten();
+            let current_file_tag_color = file_tag_key
+                .as_ref()
+                .and_then(|file_tag_key| self.file_tags.color_for(file_tag_key));
 
             let settings = ProjectPanelSettings::get_global(cx);
             let visible_worktrees_count = project.visible_worktrees(cx).count();
@@ -1129,6 +1379,19 @@ impl ProjectPanel {
                             })
                             .when(is_local, |menu| {
                                 menu.action("Open in Default App", Box::new(OpenWithSystem))
+                            })
+                            .map(|menu| {
+                                if let Some(file_tag_key) = file_tag_key.clone() {
+                                    Self::append_file_tag_submenu(
+                                        menu.separator(),
+                                        "Tag File",
+                                        file_tag_key,
+                                        current_file_tag_color,
+                                        entity.clone(),
+                                    )
+                                } else {
+                                    menu
+                                }
                             })
                             .action("Open in Terminal", Box::new(OpenInTerminal))
                             .when(is_dir, |menu| {
@@ -1237,6 +1500,531 @@ impl ProjectPanel {
         }
 
         cx.notify();
+    }
+
+    fn deploy_tagged_file_context_menu(
+        &mut self,
+        position: Point<Pixels>,
+        row: TaggedFileRow,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_tagged_file_row(row.clone(), cx);
+        let current_file_tag_color = self.file_tags.color_for(&row.file_tag_key);
+        let entity = cx.entity();
+        let context_menu = ContextMenu::build(window, cx, |menu, _, _| {
+            Self::append_file_tag_menu_items(
+                menu.context(self.focus_handle.clone()),
+                row.file_tag_key.clone(),
+                current_file_tag_color,
+                entity.clone(),
+            )
+        });
+
+        window.focus(&context_menu.focus_handle(cx), cx);
+        let subscription = cx.subscribe(&context_menu, |this, _, _: &DismissEvent, cx| {
+            this.context_menu.take();
+            cx.notify();
+        });
+        self.context_menu = Some((context_menu, position, subscription));
+        cx.notify();
+    }
+
+    fn append_file_tag_submenu(
+        menu: ContextMenu,
+        label: &'static str,
+        file_tag_key: FileTagKey,
+        current_file_tag_color: Option<FileTagColor>,
+        entity: Entity<Self>,
+    ) -> ContextMenu {
+        menu.submenu(label, move |menu, _, _| {
+            Self::append_file_tag_menu_items(
+                menu,
+                file_tag_key.clone(),
+                current_file_tag_color,
+                entity.clone(),
+            )
+        })
+    }
+
+    fn append_file_tag_menu_items(
+        menu: ContextMenu,
+        file_tag_key: FileTagKey,
+        current_file_tag_color: Option<FileTagColor>,
+        entity: Entity<Self>,
+    ) -> ContextMenu {
+        let menu = FileTagColor::ALL
+            .into_iter()
+            .fold(menu, |menu, file_tag_color| {
+                let entity = entity.clone();
+                let file_tag_key = file_tag_key.clone();
+                menu.item(
+                    ContextMenuEntry::new(file_tag_color.label())
+                        .toggle(
+                            IconPosition::Start,
+                            current_file_tag_color == Some(file_tag_color),
+                        )
+                        .handler(move |_, cx| {
+                            entity.update(cx, |this, cx| {
+                                this.set_file_tag(file_tag_key.clone(), file_tag_color, cx);
+                            });
+                        }),
+                )
+            });
+
+        if current_file_tag_color.is_some() {
+            let entity = entity.clone();
+            let file_tag_key = file_tag_key.clone();
+            menu.separator()
+                .item(ContextMenuEntry::new("Clear Tag").handler(move |_, cx| {
+                    entity.update(cx, |this, cx| {
+                        this.clear_file_tag(&file_tag_key, cx);
+                    });
+                }))
+        } else {
+            menu
+        }
+    }
+
+    fn file_tag_key_for_worktree_entry(worktree: &Worktree, entry: &Entry) -> Option<FileTagKey> {
+        entry.is_file().then(|| FileTagKey {
+            worktree_root: worktree.abs_path().to_string_lossy().into_owned(),
+            path: entry.path.as_unix_str().to_string(),
+        })
+    }
+
+    fn file_tag_color_for_entry(
+        &self,
+        worktree_id: WorktreeId,
+        kind: EntryKind,
+        path: &RelPath,
+        cx: &App,
+    ) -> Option<FileTagColor> {
+        if !kind.is_file() {
+            return None;
+        }
+
+        let project = self.project.read(cx);
+        let worktree = project.worktree_for_id(worktree_id, cx)?;
+        let worktree = worktree.read(cx);
+        self.file_tags.color_for(&FileTagKey {
+            worktree_root: worktree.abs_path().to_string_lossy().into_owned(),
+            path: path.as_unix_str().to_string(),
+        })
+    }
+
+    fn set_file_tag(
+        &mut self,
+        file_tag_key: FileTagKey,
+        file_tag_color: FileTagColor,
+        cx: &mut Context<Self>,
+    ) {
+        let mut file_tags = self.file_tags_for_update().clone();
+        let operation = FileTagOperation::Set {
+            key: file_tag_key,
+            color: file_tag_color,
+        };
+        operation.apply(&mut file_tags);
+        self.persist_file_tags(operation, file_tags, "Failed to tag file", cx);
+    }
+
+    fn clear_file_tag(&mut self, file_tag_key: &FileTagKey, cx: &mut Context<Self>) {
+        let mut file_tags = self.file_tags_for_update().clone();
+        let operation = FileTagOperation::Clear {
+            key: file_tag_key.clone(),
+        };
+        operation.apply(&mut file_tags);
+        self.persist_file_tags(operation, file_tags, "Failed to clear file tag", cx);
+    }
+
+    fn file_tags_for_update(&self) -> &FileTagStore {
+        self.pending_file_tags.as_ref().unwrap_or(&self.file_tags)
+    }
+
+    fn tagged_file_groups(&self, cx: &App) -> Vec<TaggedFileGroup> {
+        let project = self.project.read(cx);
+        let worktrees = project.visible_worktrees(cx).collect::<Vec<_>>();
+        let mut rows = Vec::new();
+
+        'tags: for (file_tag_key, color) in &self.file_tags.tags {
+            let Ok(path) = RelPath::unix(file_tag_key.path.as_str()) else {
+                continue;
+            };
+
+            for worktree in &worktrees {
+                let worktree = worktree.read(cx);
+                if worktree.abs_path().to_string_lossy().as_ref()
+                    != file_tag_key.worktree_root.as_str()
+                {
+                    continue;
+                }
+
+                let entry = worktree
+                    .entry_for_path(path)
+                    .filter(|entry| entry.is_file());
+                let root_name = worktree.root_name().as_unix_str();
+                let path_label = if root_name.is_empty() {
+                    file_tag_key.path.clone()
+                } else if file_tag_key.path.is_empty() {
+                    root_name.to_string()
+                } else {
+                    format!("{root_name}/{}", file_tag_key.path)
+                };
+                let file_name = path
+                    .file_name()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| file_tag_key.path.clone());
+                let tooltip_label = if file_tag_key.path.is_empty() {
+                    file_tag_key.worktree_root.clone()
+                } else {
+                    format!("{}/{}", file_tag_key.worktree_root, file_tag_key.path)
+                };
+                let tooltip_label = if entry.is_some() {
+                    tooltip_label
+                } else {
+                    format!("⚠ Missing: {tooltip_label}")
+                };
+
+                rows.push((
+                    *color,
+                    TaggedFileRow {
+                        worktree_id: worktree.id(),
+                        entry_id: entry.map(|entry| entry.id),
+                        file_tag_key: file_tag_key.clone(),
+                        file_name,
+                        path_label,
+                        tooltip_label,
+                    },
+                ));
+                continue 'tags;
+            }
+        }
+
+        FileTagColor::ALL
+            .into_iter()
+            .filter_map(|color| {
+                let mut group_rows = rows
+                    .iter()
+                    .filter(|(row_color, _)| *row_color == color)
+                    .map(|(_, row)| row.clone())
+                    .collect::<Vec<_>>();
+
+                if group_rows.is_empty() {
+                    return None;
+                }
+
+                group_rows.sort_by(|left, right| {
+                    left.file_name
+                        .cmp(&right.file_name)
+                        .then_with(|| left.path_label.cmp(&right.path_label))
+                        .then_with(|| {
+                            left.file_tag_key
+                                .worktree_root
+                                .cmp(&right.file_tag_key.worktree_root)
+                        })
+                });
+
+                Some(TaggedFileGroup {
+                    color,
+                    rows: group_rows,
+                })
+            })
+            .collect()
+    }
+
+    fn set_file_tag_view_mode(&mut self, view_mode: FileTagViewMode, cx: &mut Context<Self>) {
+        if self.file_tag_view_mode != view_mode {
+            self.file_tag_view_mode = view_mode;
+            cx.notify();
+        }
+    }
+
+    fn toggle_file_tag_group(&mut self, color: FileTagColor, cx: &mut Context<Self>) {
+        if !self.collapsed_file_tag_groups.insert(color) {
+            self.collapsed_file_tag_groups.remove(&color);
+        }
+        cx.notify();
+    }
+
+    fn tagged_file_flat_rows(
+        &self,
+        groups: &[TaggedFileGroup],
+    ) -> Vec<(FileTagColor, TaggedFileRow)> {
+        let mut rows = groups
+            .iter()
+            .flat_map(|group| {
+                group
+                    .rows
+                    .iter()
+                    .cloned()
+                    .map(|row| (group.color, row))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        rows.sort_by(|(left_color, left), (right_color, right)| {
+            left_color
+                .cmp(right_color)
+                .then_with(|| left.file_name.cmp(&right.file_name))
+                .then_with(|| left.path_label.cmp(&right.path_label))
+                .then_with(|| {
+                    left.file_tag_key
+                        .worktree_root
+                        .cmp(&right.file_tag_key.worktree_root)
+                })
+        });
+
+        rows
+    }
+
+    fn open_tagged_file(
+        &mut self,
+        tagged_file: &TaggedFileRow,
+        focus_opened_item: bool,
+        allow_preview: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(entry_id) = tagged_file.entry_id else {
+            return;
+        };
+
+        let selection = SelectedEntry {
+            worktree_id: tagged_file.worktree_id,
+            entry_id,
+        };
+        self.selection = Some(selection);
+        self.file_tag_selection = Some(tagged_file.file_tag_key.clone());
+        self.marked_entries.clear();
+        self.open_entry(entry_id, focus_opened_item, allow_preview, cx);
+    }
+
+    fn visible_tagged_file_rows(&self, cx: &App) -> Vec<TaggedFileRow> {
+        let groups = self.tagged_file_groups(cx);
+        match self.file_tag_view_mode {
+            FileTagViewMode::Flat => self
+                .tagged_file_flat_rows(&groups)
+                .into_iter()
+                .map(|(_, row)| row)
+                .collect(),
+            FileTagViewMode::Tree => groups
+                .into_iter()
+                .flat_map(|group| {
+                    if self.collapsed_file_tag_groups.contains(&group.color) {
+                        Vec::new()
+                    } else {
+                        group.rows
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    fn file_tag_list_items(&self, cx: &App) -> Vec<FileTagListItem> {
+        let groups = self.tagged_file_groups(cx);
+        if groups.is_empty() {
+            return Vec::new();
+        }
+
+        let tagged_file_count = groups.iter().map(|group| group.rows.len()).sum::<usize>();
+        let mut items = vec![FileTagListItem::TagsHeader { tagged_file_count }];
+        match self.file_tag_view_mode {
+            FileTagViewMode::Flat => {
+                items.extend(
+                    self.tagged_file_flat_rows(&groups)
+                        .into_iter()
+                        .map(|(color, row)| FileTagListItem::TaggedFileRow { color, row }),
+                );
+            }
+            FileTagViewMode::Tree => {
+                for group in groups {
+                    let is_expanded = !self.collapsed_file_tag_groups.contains(&group.color);
+                    items.push(FileTagListItem::GroupHeader {
+                        color: group.color,
+                        is_expanded,
+                    });
+                    if is_expanded {
+                        items.extend(group.rows.into_iter().map(|row| {
+                            FileTagListItem::TaggedFileRow {
+                                color: group.color,
+                                row,
+                            }
+                        }));
+                    }
+                }
+            }
+        }
+        items.push(FileTagListItem::ProjectFilesHeader);
+        items
+    }
+
+    fn file_tag_list_item_count(&self, cx: &App) -> usize {
+        self.file_tag_list_items(cx).len()
+    }
+
+    fn project_entry_count(&self) -> usize {
+        self.state
+            .visible_entries
+            .iter()
+            .map(|worktree| worktree.entries.len())
+            .sum()
+    }
+
+    fn project_entry_list_index(&self, project_entry_index: usize, cx: &App) -> usize {
+        self.file_tag_list_item_count(cx) + project_entry_index
+    }
+
+    fn max_width_list_item_index(&self, cx: &App) -> Option<usize> {
+        self.state
+            .max_width_item_index
+            .map(|index| self.project_entry_list_index(index, cx))
+    }
+
+    fn tagged_file_row_list_index(&self, file_tag_key: &FileTagKey, cx: &App) -> Option<usize> {
+        self.file_tag_list_items(cx)
+            .into_iter()
+            .position(|item| matches!(item, FileTagListItem::TaggedFileRow { row, .. } if &row.file_tag_key == file_tag_key))
+    }
+
+    fn selected_list_index(&self, cx: &App) -> Option<usize> {
+        if let Some(tagged_file_row) = self.selected_tagged_file_row(cx) {
+            self.tagged_file_row_list_index(&tagged_file_row.file_tag_key, cx)
+        } else {
+            self.selection
+                .and_then(|selection| self.index_for_selection(selection))
+                .map(|(_, _, index)| self.project_entry_list_index(index, cx))
+        }
+    }
+
+    fn project_entry_index_for_list_index(&self, index: usize, cx: &App) -> Option<usize> {
+        index.checked_sub(self.file_tag_list_item_count(cx))
+    }
+
+    fn project_entry_at_list_index(
+        &self,
+        index: usize,
+        cx: &App,
+    ) -> Option<(WorktreeId, GitEntryRef<'_>)> {
+        self.entry_at_index(self.project_entry_index_for_list_index(index, cx)?)
+    }
+
+    fn selected_tagged_file_row(&self, cx: &App) -> Option<TaggedFileRow> {
+        let selected_file_tag_key = self.file_tag_selection.as_ref()?;
+        let row = self
+            .visible_tagged_file_rows(cx)
+            .into_iter()
+            .find(|row| &row.file_tag_key == selected_file_tag_key)?;
+
+        match row.entry_id {
+            Some(entry_id)
+                if self.selection
+                    == Some(SelectedEntry {
+                        worktree_id: row.worktree_id,
+                        entry_id,
+                    }) =>
+            {
+                Some(row)
+            }
+            None if self.selection.is_none() => Some(row),
+            _ => None,
+        }
+    }
+
+    fn select_tagged_file_row(&mut self, row: TaggedFileRow, cx: &mut Context<Self>) {
+        self.selection = row.entry_id.map(|entry_id| SelectedEntry {
+            worktree_id: row.worktree_id,
+            entry_id,
+        });
+        self.file_tag_selection = Some(row.file_tag_key);
+        self.marked_entries.clear();
+        if let Some(index) = self
+            .file_tag_selection
+            .as_ref()
+            .and_then(|key| self.tagged_file_row_list_index(key, cx))
+        {
+            self.scroll_handle.scroll_to_item_with_offset(
+                index,
+                ScrollStrategy::Center,
+                self.sticky_items_count,
+            );
+        }
+        cx.notify();
+    }
+
+    fn tagged_file_row_id(color: FileTagColor, row: &TaggedFileRow) -> String {
+        format!(
+            "project_panel_tagged_file_{}_{}_{}",
+            color.label(),
+            row.worktree_id,
+            row.file_tag_key.path
+        )
+    }
+
+    fn persist_file_tags(
+        &mut self,
+        operation: FileTagOperation,
+        file_tags: FileTagStore,
+        error_message_prefix: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        let key_value_store = db::kvp::KeyValueStore::global(cx);
+        let previous_update = self.file_tag_update_task.clone();
+        self.pending_file_tags = Some(file_tags.clone());
+        let file_tag_update_task = cx
+            .spawn(async move |this, cx| {
+                previous_update.await;
+                match FileTagStore::persist_operation(&key_value_store, operation).await {
+                    Ok(persisted_file_tags) => {
+                        this.update(cx, |this, cx| {
+                            let is_latest_pending =
+                                this.pending_file_tags.as_ref() == Some(&file_tags);
+                            this.file_tags = persisted_file_tags;
+                            if is_latest_pending {
+                                this.pending_file_tags = None;
+                            }
+                            cx.notify();
+                        })
+                        .log_err();
+                    }
+                    Err(error) => {
+                        this.update(cx, |this, cx| {
+                            if this.pending_file_tags.as_ref() == Some(&file_tags) {
+                                this.pending_file_tags = None;
+                            }
+                            this.show_file_tag_persistence_error(
+                                format!("{error_message_prefix}: {error}"),
+                                cx,
+                            );
+                        })
+                        .log_err();
+                    }
+                }
+            })
+            .shared();
+        cx.foreground_executor()
+            .spawn({
+                let file_tag_update_task = file_tag_update_task.clone();
+                async move {
+                    file_tag_update_task.await;
+                }
+            })
+            .detach();
+        self.file_tag_update_task = file_tag_update_task;
+    }
+
+    fn show_file_tag_persistence_error(&self, message: String, cx: &mut Context<Self>) {
+        let toast = StatusToast::new(message, cx, |this, _| {
+            this.icon(
+                Icon::new(IconName::XCircle)
+                    .size(IconSize::Small)
+                    .color(Color::Error),
+            )
+            .dismiss_button(true)
+        });
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.toggle_status_toast(toast, cx);
+            })
+            .log_err();
     }
 
     fn has_git_changes(&self, entry_id: ProjectEntryId) -> bool {
@@ -1607,7 +2395,20 @@ impl ProjectPanel {
             });
             return;
         }
-        if let Some(selection) = self.selection {
+        if let Some(tagged_file_row) = self.selected_tagged_file_row(cx) {
+            let visible_tagged_file_rows = self.visible_tagged_file_rows(cx);
+            let previous_tagged_file_row = visible_tagged_file_rows
+                .iter()
+                .position(|row| row.file_tag_key == tagged_file_row.file_tag_key)
+                .and_then(|index| index.checked_sub(1))
+                .and_then(|index| visible_tagged_file_rows.get(index))
+                .cloned();
+
+            if let Some(previous_tagged_file_row) = previous_tagged_file_row {
+                self.select_tagged_file_row(previous_tagged_file_row, cx);
+            }
+        } else if let Some(selection) = self.selection {
+            self.file_tag_selection = None;
             let (mut worktree_ix, mut entry_ix, _) =
                 self.index_for_selection(selection).unwrap_or_default();
             if entry_ix > 0 {
@@ -1615,6 +2416,9 @@ impl ProjectPanel {
             } else if worktree_ix > 0 {
                 worktree_ix -= 1;
                 entry_ix = self.state.visible_entries[worktree_ix].entries.len() - 1;
+            } else if let Some(last_tagged_file_row) = self.visible_tagged_file_rows(cx).pop() {
+                self.select_tagged_file_row(last_tagged_file_row, cx);
+                return;
             } else {
                 return;
             }
@@ -1636,6 +2440,28 @@ impl ProjectPanel {
             cx.notify();
         } else {
             self.select_first(&SelectFirst {}, window, cx);
+        }
+    }
+
+    fn select_first_project_entry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(VisibleEntriesForWorktree {
+            worktree_id,
+            entries,
+            ..
+        }) = self.state.visible_entries.first()
+            && let Some(entry) = entries.first()
+        {
+            let selection = SelectedEntry {
+                worktree_id: *worktree_id,
+                entry_id: entry.id,
+            };
+            self.selection = Some(selection);
+            self.file_tag_selection = None;
+            if window.modifiers().shift {
+                self.marked_entries.push(selection);
+            }
+            self.autoscroll(cx);
+            cx.notify();
         }
     }
 
@@ -1687,6 +2513,21 @@ impl ProjectPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(tagged_file) = self.selected_tagged_file_row(cx) {
+            let Some(entry_id) = tagged_file.entry_id else {
+                return;
+            };
+
+            if split_direction.is_some() {
+                self.split_entry(entry_id, allow_preview, split_direction, cx);
+            } else {
+                self.open_tagged_file(&tagged_file, focus_opened_item, allow_preview, cx);
+            }
+            cx.notify();
+            return;
+        }
+        self.file_tag_selection = None;
+
         if let Some((_, entry)) = self.selected_entry(cx) {
             if entry.is_file() {
                 if split_direction.is_some() {
@@ -2714,7 +3555,7 @@ impl ProjectPanel {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some((_, _, index)) = self.selection.and_then(|s| self.index_for_selection(s)) {
+        if let Some(index) = self.selected_list_index(cx) {
             self.scroll_handle
                 .scroll_to_item_strict(index, ScrollStrategy::Center);
             cx.notify();
@@ -2722,7 +3563,7 @@ impl ProjectPanel {
     }
 
     fn scroll_cursor_top(&mut self, _: &ScrollCursorTop, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some((_, _, index)) = self.selection.and_then(|s| self.index_for_selection(s)) {
+        if let Some(index) = self.selected_list_index(cx) {
             self.scroll_handle
                 .scroll_to_item_strict(index, ScrollStrategy::Top);
             cx.notify();
@@ -2735,7 +3576,7 @@ impl ProjectPanel {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some((_, _, index)) = self.selection.and_then(|s| self.index_for_selection(s)) {
+        if let Some(index) = self.selected_list_index(cx) {
             self.scroll_handle
                 .scroll_to_item_strict(index, ScrollStrategy::Bottom);
             cx.notify();
@@ -2757,7 +3598,21 @@ impl ProjectPanel {
             });
             return;
         }
-        if let Some(selection) = self.selection {
+        if let Some(tagged_file_row) = self.selected_tagged_file_row(cx) {
+            let visible_tagged_file_rows = self.visible_tagged_file_rows(cx);
+            let next_tagged_file_row = visible_tagged_file_rows
+                .iter()
+                .position(|row| row.file_tag_key == tagged_file_row.file_tag_key)
+                .and_then(|index| visible_tagged_file_rows.get(index + 1))
+                .cloned();
+
+            if let Some(next_tagged_file_row) = next_tagged_file_row {
+                self.select_tagged_file_row(next_tagged_file_row, cx);
+            } else {
+                self.select_first_project_entry(window, cx);
+            }
+        } else if let Some(selection) = self.selection {
+            self.file_tag_selection = None;
             let (mut worktree_ix, mut entry_ix, _) =
                 self.index_for_selection(selection).unwrap_or_default();
             if let Some(worktree_entries) = self
@@ -2786,6 +3641,7 @@ impl ProjectPanel {
                     entry_id: entry.id,
                 };
                 self.selection = Some(selection);
+                self.file_tag_selection = None;
                 if window.modifiers().shift {
                     self.marked_entries.push(selection);
                 }
@@ -3025,23 +3881,10 @@ impl ProjectPanel {
     }
 
     fn select_first(&mut self, _: &SelectFirst, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(VisibleEntriesForWorktree {
-            worktree_id,
-            entries,
-            ..
-        }) = self.state.visible_entries.first()
-            && let Some(entry) = entries.first()
-        {
-            let selection = SelectedEntry {
-                worktree_id: *worktree_id,
-                entry_id: entry.id,
-            };
-            self.selection = Some(selection);
-            if window.modifiers().shift {
-                self.marked_entries.push(selection);
-            }
-            self.autoscroll(cx);
-            cx.notify();
+        if let Some(first_tagged_file_row) = self.visible_tagged_file_rows(cx).into_iter().next() {
+            self.select_tagged_file_row(first_tagged_file_row, cx);
+        } else {
+            self.select_first_project_entry(window, cx);
         }
     }
 
@@ -3061,6 +3904,7 @@ impl ProjectPanel {
                         entry_id: entry.id,
                     };
                     self.selection = Some(selection);
+                    self.file_tag_selection = None;
                     self.autoscroll(cx);
                     cx.notify();
                 }
@@ -3069,7 +3913,7 @@ impl ProjectPanel {
     }
 
     fn autoscroll(&mut self, cx: &mut Context<Self>) {
-        if let Some((_, _, index)) = self.selection.and_then(|s| self.index_for_selection(s)) {
+        if let Some(index) = self.selected_list_index(cx) {
             self.scroll_handle.scroll_to_item_with_offset(
                 index,
                 ScrollStrategy::Center,
@@ -5502,6 +6346,7 @@ impl ProjectPanel {
             .git_status_indicator
             .then(|| git_status_indicator(details.git_status))
             .flatten();
+        let file_tag_color = self.file_tag_color_for_entry(worktree_id, kind, &path, cx);
 
         let id: ElementId = if is_sticky {
             SharedString::from(format!("project_panel_sticky_item_{}", entry_id.to_usize())).into()
@@ -5741,6 +6586,7 @@ impl ProjectPanel {
                         project_panel.mouse_down = false;
                     }
                     cx.stop_propagation();
+                    project_panel.file_tag_selection = None;
 
                     if let Some(selection) =
                         project_panel.selection.filter(|_| event.modifiers().shift)
@@ -5801,6 +6647,7 @@ impl ProjectPanel {
                             && let Some((_, _, index)) =
                                 project_panel.index_for_entry(entry_id, worktree_id)
                         {
+                            let index = project_panel.project_entry_list_index(index, cx);
                             project_panel
                                 .scroll_handle
                                 .scroll_to_item_strict_with_offset(
@@ -5848,6 +6695,7 @@ impl ProjectPanel {
                     .when(
                         canonical_path.is_some()
                             || diagnostic_count.is_some()
+                            || file_tag_color.is_some()
                             || git_indicator.is_some(),
                         |this| {
                             let symlink_element = canonical_path.map(|path| {
@@ -5889,6 +6737,13 @@ impl ProjectPanel {
                                                         .color(Color::Warning),
                                                 )
                                             },
+                                        )
+                                    })
+                                    .when_some(file_tag_color, |this, file_tag_color| {
+                                        this.child(
+                                            Indicator::dot()
+                                                .color(Color::Custom(file_tag_color.color()))
+                                                .into_any_element(),
                                         )
                                     })
                                     .when_some(git_indicator, |this, (label, color)| {
@@ -6247,6 +7102,300 @@ impl ProjectPanel {
             )
     }
 
+    fn render_file_tag_list_item(
+        &self,
+        item: FileTagListItem,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match item {
+            FileTagListItem::TagsHeader { tagged_file_count } => {
+                self.render_file_tag_header(tagged_file_count, cx)
+            }
+            FileTagListItem::GroupHeader { color, is_expanded } => {
+                self.render_file_tag_group_header(color, is_expanded, cx)
+            }
+            FileTagListItem::TaggedFileRow { color, row } => {
+                let indent_level = match self.file_tag_view_mode {
+                    FileTagViewMode::Flat => 0,
+                    FileTagViewMode::Tree => 2,
+                };
+                self.render_file_tag_row_with_indent(color, row, indent_level, cx)
+            }
+            FileTagListItem::ProjectFilesHeader => ListHeader::new("Project Files")
+                .inset(true)
+                .into_any_element(),
+        }
+    }
+
+    fn render_file_tag_header(
+        &self,
+        tagged_file_count: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        ListHeader::new("Tags")
+            .inset(true)
+            .end_slot(
+                h_flex()
+                    .items_center()
+                    .gap_1()
+                    .child(Label::new(tagged_file_count.to_string()).color(Color::Muted))
+                    .child(self.render_file_tag_view_mode_menu(cx)),
+            )
+            .into_any_element()
+    }
+
+    fn render_file_tag_view_mode_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+        let current_view_mode = self.file_tag_view_mode;
+        let entity = cx.entity();
+        let focus_handle = self.focus_handle.clone();
+
+        PopoverMenu::new("project-panel-tags-view-mode-menu")
+            .trigger(
+                IconButton::new("project-panel-tags-view-mode-trigger", IconName::Ellipsis)
+                    .icon_size(IconSize::Small),
+            )
+            .menu(move |window, cx| {
+                Some(ContextMenu::build(window, cx, {
+                    let entity = entity.clone();
+                    let focus_handle = focus_handle.clone();
+                    move |menu, _, _| {
+                        let flat_entity = entity.clone();
+                        let tree_entity = entity.clone();
+                        menu.context(focus_handle.clone())
+                            .item(
+                                ContextMenuEntry::new("Flat View")
+                                    .toggle(
+                                        IconPosition::Start,
+                                        current_view_mode == FileTagViewMode::Flat,
+                                    )
+                                    .handler(move |_, cx| {
+                                        flat_entity.update(cx, |this, cx| {
+                                            this.set_file_tag_view_mode(FileTagViewMode::Flat, cx);
+                                        });
+                                    }),
+                            )
+                            .item(
+                                ContextMenuEntry::new("Tree View")
+                                    .toggle(
+                                        IconPosition::Start,
+                                        current_view_mode == FileTagViewMode::Tree,
+                                    )
+                                    .handler(move |_, cx| {
+                                        tree_entity.update(cx, |this, cx| {
+                                            this.set_file_tag_view_mode(FileTagViewMode::Tree, cx);
+                                        });
+                                    }),
+                            )
+                    }
+                }))
+            })
+            .anchor(Anchor::TopRight)
+            .into_any_element()
+    }
+
+    fn render_file_tag_group_header(
+        &self,
+        color: FileTagColor,
+        is_expanded: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        h_flex()
+            .id(format!("project-panel-file-tag-group-{}", color.label()))
+            .h_7()
+            .w_full()
+            .items_center()
+            .gap_1()
+            .pr_3()
+            .child(
+                div().ml(px(4.)).child(
+                    Disclosure::new(
+                        format!("project-panel-file-tag-group-disclosure-{}", color.label()),
+                        is_expanded,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_file_tag_group(color, cx);
+                    })),
+                ),
+            )
+            .child(Indicator::dot().color(Color::Custom(color.color())))
+            .child(
+                Label::new(color.label())
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .into_any_element()
+    }
+
+    fn render_file_tag_row_with_indent(
+        &self,
+        color: FileTagColor,
+        row: TaggedFileRow,
+        indent_level: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let panel_settings = ProjectPanelSettings::get_global(cx);
+        let drag_and_drop_enabled = panel_settings.drag_and_drop;
+        let icon = FileIcons::get_icon(Path::new(&row.file_name), cx);
+        let id: ElementId = SharedString::from(Self::tagged_file_row_id(color, &row)).into();
+        let is_resolved = row.entry_id.is_some();
+        let is_selected = self.file_tag_selection.as_ref() == Some(&row.file_tag_key)
+            && match row.entry_id {
+                Some(entry_id) => {
+                    self.selection
+                        == Some(SelectedEntry {
+                            worktree_id: row.worktree_id,
+                            entry_id,
+                        })
+                }
+                None => self.selection.is_none(),
+            };
+        let item_colors = get_item_color(false, cx);
+        let bg_color = if is_selected {
+            item_colors.marked
+        } else {
+            item_colors.default
+        };
+        let bg_hover_color = if is_selected {
+            item_colors.marked
+        } else {
+            item_colors.hover
+        };
+        let border_color = if is_selected {
+            item_colors.focused
+        } else {
+            bg_color
+        };
+        let border_hover_color = if is_selected {
+            item_colors.focused
+        } else {
+            bg_hover_color
+        };
+        let row_for_open = row.clone();
+        let row_for_context_menu = row.clone();
+        let tooltip_label = row.tooltip_label.clone();
+        let tooltip_path = row.entry_id.is_none().then(|| {
+            tooltip_label
+                .strip_prefix("⚠ Missing: ")
+                .unwrap_or(&tooltip_label)
+                .to_owned()
+        });
+        let status_label = row.status_label();
+        let dragged_selection = row.entry_id.map(|entry_id| DraggedSelection {
+            active_selection: SelectedEntry {
+                worktree_id: row.worktree_id,
+                entry_id,
+            },
+            marked_selections: Arc::from([SelectedEntry {
+                worktree_id: row.worktree_id,
+                entry_id,
+            }]),
+        });
+        let filename = row.file_name.clone();
+
+        div()
+            .id(id.clone())
+            .bg(bg_color)
+            .border_1()
+            .border_r_2()
+            .border_color(border_color)
+            .hover(|style| style.bg(bg_hover_color).border_color(border_hover_color))
+            .when_some(
+                dragged_selection.filter(|_| drag_and_drop_enabled),
+                |this, dragged_selection| {
+                    this.on_drag(
+                        dragged_selection,
+                        move |selection, click_offset, _window, cx| {
+                            cx.new(|_| DraggedProjectEntryView {
+                                icon: icon.clone(),
+                                filename: filename.clone(),
+                                click_offset,
+                                selection: selection.active_selection,
+                                selections: selection.marked_selections.clone(),
+                            })
+                        },
+                    )
+                },
+            )
+            .when(is_resolved, |this| {
+                this.cursor_pointer().on_click(cx.listener(
+                    move |this, event: &gpui::ClickEvent, _window, cx| {
+                        if !event.standard_click() {
+                            return;
+                        }
+
+                        let preview_tabs_enabled =
+                            PreviewTabsSettings::get_global(cx).enable_preview_from_project_panel;
+                        let click_count = event.click_count();
+                        let focus_opened_item = click_count > 1;
+                        let allow_preview = preview_tabs_enabled && click_count == 1;
+                        this.open_tagged_file(&row_for_open, focus_opened_item, allow_preview, cx);
+                        cx.stop_propagation();
+                    },
+                ))
+            })
+            .child(
+                ListItem::new(id)
+                    .height(px(28.))
+                    .indent_level(indent_level)
+                    .indent_step_size(px(panel_settings.indent_size))
+                    .spacing(match panel_settings.entry_spacing {
+                        ProjectPanelEntrySpacing::Comfortable => ListItemSpacing::Dense,
+                        ProjectPanelEntrySpacing::Standard => ListItemSpacing::ExtraDense,
+                    })
+                    .selectable(false)
+                    .tooltip(move |_window, cx| {
+                        if let Some(tooltip_path) = tooltip_path.clone() {
+                            cx.new(|_| {
+                                Tooltip::new_element(move |_window, _cx| {
+                                    h_flex()
+                                        .gap_1()
+                                        .flex_wrap()
+                                        .child(Label::new("⚠ Missing:").color(Color::Error))
+                                        .child(Label::new(tooltip_path.clone()))
+                                        .into_any_element()
+                                })
+                            })
+                            .into()
+                        } else {
+                            Tooltip::simple(tooltip_label.clone(), cx)
+                        }
+                    })
+                    .on_secondary_mouse_down(cx.listener(
+                        move |this, event: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.deploy_tagged_file_context_menu(
+                                event.position,
+                                row_for_context_menu.clone(),
+                                window,
+                                cx,
+                            );
+                        },
+                    ))
+                    .child(
+                        h_flex()
+                            .h_full()
+                            .w_full()
+                            .items_center()
+                            .gap_1()
+                            .overflow_hidden()
+                            .child(Indicator::dot().color(Color::Custom(color.color())))
+                            .child(
+                                Label::new(row.file_name)
+                                    .single_line()
+                                    .when(!is_resolved, |this| this.color(Color::Muted)),
+                            )
+                            .when_some(status_label, |this, status_label| {
+                                this.child(
+                                    Label::new(status_label)
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Error),
+                                )
+                            }),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn details_for_entry(
         &self,
         entry: &Entry,
@@ -6464,7 +7613,7 @@ impl ProjectPanel {
                 child_count += 1;
             }
 
-            let start = ix + 1;
+            let start = self.project_entry_list_index(ix + 1, cx);
             let end = start + child_count;
 
             let visible_worktree = &self.state.visible_entries[worktree_ix];
@@ -6635,6 +7784,12 @@ fn item_width_estimate(depth: usize, item_text_chars: usize, is_symlink: bool) -
 impl Render for ProjectPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let has_worktree = !self.state.visible_entries.is_empty();
+        let file_tag_list_items = if has_worktree {
+            self.file_tag_list_items(cx)
+        } else {
+            Vec::new()
+        };
+        let has_file_tags_section = !file_tag_list_items.is_empty();
         let project = self.project.read(cx);
         let panel_settings = ProjectPanelSettings::get_global(cx);
         let indent_size = panel_settings.indent_size;
@@ -6644,7 +7799,7 @@ impl Render for ProjectPanel {
             if panel_settings.sticky_scroll {
                 let is_scrollable = self.scroll_handle.is_scrollable();
                 let is_scrolled = self.scroll_handle.offset().y < px(0.);
-                is_scrollable && is_scrolled
+                is_scrollable && is_scrolled && !has_file_tags_section
             } else {
                 false
             }
@@ -6653,12 +7808,8 @@ impl Render for ProjectPanel {
         let is_local = project.is_local();
 
         if has_worktree {
-            let item_count = self
-                .state
-                .visible_entries
-                .iter()
-                .map(|worktree| worktree.entries.len())
-                .sum();
+            let item_count = file_tag_list_items.len() + self.project_entry_count();
+            let max_width_item_index = self.max_width_list_item_index(cx);
 
             fn handle_drag_move<T: 'static>(
                 this: &mut ProjectPanel,
@@ -6815,14 +7966,34 @@ impl Render for ProjectPanel {
                                 cx.processor(|this, range: Range<usize>, window, cx| {
                                     this.rendered_entries_len = range.end - range.start;
                                     let mut items = Vec::with_capacity(this.rendered_entries_len);
-                                    this.for_each_visible_entry(
-                                        range,
-                                        window,
-                                        cx,
-                                        &mut |id, details, window, cx| {
-                                            items.push(this.render_entry(id, details, window, cx));
-                                        },
-                                    );
+                                    let file_tag_list_items = this.file_tag_list_items(cx);
+                                    let file_tag_items_end =
+                                        range.end.min(file_tag_list_items.len());
+                                    for item in file_tag_list_items
+                                        [range.start.min(file_tag_items_end)..file_tag_items_end]
+                                        .iter()
+                                        .cloned()
+                                    {
+                                        items.push(this.render_file_tag_list_item(item, cx));
+                                    }
+
+                                    let project_range_start =
+                                        range.start.saturating_sub(file_tag_list_items.len());
+                                    let project_range_end =
+                                        range.end.saturating_sub(file_tag_list_items.len());
+                                    if project_range_start < project_range_end {
+                                        this.for_each_visible_entry(
+                                            project_range_start..project_range_end,
+                                            window,
+                                            cx,
+                                            &mut |id, details, window, cx| {
+                                                items.push(
+                                                    this.render_entry(id, details, window, cx)
+                                                        .into_any_element(),
+                                                );
+                                            },
+                                        );
+                                    }
                                     items
                                 })
                             })
@@ -6837,8 +8008,22 @@ impl Render for ProjectPanel {
                                         |this, range, window, cx| {
                                             let mut items =
                                                 SmallVec::with_capacity(range.end - range.start);
+                                            let file_tag_list_item_count =
+                                                this.file_tag_list_item_count(cx);
+                                            let file_tag_items_end =
+                                                range.end.min(file_tag_list_item_count);
+                                            items.extend(
+                                                (range.start.min(file_tag_items_end)
+                                                    ..file_tag_items_end)
+                                                    .map(|_| 0),
+                                            );
+                                            let project_range_start = range
+                                                .start
+                                                .saturating_sub(file_tag_list_item_count);
+                                            let project_range_end =
+                                                range.end.saturating_sub(file_tag_list_item_count);
                                             this.iter_visible_entries(
-                                                range,
+                                                project_range_start..project_range_end,
                                                 window,
                                                 cx,
                                                 &mut |entry, _, entries, _, _| {
@@ -6861,7 +8046,7 @@ impl Render for ProjectPanel {
                                                 let ix = active_indent_guide.offset.y;
                                                 let Some((target_entry, worktree)) = maybe!({
                                                     let (worktree_id, entry) =
-                                                        this.entry_at_index(ix)?;
+                                                        this.project_entry_at_list_index(ix, cx)?;
                                                     let worktree = this
                                                         .project
                                                         .read(cx)
@@ -6950,8 +8135,14 @@ impl Render for ProjectPanel {
                                     |this, range, window, cx| {
                                         let mut items =
                                             SmallVec::with_capacity(range.end - range.start);
+                                        let file_tag_list_item_count =
+                                            this.file_tag_list_item_count(cx);
+                                        let project_range_start =
+                                            range.start.saturating_sub(file_tag_list_item_count);
+                                        let project_range_end =
+                                            range.end.saturating_sub(file_tag_list_item_count);
                                         this.iter_visible_entries(
-                                            range,
+                                            project_range_start..project_range_end,
                                             window,
                                             cx,
                                             &mut |entry, index, entries, _, _| {
@@ -7024,7 +8215,7 @@ impl Render for ProjectPanel {
                                 ListHorizontalSizingBehavior::FitList
                             })
                             .when(horizontal_scroll, |list| {
-                                list.with_width_from_item(self.state.max_width_item_index)
+                                list.with_width_from_item(max_width_item_index)
                             })
                             .track_scroll(&self.scroll_handle),
                         )
@@ -7137,6 +8328,7 @@ impl Render for ProjectPanel {
                                     }
                                     cx.stop_propagation();
                                     this.selection = None;
+                                    this.file_tag_selection = None;
                                     this.marked_entries.clear();
                                     this.focus_handle(cx).focus(window, cx);
                                 }))

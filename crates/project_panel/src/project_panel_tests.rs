@@ -13,7 +13,11 @@ use project::{FakeFs, ProjectPath};
 use serde_json::json;
 use settings::{ProjectPanelAutoOpenSettings, SettingsStore};
 use smallvec::smallvec;
-use std::path::{Path, PathBuf};
+use std::{
+    cell::RefCell,
+    path::{Path, PathBuf},
+    rc::Rc,
+};
 use util::{path, paths::PathStyle, rel_path::rel_path};
 use workspace::{
     AppState, ItemHandle, MultiWorkspace, Pane, Workspace,
@@ -10696,6 +10700,15 @@ pub(crate) fn init_test(cx: &mut TestAppContext) {
     });
 }
 
+async fn clear_file_tags_for_test(cx: &mut TestAppContext) {
+    let key_value_store = cx.update(|cx| db::kvp::KeyValueStore::global(cx));
+    key_value_store
+        .scoped(FileTagStore::KVP_NAMESPACE)
+        .delete_all()
+        .await
+        .expect("file-tag test store should be cleared");
+}
+
 fn init_test_with_editor(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let app_state = AppState::test(cx);
@@ -10933,5 +10946,1190 @@ async fn test_delete_prompt_escapes_markdown_in_file_name(cx: &mut gpui::TestApp
     assert_eq!(
         message,
         "Are you sure you want to permanently delete `__somefile__`?"
+    );
+}
+
+#[gpui::test]
+async fn test_file_tags_set_change_clear_for_file(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    clear_file_tags_for_test(cx).await;
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            "src": {
+                "main.rs": "",
+            },
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+        .expect("workspace should be available");
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+
+    let file_entry_id =
+        find_project_entry(&panel, "root/src/main.rs", cx).expect("file entry should exist");
+
+    let (worktree_id, file_tag_key) = panel.update(cx, |panel, cx| {
+        let worktree = panel
+            .project
+            .read(cx)
+            .worktree_for_entry(file_entry_id, cx)
+            .expect("file entry should belong to a worktree");
+        {
+            let worktree = worktree.read(cx);
+            let entry = worktree
+                .entry_for_id(file_entry_id)
+                .expect("file entry should still exist");
+            (
+                worktree.id(),
+                ProjectPanel::file_tag_key_for_worktree_entry(worktree, entry)
+                    .expect("files should support tags"),
+            )
+        }
+    });
+
+    panel.update(cx, |panel, cx| {
+        panel.set_file_tag(file_tag_key.clone(), FileTagColor::Red, cx);
+        assert_eq!(panel.file_tags.color_for(&file_tag_key), None);
+    });
+    cx.run_until_parked();
+    panel.update(cx, |panel, cx| {
+        assert_eq!(
+            panel.file_tags.color_for(&file_tag_key),
+            Some(FileTagColor::Red)
+        );
+        assert_eq!(
+            panel.file_tag_color_for_entry(
+                worktree_id,
+                EntryKind::File,
+                rel_path("src/main.rs"),
+                cx
+            ),
+            Some(FileTagColor::Red)
+        );
+
+        panel.set_file_tag(file_tag_key.clone(), FileTagColor::Blue, cx);
+        assert_eq!(
+            panel.file_tags.color_for(&file_tag_key),
+            Some(FileTagColor::Red)
+        );
+    });
+    cx.run_until_parked();
+    panel.update(cx, |panel, project_panel_cx| {
+        assert_eq!(
+            panel.file_tags.color_for(&file_tag_key),
+            Some(FileTagColor::Blue)
+        );
+
+        panel.clear_file_tag(&file_tag_key, project_panel_cx);
+        assert_eq!(
+            panel.file_tags.color_for(&file_tag_key),
+            Some(FileTagColor::Blue)
+        );
+    });
+    cx.run_until_parked();
+    panel.update(cx, |panel, _cx| {
+        assert_eq!(panel.file_tags.color_for(&file_tag_key), None);
+    });
+}
+
+fn set_file_tag_for_test(
+    panel: &Entity<ProjectPanel>,
+    path: &str,
+    file_tag_color: FileTagColor,
+    cx: &mut VisualTestContext,
+) -> ProjectEntryId {
+    let (_, file_entry_id, file_tag_key) = file_tag_key_for_test(panel, path, cx);
+
+    panel.update(cx, |panel, cx| {
+        panel.file_tags.set_color(file_tag_key, file_tag_color);
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    file_entry_id
+}
+
+fn file_tag_key_for_test(
+    panel: &Entity<ProjectPanel>,
+    path: &str,
+    cx: &mut VisualTestContext,
+) -> (WorktreeId, ProjectEntryId, FileTagKey) {
+    let file_entry_id =
+        find_project_entry(panel, path, cx).unwrap_or_else(|| panic!("file {path:?} should exist"));
+
+    panel.update(cx, |panel, cx| {
+        let worktree = panel
+            .project
+            .read(cx)
+            .worktree_for_entry(file_entry_id, cx)
+            .expect("file entry should belong to a worktree");
+        let worktree = worktree.read(cx);
+        let entry = worktree
+            .entry_for_id(file_entry_id)
+            .expect("file entry should still exist");
+
+        (
+            worktree.id(),
+            file_entry_id,
+            ProjectPanel::file_tag_key_for_worktree_entry(worktree, entry)
+                .expect("files should support tags"),
+        )
+    })
+}
+
+fn file_tag_key_for_worktree_path_for_test(
+    panel: &Entity<ProjectPanel>,
+    worktree_abs_path: &str,
+    path: &str,
+    cx: &mut VisualTestContext,
+) -> (WorktreeId, ProjectEntryId, FileTagKey) {
+    panel.update(cx, |panel, cx| {
+        for worktree in panel.project.read(cx).worktrees(cx).collect::<Vec<_>>() {
+            let worktree = worktree.read(cx);
+            if worktree.abs_path().as_ref() != Path::new(worktree_abs_path) {
+                continue;
+            }
+
+            let entry = worktree
+                .entry_for_path(rel_path(path))
+                .unwrap_or_else(|| panic!("file {path:?} should exist in {worktree_abs_path:?}"));
+            return (
+                worktree.id(),
+                entry.id,
+                ProjectPanel::file_tag_key_for_worktree_entry(worktree, entry)
+                    .expect("files should support tags"),
+            );
+        }
+
+        panic!("worktree {worktree_abs_path:?} should exist");
+    })
+}
+
+fn set_missing_file_tag_for_test(
+    panel: &Entity<ProjectPanel>,
+    worktree_abs_path: &str,
+    path: &str,
+    file_tag_color: FileTagColor,
+    cx: &mut VisualTestContext,
+) -> FileTagKey {
+    let file_tag_key = FileTagKey {
+        worktree_root: worktree_abs_path.to_string(),
+        path: path.to_string(),
+    };
+
+    panel.update(cx, |panel, cx| {
+        panel
+            .file_tags
+            .set_color(file_tag_key.clone(), file_tag_color);
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    file_tag_key
+}
+
+fn tagged_file_groups_as_strings(
+    panel: &Entity<ProjectPanel>,
+    cx: &mut VisualTestContext,
+) -> Vec<String> {
+    panel.update(cx, |panel, cx| {
+        panel
+            .tagged_file_groups(cx)
+            .into_iter()
+            .flat_map(|group| {
+                std::iter::once(group.color.label().to_string()).chain(
+                    group
+                        .rows
+                        .into_iter()
+                        .map(|row| format!("  {} - {}", row.file_name, row.path_label)),
+                )
+            })
+            .collect()
+    })
+}
+
+fn visible_tagged_file_tree_rows_as_strings(
+    panel: &Entity<ProjectPanel>,
+    cx: &mut VisualTestContext,
+) -> Vec<String> {
+    panel.update(cx, |panel, cx| {
+        panel
+            .tagged_file_groups(cx)
+            .into_iter()
+            .flat_map(|group| {
+                let group_label = std::iter::once(group.color.label().to_string());
+                if panel.collapsed_file_tag_groups.contains(&group.color) {
+                    group_label.collect::<Vec<_>>()
+                } else {
+                    group_label
+                        .chain(
+                            group
+                                .rows
+                                .into_iter()
+                                .map(|row| format!("  {} - {}", row.file_name, row.path_label)),
+                        )
+                        .collect::<Vec<_>>()
+                }
+            })
+            .collect()
+    })
+}
+
+fn tagged_file_flat_rows_as_strings(
+    panel: &Entity<ProjectPanel>,
+    cx: &mut VisualTestContext,
+) -> Vec<String> {
+    panel.update(cx, |panel, cx| {
+        let groups = panel.tagged_file_groups(cx);
+        panel
+            .tagged_file_flat_rows(&groups)
+            .into_iter()
+            .map(|(color, row)| {
+                format!("{} - {} - {}", row.file_name, row.path_label, color.label())
+            })
+            .collect()
+    })
+}
+
+#[gpui::test]
+async fn test_file_tags_compose_updates_while_persistence_is_pending(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+    clear_file_tags_for_test(cx).await;
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            "src": {
+                "lib.rs": "",
+                "main.rs": "",
+            },
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+        .expect("workspace should be available");
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+
+    let (_, _, main_file_tag_key) = file_tag_key_for_test(&panel, "root/src/main.rs", cx);
+    let (_, _, lib_file_tag_key) = file_tag_key_for_test(&panel, "root/src/lib.rs", cx);
+
+    panel.update(cx, |panel, cx| {
+        panel.set_file_tag(main_file_tag_key.clone(), FileTagColor::Red, cx);
+        panel.set_file_tag(lib_file_tag_key.clone(), FileTagColor::Blue, cx);
+
+        assert_eq!(panel.file_tags.color_for(&main_file_tag_key), None);
+        assert_eq!(panel.file_tags.color_for(&lib_file_tag_key), None);
+        let pending_file_tags = panel
+            .pending_file_tags
+            .as_ref()
+            .expect("pending tags should compose both writes");
+        assert_eq!(
+            pending_file_tags.color_for(&main_file_tag_key),
+            Some(FileTagColor::Red)
+        );
+        assert_eq!(
+            pending_file_tags.color_for(&lib_file_tag_key),
+            Some(FileTagColor::Blue)
+        );
+    });
+    cx.run_until_parked();
+
+    panel.update(cx, |panel, _| {
+        assert_eq!(
+            panel.file_tags.color_for(&main_file_tag_key),
+            Some(FileTagColor::Red)
+        );
+        assert_eq!(
+            panel.file_tags.color_for(&lib_file_tag_key),
+            Some(FileTagColor::Blue)
+        );
+        assert_eq!(panel.pending_file_tags, None);
+    });
+}
+
+#[gpui::test]
+async fn test_file_tags_do_not_apply_to_directories(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    clear_file_tags_for_test(cx).await;
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            "src": {
+                "main.rs": "",
+            },
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+        .expect("workspace should be available");
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+
+    let directory_entry_id =
+        find_project_entry(&panel, "root/src", cx).expect("directory entry should exist");
+
+    panel.update(cx, |panel, cx| {
+        let worktree = panel
+            .project
+            .read(cx)
+            .worktree_for_entry(directory_entry_id, cx)
+            .expect("directory entry should belong to a worktree");
+        let worktree = worktree.read(cx);
+        let entry = worktree
+            .entry_for_id(directory_entry_id)
+            .expect("directory entry should still exist");
+
+        assert_eq!(
+            ProjectPanel::file_tag_key_for_worktree_entry(worktree, entry),
+            None
+        );
+        assert_eq!(
+            panel.file_tag_color_for_entry(worktree.id(), EntryKind::Dir, rel_path("src"), cx),
+            None
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_file_tags_persist_to_local_kvp_store() {
+    let db =
+        db::kvp::KeyValueStore::open_test_db("project_panel_file_tags_persist_to_local_kvp_store")
+            .await;
+    db.scoped(FileTagStore::KVP_NAMESPACE)
+        .delete_all()
+        .await
+        .expect("test store should be cleared");
+
+    let file_tag_key = FileTagKey {
+        worktree_root: "/root".to_string(),
+        path: "src/main.rs".to_string(),
+    };
+
+    let mut file_tags = FileTagStore::default();
+    file_tags.set_color(file_tag_key.clone(), FileTagColor::Green);
+    file_tags
+        .persist(&db)
+        .await
+        .expect("file tags should persist");
+
+    let loaded_file_tags = FileTagStore::load(&db);
+    assert_eq!(
+        loaded_file_tags.color_for(&file_tag_key),
+        Some(FileTagColor::Green)
+    );
+}
+
+#[gpui::test]
+async fn test_file_tag_store_operations_merge_with_latest_kvp_snapshot() {
+    let db = db::kvp::KeyValueStore::open_test_db(
+        "project_panel_file_tag_store_operations_merge_with_latest_kvp_snapshot",
+    )
+    .await;
+    db.scoped(FileTagStore::KVP_NAMESPACE)
+        .delete_all()
+        .await
+        .expect("test store should be cleared");
+
+    let first_file_tag_key = FileTagKey {
+        worktree_root: "/root".to_string(),
+        path: "src/main.rs".to_string(),
+    };
+    let second_file_tag_key = FileTagKey {
+        worktree_root: "/root".to_string(),
+        path: "src/lib.rs".to_string(),
+    };
+
+    FileTagStore::persist_operation(
+        &db,
+        FileTagOperation::Set {
+            key: first_file_tag_key.clone(),
+            color: FileTagColor::Red,
+        },
+    )
+    .await
+    .expect("first tag should persist");
+    FileTagStore::persist_operation(
+        &db,
+        FileTagOperation::Set {
+            key: second_file_tag_key.clone(),
+            color: FileTagColor::Blue,
+        },
+    )
+    .await
+    .expect("second tag should merge with existing store");
+
+    let loaded_file_tags = FileTagStore::load(&db);
+    assert_eq!(
+        loaded_file_tags.color_for(&first_file_tag_key),
+        Some(FileTagColor::Red)
+    );
+    assert_eq!(
+        loaded_file_tags.color_for(&second_file_tag_key),
+        Some(FileTagColor::Blue)
+    );
+
+    FileTagStore::persist_operation(
+        &db,
+        FileTagOperation::Clear {
+            key: second_file_tag_key.clone(),
+        },
+    )
+    .await
+    .expect("clearing one tag should merge with existing store");
+
+    let loaded_file_tags = FileTagStore::load(&db);
+    assert_eq!(
+        loaded_file_tags.color_for(&first_file_tag_key),
+        Some(FileTagColor::Red)
+    );
+    assert_eq!(loaded_file_tags.color_for(&second_file_tag_key), None);
+}
+
+#[gpui::test]
+async fn test_file_tags_disambiguate_same_root_name_worktrees(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    clear_file_tags_for_test(cx).await;
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/one/root",
+        json!({
+            "src": {
+                "main.rs": "",
+            },
+        }),
+    )
+    .await;
+    fs.insert_tree(
+        "/two/root",
+        json!({
+            "src": {
+                "main.rs": "",
+            },
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), ["/one/root".as_ref(), "/two/root".as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+        .expect("workspace should be available");
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+
+    let (_, _, first_file_tag_key) =
+        file_tag_key_for_worktree_path_for_test(&panel, "/one/root", "src/main.rs", cx);
+    let (_, _, second_file_tag_key) =
+        file_tag_key_for_worktree_path_for_test(&panel, "/two/root", "src/main.rs", cx);
+
+    panel.update(cx, |panel, cx| {
+        panel.set_file_tag(first_file_tag_key, FileTagColor::Red, cx);
+        panel.set_file_tag(second_file_tag_key, FileTagColor::Red, cx);
+    });
+    cx.run_until_parked();
+
+    let rows = panel.update(cx, |panel, cx| {
+        panel
+            .tagged_file_groups(cx)
+            .into_iter()
+            .find(|group| group.color == FileTagColor::Red)
+            .expect("red group should exist")
+            .rows
+    });
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.path_label.as_str())
+            .collect::<Vec<_>>(),
+        vec!["root/src/main.rs", "root/src/main.rs"]
+    );
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.tooltip_label.as_str())
+            .collect::<Vec<_>>(),
+        vec!["/one/root/src/main.rs", "/two/root/src/main.rs"]
+    );
+    assert_eq!(
+        rows.iter()
+            .map(|row| ProjectPanel::tagged_file_row_id(FileTagColor::Red, row))
+            .collect::<HashSet<_>>()
+            .len(),
+        2
+    );
+}
+
+#[gpui::test]
+async fn test_file_tags_group_by_color_for_project_panel_tags_section(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+    clear_file_tags_for_test(cx).await;
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            "src": {
+                "lib.rs": "",
+                "main.rs": "",
+            },
+            "tests": {
+                "main.rs": "",
+            },
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+        .expect("workspace should be available");
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+
+    set_file_tag_for_test(&panel, "root/tests/main.rs", FileTagColor::Red, cx);
+    set_file_tag_for_test(&panel, "root/src/lib.rs", FileTagColor::Blue, cx);
+    set_file_tag_for_test(&panel, "root/src/main.rs", FileTagColor::Red, cx);
+    assert_eq!(
+        tagged_file_groups_as_strings(&panel, cx),
+        vec![
+            "Red",
+            "  main.rs - root/src/main.rs",
+            "  main.rs - root/tests/main.rs",
+            "Blue",
+            "  lib.rs - root/src/lib.rs",
+        ]
+    );
+}
+
+#[gpui::test]
+async fn test_file_tags_switch_between_flat_and_tree_view(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    clear_file_tags_for_test(cx).await;
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            "src": {
+                "app.rs": "",
+                "lib.rs": "",
+                "main.rs": "",
+            },
+            "tests": {
+                "main.rs": "",
+            },
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+        .expect("workspace should be available");
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+
+    set_file_tag_for_test(&panel, "root/tests/main.rs", FileTagColor::Red, cx);
+    set_file_tag_for_test(&panel, "root/src/lib.rs", FileTagColor::Blue, cx);
+    set_file_tag_for_test(&panel, "root/src/main.rs", FileTagColor::Red, cx);
+    set_file_tag_for_test(&panel, "root/src/app.rs", FileTagColor::Red, cx);
+
+    assert_eq!(
+        panel.read_with(cx, |panel, _| panel.file_tag_view_mode),
+        FileTagViewMode::Tree
+    );
+    assert_eq!(
+        tagged_file_groups_as_strings(&panel, cx),
+        vec![
+            "Red",
+            "  app.rs - root/src/app.rs",
+            "  main.rs - root/src/main.rs",
+            "  main.rs - root/tests/main.rs",
+            "Blue",
+            "  lib.rs - root/src/lib.rs",
+        ]
+    );
+
+    panel.update(cx, |panel, cx| {
+        panel.set_file_tag_view_mode(FileTagViewMode::Flat, cx);
+    });
+
+    assert_eq!(
+        panel.read_with(cx, |panel, _| panel.file_tag_view_mode),
+        FileTagViewMode::Flat
+    );
+    assert_eq!(
+        tagged_file_flat_rows_as_strings(&panel, cx),
+        vec![
+            "app.rs - root/src/app.rs - Red",
+            "main.rs - root/src/main.rs - Red",
+            "main.rs - root/tests/main.rs - Red",
+            "lib.rs - root/src/lib.rs - Blue",
+        ]
+    );
+
+    panel.update(cx, |panel, cx| {
+        panel.set_file_tag_view_mode(FileTagViewMode::Tree, cx);
+    });
+    assert_eq!(
+        panel.read_with(cx, |panel, _| panel.file_tag_view_mode),
+        FileTagViewMode::Tree
+    );
+}
+
+#[gpui::test]
+async fn test_file_tags_tree_groups_expand_and_collapse(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    clear_file_tags_for_test(cx).await;
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            "src": {
+                "lib.rs": "",
+                "main.rs": "",
+            },
+            "tests": {
+                "main.rs": "",
+            },
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+        .expect("workspace should be available");
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+
+    set_file_tag_for_test(&panel, "root/tests/main.rs", FileTagColor::Red, cx);
+    set_file_tag_for_test(&panel, "root/src/lib.rs", FileTagColor::Blue, cx);
+    set_file_tag_for_test(&panel, "root/src/main.rs", FileTagColor::Red, cx);
+
+    assert_eq!(
+        visible_tagged_file_tree_rows_as_strings(&panel, cx),
+        vec![
+            "Red",
+            "  main.rs - root/src/main.rs",
+            "  main.rs - root/tests/main.rs",
+            "Blue",
+            "  lib.rs - root/src/lib.rs",
+        ]
+    );
+
+    panel.update(cx, |panel, cx| {
+        panel.toggle_file_tag_group(FileTagColor::Red, cx);
+    });
+
+    assert_eq!(
+        visible_tagged_file_tree_rows_as_strings(&panel, cx),
+        vec!["Red", "Blue", "  lib.rs - root/src/lib.rs"]
+    );
+
+    panel.update(cx, |panel, cx| {
+        panel.set_file_tag_view_mode(FileTagViewMode::Flat, cx);
+    });
+
+    assert_eq!(
+        tagged_file_flat_rows_as_strings(&panel, cx),
+        vec![
+            "main.rs - root/src/main.rs - Red",
+            "main.rs - root/tests/main.rs - Red",
+            "lib.rs - root/src/lib.rs - Blue",
+        ]
+    );
+
+    panel.update(cx, |panel, cx| {
+        panel.set_file_tag_view_mode(FileTagViewMode::Tree, cx);
+        panel.toggle_file_tag_group(FileTagColor::Red, cx);
+    });
+
+    assert_eq!(
+        visible_tagged_file_tree_rows_as_strings(&panel, cx),
+        vec![
+            "Red",
+            "  main.rs - root/src/main.rs",
+            "  main.rs - root/tests/main.rs",
+            "Blue",
+            "  lib.rs - root/src/lib.rs",
+        ]
+    );
+}
+
+#[gpui::test]
+async fn test_file_tags_show_missing_rows_as_unresolved_and_clearable(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+    clear_file_tags_for_test(cx).await;
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            "src": {
+                "main.rs": "",
+            },
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+        .expect("workspace should be available");
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+
+    let missing_file_tag_key =
+        set_missing_file_tag_for_test(&panel, "/root", "src/missing.rs", FileTagColor::Red, cx);
+    let missing_row = panel.update(cx, |panel, cx| {
+        panel
+            .tagged_file_groups(cx)
+            .into_iter()
+            .find(|group| group.color == FileTagColor::Red)
+            .expect("red group should exist")
+            .rows
+            .into_iter()
+            .find(|row| row.file_tag_key == missing_file_tag_key)
+            .expect("missing tagged row should be present")
+    });
+
+    assert_eq!(missing_row.entry_id, None);
+    assert_eq!(missing_row.file_name, "missing.rs");
+    assert_eq!(missing_row.path_label, "root/src/missing.rs");
+    assert_eq!(missing_row.tooltip_label, "⚠ Missing: /root/src/missing.rs");
+    assert_eq!(missing_row.status_label(), Some("⚠ Missing"));
+
+    let opened_entries = Rc::new(RefCell::new(Vec::new()));
+    let _subscription = panel.update(cx, |_, cx| {
+        let panel = cx.entity();
+        let opened_entries = opened_entries.clone();
+        cx.subscribe(&panel, move |_, _, event: &Event, _| {
+            if let Event::OpenedEntry { entry_id, .. } = event {
+                opened_entries.borrow_mut().push(*entry_id);
+            }
+        })
+    });
+
+    panel.update(cx, |panel, cx| {
+        panel.open_tagged_file(&missing_row, false, true, cx);
+    });
+    assert!(
+        opened_entries.borrow().is_empty(),
+        "unresolved tagged rows should not open an entry"
+    );
+
+    fs.insert_tree(
+        "/root",
+        json!({
+            "src": {
+                "missing.rs": "",
+            },
+        }),
+    )
+    .await;
+    cx.run_until_parked();
+
+    let restored_row = panel.update(cx, |panel, cx| {
+        panel
+            .tagged_file_groups(cx)
+            .into_iter()
+            .find(|group| group.color == FileTagColor::Red)
+            .expect("red group should still exist")
+            .rows
+            .into_iter()
+            .find(|row| row.file_tag_key == missing_file_tag_key)
+            .expect("restored tagged row should still be present")
+    });
+    assert!(
+        restored_row.entry_id.is_some(),
+        "restoring the file at the same path should resolve the tagged row"
+    );
+    assert_eq!(restored_row.tooltip_label, "/root/src/missing.rs");
+    assert_eq!(restored_row.status_label(), None);
+
+    panel.update(cx, |panel, cx| {
+        panel.clear_file_tag(&missing_file_tag_key, cx);
+    });
+    cx.run_until_parked();
+    panel.update(cx, |panel, cx| {
+        assert_eq!(panel.file_tags.color_for(&missing_file_tag_key), None);
+        assert!(
+            panel
+                .tagged_file_groups(cx)
+                .into_iter()
+                .flat_map(|group| group.rows)
+                .all(|row| row.file_tag_key != missing_file_tag_key),
+            "cleared missing tag should disappear from the Tags section"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_file_tags_context_menu_selects_tagged_row(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    clear_file_tags_for_test(cx).await;
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            "src": {
+                "lib.rs": "",
+                "main.rs": "",
+            },
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+        .expect("workspace should be available");
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+
+    let main_file_entry_id =
+        set_file_tag_for_test(&panel, "root/src/main.rs", FileTagColor::Red, cx);
+    let lib_file_entry_id =
+        set_file_tag_for_test(&panel, "root/src/lib.rs", FileTagColor::Blue, cx);
+    let tagged_file_rows = panel.update(cx, |panel, cx| panel.visible_tagged_file_rows(cx));
+    let lib_tagged_file_row = tagged_file_rows
+        .into_iter()
+        .find(|row| row.entry_id == Some(lib_file_entry_id))
+        .expect("tagged lib.rs row should be present");
+
+    panel.update(cx, |panel, _| {
+        panel.selection = Some(SelectedEntry {
+            worktree_id: lib_tagged_file_row.worktree_id,
+            entry_id: main_file_entry_id,
+        });
+        panel.file_tag_selection = None;
+    });
+    panel.update_in(cx, |panel, window, cx| {
+        panel.deploy_tagged_file_context_menu(
+            Point::default(),
+            lib_tagged_file_row.clone(),
+            window,
+            cx,
+        );
+    });
+
+    panel.update(cx, |panel, _| {
+        assert_eq!(
+            panel.selection,
+            Some(SelectedEntry {
+                worktree_id: lib_tagged_file_row.worktree_id,
+                entry_id: lib_file_entry_id,
+            })
+        );
+        assert_eq!(
+            panel.file_tag_selection.as_ref(),
+            Some(&lib_tagged_file_row.file_tag_key)
+        );
+        assert!(panel.context_menu.is_some());
+    });
+}
+
+#[gpui::test]
+async fn test_file_tags_selection_scrolls_tagged_rows(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    clear_file_tags_for_test(cx).await;
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            "src": {
+                "lib.rs": "",
+                "main.rs": "",
+            },
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+        .expect("workspace should be available");
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+
+    let main_file_entry_id =
+        set_file_tag_for_test(&panel, "root/src/main.rs", FileTagColor::Red, cx);
+    let lib_file_entry_id =
+        set_file_tag_for_test(&panel, "root/src/lib.rs", FileTagColor::Blue, cx);
+    let (red_tagged_file_row, blue_tagged_file_row) = panel.update(cx, |panel, cx| {
+        let rows = panel.visible_tagged_file_rows(cx);
+        let red = rows
+            .iter()
+            .find(|row| row.entry_id == Some(main_file_entry_id))
+            .expect("tagged main.rs row should be present")
+            .clone();
+        let blue = rows
+            .iter()
+            .find(|row| row.entry_id == Some(lib_file_entry_id))
+            .expect("tagged lib.rs row should be present")
+            .clone();
+        (red, blue)
+    });
+
+    panel.update(cx, |panel, cx| {
+        let red_tagged_file_list_index = panel
+            .tagged_file_row_list_index(&red_tagged_file_row.file_tag_key, cx)
+            .expect("red tagged row should have a list index");
+        let blue_tagged_file_list_index = panel
+            .tagged_file_row_list_index(&blue_tagged_file_row.file_tag_key, cx)
+            .expect("blue tagged row should have a list index");
+        assert!(
+            red_tagged_file_list_index < panel.project_entry_list_index(0, cx),
+            "red tagged row should be in the scrollable Tags prefix"
+        );
+        assert!(
+            blue_tagged_file_list_index < panel.project_entry_list_index(0, cx),
+            "blue tagged row should be in the scrollable Tags prefix"
+        );
+
+        panel.select_tagged_file_row(blue_tagged_file_row.clone(), cx);
+        assert_eq!(
+            panel
+                .scroll_handle
+                .0
+                .borrow()
+                .deferred_scroll_to_item
+                .expect("tagged-row selection should request a scroll")
+                .item_index,
+            blue_tagged_file_list_index
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_file_tags_keyboard_navigation_opens_tags_section_rows(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    clear_file_tags_for_test(cx).await;
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/keyboard-root",
+        json!({
+            "src": {
+                "lib.rs": "",
+                "main.rs": "",
+            },
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), ["/keyboard-root".as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+        .expect("workspace should be available");
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+
+    let opened_entries = Rc::new(RefCell::new(Vec::new()));
+    let _subscription = panel.update(cx, |_, cx| {
+        let panel = cx.entity();
+        let opened_entries = opened_entries.clone();
+        cx.subscribe(&panel, move |_, _, event: &Event, _| {
+            if let Event::OpenedEntry {
+                entry_id,
+                focus_opened_item,
+                allow_preview,
+            } = event
+            {
+                opened_entries
+                    .borrow_mut()
+                    .push((*entry_id, *focus_opened_item, *allow_preview));
+            }
+        })
+    });
+
+    let red_file_entry_id =
+        set_file_tag_for_test(&panel, "keyboard-root/src/main.rs", FileTagColor::Red, cx);
+    let blue_file_entry_id =
+        set_file_tag_for_test(&panel, "keyboard-root/src/lib.rs", FileTagColor::Blue, cx);
+    let visible_tagged_file_rows = panel.update(cx, |panel, cx| panel.visible_tagged_file_rows(cx));
+
+    assert_eq!(
+        visible_tagged_file_rows
+            .iter()
+            .map(|row| row.entry_id.expect("tagged row should resolve"))
+            .collect::<Vec<_>>(),
+        vec![red_file_entry_id, blue_file_entry_id]
+    );
+
+    panel.update_in(cx, |panel, window, cx| {
+        panel.select_first(&SelectFirst, window, cx);
+    });
+    panel.update(cx, |panel, _| {
+        assert_eq!(
+            panel.file_tag_selection.as_ref(),
+            Some(&visible_tagged_file_rows[0].file_tag_key)
+        );
+        assert_eq!(
+            panel.selection,
+            Some(SelectedEntry {
+                worktree_id: visible_tagged_file_rows[0].worktree_id,
+                entry_id: red_file_entry_id,
+            })
+        );
+    });
+
+    panel.update_in(cx, |panel, window, cx| {
+        panel.open(&Open, window, cx);
+    });
+    panel.update_in(cx, |panel, window, cx| {
+        panel.select_next(&SelectNext, window, cx);
+    });
+    panel.update(cx, |panel, _| {
+        assert_eq!(
+            panel.file_tag_selection.as_ref(),
+            Some(&visible_tagged_file_rows[1].file_tag_key)
+        );
+        assert_eq!(
+            panel.selection,
+            Some(SelectedEntry {
+                worktree_id: visible_tagged_file_rows[1].worktree_id,
+                entry_id: blue_file_entry_id,
+            })
+        );
+    });
+
+    panel.update_in(cx, |panel, window, cx| {
+        panel.open(&Open, window, cx);
+    });
+    panel.update_in(cx, |panel, window, cx| {
+        panel.select_next(&SelectNext, window, cx);
+    });
+    panel.update(cx, |panel, _| {
+        assert_eq!(panel.file_tag_selection, None);
+        assert!(panel.selection.is_some());
+    });
+
+    assert_eq!(
+        opened_entries
+            .borrow()
+            .iter()
+            .map(|(entry_id, _, _)| *entry_id)
+            .collect::<Vec<_>>(),
+        vec![red_file_entry_id, blue_file_entry_id]
+    );
+}
+
+#[gpui::test]
+async fn test_file_tags_open_resolvable_row_from_tags_section(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    clear_file_tags_for_test(cx).await;
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            "src": {
+                "main.rs": "",
+            },
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+        .expect("workspace should be available");
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+
+    let opened_entries = Rc::new(RefCell::new(Vec::new()));
+    let _subscription = panel.update(cx, |_, cx| {
+        let panel = cx.entity();
+        let opened_entries = opened_entries.clone();
+        cx.subscribe(&panel, move |_, _, event: &Event, _| {
+            if let Event::OpenedEntry {
+                entry_id,
+                focus_opened_item,
+                allow_preview,
+            } = event
+            {
+                opened_entries
+                    .borrow_mut()
+                    .push((*entry_id, *focus_opened_item, *allow_preview));
+            }
+        })
+    });
+
+    let file_entry_id = set_file_tag_for_test(&panel, "root/src/main.rs", FileTagColor::Green, cx);
+    let tagged_file_row = panel.update(cx, |panel, cx| {
+        panel
+            .tagged_file_groups(cx)
+            .into_iter()
+            .flat_map(|group| group.rows)
+            .find(|row| row.entry_id == Some(file_entry_id))
+            .expect("tagged file row should be present")
+    });
+
+    panel.update(cx, |panel, cx| {
+        panel.open_tagged_file(&tagged_file_row, false, true, cx);
+    });
+
+    assert_eq!(
+        panel.update(cx, |panel, _| panel.selection),
+        Some(SelectedEntry {
+            worktree_id: tagged_file_row.worktree_id,
+            entry_id: file_entry_id,
+        })
+    );
+    assert_eq!(
+        opened_entries.borrow().as_slice(),
+        &[(file_entry_id, false, true)]
     );
 }

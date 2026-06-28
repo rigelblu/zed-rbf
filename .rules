@@ -187,5 +187,5 @@ Rules emerge from validated patterns, not one-off observations. The workflow is:
 2. Team validates the pattern in code review.
 3. A dedicated commit adds the rule with context on *why* it exists.
 
-# Read WARP-RBF
+# Read Zed-RBF
 Read and use @zed-rfb/AGENTS.md

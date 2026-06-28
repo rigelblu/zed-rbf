@@ -6,6 +6,15 @@ title: "Zed RBF Changelog"
 
 ---
 
+# 🔵⋯ v0.48.0 (2026-07-01) — #zed-44
+- 2026-07-01 - feat (ux) | mark files with lightweight Zed-local color tags from the Project Panel file-row workflow, visible as markers on file rows [@zed-rbf]
+- 2026-07-01 - feat (ux) | browse and open tagged files in a new Tags section above Project Files, grouped by color with path context and drag/keyboard support [@zed-rbf]
+- 2026-07-01 - feat (ux) | switch the Tags section between Tree View and Flat View via an ellipsis menu, with expandable/collapsible categories and context-menu controls to change/clear tags [@zed-rbf]
+- 2026-07-01 - feat (ux) | show unresolved/missing tagged paths as explicit missing rows in the Tags section so they can be easily cleared [@zed-rbf]
+- 2026-07-01 - fix (ux) | ensure stable file-tag submenus when placement flips left, and compost pending writes safely [@zed-rbf]
+
+---
+
 # 🔵⋯ v0.47.0 (2026-07-01) — #zed-43
 - 2026-07-01 - feat (ux) | toggle task checkboxes by clicking the rendered checkbox directly in the editor [@zed-rbf]
 - 2026-07-01 - feat (ux) | read strikethrough text with ~~ markers concealed off-cursor and render completed tasks as greyed out with a fixed #9893A5 checked glyph and task text [@zed-rbf]
