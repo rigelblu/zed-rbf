@@ -34,9 +34,6 @@ A missing or empty version file does not fail the build. It silently produces an
 # 🔵⋯ Divergence Inventory
 Use this during conflict triage to answer "is this file ours?" This inventory is curated from the current rebuilt stack; `zed-rbf/scripts/upstream-sync.sh --check-only` supplements it with live merge-base classification.
 
-Compatibility wrappers outside this directory:
-- `script/install-local` - delegates to `zed-rbf/scripts/install-local.sh`
-
 Core fork hooks outside this directory:
 - `crates/editor/src/ymd.rs` - YMD scanner and conceal engine
 - `crates/project/src/markdown_table_formatter.rs` - table align on save
