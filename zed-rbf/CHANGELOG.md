@@ -6,6 +6,10 @@ title: "Zed RBF Changelog"
 
 ---
 
+# 🔵⋯ v0.46.0 (2026-07-01) — #zed-46
+- 2026-06-29 - fix (ux) | install a new local build with `--open` without launching a competing Zed RBF process before the running app has quit, preserving the restart path for restored windows and workspace tabs [@zed-rbf]
+- 2026-06-29 - improve (dev) | remove the root `script/install-local` compatibility wrapper so local installs use the fork-owned `zed-rbf/scripts/install-local.sh` entry point directly [@zed-rbf]
+
 # 🔵⋯ v0.37.0 — #zed-37
 - 2026-07-01 - feat (ux) | switch between open projects from a vertical workspace-tab strip with each project's state preserved, available without enabling the AI agent [@zed-rbf]
 
