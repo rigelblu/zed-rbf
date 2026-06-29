@@ -4,7 +4,7 @@ title: "Zed RBF"
 
 This directory holds this flavour's docs, scripts, and version metadata.
 See [MAINTENANCE.md](MAINTENANCE.md) for maintenance and upstream-sync guidance.
-Use `script/install-local` to install the current build, and `zed-rbf/scripts/weekly-build.sh` to rebuild it weekly.
+Use `zed-rbf/scripts/install-local.sh` to install the current build, and `zed-rbf/scripts/weekly-build.sh` to rebuild it weekly.
 
 # 🔵⋯ Use
 This is for my personal use and shared publicly for those curious.
@@ -160,7 +160,7 @@ cargo run --release  # Release build
 ## 🟠⋯ Install as Local App
 Run commands from the repository root:
 ```sh
-zed-rbf/scripts/install-local.sh
+zed-rbf/scripts/install-local.sh --open
 ```
 
 Notes:
@@ -168,7 +168,7 @@ Notes:
 - Default install path: `$HOME/Applications/Zed RBF.app`
 - Default bundle id: `dev.zed.Zed-RBF`
 - Use `--debug` for faster local dogfood builds; the result is larger and slower than release
-- Use `--open` to launch after install
+- Use `--open` to launch after install (if the app is already running, the installer gracefully quits it first to ensure session state is fully saved before relaunching)
 - First run may install the pinned Zed fork of `cargo-bundle` into the build target's local tool cache and download WebRTC/dugite artifacts; those dependencies are cached afterward
 
 Temporary dogfood install:

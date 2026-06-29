@@ -55,6 +55,69 @@ set_plist_string() {
   /usr/libexec/PlistBuddy -c "Add :${key} string ${value}" "$plist"
 }
 
+running_app_pids_for_executable() {
+  local app_executable="$1"
+
+  ps -axww -o pid= -o command= | awk -v app_executable="$app_executable" '
+    {
+      pid = $1
+      sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", $0)
+      if ($0 == app_executable || index($0, app_executable " ") == 1) {
+        print pid
+      }
+    }
+  '
+}
+
+request_app_quit() {
+  local target_bundle_id="$1"
+
+  /usr/bin/osascript - "$target_bundle_id" <<'APPLESCRIPT'
+on run argv
+  set targetBundleIdentifier to item 1 of argv
+  tell application id targetBundleIdentifier to quit
+end run
+APPLESCRIPT
+}
+
+wait_for_app_exit() {
+  local target_bundle_id="$1"
+  local app_executable="$2"
+  local timeout_seconds="$3"
+  local deadline=$((SECONDS + timeout_seconds))
+  local pids
+
+  while true; do
+    pids="$(running_app_pids_for_executable "$app_executable")"
+    if [[ -z "$pids" ]]; then
+      return
+    fi
+    if (( SECONDS >= deadline )); then
+      fail "timed out waiting for app with bundle identifier $target_bundle_id to quit; still running pid(s): ${pids//$'\n'/, }"
+    fi
+    sleep 1
+  done
+}
+
+quit_running_app_before_relaunch() {
+  local target_bundle_id="$1"
+  local app_executable="$2"
+  local timeout_seconds="$3"
+  local pids
+
+  pids="$(running_app_pids_for_executable "$app_executable")"
+  if [[ -z "$pids" ]]; then
+    return
+  fi
+
+  echo "Requesting quit for running app with bundle identifier: $target_bundle_id"
+  if ! request_app_quit "$target_bundle_id" >/dev/null; then
+    fail "failed to request quit for running app with bundle identifier $target_bundle_id"
+  fi
+  echo "Waiting for running app to exit"
+  wait_for_app_exit "$target_bundle_id" "$app_executable" "$timeout_seconds"
+}
+
 download_and_unpack() {
   local url="$1"
   local path_to_unpack="$2"
@@ -153,6 +216,7 @@ install_backup=""
 install_destination=""
 install_temp_dir=""
 install_completed=false
+quit_timeout_seconds="${ZED_RBF_INSTALL_QUIT_TIMEOUT_SECONDS:-30}"
 
 restore_cargo_toml() {
   if [[ -n "$cargo_toml_backup" && -f "$cargo_toml_backup" ]]; then
@@ -234,9 +298,13 @@ done
 [[ -n "$app_name" ]] || fail "--name cannot be empty"
 [[ "$app_name" != */* ]] || fail "--name cannot contain /"
 [[ -n "$bundle_id" ]] || fail "--bundle-id cannot be empty"
+[[ "$quit_timeout_seconds" =~ ^[0-9]+$ && "$quit_timeout_seconds" -gt 0 ]] || fail "ZED_RBF_INSTALL_QUIT_TIMEOUT_SECONDS must be a positive integer"
 [[ -f "$cargo_toml" ]] || fail "missing $cargo_toml"
 command -v cargo >/dev/null 2>&1 || fail "cargo not found"
 command -v rustc >/dev/null 2>&1 || fail "rustc not found"
+if [[ "$open_result" == "true" ]]; then
+  command -v /usr/bin/osascript >/dev/null 2>&1 || fail "osascript not found"
+fi
 [[ -x /usr/libexec/PlistBuddy ]] || fail "PlistBuddy not found"
 
 host_triple="$(rustc -vV | sed -n 's/^host: //p')"
@@ -397,6 +465,9 @@ fi
 mkdir -p "$install_dir"
 install_destination="${install_dir}/${app_name}.app"
 destination="$install_destination"
+if [[ "$open_result" == "true" ]]; then
+  quit_running_app_before_relaunch "$bundle_id" "${destination}/Contents/MacOS/zed" "$quit_timeout_seconds"
+fi
 install_temp_dir="$(mktemp -d "${install_dir}/.${app_name}.install.XXXXXX")"
 temporary_destination="${install_temp_dir}/${app_name}.app"
 install_backup="${install_temp_dir}/previous.app"
