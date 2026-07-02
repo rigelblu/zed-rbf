@@ -6,6 +6,13 @@ title: "Zed RBF Changelog"
 
 ---
 
+# 🔵⋯ v0.47.0 (2026-07-01) — #zed-43
+- 2026-07-01 - feat (ux) | toggle task checkboxes by clicking the rendered checkbox directly in the editor [@zed-rbf]
+- 2026-07-01 - feat (ux) | read strikethrough text with ~~ markers concealed off-cursor and render completed tasks as greyed out with a fixed #9893A5 checked glyph and task text [@zed-rbf]
+- 2026-07-01 - fix (ux) | keep color emoji and highlight markers inside inline code literal without driving YMD line color or conceal [@zed-rbf]
+
+---
+
 # 🔵⋯ v0.46.0 (2026-07-01) — #zed-46
 - 2026-06-29 - fix (ux) | install a new local build with `--open` without launching a competing Zed RBF process before the running app has quit, preserving the restart path for restored windows and workspace tabs [@zed-rbf]
 - 2026-06-29 - improve (dev) | remove the root `script/install-local` compatibility wrapper so local installs use the fork-owned `zed-rbf/scripts/install-local.sh` entry point directly [@zed-rbf]

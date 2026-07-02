@@ -1,4 +1,4 @@
-use gpui::{HighlightStyle, Hsla, UnderlineStyle, px, rgba};
+use gpui::{HighlightStyle, Hsla, StrikethroughStyle, UnderlineStyle, px, rgba};
 use std::ops::Range;
 use theme::Appearance;
 
@@ -84,6 +84,13 @@ struct YmdInlineHighlight {
     open_marker_range: Range<usize>,
     close_marker_range: Range<usize>,
     color: YmdColor,
+}
+
+struct YmdInlineStyle {
+    marker: &'static str,
+    content_range: Range<usize>,
+    open_marker_range: Range<usize>,
+    close_marker_range: Range<usize>,
 }
 
 impl YmdColor {
@@ -232,6 +239,23 @@ pub(crate) fn block_quote_style(color: Hsla) -> HighlightStyle {
     }
 }
 
+pub(crate) fn completed_task_style(color: Hsla) -> HighlightStyle {
+    HighlightStyle {
+        color: Some(color),
+        ..HighlightStyle::default()
+    }
+}
+
+pub(crate) fn strikethrough_style() -> HighlightStyle {
+    HighlightStyle {
+        strikethrough: Some(StrikethroughStyle {
+            thickness: px(1.),
+            color: None,
+        }),
+        ..HighlightStyle::default()
+    }
+}
+
 fn for_each_line(text: &str, mut callback: impl FnMut(&str, usize)) {
     let mut line_start = 0;
 
@@ -307,7 +331,9 @@ pub(crate) fn scan(text: &str) -> Vec<YmdHighlight> {
         ) {
             return;
         }
-        let inline_highlights = scan_line_background_markups(line_content, line_start);
+        let inline_code_ranges = inline_code_ranges(line_content);
+        let inline_highlights =
+            scan_line_background_markups(line_content, line_start, &inline_code_ranges);
         for inline_highlight in &inline_highlights {
             highlights.push(YmdHighlight {
                 range: inline_highlight.range.clone(),
@@ -315,7 +341,8 @@ pub(crate) fn scan(text: &str) -> Vec<YmdHighlight> {
             });
         }
 
-        let captures = capture_ranges(&inline_highlights, line_start);
+        let mut captures = capture_ranges(&inline_highlights, line_start);
+        captures.extend(inline_code_ranges);
         if let Some((_, color)) = first_effective_emoji(line_content, &captures) {
             highlights.push(YmdHighlight {
                 range: line_start..line_start + line_content.len(),
@@ -459,6 +486,55 @@ pub(crate) fn scan_checkboxes(text: &str) -> Vec<YmdCheckbox> {
     checkboxes
 }
 
+pub(crate) fn scan_checked_task_text_ranges(text: &str) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let fenced_code_ranges = fenced_code_block_ranges(text);
+
+    for_each_line(text, |line_content, line_start| {
+        if range_overlaps_any(
+            &(line_start..line_start + line_content.len()),
+            &fenced_code_ranges,
+        ) {
+            return;
+        }
+        let Some(checkbox) = scan_line_checkbox(line_content, line_start) else {
+            return;
+        };
+        if !checkbox.checked {
+            return;
+        }
+
+        let text_range = checkbox.range.end..line_start + line_content.len();
+        if text_range.start < text_range.end {
+            ranges.push(text_range);
+        }
+    });
+
+    ranges
+}
+
+pub(crate) fn scan_strikethroughs(text: &str) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let fenced_code_ranges = fenced_code_block_ranges(text);
+
+    for_each_line(text, |line_content, line_start| {
+        if range_overlaps_any(
+            &(line_start..line_start + line_content.len()),
+            &fenced_code_ranges,
+        ) {
+            return;
+        }
+        ranges.extend(
+            scan_line_inline_styles(line_content, line_start)
+                .into_iter()
+                .filter(|inline_style| inline_style.marker == "~~")
+                .map(|inline_style| inline_style.content_range),
+        );
+    });
+
+    ranges
+}
+
 pub(crate) fn scan_conceals(text: &str) -> Vec<YmdConceal> {
     let mut conceals = Vec::new();
     let fenced_code_ranges = fenced_code_block_ranges(text);
@@ -470,7 +546,9 @@ pub(crate) fn scan_conceals(text: &str) -> Vec<YmdConceal> {
         ) {
             return;
         }
-        let inline_highlights = scan_line_background_markups(line_content, line_start);
+        let inline_code_ranges = inline_code_ranges(line_content);
+        let inline_highlights =
+            scan_line_background_markups(line_content, line_start, &inline_code_ranges);
         for inline_highlight in &inline_highlights {
             conceals.push(YmdConceal {
                 range: inline_highlight.open_marker_range.clone(),
@@ -502,14 +580,15 @@ pub(crate) fn scan_conceals(text: &str) -> Vec<YmdConceal> {
             conceals.push(YmdConceal { range });
         }
 
-        let heading_range = heading_conceal_range(line_content, line_start);
+        let heading_range = heading_conceal_range(line_content, line_start, &inline_code_ranges);
         if let Some(heading_range) = heading_range.clone() {
             conceals.push(YmdConceal {
                 range: heading_range,
             });
         }
 
-        let captures = capture_ranges(&inline_highlights, line_start);
+        let mut captures = capture_ranges(&inline_highlights, line_start);
+        captures.extend(inline_code_ranges);
         if let Some((emoji_range, _)) = first_effective_emoji(line_content, &captures) {
             let absolute_emoji_range = line_start + emoji_range.start..line_start + emoji_range.end;
             // When the heading fold has already absorbed the color marker (it sits
@@ -582,7 +661,11 @@ fn first_effective_emoji(
 // in suite headings like `## 🟠⋯ Heading` is plain content, not YMD syntax, so it
 // stays visible — the fold ends right after the emoji (here `⋯` directly follows it,
 // so there is no whitespace to absorb).
-fn heading_conceal_range(line: &str, line_start: usize) -> Option<Range<usize>> {
+fn heading_conceal_range(
+    line: &str,
+    line_start: usize,
+    excluded_ranges: &[Range<usize>],
+) -> Option<Range<usize>> {
     let bytes = line.as_bytes();
     let mut hash_count = 0;
     while bytes.get(hash_count) == Some(&b'#') {
@@ -603,14 +686,25 @@ fn heading_conceal_range(line: &str, line_start: usize) -> Option<Range<usize>> 
     }
 
     let heading_text = &line[prefix_end..];
-    let color_match = YmdColor::first_match_in(heading_text);
+    let heading_excluded_ranges = excluded_ranges
+        .iter()
+        .filter(|range| range.start < line.len() && range.end > prefix_end)
+        .filter_map(|range| {
+            let start = range.start.max(prefix_end) - prefix_end;
+            let end = range.end.min(line.len()) - prefix_end;
+            (start < end).then_some(start..end)
+        })
+        .collect::<Vec<_>>();
+    let color_match = first_effective_emoji(heading_text, &heading_excluded_ranges);
     if heading_text.trim().is_empty() || color_match.is_none() {
         return None;
     }
 
     let mut conceal_end = prefix_end;
-    if let Some((0, _, emoji_len)) = color_match {
-        conceal_end += emoji_len;
+    if let Some((emoji_range, _)) = color_match
+        && emoji_range.start == 0
+    {
+        conceal_end += emoji_range.end;
         while matches!(bytes.get(conceal_end), Some(b' ' | b'\t')) {
             conceal_end += 1;
         }
@@ -711,7 +805,19 @@ fn scan_line_images(line: &str, line_start: usize) -> Vec<YmdImage> {
 }
 
 fn scan_line_inline_style_markers(line: &str, line_start: usize) -> Vec<Range<usize>> {
-    let mut ranges = Vec::new();
+    scan_line_inline_styles(line, line_start)
+        .into_iter()
+        .flat_map(|inline_style| {
+            [
+                inline_style.open_marker_range,
+                inline_style.close_marker_range,
+            ]
+        })
+        .collect()
+}
+
+fn scan_line_inline_styles(line: &str, line_start: usize) -> Vec<YmdInlineStyle> {
+    let mut inline_styles = Vec::new();
     let mut search_start = 0;
 
     while search_start < line.len() {
@@ -751,12 +857,16 @@ fn scan_line_inline_style_markers(line: &str, line_start: usize) -> Vec<Range<us
             continue;
         };
 
-        ranges.push(line_start + open..line_start + content_start);
-        ranges.push(line_start + close..line_start + close + marker_len);
+        inline_styles.push(YmdInlineStyle {
+            marker,
+            content_range: line_start + content_start..line_start + close,
+            open_marker_range: line_start + open..line_start + content_start,
+            close_marker_range: line_start + close..line_start + close + marker_len,
+        });
         search_start = close + marker_len;
     }
 
-    ranges
+    inline_styles
 }
 
 fn next_inline_style_marker(line: &str, search_start: usize) -> Option<(usize, &'static str)> {
@@ -848,6 +958,46 @@ pub(crate) fn is_inside_inline_code_at(line: &str, index: usize) -> bool {
     false
 }
 
+fn inline_code_ranges(line: &str) -> Vec<Range<usize>> {
+    let bytes = line.as_bytes();
+    let mut ranges = Vec::new();
+    let mut cursor = 0;
+
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'`' && !is_escaped_at(line, cursor) {
+            let open_start = cursor;
+            let run_len = backtick_run_len(bytes, cursor);
+            let open_end = cursor + run_len;
+            let mut scan = open_end;
+            let mut close = None;
+
+            while scan < bytes.len() {
+                if bytes[scan] == b'`' && !is_escaped_at(line, scan) {
+                    let close_len = backtick_run_len(bytes, scan);
+                    if close_len == run_len {
+                        close = Some((scan, close_len));
+                        break;
+                    }
+                    scan += close_len;
+                } else {
+                    scan += 1;
+                }
+            }
+
+            if let Some((close_start, close_len)) = close {
+                cursor = close_start + close_len;
+                ranges.push(open_start..cursor);
+            } else {
+                cursor = open_end;
+            }
+        } else {
+            cursor += 1;
+        }
+    }
+
+    ranges
+}
+
 fn backtick_run_len(bytes: &[u8], start: usize) -> usize {
     let mut len = 0;
     while start + len < bytes.len() && bytes[start + len] == b'`' {
@@ -927,17 +1077,39 @@ fn scan_line_checkbox(line: &str, line_start: usize) -> Option<YmdCheckbox> {
     })
 }
 
-fn scan_line_background_markups(line: &str, line_start: usize) -> Vec<YmdInlineHighlight> {
+fn scan_line_background_markups(
+    line: &str,
+    line_start: usize,
+    excluded_ranges: &[Range<usize>],
+) -> Vec<YmdInlineHighlight> {
     let mut inline_highlights = Vec::new();
     let mut search_start = 0;
 
     while let Some(open_relative) = line[search_start..].find("==") {
         let open = search_start + open_relative;
         let content_start = open + 2;
-        let Some(close_relative) = line[content_start..].find("==") else {
+        if excluded_ranges.iter().any(|range| range.contains(&open)) {
+            search_start = content_start;
+            continue;
+        }
+
+        let mut close_search_start = content_start;
+        let mut close = None;
+        while let Some(close_relative) = line[close_search_start..].find("==") {
+            let candidate = close_search_start + close_relative;
+            if excluded_ranges
+                .iter()
+                .any(|range| range.contains(&candidate))
+            {
+                close_search_start = candidate + 2;
+                continue;
+            }
+            close = Some(candidate);
+            break;
+        }
+        let Some(close) = close else {
             break;
         };
-        let close = content_start + close_relative;
         let content = &line[content_start..close];
 
         if !content.is_empty() {
@@ -969,13 +1141,13 @@ struct CodeFence {
 // Byte ranges of fenced code blocks (``` or ~~~), delimiter lines included, so YMD
 // styling never applies inside them — code is quoted evidence and its punctuation,
 // emoji, markers, and URLs must stay literal (#zed-09, value-mode CORRECTNESS). A
-// scanner-local CommonMark heuristic, deliberately simpler than tree-sitter: up to
-// three leading spaces, then a run of >=3 backticks or tildes; a backtick opener
-// may not carry a backtick in its info string; the block closes on a same-marker
-// run at least as long, followed only by whitespace, or runs to end-of-buffer while
-// unclosed (so in-progress code stays literal as it is typed). Indented code blocks
-// and inline code spans are out of scope (the live Future item is fences; inline
-// spans are `#zed-310`).
+// scanner-local CommonMark heuristic, deliberately simpler than tree-sitter: up
+// to three leading spaces, then a run of >=3 backticks or tildes; a backtick
+// opener may not carry a backtick in its info string; the block closes on a
+// same-marker run at least as long, followed only by whitespace, or runs to
+// end-of-buffer while unclosed (so in-progress code stays literal as it is typed).
+// Indented code blocks remain out of scope; inline code spans are handled by the
+// single-line scanners that need them.
 fn fenced_code_block_ranges(text: &str) -> Vec<Range<usize>> {
     let mut ranges = Vec::new();
     let mut opening_fence: Option<(usize, CodeFence)> = None;
@@ -2119,6 +2291,44 @@ mod tests {
                 range: 21..27,
                 checked: true,
             }]
+        );
+    }
+
+    #[test]
+    fn inline_code_keeps_ymd_markers_literal() {
+        assert!(scan("`🔴 literal`").is_empty());
+        assert!(scan("`==🔴literal==`").is_empty());
+        assert_eq!(scan_conceals("`🔴 literal`"), Vec::<YmdConceal>::new());
+        assert_eq!(scan_conceals("`==🔴literal==`"), Vec::<YmdConceal>::new());
+        assert_eq!(
+            scan("# `🔵` heading\n# 🟢 heading"),
+            vec![YmdHighlight {
+                range: 17..31,
+                kind: YmdHighlightKind::LineForeground(YmdColor::Green),
+            }]
+        );
+        assert_eq!(
+            scan_conceals("# `🔵` heading\n# 🟢 heading"),
+            vec![YmdConceal { range: 17..24 }]
+        );
+    }
+
+    #[test]
+    fn scans_strikethrough_content_ranges() {
+        assert_eq!(scan_strikethroughs("~~done~~"), vec![2..6]);
+        assert_eq!(
+            scan_strikethroughs("plain ~~done~~\n`~~literal~~`\n```md\n~~code~~\n```"),
+            vec![8..12]
+        );
+    }
+
+    #[test]
+    fn scans_checked_task_text_ranges() {
+        assert_eq!(
+            scan_checked_task_text_ranges(
+                "- [ ] todo\n- [x] done\n  - [x] nested\n```md\n- [x] code\n```"
+            ),
+            vec![17..21, 30..36]
         );
     }
 }

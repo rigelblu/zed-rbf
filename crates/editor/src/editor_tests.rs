@@ -33825,6 +33825,106 @@ async fn test_ymd_highlights_do_not_apply_to_non_markdown_buffers(cx: &mut gpui:
 }
 
 #[gpui::test]
+async fn test_ymd_inline_code_stays_literal(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    cx.set_state("ˇ`🔴 literal`\n`==🔴literal==`\n# `🔵` heading\n# 🟢 heading");
+    cx.run_until_parked();
+
+    cx.assert_editor_text_highlights(
+        HighlightKey::YmdLineForeground(1),
+        "`🔴 literal`\n`==🔴literal==`\n# `🔵` heading\n# 🟢 heading",
+    );
+    cx.assert_editor_text_highlights(
+        HighlightKey::YmdBackground(1),
+        "`🔴 literal`\n`==🔴literal==`\n# `🔵` heading\n# 🟢 heading",
+    );
+    cx.assert_editor_text_highlights(
+        HighlightKey::YmdLineForeground(5),
+        "`🔴 literal`\n`==🔴literal==`\n# `🔵` heading\n# 🟢 heading",
+    );
+    cx.assert_editor_text_highlights(
+        HighlightKey::YmdLineForeground(4),
+        "`🔴 literal`\n`==🔴literal==`\n# `🔵` heading\n«# 🟢 heading»",
+    );
+    cx.update_editor(|editor, _, cx| {
+        assert_eq!(
+            editor.display_text(cx).replace('\u{2060}', ""),
+            "`🔴 literal`\n`==🔴literal==`\n# `🔵` heading\nheading"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_ymd_strikethrough_highlights_content(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    cx.set_state("ˇactive\n~~cancelled~~\n`~~literal~~`");
+    cx.run_until_parked();
+
+    cx.assert_editor_text_highlights(
+        HighlightKey::YmdStrikethrough,
+        "active\n~~«cancelled»~~\n`~~literal~~`",
+    );
+    cx.update_editor(|editor, _, cx| {
+        assert_eq!(
+            editor.display_text(cx).replace('\u{2060}', ""),
+            "active\ncancelled\n`~~literal~~`"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_ymd_checked_tasks_use_completed_text_color(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    cx.set_state("ˇ- [ ] todo\n- [x] done\n```md\n- [x] code\n```");
+    cx.run_until_parked();
+
+    cx.assert_editor_text_highlights(
+        HighlightKey::YmdCompletedTask,
+        "- [ ] todo\n- [x] «done»\n```md\n- [x] code\n```",
+    );
+    let completed_task_color = cx.update_editor(|editor, window, cx| {
+        editor
+            .snapshot(window, cx)
+            .text_highlight_ranges(HighlightKey::YmdCompletedTask)
+            .map(|highlights| highlights.0.color)
+    });
+    assert_eq!(completed_task_color, Some(Some(gpui::rgb(0x9893A5).into())));
+}
+
+#[gpui::test]
 async fn test_ymd_highlights_clear_above_size_cap(cx: &mut gpui::TestAppContext) {
     init_test(cx, |_| {});
 
@@ -34467,6 +34567,89 @@ async fn test_ymd_conceals_task_checkboxes(cx: &mut gpui::TestAppContext) {
             "intro\n- [ ] todo\n- [x] done\n  - [ ] nested\n```md\n- [ ] code\n```"
         );
     });
+}
+
+#[gpui::test]
+async fn test_ymd_clicking_rendered_checkbox_toggles_task_marker(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    cx.set_state("ˇintro\n- [ ] todo\n- [x] done\n```md\n- [ ] code\n```");
+    cx.run_until_parked();
+
+    let checkbox_click_position = cx.update_editor(|editor, _, _| {
+        let position_map = editor.last_position_map.as_ref().unwrap();
+        gpui::Point {
+            x: position_map.text_hitbox.bounds.origin.x + position_map.em_layout_width / 2.0,
+            y: position_map.text_hitbox.bounds.origin.y + position_map.line_height * 1.5,
+        }
+    });
+
+    cx.simulate_click(checkbox_click_position, Modifiers::none());
+    cx.run_until_parked();
+
+    cx.assert_editor_state("ˇintro\n- [x] todo\n- [x] done\n```md\n- [ ] code\n```");
+    cx.update_editor(|editor, _, cx| {
+        assert_eq!(
+            editor.display_text(cx).replace('\u{2060}', ""),
+            "intro\n■ todo\n■ done\n```md\n- [ ] code\n```"
+        );
+    });
+
+    let checkbox_click_position = cx.update_editor(|editor, _, _| {
+        let position_map = editor.last_position_map.as_ref().unwrap();
+        gpui::Point {
+            x: position_map.text_hitbox.bounds.origin.x + position_map.em_layout_width / 2.0,
+            y: position_map.text_hitbox.bounds.origin.y + position_map.line_height * 1.5,
+        }
+    });
+    cx.simulate_click(checkbox_click_position, Modifiers::none());
+    cx.run_until_parked();
+
+    cx.assert_editor_state("ˇintro\n- [ ] todo\n- [x] done\n```md\n- [ ] code\n```");
+}
+
+#[gpui::test]
+async fn test_ymd_clicking_past_short_row_does_not_toggle_checkbox(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    cx.set_state("ˇintro\n- [ ] todo\nx\nbody");
+    cx.run_until_parked();
+
+    let click_position = cx.update_editor(|editor, _, _| {
+        let position_map = editor.last_position_map.as_ref().unwrap();
+        gpui::Point {
+            x: position_map.text_hitbox.bounds.origin.x + position_map.em_layout_width * 8.0,
+            y: position_map.text_hitbox.bounds.origin.y + position_map.line_height * 2.5,
+        }
+    });
+
+    cx.simulate_click(click_position, Modifiers::none());
+    cx.run_until_parked();
+
+    assert_eq!(
+        cx.buffer(|buffer, _| buffer.text()),
+        "intro\n- [ ] todo\nx\nbody"
+    );
 }
 
 #[gpui::test]

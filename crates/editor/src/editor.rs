@@ -437,6 +437,10 @@ fn ymd_block_quote_border_color(_cx: &App) -> Hsla {
     gpui::rgb(0x706C84).into()
 }
 
+fn ymd_completed_task_text_color(_cx: &App) -> Hsla {
+    gpui::rgb(0x9893A5).into()
+}
+
 fn is_ymd_conceal_fold(fold: &crate::display_map::Fold) -> bool {
     fold.placeholder.type_tag == Some(ymd_conceal_fold_type_id())
 }
@@ -451,6 +455,8 @@ struct YmdConcealCache {
     buffer_version: clock::Global,
     conceal_ranges: Vec<Range<usize>>,
     conceal_rows: Vec<u32>,
+    checkboxes: Vec<ymd::YmdCheckbox>,
+    checkbox_rows: Vec<u32>,
     folded: HashSet<(usize, usize)>,
     // Some conceal ranges need a non-default placeholder: checkboxes render a
     // visible glyph, and table-cell padding folds expand to absorb hidden marker
@@ -480,12 +486,22 @@ fn ymd_conceal_fold_placeholder() -> FoldPlaceholder {
 // text keeps the same left margin it had raw, and it is what `display_text`
 // returns (e.g. `"□ todo"`). Shares the conceal type tag so cursor-row reveal,
 // the toggle, and the diff-sync delta treat it as one of the YMD conceal folds.
-fn ymd_checkbox_fold_placeholder(display_character: &str) -> FoldPlaceholder {
+fn ymd_checkbox_fold_placeholder(
+    display_character: &str,
+    text_color: Option<Hsla>,
+) -> FoldPlaceholder {
     let collapsed_text = SharedString::from(format!("{display_character} "));
     FoldPlaceholder {
         render: Arc::new({
             let collapsed_text = collapsed_text.clone();
-            move |_, _, _| div().child(collapsed_text.clone()).into_any_element()
+            move |_, _, _| {
+                div()
+                    .when_some(text_color, |element, text_color| {
+                        element.text_color(text_color)
+                    })
+                    .child(collapsed_text.clone())
+                    .into_any_element()
+            }
         }),
         constrain_width: true,
         merge_adjacent: false,
@@ -9473,8 +9489,10 @@ impl Editor {
                     key,
                     HighlightKey::YmdBackground(_)
                         | HighlightKey::YmdBlockQuote
+                        | HighlightKey::YmdCompletedTask
                         | HighlightKey::YmdLineForeground(_)
                         | HighlightKey::YmdLink
+                        | HighlightKey::YmdStrikethrough
                 )
             },
             cx,
@@ -9626,10 +9644,7 @@ impl Editor {
             && self.buffer.read(cx).snapshot(cx).len().0 <= ymd::MAX_YMD_HIGHLIGHT_BYTES
     }
 
-    fn ymd_markdown_snapshot_and_text(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> Option<(MultiBufferSnapshot, String)> {
+    fn ymd_markdown_snapshot_and_text(&self, cx: &App) -> Option<(MultiBufferSnapshot, String)> {
         if !self.is_ymd_markdown_singleton(cx) {
             return None;
         }
@@ -9997,6 +10012,46 @@ impl Editor {
             self.highlight_text(HighlightKey::YmdLink, link_ranges, ymd::link_style(), cx);
         }
 
+        let completed_task_ranges = ymd::scan_checked_task_text_ranges(&text)
+            .into_iter()
+            .filter(|range| {
+                let row = MultiBufferRow(MultiBufferOffset(range.start).to_point(&snapshot).row);
+                !diff_rows.contains(&row)
+            })
+            .map(|range| {
+                snapshot.anchor_before(MultiBufferOffset(range.start))
+                    ..snapshot.anchor_after(MultiBufferOffset(range.end))
+            })
+            .collect::<Vec<_>>();
+        if !completed_task_ranges.is_empty() {
+            self.highlight_text(
+                HighlightKey::YmdCompletedTask,
+                completed_task_ranges,
+                ymd::completed_task_style(ymd_completed_task_text_color(cx)),
+                cx,
+            );
+        }
+
+        let strikethrough_ranges = ymd::scan_strikethroughs(&text)
+            .into_iter()
+            .filter(|range| {
+                let row = MultiBufferRow(MultiBufferOffset(range.start).to_point(&snapshot).row);
+                !diff_rows.contains(&row)
+            })
+            .map(|range| {
+                snapshot.anchor_before(MultiBufferOffset(range.start))
+                    ..snapshot.anchor_after(MultiBufferOffset(range.end))
+            })
+            .collect::<Vec<_>>();
+        if !strikethrough_ranges.is_empty() {
+            self.highlight_text(
+                HighlightKey::YmdStrikethrough,
+                strikethrough_ranges,
+                ymd::strikethrough_style(),
+                cx,
+            );
+        }
+
         // Block quotes: mute the content text and paint a vertical border in the
         // gutter for each quote line. A quote line on a diff row stays fully raw
         // (no muting, no border), matching every other YMD feature. A bare `>`
@@ -10053,12 +10108,22 @@ impl Editor {
         Some((singleton_buffer.remote_id(), singleton_buffer.version()))
     }
 
+    fn ymd_conceal_cache_is_valid(&self, cache: &YmdConcealCache, cx: &App) -> bool {
+        self.is_ymd_markdown_singleton(cx)
+            && self
+                .ymd_singleton_buffer_identity(cx)
+                .is_some_and(|(buffer_id, buffer_version)| {
+                    cache.buffer_id == buffer_id && cache.buffer_version == buffer_version
+                })
+    }
+
     // The conceal-fold set concealed mode wants right now; empty when the buffer
     // is not a YMD surface. Marker folds on cursor-head rows are excluded, and
     // the reveal row set updates here, behind the Markdown-and-cap gate, so
     // non-YMD editors never carry reveal state. Scan results (ranges plus their
     // rows) are served from the identity-keyed cache when the buffer has not
-    // changed, so toggle presses and cursor motion never re-run the scanner.
+    // changed, so cursor motion and checkbox hover never re-run the scanner.
+    // Checkbox clicks use the same cache, priming it first only if needed.
     // Validity includes the Markdown gate: a language flip does not bump the
     // buffer version.
     fn ymd_desired_conceal_ranges(
@@ -10072,9 +10137,10 @@ impl Editor {
             return Vec::new();
         };
 
-        let cache_is_valid = self.ymd_conceal_cache.as_ref().is_some_and(|cache| {
-            cache.buffer_id == buffer_id && cache.buffer_version == buffer_version
-        }) && self.is_ymd_markdown_singleton(cx);
+        let cache_is_valid = self
+            .ymd_conceal_cache
+            .as_ref()
+            .is_some_and(|cache| self.ymd_conceal_cache_is_valid(cache, cx));
 
         if !cache_is_valid {
             let Some((snapshot, text)) = self.ymd_markdown_snapshot_and_text(cx) else {
@@ -10091,21 +10157,20 @@ impl Editor {
             let mut conceal_placeholders: HashMap<(usize, usize), FoldPlaceholder> =
                 HashMap::default();
             let mut table_padding_widths: HashMap<(usize, usize), usize> = HashMap::default();
-            let checkbox_ranges = ymd::scan_checkboxes(&text)
-                .into_iter()
-                .map(|checkbox| {
-                    let display_character = if checkbox.checked {
-                        ymd_settings.checkbox_checked_char.as_str()
-                    } else {
-                        ymd_settings.checkbox_unchecked_char.as_str()
-                    };
-                    conceal_placeholders.insert(
-                        (checkbox.range.start, checkbox.range.end),
-                        ymd_checkbox_fold_placeholder(display_character),
-                    );
-                    checkbox.range
-                })
-                .collect::<Vec<_>>();
+            let checkboxes = ymd::scan_checkboxes(&text);
+            for checkbox in &checkboxes {
+                let display_character = if checkbox.checked {
+                    ymd_settings.checkbox_checked_char.as_str()
+                } else {
+                    ymd_settings.checkbox_unchecked_char.as_str()
+                };
+                let checkbox_text_color =
+                    checkbox.checked.then(|| ymd_completed_task_text_color(cx));
+                conceal_placeholders.insert(
+                    (checkbox.range.start, checkbox.range.end),
+                    ymd_checkbox_fold_placeholder(display_character, checkbox_text_color),
+                );
+            }
 
             let ymd_conceal_ranges = ymd::scan_conceals(&text)
                 .into_iter()
@@ -10123,7 +10188,7 @@ impl Editor {
                 .collect::<Vec<_>>();
             let mut conceal_ranges: Vec<Range<usize>> = ymd_conceal_ranges
                 .into_iter()
-                .chain(checkbox_ranges)
+                .chain(checkboxes.iter().map(|checkbox| checkbox.range.clone()))
                 .collect();
             for ((padding_start, padding_end), concealed_width) in table_padding_widths {
                 let padding_range = padding_start..padding_end;
@@ -10155,6 +10220,14 @@ impl Editor {
                 .iter()
                 .map(|range| MultiBufferOffset(range.start).to_point(&snapshot).row)
                 .collect();
+            let checkbox_rows = checkboxes
+                .iter()
+                .map(|checkbox| {
+                    MultiBufferOffset(checkbox.range.start)
+                        .to_point(&snapshot)
+                        .row
+                })
+                .collect();
             let thematic_break_ranges = ymd::scan_thematic_breaks(&text);
             let thematic_break_rows = thematic_break_ranges
                 .iter()
@@ -10165,6 +10238,8 @@ impl Editor {
                 buffer_version,
                 conceal_ranges,
                 conceal_rows,
+                checkboxes,
+                checkbox_rows,
                 folded: HashSet::default(),
                 conceal_placeholders,
                 thematic_break_ranges,
@@ -10215,6 +10290,107 @@ impl Editor {
                     ..fold.range.end.to_offset(buffer_snapshot).0
             })
             .collect()
+    }
+
+    fn ymd_checkbox_at_display_point(
+        &self,
+        display_point: DisplayPoint,
+        display_snapshot: &DisplaySnapshot,
+        cx: &App,
+    ) -> Option<ymd::YmdCheckbox> {
+        if self.read_only(cx) || !self.ymd_concealed {
+            return None;
+        }
+
+        let Some(cache) = self.ymd_conceal_cache.as_ref() else {
+            return None;
+        };
+        if !self.ymd_conceal_cache_is_valid(cache, cx) {
+            return None;
+        }
+
+        let cursor_rows = self.ymd_cursor_rows(display_snapshot);
+        let diff_rows = self.ymd_diff_rows(cx);
+        let ymd_settings = &EditorSettings::get_global(cx).ymd;
+
+        for (checkbox, row) in cache.checkboxes.iter().zip(&cache.checkbox_rows) {
+            let row = MultiBufferRow(*row);
+            if cursor_rows.contains(&row) || diff_rows.contains(&row) {
+                continue;
+            }
+
+            let display_start =
+                MultiBufferOffset(checkbox.range.start).to_display_point(display_snapshot);
+            let display_character = if checkbox.checked {
+                ymd_settings.checkbox_checked_char.as_str()
+            } else {
+                ymd_settings.checkbox_unchecked_char.as_str()
+            };
+            let display_end_column =
+                display_start.column() + display_character.chars().count() as u32 + 1;
+            let over_rendered_checkbox = display_point.row() == display_start.row()
+                && display_point.column() >= display_start.column()
+                && display_point.column() < display_end_column;
+
+            if over_rendered_checkbox {
+                return Some(checkbox.clone());
+            }
+        }
+
+        None
+    }
+
+    pub(crate) fn is_ymd_checkbox_at_display_point(
+        &self,
+        display_point: DisplayPoint,
+        display_snapshot: &DisplaySnapshot,
+        cx: &App,
+    ) -> bool {
+        self.ymd_checkbox_at_display_point(display_point, display_snapshot, cx)
+            .is_some()
+    }
+
+    pub(crate) fn toggle_ymd_checkbox_at_display_point(
+        &mut self,
+        clicked_point: DisplayPoint,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.read_only(cx) || !self.ymd_concealed {
+            return false;
+        }
+
+        let display_snapshot = self.display_map.update(cx, |map, cx| map.snapshot(cx));
+        if !self
+            .ymd_conceal_cache
+            .as_ref()
+            .is_some_and(|cache| self.ymd_conceal_cache_is_valid(cache, cx))
+        {
+            let diff_rows = self.ymd_diff_rows(cx);
+            self.ymd_desired_conceal_ranges(None, &diff_rows, cx);
+        }
+        let Some(checkbox) =
+            self.ymd_checkbox_at_display_point(clicked_point, &display_snapshot, cx)
+        else {
+            return false;
+        };
+
+        let replacement = if checkbox.checked { " " } else { "x" };
+        let edit_start = checkbox.range.start + 3;
+        self.transact(window, cx, |this, _window, cx| {
+            this.edit(
+                [(
+                    MultiBufferOffset(edit_start)..MultiBufferOffset(edit_start + 1),
+                    replacement,
+                )],
+                cx,
+            );
+        });
+        // The raw marker changes from `[ ]` to `[x]` without changing the
+        // folded range, so the range-diff sync would otherwise keep the old
+        // checkbox placeholder on screen.
+        self.rebuild_ymd_checkbox_folds_after_settings_change(cx);
+        true
     }
 
     fn refresh_ymd_conceals(
