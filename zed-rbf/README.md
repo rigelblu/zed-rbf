@@ -88,6 +88,7 @@ Tables with repeated delimiter rows are preserved as sectioned tables when align
 - `editor::CopyFileLocation` copies `path:line` or `path:start-end` to the clipboard. In vim mode, `space c y` invokes it.
 
 ## 🟠⋯ Git History Workflows
+- Git Panel modes list as Changes, History, Compare; use `cmd-1`, `cmd-2`, and `cmd-3` on macOS (`ctrl-1`, `ctrl-2`, `ctrl-3` on Linux/Windows) to switch directly
 - Git Panel History loads on branches and in detached checkouts
 - Expand a History commit to preview its changed files; click a file row for its file-scoped patch
 - `Compare Since` from a commit compares the current workspace against that commit without moving branch, `HEAD`, or worktree status

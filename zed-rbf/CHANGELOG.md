@@ -6,6 +6,11 @@ title: "Zed RBF Changelog"
 
 ---
 
+# 🔵⋯ v0.51.0 (2026-07-05) — #zed-47
+- 2026-07-05 - improve (ux) | list Git Panel modes as Changes, History, Compare and add the matching Compare shortcut after Changes and History [@zed-rbf]
+
+---
+
 # 🔵⋯ v0.48.0 (2026-07-01) — #zed-44
 - 2026-07-01 - feat (ux) | mark files with lightweight Zed-local color tags from the Project Panel file-row workflow, visible as markers on file rows [@zed-rbf]
 - 2026-07-01 - feat (ux) | browse and open tagged files in a new Tags section above Project Files, grouped by color with path context and drag/keyboard support [@zed-rbf]
