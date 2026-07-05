@@ -126,10 +126,10 @@ actions!(
         CollapseSelectedEntry,
         /// Activates the Changes tab.
         ActivateChangesTab,
-        /// Activates the Compare tab.
-        ActivateCompareTab,
         /// Activates the History tab.
         ActivateHistoryTab,
+        /// Activates the Compare tab.
+        ActivateCompareTab,
     ]
 );
 
@@ -293,19 +293,19 @@ pub fn register(workspace: &mut Workspace) {
             });
         }
     });
-    workspace.register_action(|workspace, _: &ActivateCompareTab, window, cx| {
-        if let Some(panel) = workspace.panel::<GitPanel>(cx) {
-            workspace.open_panel::<GitPanel>(window, cx);
-            panel.update(cx, |panel, cx| {
-                panel.show_compare_with_default_base(window, cx);
-            });
-        }
-    });
     workspace.register_action(|workspace, _: &ActivateHistoryTab, window, cx| {
         if let Some(panel) = workspace.panel::<GitPanel>(cx) {
             workspace.open_panel::<GitPanel>(window, cx);
             panel.update(cx, |panel, cx| {
                 panel.set_active_tab(GitPanelTab::History, window, cx);
+            });
+        }
+    });
+    workspace.register_action(|workspace, _: &ActivateCompareTab, window, cx| {
+        if let Some(panel) = workspace.panel::<GitPanel>(cx) {
+            workspace.open_panel::<GitPanel>(window, cx);
+            panel.update(cx, |panel, cx| {
+                panel.show_compare_with_default_base(window, cx);
             });
         }
     });
@@ -419,8 +419,8 @@ struct SerializedGitPanel {
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum GitPanelTab {
     Changes,
-    Compare,
     History,
+    Compare,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -5665,8 +5665,8 @@ impl GitPanel {
                 format!("Changes ({})", self.changes_count)
             }
             GitPanelTab::Changes => "Changes".to_string(),
-            GitPanelTab::Compare => "Compare".to_string(),
             GitPanelTab::History => "History".to_string(),
+            GitPanelTab::Compare => "Compare".to_string(),
         };
         let git_panel = cx.weak_entity();
 
@@ -5696,29 +5696,25 @@ impl GitPanel {
                                     .ok();
                             }
                         })
-                        .entry("Compare", Some(Box::new(ActivateCompareTab)), {
+                        .entry("History", Some(Box::new(ActivateHistoryTab)), {
                             let git_panel = git_panel.clone();
                             move |window, cx| {
                                 git_panel
                                     .update(cx, |git_panel, cx| {
-                                        git_panel.show_compare_with_default_base(window, cx);
+                                        git_panel.set_active_tab(GitPanelTab::History, window, cx);
                                     })
                                     .ok();
                             }
                         })
                         .entry(
-                            "History",
-                            Some(Box::new(ActivateHistoryTab)),
+                            "Compare",
+                            Some(Box::new(ActivateCompareTab)),
                             {
                                 let git_panel = git_panel.clone();
                                 move |window, cx| {
                                     git_panel
                                         .update(cx, |git_panel, cx| {
-                                            git_panel.set_active_tab(
-                                                GitPanelTab::History,
-                                                window,
-                                                cx,
-                                            );
+                                            git_panel.show_compare_with_default_base(window, cx);
                                         })
                                         .ok();
                                 }
@@ -6875,15 +6871,6 @@ impl GitPanel {
         self.set_active_tab(GitPanelTab::Changes, window, cx);
     }
 
-    fn activate_compare_tab(
-        &mut self,
-        _: &ActivateCompareTab,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.show_compare_with_default_base(window, cx);
-    }
-
     fn activate_history_tab(
         &mut self,
         _: &ActivateHistoryTab,
@@ -6891,6 +6878,15 @@ impl GitPanel {
         cx: &mut Context<Self>,
     ) {
         self.set_active_tab(GitPanelTab::History, window, cx);
+    }
+
+    fn activate_compare_tab(
+        &mut self,
+        _: &ActivateCompareTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_compare_with_default_base(window, cx);
     }
 
     fn open_file_history(
@@ -6918,17 +6914,17 @@ impl GitPanel {
         }
         self.active_tab = tab;
         match tab {
-            GitPanelTab::Compare => {
+            GitPanelTab::Changes => {
                 self.focus_handle.focus(window, cx);
+                self.reset_commit_history_state();
+                self._repo_subscriptions.clear();
             }
             GitPanelTab::History => {
                 self.focus_handle.focus(window, cx);
                 self.load_commit_history(cx);
             }
-            GitPanelTab::Changes => {
+            GitPanelTab::Compare => {
                 self.focus_handle.focus(window, cx);
-                self.reset_commit_history_state();
-                self._repo_subscriptions.clear();
             }
         }
         cx.notify();
@@ -9068,8 +9064,8 @@ impl Render for GitPanel {
             .on_action(cx.listener(Self::decrease_font_size))
             .on_action(cx.listener(Self::reset_font_size))
             .on_action(cx.listener(Self::activate_changes_tab))
-            .on_action(cx.listener(Self::activate_compare_tab))
             .on_action(cx.listener(Self::activate_history_tab))
+            .on_action(cx.listener(Self::activate_compare_tab))
             .on_action(cx.listener(Self::open_file_history))
             .size_full()
             .overflow_hidden()
@@ -9106,8 +9102,8 @@ impl Render for GitPanel {
                             .when(!self.amend_pending, |this| {
                                 this.children(self.render_previous_commit(window, cx))
                             }),
-                        GitPanelTab::Compare => this.child(self.render_compare_tab(window, cx)),
                         GitPanelTab::History => this.child(self.render_history_tab(window, cx)),
+                        GitPanelTab::Compare => this.child(self.render_compare_tab(window, cx)),
                     })
                     .into_any_element(),
             )
