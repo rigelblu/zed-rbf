@@ -217,6 +217,7 @@ members = [
     "crates/util_macros",
     "crates/vim",
     "crates/vim_mode_setting",
+    "crates/ymd",
     "crates/watch",
     "crates/web_search",
     "crates/web_search_providers",
@@ -473,6 +474,7 @@ util = { path = "crates/util" }
 util_macros = { path = "crates/util_macros" }
 vim = { path = "crates/vim" }
 vim_mode_setting = { path = "crates/vim_mode_setting" }
+ymd = { path = "crates/ymd" }
 which_key = { path = "crates/which_key" }
 
 watch = { path = "crates/watch" }

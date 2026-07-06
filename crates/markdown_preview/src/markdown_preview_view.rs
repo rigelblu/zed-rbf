@@ -609,7 +609,7 @@ impl MarkdownPreviewView {
             }
         }
 
-        let markdown_style = if let Some(theme) = preview_theme {
+        let mut markdown_style = if let Some(theme) = preview_theme {
             MarkdownStyle::themed_with_overrides(
                 MarkdownFont::Preview,
                 theme.colors(),
@@ -620,6 +620,11 @@ impl MarkdownPreviewView {
         } else {
             MarkdownStyle::themed(MarkdownFont::Preview, window, cx)
         };
+        markdown_style.ymd = Some(markdown::YmdRenderOptions {
+            appearance: preview_theme
+                .as_ref()
+                .map_or_else(|| cx.theme().appearance(), |theme| theme.appearance()),
+        });
 
         let mut markdown_element = MarkdownElement::new(self.markdown.clone(), markdown_style)
             .code_block_renderer(CodeBlockRenderer::Default {
