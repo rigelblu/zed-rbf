@@ -2289,6 +2289,14 @@ impl OutlinePanel {
             Some(PanelEntry::Outline(OutlineEntry::Outline(selected))) => outline == selected,
             _ => false,
         };
+        let markdown_headings = self
+            .buffer_snapshot_for_id(outline.range.start.buffer_id, cx)
+            .and_then(|snapshot| {
+                snapshot
+                    .language()
+                    .map(|language| language.name() == "Markdown")
+            })
+            .unwrap_or(false);
         let label_element = outline::render_item(
             &outline,
             string_match
@@ -2297,6 +2305,8 @@ impl OutlinePanel {
             outline::RenderItemOptions {
                 ymd: true,
                 is_active,
+                typography: outline::RenderItemTypography::Ui,
+                markdown_headings,
             },
             cx,
         )

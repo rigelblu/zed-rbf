@@ -61,6 +61,7 @@ I don't commit these to the repo, but I sync the latest versions to [Google Driv
 - Fenced code blocks are excluded from YMD styling
 - Expanded diff hunks always show raw syntax
 - Large Markdown buffers over the YMD scanner cap skip YMD styling instead of doing unbounded whole-buffer work
+- The Outline panel and the ⌘⇧O outline picker show YMD headings concealed and colored like the editor, with Outline panel entries matching Project Panel typography and plain (non-YMD) heading prefixes concealed too
 
 ## 🟠⋯ Markdown Shortcuts
 | Shortcut (macOS)        | Action               |
