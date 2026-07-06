@@ -7395,10 +7395,14 @@ impl ProjectPanel {
                 };
                 self.render_file_tag_row_with_indent(color, row, indent_level, cx)
             }
-            FileTagListItem::ProjectFilesHeader => ListHeader::new("Project Files")
-                .inset(true)
-                .into_any_element(),
+            FileTagListItem::ProjectFilesHeader => self.render_project_files_header(),
         }
+    }
+
+    fn render_project_files_header(&self) -> AnyElement {
+        ListHeader::new("Project Files")
+            .inset(true)
+            .into_any_element()
     }
 
     fn render_file_tag_header(
@@ -7416,6 +7420,31 @@ impl ProjectPanel {
                     .child(self.render_file_tag_view_mode_menu(cx)),
             )
             .into_any_element()
+    }
+
+    fn render_sticky_section_header(
+        &self,
+        header: AnyElement,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .w_full()
+            .bg(cx.theme().colors().panel_background)
+            .child(header)
+            .into_any_element()
+    }
+
+    fn render_sticky_tags_header(&self, cx: &mut Context<Self>) -> AnyElement {
+        let tagged_file_count = self
+            .tagged_file_groups(cx)
+            .iter()
+            .map(|group| group.rows.len())
+            .sum::<usize>();
+        self.render_sticky_section_header(self.render_file_tag_header(tagged_file_count, cx), cx)
+    }
+
+    fn render_sticky_project_files_header(&self, cx: &mut Context<Self>) -> AnyElement {
+        self.render_sticky_section_header(self.render_project_files_header(), cx)
     }
 
     fn render_file_tag_view_mode_menu(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -7926,10 +7955,47 @@ impl ProjectPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> SmallVec<[AnyElement; 8]> {
+        match child.kind {
+            StickyProjectPanelCandidateKind::Sentinel => SmallVec::new(),
+            StickyProjectPanelCandidateKind::TagsSection => {
+                let mut elements = SmallVec::new();
+                elements.push(self.render_sticky_tags_header(cx));
+                return elements;
+            }
+            StickyProjectPanelCandidateKind::ProjectFilesSection {
+                project_entry_index,
+            } => {
+                if let Some(project_entry_index) = project_entry_index {
+                    return self.render_project_sticky_entries(project_entry_index, window, cx);
+                } else {
+                    let mut elements = SmallVec::new();
+                    elements.push(self.render_sticky_tags_header(cx));
+                    elements.push(self.render_sticky_project_files_header(cx));
+                    return elements;
+                }
+            }
+            StickyProjectPanelCandidateKind::ProjectEntry { index } => {
+                return self.render_project_sticky_entries(index, window, cx);
+            }
+        }
+    }
+
+    fn render_project_sticky_entries(
+        &self,
+        child_index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> SmallVec<[AnyElement; 8]> {
+        let mut elements = SmallVec::new();
+        if self.file_tag_list_item_count(cx) > 0 {
+            elements.push(self.render_sticky_tags_header(cx));
+            elements.push(self.render_sticky_project_files_header(cx));
+        }
+
         let project = self.project.read(cx);
 
-        let Some((worktree_id, entry_ref)) = self.entry_at_index(child.index) else {
-            return SmallVec::new();
+        let Some((worktree_id, entry_ref)) = self.entry_at_index(child_index) else {
+            return elements;
         };
 
         let Some(visible) = self
@@ -7938,11 +8004,11 @@ impl ProjectPanel {
             .iter()
             .find(|worktree| worktree.worktree_id == worktree_id)
         else {
-            return SmallVec::new();
+            return elements;
         };
 
         let Some(worktree) = project.worktree_for_id(worktree_id, cx) else {
-            return SmallVec::new();
+            return elements;
         };
         let worktree = worktree.read(cx).snapshot();
 
@@ -7969,7 +8035,7 @@ impl ProjectPanel {
         }
 
         if sticky_parents.is_empty() {
-            return SmallVec::new();
+            return elements;
         }
 
         sticky_parents.reverse();
@@ -7991,34 +8057,31 @@ impl ProjectPanel {
         // already checked if non empty above
         let last_item_index = sticky_parents.len() - 1;
         let marked_selections: Arc<[SelectedEntry]> = Arc::from(self.marked_entries.clone());
-        sticky_parents
-            .iter()
-            .enumerate()
-            .map(|(index, entry)| {
-                let git_status = git_summaries_by_id
-                    .get(&entry.id)
-                    .copied()
-                    .unwrap_or_default();
-                let sticky_details = Some(StickyDetails {
-                    sticky_index: index,
-                });
-                let details = self.details_for_entry(
-                    entry,
-                    worktree_id,
-                    root_name,
-                    paths,
-                    git_status,
-                    sticky_details,
-                    window,
-                    cx,
-                );
-                self.render_entry(
-                    entry.id,
-                    details,
-                    Arc::clone(&marked_selections),
-                    window,
-                    cx,
-                )
+        elements.extend(sticky_parents.iter().enumerate().map(|(index, entry)| {
+            let git_status = git_summaries_by_id
+                .get(&entry.id)
+                .copied()
+                .unwrap_or_default();
+            let sticky_details = Some(StickyDetails {
+                sticky_index: index,
+            });
+            let details = self.details_for_entry(
+                entry,
+                worktree_id,
+                root_name,
+                paths,
+                git_status,
+                sticky_details,
+                window,
+                cx,
+            );
+            self.render_entry(
+                entry.id,
+                details,
+                Arc::clone(&marked_selections),
+                window,
+                cx,
+            )
                 .when(index == last_item_index, |this| {
                     let shadow_color_top = hsla(0.0, 0.0, 0.0, 0.1);
                     let shadow_color_bottom = hsla(0.0, 0.0, 0.0, 0.);
@@ -8036,15 +8099,29 @@ impl ProjectPanel {
                     this.child(sticky_shadow)
                 })
                 .into_any()
-            })
-            .collect()
+        }));
+        elements
     }
 }
 
 #[derive(Clone)]
 struct StickyProjectPanelCandidate {
-    index: usize,
+    kind: StickyProjectPanelCandidateKind,
     depth: usize,
+}
+
+#[derive(Clone)]
+enum StickyProjectPanelCandidateKind {
+    Sentinel,
+    TagsSection,
+    ProjectFilesSection { project_entry_index: Option<usize> },
+    ProjectEntry { index: usize },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum StickyProjectPanelSection {
+    Tags,
+    ProjectFiles { project_entry_index: Option<usize> },
 }
 
 impl StickyCandidate for StickyProjectPanelCandidate {
@@ -8062,6 +8139,33 @@ fn item_width_estimate(depth: usize, item_text_chars: usize, is_symlink: bool) -
     item_width
 }
 
+fn should_show_sticky_entries(
+    panel_settings: &ProjectPanelSettings,
+    is_scrollable: bool,
+    scroll_offset: Point<Pixels>,
+) -> bool {
+    panel_settings.sticky_scroll && is_scrollable && scroll_offset.y < px(0.)
+}
+
+fn sticky_section_for_visible_range(
+    range: Range<usize>,
+    file_tag_list_item_count: usize,
+) -> Option<StickyProjectPanelSection> {
+    let project_files_header_index = file_tag_list_item_count.checked_sub(1)?;
+    let project_range_start = range.start.saturating_sub(file_tag_list_item_count);
+    let project_range_end = range.end.saturating_sub(file_tag_list_item_count);
+    let project_entry_index =
+        (project_range_start < project_range_end).then_some(project_range_start);
+
+    if range.start < project_files_header_index {
+        Some(StickyProjectPanelSection::Tags)
+    } else {
+        Some(StickyProjectPanelSection::ProjectFiles {
+            project_entry_index,
+        })
+    }
+}
+
 impl Render for ProjectPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let has_worktree = !self.state.visible_entries.is_empty();
@@ -8070,21 +8174,16 @@ impl Render for ProjectPanel {
         } else {
             Vec::new()
         };
-        let has_file_tags_section = !file_tag_list_items.is_empty();
         let project = self.project.read(cx);
         let panel_settings = ProjectPanelSettings::get_global(cx);
         let indent_size = panel_settings.indent_size;
         let show_indent_guides = panel_settings.indent_guides.show == ShowIndentGuides::Always;
         let horizontal_scroll = panel_settings.scrollbar.horizontal_scroll;
-        let show_sticky_entries = {
-            if panel_settings.sticky_scroll {
-                let is_scrollable = self.scroll_handle.is_scrollable();
-                let is_scrolled = self.scroll_handle.offset().y < px(0.);
-                is_scrollable && is_scrolled && !has_file_tags_section
-            } else {
-                false
-            }
-        };
+        let show_sticky_entries = should_show_sticky_entries(
+            panel_settings,
+            self.scroll_handle.is_scrollable(),
+            self.scroll_handle.offset(),
+        );
 
         // Trashing, undo, and redo rely on the `TrashProjectEntry` and
         // `RestoreProjectEntry` messages, which older collab hosts can't
@@ -8446,6 +8545,33 @@ impl Render for ProjectPanel {
                                             range.start.saturating_sub(file_tag_list_item_count);
                                         let project_range_end =
                                             range.end.saturating_sub(file_tag_list_item_count);
+
+                                        if let Some(section) = sticky_section_for_visible_range(
+                                            range.clone(),
+                                            file_tag_list_item_count,
+                                        ) {
+                                            let section_kind = match section {
+                                                StickyProjectPanelSection::Tags => {
+                                                    StickyProjectPanelCandidateKind::TagsSection
+                                                }
+                                                StickyProjectPanelSection::ProjectFiles {
+                                                    project_entry_index,
+                                                } => {
+                                                    StickyProjectPanelCandidateKind::ProjectFilesSection {
+                                                        project_entry_index,
+                                                    }
+                                                }
+                                            };
+                                            items.push(StickyProjectPanelCandidate {
+                                                kind: StickyProjectPanelCandidateKind::Sentinel,
+                                                depth: 2,
+                                            });
+                                            items.push(StickyProjectPanelCandidate {
+                                                kind: section_kind,
+                                                depth: 0,
+                                            });
+                                        }
+
                                         this.iter_visible_entries(
                                             project_range_start..project_range_end,
                                             window,
@@ -8455,9 +8581,16 @@ impl Render for ProjectPanel {
                                                     Self::calculate_depth_and_difference(
                                                         entry, entries,
                                                     );
-                                                let candidate =
-                                                    StickyProjectPanelCandidate { index, depth };
-                                                items.push(candidate);
+                                                items.push(StickyProjectPanelCandidate {
+                                                    kind: StickyProjectPanelCandidateKind::ProjectEntry {
+                                                        index,
+                                                    },
+                                                    depth: if file_tag_list_item_count > 0 {
+                                                        depth + 1
+                                                    } else {
+                                                        depth
+                                                    },
+                                                });
                                             },
                                         );
                                         items

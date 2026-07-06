@@ -12667,6 +12667,58 @@ async fn test_file_tags_selection_scrolls_tagged_rows(cx: &mut gpui::TestAppCont
 }
 
 #[gpui::test]
+fn test_file_tags_allow_sticky_section_headers(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let settings = cx.read(|cx| *ProjectPanelSettings::get_global(cx));
+    let settings = ProjectPanelSettings {
+        sticky_scroll: true,
+        ..settings
+    };
+    let scrolled_offset = gpui::point(gpui::px(0.), gpui::px(-10.));
+    let unscrolled_offset = gpui::point(gpui::px(0.), gpui::px(0.));
+    assert!(should_show_sticky_entries(&settings, true, scrolled_offset,));
+    assert!(!should_show_sticky_entries(
+        &settings,
+        false,
+        scrolled_offset,
+    ));
+    assert!(!should_show_sticky_entries(
+        &settings,
+        true,
+        unscrolled_offset,
+    ));
+
+    let settings = ProjectPanelSettings {
+        sticky_scroll: false,
+        ..settings
+    };
+    assert!(!should_show_sticky_entries(
+        &settings,
+        true,
+        scrolled_offset,
+    ));
+
+    assert_eq!(
+        sticky_section_for_visible_range(1..12, 7),
+        Some(StickyProjectPanelSection::Tags)
+    );
+    assert_eq!(
+        sticky_section_for_visible_range(6..14, 7),
+        Some(StickyProjectPanelSection::ProjectFiles {
+            project_entry_index: Some(0),
+        })
+    );
+    assert_eq!(
+        sticky_section_for_visible_range(12..20, 7),
+        Some(StickyProjectPanelSection::ProjectFiles {
+            project_entry_index: Some(5),
+        })
+    );
+    assert_eq!(sticky_section_for_visible_range(0..8, 0), None);
+}
+
+#[gpui::test]
 async fn test_file_tags_keyboard_navigation_opens_tags_section_rows(cx: &mut gpui::TestAppContext) {
     init_test(cx);
     clear_file_tags_for_test(cx).await;
