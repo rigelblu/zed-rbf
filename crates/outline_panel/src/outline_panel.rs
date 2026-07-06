@@ -2285,19 +2285,22 @@ impl OutlinePanel {
             outline.range, &outline.text,
         )));
 
+        let is_active = match self.selected_entry() {
+            Some(PanelEntry::Outline(OutlineEntry::Outline(selected))) => outline == selected,
+            _ => false,
+        };
         let label_element = outline::render_item(
             &outline,
             string_match
                 .map(|string_match| string_match.ranges().collect::<Vec<_>>())
                 .unwrap_or_default(),
+            outline::RenderItemOptions {
+                ymd: true,
+                is_active,
+            },
             cx,
         )
         .into_any_element();
-
-        let is_active = match self.selected_entry() {
-            Some(PanelEntry::Outline(OutlineEntry::Outline(selected))) => outline == selected,
-            _ => false,
-        };
 
         let has_children = self
             .outline_children_cache
@@ -2578,6 +2581,7 @@ impl OutlinePanel {
                 body_range: Some(search_data.context_range.clone()),
             },
             match_ranges.iter().cloned(),
+            outline::RenderItemOptions::default(),
             cx,
         );
         let truncated_contents_label = || Label::new(TRUNCATED_CONTEXT_MARK);
