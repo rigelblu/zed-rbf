@@ -6,6 +6,11 @@ title: "Zed RBF Changelog"
 
 ---
 
+# 🔵⋯ v0.52.0 (2026-07-27) — #zed-48
+- 2026-07-27 - fix (ux) | see Outline panel entries at the same type scale as the Project Panel, and read plain Markdown headings without their raw `#` prefixes [@zed-rbf]
+
+---
+
 # 🔵⋯ v0.51.0 (2026-07-05) — #zed-47
 - 2026-07-05 - improve (ux) | list Git Panel modes as Changes, History, Compare and add the matching Compare shortcut after Changes and History [@zed-rbf]
 
