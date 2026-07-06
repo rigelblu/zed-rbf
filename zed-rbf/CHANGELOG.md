@@ -6,6 +6,11 @@ title: "Zed RBF Changelog"
 
 ---
 
+# 🔵⋯ v0.53.0 (2026-07-27) — #zed-38
+- 2026-07-06 - feat (ux) | render YMD background highlights and line foreground colors in Markdown Preview with YMD markers concealed, gated to the Preview surface [@zed-rbf]
+
+---
+
 # 🔵⋯ v0.52.0 (2026-07-27) — #zed-48
 - 2026-07-27 - fix (ux) | see Outline panel entries at the same type scale as the Project Panel, and read plain Markdown headings without their raw `#` prefixes [@zed-rbf]
 

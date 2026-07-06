@@ -36,6 +36,7 @@ I don't commit these to the repo, but I sync the latest versions to [Google Driv
 - `==text==` renders as a default background highlight
 - `==🔴 text==`, `==🟠 text==`, `==🟡 text==`, `==🟢 text==`, `==🔵 text==`, `==🟣 text==`, and `==⚫ text==` render as coloured highlights
 - A standalone supported colour emoji outside highlight markers colours the whole line foreground; the supported line-colour set is 🔴 🟠 🟡 🟢 🔵 🟣 ⚫
+- YMD highlight and line colours also render in the Markdown Preview page, with the `==` delimiters and marker emoji concealed
 
 - `[label](url)` shows as an underlined label with the brackets and URL hidden; Cmd-click the label to open its destination in read mode — a web URL (a bare `google.com` works too), a relative file (opens as a buffer), or a directory (revealed in the project panel) — or move the cursor onto the line to reveal the raw link
 - `~~text~~` renders as struck-through text with the double-tilde markers concealed
