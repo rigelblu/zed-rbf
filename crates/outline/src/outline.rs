@@ -458,22 +458,61 @@ impl PickerDelegate for OutlineViewDelegate {
                     div()
                         .text_ui(cx)
                         .pl(rems(outline_item.depth as f32))
-                        .child(render_item(outline_item, ranges, cx)),
+                        .child(render_item(
+                            outline_item,
+                            ranges,
+                            RenderItemOptions {
+                                ymd: true,
+                                is_active: selected,
+                            },
+                            cx,
+                        )),
                 ),
         )
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RenderItemOptions {
+    pub ymd: bool,
+    pub is_active: bool,
+}
+
 pub fn render_item<T>(
     outline_item: &OutlineItem<T>,
     match_ranges: impl IntoIterator<Item = Range<usize>>,
+    options: RenderItemOptions,
     cx: &App,
 ) -> StyledText {
     let highlight_style = HighlightStyle {
         background_color: Some(cx.theme().colors().text_accent.alpha(0.3)),
         ..Default::default()
     };
-    let custom_highlights = match_ranges
+    let mut text = outline_item.text.clone();
+    let mut item_highlights = outline_item.highlight_ranges.clone();
+    let match_ranges = match_ranges.into_iter().collect::<Vec<_>>();
+
+    let custom_highlight_ranges = if options.ymd {
+        if let Some(styled_heading) =
+            ymd::style_heading(&outline_item.text, cx.theme().appearance())
+        {
+            text = styled_heading.text.clone();
+            item_highlights.clear();
+            if !options.is_active {
+                item_highlights.push((0..text.len(), styled_heading.foreground_style));
+            }
+            match_ranges
+                .into_iter()
+                .filter_map(|range| styled_heading.rendered_range_for_source_range(range))
+                .collect::<Vec<_>>()
+        } else {
+            match_ranges
+        }
+    } else {
+        match_ranges
+    };
+
+    let custom_highlights = custom_highlight_ranges
         .into_iter()
         .map(|range| (range, highlight_style));
 
@@ -492,12 +531,9 @@ pub fn render_item<T>(
         line_height: relative(1.),
         ..Default::default()
     };
-    let highlights = gpui::combine_highlights(
-        custom_highlights,
-        outline_item.highlight_ranges.iter().cloned(),
-    );
+    let highlights = gpui::combine_highlights(custom_highlights, item_highlights);
 
-    StyledText::new(outline_item.text.clone()).with_default_highlights(&text_style, highlights)
+    StyledText::new(text).with_default_highlights(&text_style, highlights)
 }
 
 #[cfg(test)]

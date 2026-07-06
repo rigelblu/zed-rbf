@@ -43,12 +43,12 @@ use gpui::{
 use language::{CharClassifier, Language, LanguageRegistry, Rope};
 use parser::CodeBlockMetadata;
 use parser::{
-    MarkdownEvent, MarkdownTag, MarkdownTagEnd, ParsedMetadataBlock, parse_links_only,
-    parse_markdown_with_options,
+    MarkdownEvent, MarkdownTag, MarkdownTagEnd, PARSE_OPTIONS, ParsedMetadataBlock,
+    parse_links_only, parse_markdown_with_options,
 };
-use pulldown_cmark::{Alignment, BlockQuoteKind};
+use pulldown_cmark::{Alignment, BlockQuoteKind, Event, Parser};
 use sum_tree::TreeMap;
-use theme::SyntaxTheme;
+use theme::{Appearance, SyntaxTheme};
 use ui::{Checkbox, CopyButton, ScrollAxes, Scrollbars, Tooltip, WithScrollbar, prelude::*};
 use util::ResultExt;
 
@@ -125,6 +125,12 @@ pub struct MarkdownStyle {
     pub prevent_mouse_interaction: bool,
     pub table_columns_min_size: bool,
     pub soft_break_as_hard_break: bool,
+    pub ymd: Option<YmdRenderOptions>,
+}
+
+#[derive(Clone, Copy)]
+pub struct YmdRenderOptions {
+    pub appearance: Appearance,
 }
 
 impl Default for MarkdownStyle {
@@ -150,6 +156,7 @@ impl Default for MarkdownStyle {
             prevent_mouse_interaction: false,
             table_columns_min_size: false,
             soft_break_as_hard_break: false,
+            ymd: None,
         }
     }
 }
@@ -2422,6 +2429,15 @@ impl Element for MarkdownElement {
                 markdown.mermaid_state.clone(),
             )
         };
+        if let Some(ymd_options) = self.style.ymd
+            && parsed_markdown.source.len() <= ymd::MAX_YMD_HIGHLIGHT_BYTES
+        {
+            builder.set_ymd_background_markups(
+                parsed_markdown.source.clone(),
+                ymd::scan_background_markups(&parsed_markdown.source),
+                ymd_options.appearance,
+            );
+        }
         let markdown_end = if let Some(last) = parsed_markdown.events.last() {
             last.0.end
         } else {
@@ -3474,6 +3490,9 @@ struct MarkdownElementBuilder {
     list_stack: Vec<ListStackEntry>,
     table: TableState,
     syntax_theme: Arc<SyntaxTheme>,
+    ymd_source: Option<SharedString>,
+    ymd_background_markups: Vec<ymd::YmdBackgroundMarkup>,
+    ymd_appearance: Option<Appearance>,
 }
 
 struct DivStackEntry {
@@ -3501,6 +3520,7 @@ struct PendingLine {
     text: String,
     runs: Vec<TextRun>,
     source_mappings: Vec<SourceMapping>,
+    source_start: Option<usize>,
 }
 
 struct ListStackEntry {
@@ -3534,7 +3554,21 @@ impl MarkdownElementBuilder {
             list_stack: Vec::new(),
             table: TableState::default(),
             syntax_theme,
+            ymd_source: None,
+            ymd_background_markups: Vec::new(),
+            ymd_appearance: None,
         }
+    }
+
+    fn set_ymd_background_markups(
+        &mut self,
+        source: SharedString,
+        markups: Vec<ymd::YmdBackgroundMarkup>,
+        appearance: Appearance,
+    ) {
+        self.ymd_source = Some(source);
+        self.ymd_background_markups = markups;
+        self.ymd_appearance = Some(appearance);
     }
 
     fn push_text_style(&mut self, style: TextStyleRefinement) {
@@ -3732,17 +3766,21 @@ impl MarkdownElementBuilder {
     }
 
     fn push_text(&mut self, text: &str, source_range: Range<usize>) {
-        self.pending_line.source_mappings.push(SourceMapping {
-            rendered_index: self.pending_line.text.len(),
-            source_index: source_range.start,
-        });
-        self.pending_line.text.push_str(text);
-        self.current_source_index = source_range.end;
+        self.pending_line
+            .source_start
+            .get_or_insert(source_range.start);
 
         // Compute the base text style once
         let text_style = self.text_style();
 
         if let Some(Some(language)) = self.code_block_stack.last() {
+            self.pending_line.source_mappings.push(SourceMapping {
+                rendered_index: self.pending_line.text.len(),
+                source_index: source_range.start,
+            });
+            self.pending_line.text.push_str(text);
+            self.current_source_index = source_range.end;
+
             let mut offset = 0;
             for (range, highlight_id) in language.highlight_text(&Rope::from(text), 0..text.len()) {
                 if range.start > offset {
@@ -3767,9 +3805,122 @@ impl MarkdownElementBuilder {
                     .runs
                     .push(text_style.to_run(text.len() - offset));
             }
+        } else if self.push_ymd_text(text, source_range.clone(), text_style.clone()) {
+            self.current_source_index = source_range.end;
         } else {
+            self.pending_line.source_mappings.push(SourceMapping {
+                rendered_index: self.pending_line.text.len(),
+                source_index: source_range.start,
+            });
+            self.pending_line.text.push_str(text);
+            self.current_source_index = source_range.end;
             self.pending_line.runs.push(text_style.to_run(text.len()));
         }
+    }
+
+    fn push_ymd_text(
+        &mut self,
+        text: &str,
+        source_range: Range<usize>,
+        text_style: TextStyle,
+    ) -> bool {
+        let Some(appearance) = self.ymd_appearance else {
+            return false;
+        };
+
+        let markups = self
+            .ymd_background_markups
+            .iter()
+            .filter(|markup| {
+                ranges_overlap(&markup.range, &source_range)
+                    || ranges_overlap(&markup.open_marker_range, &source_range)
+                    || ranges_overlap(&markup.close_marker_range, &source_range)
+            })
+            .collect::<Vec<_>>();
+        if markups.is_empty() {
+            return false;
+        }
+
+        let mut boundaries = vec![source_range.start, source_range.end];
+        for markup in &markups {
+            push_clipped_range_boundaries(&mut boundaries, &markup.range, &source_range);
+            push_clipped_range_boundaries(
+                &mut boundaries,
+                &markup.open_marker_range,
+                &source_range,
+            );
+            push_clipped_range_boundaries(
+                &mut boundaries,
+                &markup.close_marker_range,
+                &source_range,
+            );
+        }
+        boundaries.sort_unstable();
+        boundaries.dedup();
+
+        for segment in boundaries.windows(2) {
+            let segment_range = segment[0]..segment[1];
+            if segment_range.is_empty() {
+                continue;
+            }
+            let concealed = markups.iter().any(|markup| {
+                range_contains_range(&markup.open_marker_range, &segment_range)
+                    || range_contains_range(&markup.close_marker_range, &segment_range)
+            });
+            if concealed {
+                self.pending_line.source_mappings.push(SourceMapping {
+                    rendered_index: self.pending_line.text.len(),
+                    source_index: segment_range.start,
+                });
+                continue;
+            }
+
+            let Some(segment_text) = self.ymd_segment_text(&segment_range, &source_range, text)
+            else {
+                continue;
+            };
+            if segment_text.is_empty() {
+                continue;
+            }
+
+            self.pending_line.source_mappings.push(SourceMapping {
+                rendered_index: self.pending_line.text.len(),
+                source_index: segment_range.start,
+            });
+            self.pending_line.text.push_str(&segment_text);
+
+            let mut segment_style = text_style.clone();
+            if let Some(markup) = markups
+                .iter()
+                .find(|markup| range_contains_range(&markup.range, &segment_range))
+            {
+                segment_style =
+                    segment_style.highlight(ymd::background_style(markup.color, appearance));
+            }
+            self.pending_line
+                .runs
+                .push(segment_style.to_run(segment_text.len()));
+        }
+
+        true
+    }
+
+    fn ymd_segment_text(
+        &self,
+        segment_range: &Range<usize>,
+        source_range: &Range<usize>,
+        text: &str,
+    ) -> Option<String> {
+        if text.len() == source_range.len() {
+            let local_range =
+                segment_range.start - source_range.start..segment_range.end - source_range.start;
+            return text.get(local_range).map(ToString::to_string);
+        }
+
+        let source = self.ymd_source.as_ref()?;
+        source
+            .get(segment_range.clone())
+            .map(render_markdown_text_segment)
     }
 
     fn trim_trailing_newline(&mut self) {
@@ -3850,6 +4001,7 @@ impl MarkdownElementBuilder {
                 rendered_index: 0,
                 source_index: source_range.start,
             }],
+            source_start: source_range.start,
             source_end: source_range.end,
             language: None,
             text_align: TextAlign::Left,
@@ -3874,6 +4026,7 @@ impl MarkdownElementBuilder {
         self.rendered_lines.push(RenderedLine {
             layout: text.layout().clone(),
             source_mappings: line.source_mappings,
+            source_start: line.source_start.unwrap_or(self.current_source_index),
             source_end: self.current_source_index,
             language: self.code_block_stack.last().cloned().flatten(),
             text_align,
@@ -3899,6 +4052,7 @@ impl MarkdownElementBuilder {
 struct RenderedLine {
     layout: TextLayout,
     source_mappings: Vec<SourceMapping>,
+    source_start: usize,
     source_end: usize,
     language: Option<Arc<Language>>,
     text_align: TextAlign,
@@ -3910,13 +4064,22 @@ impl RenderedLine {
             return self.layout.len();
         }
 
-        let mapping = match self
+        let mapping_ix = match self
             .source_mappings
             .binary_search_by_key(&source_index, |probe| probe.source_index)
         {
-            Ok(ix) => &self.source_mappings[ix],
-            Err(ix) => &self.source_mappings[ix - 1],
+            Ok(ix) => ix,
+            Err(0) => return 0,
+            Err(ix) => ix - 1,
         };
+        let mapping = &self.source_mappings[mapping_ix];
+        if let Some(next_mapping) = self.source_mappings.get(mapping_ix + 1) {
+            let rendered_segment_len = next_mapping.rendered_index - mapping.rendered_index;
+            let source_offset = source_index - mapping.source_index;
+            if source_offset >= rendered_segment_len {
+                return next_mapping.rendered_index;
+            }
+        }
         (mapping.rendered_index + (source_index - mapping.source_index)).min(self.layout.len())
     }
 
@@ -3925,13 +4088,24 @@ impl RenderedLine {
             return self.source_end;
         }
 
-        let mapping = match self
+        let mapping_ix = match self
             .source_mappings
             .binary_search_by_key(&rendered_index, |probe| probe.rendered_index)
         {
-            Ok(ix) => &self.source_mappings[ix],
-            Err(ix) => &self.source_mappings[ix - 1],
+            Ok(mut ix) => {
+                while self
+                    .source_mappings
+                    .get(ix + 1)
+                    .is_some_and(|mapping| mapping.rendered_index == rendered_index)
+                {
+                    ix += 1;
+                }
+                ix
+            }
+            Err(0) => return self.source_start,
+            Err(ix) => ix - 1,
         };
+        let mapping = &self.source_mappings[mapping_ix];
         mapping.source_index + (rendered_index - mapping.rendered_index)
     }
 
@@ -4080,6 +4254,51 @@ fn source_index_for_rendered(mappings: &[SourceMapping], rendered_index: usize) 
     last.map(|m| m.source_index + (rendered_index - m.rendered_index))
 }
 
+fn ranges_overlap<T: Ord>(left: &Range<T>, right: &Range<T>) -> bool {
+    left.start < right.end && right.start < left.end
+}
+
+fn range_contains_range<T: Ord>(outer: &Range<T>, inner: &Range<T>) -> bool {
+    outer.start <= inner.start && inner.end <= outer.end
+}
+
+fn push_clipped_range_boundaries(
+    boundaries: &mut Vec<usize>,
+    candidate: &Range<usize>,
+    bounds: &Range<usize>,
+) {
+    if !ranges_overlap(candidate, bounds) {
+        return;
+    }
+    boundaries.push(candidate.start.max(bounds.start));
+    boundaries.push(candidate.end.min(bounds.end));
+}
+
+fn render_markdown_text_segment(source: &str) -> String {
+    let mut rendered = String::new();
+    for event in Parser::new_ext(source, PARSE_OPTIONS) {
+        match event {
+            Event::Text(text)
+            | Event::Code(text)
+            | Event::InlineMath(text)
+            | Event::DisplayMath(text)
+            | Event::Html(text)
+            | Event::InlineHtml(text)
+            | Event::FootnoteReference(text) => rendered.push_str(&text),
+            Event::SoftBreak | Event::HardBreak => rendered.push('\n'),
+            Event::TaskListMarker(checked) => {
+                if checked {
+                    rendered.push_str("[x]");
+                } else {
+                    rendered.push_str("[ ]");
+                }
+            }
+            Event::Start(_) | Event::End(_) | Event::Rule => {}
+        }
+    }
+    rendered
+}
+
 pub struct RenderedMarkdown {
     element: AnyElement,
     text: RenderedText,
@@ -4137,7 +4356,7 @@ impl RenderedText {
         let mut first_possible_range_ix = 0;
 
         for line in self.lines.iter() {
-            let line_source_start = line.source_mappings.first().unwrap().source_index;
+            let line_source_start = line.source_start;
             while ranges
                 .get(first_possible_range_ix)
                 .is_some_and(|(_, range)| range.end <= line_source_start)
@@ -4313,7 +4532,9 @@ impl RenderedText {
 
     fn position_for_source_index(&self, source_index: usize) -> Option<(Point<Pixels>, Pixels)> {
         for line in self.lines.iter() {
-            if source_index > line.source_end {
+            if source_index < line.source_start {
+                break;
+            } else if source_index > line.source_end {
                 continue;
             }
             let line_source_start = line.source_mappings.first().unwrap().source_index;
@@ -4328,6 +4549,9 @@ impl RenderedText {
 
     fn surrounding_word_range(&self, source_index: usize) -> Range<usize> {
         for line in self.lines.iter() {
+            if source_index < line.source_start {
+                break;
+            }
             if source_index > line.source_end {
                 continue;
             }
@@ -4378,8 +4602,7 @@ impl RenderedText {
             if source_index > line.source_end {
                 continue;
             }
-            let line_source_start = line.source_mappings.first().unwrap().source_index;
-            return line_source_start..line.source_end;
+            return line.source_start..line.source_end;
         }
 
         source_index..source_index
@@ -4392,14 +4615,13 @@ impl RenderedText {
             if range.start > line.source_end {
                 continue;
             }
-            let line_source_start = line.source_mappings.first().unwrap().source_index;
-            if range.end < line_source_start {
+            if range.end < line.source_start {
                 break;
             }
 
             let text = line.layout.text();
 
-            let start = if range.start < line_source_start {
+            let start = if range.start < line.source_start {
                 0
             } else {
                 line.rendered_index_for_source_index(range.start)
@@ -4694,6 +4916,87 @@ mod tests {
 
     fn render_markdown(markdown: &str, cx: &mut TestAppContext) -> RenderedText {
         render_markdown_with_language_registry(markdown, None, cx)
+    }
+
+    fn render_markdown_with_style(
+        markdown: &str,
+        style: MarkdownStyle,
+        cx: &mut TestAppContext,
+    ) -> RenderedText {
+        render_markdown_with_code_span_link_style(markdown, style, |_, _| None, cx)
+    }
+
+    fn ymd_preview_style() -> MarkdownStyle {
+        MarkdownStyle {
+            ymd: Some(YmdRenderOptions {
+                appearance: Appearance::Light,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[gpui::test]
+    fn test_ymd_background_markup_is_disabled_by_default(cx: &mut TestAppContext) {
+        let markdown = "==🔴urgent==";
+        let rendered = render_markdown(markdown, cx);
+
+        assert_eq!(rendered.lines[0].layout.text(), markdown);
+        assert_eq!(rendered.text_for_range(0..markdown.len()), markdown);
+    }
+
+    #[gpui::test]
+    fn test_ymd_background_markup_conceals_markers_in_preview(cx: &mut TestAppContext) {
+        let markdown = "==🔴urgent==";
+        let rendered = render_markdown_with_style(markdown, ymd_preview_style(), cx);
+
+        assert_eq!(rendered.lines[0].layout.text(), "urgent");
+        assert_eq!(rendered.text_for_range(0..markdown.len()), "urgent");
+        assert_eq!(rendered.surrounding_line_range(0), 0..markdown.len());
+        assert_eq!(rendered.lines[0].rendered_index_for_source_index(0), 0);
+        assert_eq!(rendered.lines[0].rendered_index_for_source_index(6), 0);
+        assert_eq!(rendered.lines[0].source_index_for_rendered_index(0), 6);
+    }
+
+    #[gpui::test]
+    fn test_ymd_background_markup_renders_decoded_text_in_preview(cx: &mut TestAppContext) {
+        let markdown = "==a &amp; b==";
+        let rendered = render_markdown_with_style(markdown, ymd_preview_style(), cx);
+
+        assert_eq!(rendered.lines[0].layout.text(), "a & b");
+        assert_eq!(rendered.text_for_range(0..markdown.len()), "a & b");
+        assert_eq!(rendered.lines[0].source_index_for_rendered_index(0), 2);
+    }
+
+    #[gpui::test]
+    fn test_ymd_background_markup_concealed_marker_offsets_pin_to_boundary(
+        cx: &mut TestAppContext,
+    ) {
+        let markdown = "prefix ==🔴urgent==";
+        let rendered = render_markdown_with_style(markdown, ymd_preview_style(), cx);
+        let prefix_len = "prefix ".len();
+        let content_start = markdown.find("urgent").expect("test markdown has content");
+
+        assert_eq!(rendered.lines[0].layout.text(), "prefix urgent");
+        assert_eq!(rendered.text_for_range(0..markdown.len()), "prefix urgent");
+        for source_index in prefix_len.."prefix ==🔴".len() {
+            assert_eq!(
+                rendered.lines[0].rendered_index_for_source_index(source_index),
+                prefix_len
+            );
+        }
+        assert_eq!(
+            rendered.lines[0].source_index_for_rendered_index(prefix_len),
+            content_start
+        );
+    }
+
+    #[gpui::test]
+    fn test_ymd_standalone_line_color_emoji_stays_visible_in_preview(cx: &mut TestAppContext) {
+        let markdown = "🔴 urgent";
+        let rendered = render_markdown_with_style(markdown, ymd_preview_style(), cx);
+
+        assert_eq!(rendered.lines[0].layout.text(), markdown);
+        assert_eq!(rendered.text_for_range(0..markdown.len()), markdown);
     }
 
     #[gpui::test]

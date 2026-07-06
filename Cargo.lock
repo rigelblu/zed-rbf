@@ -5825,6 +5825,7 @@ dependencies = [
  "uuid",
  "vim_mode_setting",
  "workspace",
+ "ymd",
  "zed_actions",
  "zlog",
  "ztracing",
@@ -10827,6 +10828,7 @@ dependencies = [
  "theme_settings",
  "ui",
  "util",
+ "ymd",
 ]
 
 [[package]]
@@ -12707,6 +12709,7 @@ dependencies = [
  "ui",
  "util",
  "workspace",
+ "ymd",
  "zed_actions",
 ]
 
@@ -23154,6 +23157,14 @@ dependencies = [
  "dlib",
  "once_cell",
  "pkg-config",
+]
+
+[[package]]
+name = "ymd"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "theme",
 ]
 
 [[package]]
