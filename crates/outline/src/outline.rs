@@ -464,6 +464,7 @@ impl PickerDelegate for OutlineViewDelegate {
                             RenderItemOptions {
                                 ymd: true,
                                 is_active: selected,
+                                ..Default::default()
                             },
                             cx,
                         )),
@@ -476,6 +477,15 @@ impl PickerDelegate for OutlineViewDelegate {
 pub struct RenderItemOptions {
     pub ymd: bool,
     pub is_active: bool,
+    pub typography: RenderItemTypography,
+    pub markdown_headings: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub enum RenderItemTypography {
+    #[default]
+    Buffer,
+    Ui,
 }
 
 pub fn render_item<T>(
@@ -490,9 +500,9 @@ pub fn render_item<T>(
     };
     let mut text = outline_item.text.clone();
     let mut item_highlights = outline_item.highlight_ranges.clone();
-    let match_ranges = match_ranges.into_iter().collect::<Vec<_>>();
+    let mut match_ranges = match_ranges.into_iter().collect::<Vec<_>>();
 
-    let custom_highlight_ranges = if options.ymd {
+    let ymd_heading = if options.ymd {
         if let Some(styled_heading) =
             ymd::style_heading(&outline_item.text, cx.theme().appearance())
         {
@@ -501,39 +511,103 @@ pub fn render_item<T>(
             if !options.is_active {
                 item_highlights.push((0..text.len(), styled_heading.foreground_style));
             }
-            match_ranges
+            match_ranges = match_ranges
                 .into_iter()
                 .filter_map(|range| styled_heading.rendered_range_for_source_range(range))
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            true
         } else {
-            match_ranges
+            false
         }
     } else {
-        match_ranges
+        false
     };
 
-    let custom_highlights = custom_highlight_ranges
+    if options.markdown_headings
+        && !ymd_heading
+        && let Some(prefix_range) = markdown_heading_prefix_range(&text)
+    {
+        let prefix_end = prefix_range.end;
+        let rendered_text = &text[prefix_end..];
+        if !rendered_text.trim().is_empty() {
+            text = rendered_text.into();
+            item_highlights = item_highlights
+                .into_iter()
+                .filter_map(|(range, style)| {
+                    remap_prefix_concealed_range(range, prefix_end).map(|range| (range, style))
+                })
+                .collect();
+            match_ranges = match_ranges
+                .into_iter()
+                .filter_map(|range| remap_prefix_concealed_range(range, prefix_end))
+                .collect();
+        }
+    }
+
+    let custom_highlights = match_ranges
         .into_iter()
         .map(|range| (range, highlight_style));
 
     let settings = ThemeSettings::get_global(cx);
 
-    // TODO: We probably shouldn't need to build a whole new text style here
-    // but I'm not sure how to get the current one and modify it.
-    // Before this change TextStyle::default() was used here, which was giving us the wrong font and text color.
-    let text_style = TextStyle {
-        color: cx.theme().colors().text,
-        font_family: settings.buffer_font.family.clone(),
-        font_features: settings.buffer_font.features.clone(),
-        font_fallbacks: settings.buffer_font.fallbacks.clone(),
-        font_size: settings.buffer_font_size(cx).into(),
-        font_weight: settings.buffer_font.weight,
-        line_height: relative(1.),
-        ..Default::default()
+    let text_style = match options.typography {
+        RenderItemTypography::Buffer => TextStyle {
+            color: cx.theme().colors().text,
+            font_family: settings.buffer_font.family.clone(),
+            font_features: settings.buffer_font.features.clone(),
+            font_fallbacks: settings.buffer_font.fallbacks.clone(),
+            font_size: settings.buffer_font_size(cx).into(),
+            font_weight: settings.buffer_font.weight,
+            line_height: relative(1.),
+            ..Default::default()
+        },
+        RenderItemTypography::Ui => TextStyle {
+            color: cx.theme().colors().text,
+            font_family: settings.ui_font.family.clone(),
+            font_features: settings.ui_font.features.clone(),
+            font_fallbacks: settings.ui_font.fallbacks.clone(),
+            font_size: TextSize::Default.rems(cx).into(),
+            font_weight: settings.ui_font.weight,
+            line_height: relative(1.),
+            ..Default::default()
+        },
     };
     let highlights = gpui::combine_highlights(custom_highlights, item_highlights);
 
     StyledText::new(text).with_default_highlights(&text_style, highlights)
+}
+
+fn markdown_heading_prefix_range(text: &str) -> Option<Range<usize>> {
+    let bytes = text.as_bytes();
+    let hash_count = bytes.iter().take_while(|byte| **byte == b'#').count();
+    if !(1..=6).contains(&hash_count) {
+        return None;
+    }
+
+    let mut end = hash_count;
+    let next_byte = bytes.get(end)?;
+    if !next_byte.is_ascii_whitespace() {
+        return None;
+    }
+
+    while bytes
+        .get(end)
+        .is_some_and(|byte| byte.is_ascii_whitespace())
+    {
+        end += 1;
+    }
+
+    Some(0..end)
+}
+
+fn remap_prefix_concealed_range(range: Range<usize>, prefix_end: usize) -> Option<Range<usize>> {
+    if range.end <= prefix_end {
+        return None;
+    }
+
+    let start = range.start.saturating_sub(prefix_end);
+    let end = range.end - prefix_end;
+    if start < end { Some(start..end) } else { None }
 }
 
 #[cfg(test)]
@@ -550,6 +624,29 @@ mod tests {
     use settings::SettingsStore;
     use util::{path, rel_path::rel_path};
     use workspace::{AppState, MultiWorkspace, Workspace};
+
+    #[test]
+    fn markdown_heading_prefix_concealment_remaps_ranges() {
+        assert_eq!(
+            markdown_heading_prefix_range("## Heading"),
+            Some(0..3),
+            "conceals heading marker and following space"
+        );
+        assert_eq!(
+            markdown_heading_prefix_range("####### Not a heading"),
+            None,
+            "does not conceal invalid Markdown heading levels"
+        );
+        assert_eq!(
+            markdown_heading_prefix_range("#Not a heading"),
+            None,
+            "does not conceal hash-prefixed symbols without heading whitespace"
+        );
+
+        assert_eq!(remap_prefix_concealed_range(0..2, 3), None);
+        assert_eq!(remap_prefix_concealed_range(0..8, 3), Some(0..5));
+        assert_eq!(remap_prefix_concealed_range(4..8, 3), Some(1..5));
+    }
 
     #[gpui::test]
     async fn test_outline_view_row_highlights(cx: &mut TestAppContext) {
