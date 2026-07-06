@@ -32,6 +32,7 @@ I don't commit these to the repo, but I sync the latest versions to [Google Driv
 - YMD syntax markers conceal off the cursor row and reveal on it; `editor::ToggleYmdConceal` reveals and re-conceals the syntax
 
 - Emoji-gated Markdown headings hide their `#` prefix
+- Outline surfaces show YMD headings cleanly too: the Outline panel and ⌘⇧O picker hide heading markers and apply YMD line color outside the active row
 
 - `==text==` renders as a default background highlight
 - `==🔴 text==`, `==🟠 text==`, `==🟡 text==`, `==🟢 text==`, `==🔵 text==`, `==🟣 text==`, and `==⚫ text==` render as coloured highlights
@@ -121,6 +122,7 @@ The configured order is the display order. `~` and `$VAR` expand. Missing paths 
 - View and manage tagged files in a dedicated Tags section at the top of the Project Panel, grouped by color with path context and drag/keyboard support
 - Toggle the Tags section between Tree View and Flat View via an ellipsis menu, with expandable/collapsible categories and context-menu controls to change/clear tags
 - Handle missing/unresolved tagged paths by showing them as explicit missing rows in the Tags section so they can be easily cleared
+- Keep `Tags`, `Project Files`, and project directory headers sticky together while scrolling the Project Panel
 
 ## 🟠⋯ Versions
 - The fork version lives in `zed-rbf/RBF_VERSION`
