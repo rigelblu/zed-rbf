@@ -1987,9 +1987,10 @@ impl Element for MarkdownElement {
         if let Some(ymd_options) = self.style.ymd
             && parsed_markdown.source.len() <= ymd::MAX_YMD_HIGHLIGHT_BYTES
         {
-            builder.set_ymd_background_markups(
+            builder.set_ymd_ranges(
                 parsed_markdown.source.clone(),
-                ymd::scan_background_markups(&parsed_markdown.source),
+                ymd::scan(&parsed_markdown.source),
+                ymd::scan_conceals(&parsed_markdown.source),
                 ymd_options.appearance,
             );
         }
@@ -3010,7 +3011,8 @@ struct MarkdownElementBuilder {
     table: TableState,
     syntax_theme: Arc<SyntaxTheme>,
     ymd_source: Option<SharedString>,
-    ymd_background_markups: Vec<ymd::YmdBackgroundMarkup>,
+    ymd_highlights: Vec<ymd::YmdHighlight>,
+    ymd_conceals: Vec<ymd::YmdConceal>,
     ymd_appearance: Option<Appearance>,
 }
 
@@ -3053,19 +3055,22 @@ impl MarkdownElementBuilder {
             table: TableState::default(),
             syntax_theme,
             ymd_source: None,
-            ymd_background_markups: Vec::new(),
+            ymd_highlights: Vec::new(),
+            ymd_conceals: Vec::new(),
             ymd_appearance: None,
         }
     }
 
-    fn set_ymd_background_markups(
+    fn set_ymd_ranges(
         &mut self,
         source: SharedString,
-        markups: Vec<ymd::YmdBackgroundMarkup>,
+        highlights: Vec<ymd::YmdHighlight>,
+        conceals: Vec<ymd::YmdConceal>,
         appearance: Appearance,
     ) {
         self.ymd_source = Some(source);
-        self.ymd_background_markups = markups;
+        self.ymd_highlights = highlights;
+        self.ymd_conceals = conceals;
         self.ymd_appearance = Some(appearance);
     }
 
@@ -3289,32 +3294,26 @@ impl MarkdownElementBuilder {
             return false;
         };
 
-        let markups = self
-            .ymd_background_markups
+        let highlights = self
+            .ymd_highlights
             .iter()
-            .filter(|markup| {
-                ranges_overlap(&markup.range, &source_range)
-                    || ranges_overlap(&markup.open_marker_range, &source_range)
-                    || ranges_overlap(&markup.close_marker_range, &source_range)
-            })
+            .filter(|highlight| ranges_overlap(&highlight.range, &source_range))
             .collect::<Vec<_>>();
-        if markups.is_empty() {
+        let conceals = self
+            .ymd_conceals
+            .iter()
+            .filter(|conceal| ranges_overlap(&conceal.range, &source_range))
+            .collect::<Vec<_>>();
+        if highlights.is_empty() && conceals.is_empty() {
             return false;
         }
 
         let mut boundaries = vec![source_range.start, source_range.end];
-        for markup in &markups {
-            push_clipped_range_boundaries(&mut boundaries, &markup.range, &source_range);
-            push_clipped_range_boundaries(
-                &mut boundaries,
-                &markup.open_marker_range,
-                &source_range,
-            );
-            push_clipped_range_boundaries(
-                &mut boundaries,
-                &markup.close_marker_range,
-                &source_range,
-            );
+        for highlight in &highlights {
+            push_clipped_range_boundaries(&mut boundaries, &highlight.range, &source_range);
+        }
+        for conceal in &conceals {
+            push_clipped_range_boundaries(&mut boundaries, &conceal.range, &source_range);
         }
         boundaries.sort_unstable();
         boundaries.dedup();
@@ -3324,10 +3323,9 @@ impl MarkdownElementBuilder {
             if segment_range.is_empty() {
                 continue;
             }
-            let concealed = markups.iter().any(|markup| {
-                range_contains_range(&markup.open_marker_range, &segment_range)
-                    || range_contains_range(&markup.close_marker_range, &segment_range)
-            });
+            let concealed = conceals
+                .iter()
+                .any(|conceal| range_contains_range(&conceal.range, &segment_range));
             if concealed {
                 self.pending_line.source_mappings.push(SourceMapping {
                     rendered_index: self.pending_line.text.len(),
@@ -3351,12 +3349,23 @@ impl MarkdownElementBuilder {
             self.pending_line.text.push_str(&segment_text);
 
             let mut segment_style = text_style.clone();
-            if let Some(markup) = markups
-                .iter()
-                .find(|markup| range_contains_range(&markup.range, &segment_range))
-            {
-                segment_style =
-                    segment_style.highlight(ymd::background_style(markup.color, appearance));
+            if let Some(highlight) = highlights.iter().find(|highlight| {
+                range_contains_range(&highlight.range, &segment_range)
+                    && matches!(highlight.kind, ymd::YmdHighlightKind::LineForeground(_))
+            }) {
+                if let ymd::YmdHighlightKind::LineForeground(color) = highlight.kind {
+                    segment_style =
+                        segment_style.highlight(ymd::line_foreground_style(color, appearance));
+                }
+            }
+            if let Some(highlight) = highlights.iter().find(|highlight| {
+                range_contains_range(&highlight.range, &segment_range)
+                    && matches!(highlight.kind, ymd::YmdHighlightKind::Background(_))
+            }) {
+                if let ymd::YmdHighlightKind::Background(color) = highlight.kind {
+                    segment_style =
+                        segment_style.highlight(ymd::background_style(color, appearance));
+                }
             }
             self.pending_line
                 .runs
@@ -3458,9 +3467,15 @@ impl MarkdownElementBuilder {
         let mut text_style = self.base_text_style.clone();
         text_style.color = Hsla::transparent_black();
         let text = "\u{200B}";
-        let styled_text = StyledText::new(text).with_runs(vec![text_style.to_run(text.len())]);
+        let text_run = text_style.to_run(text.len());
+        #[cfg(test)]
+        let rendered_run = text_run.clone();
+        let styled_text = StyledText::new(text).with_runs(vec![text_run]);
         self.rendered_lines.push(RenderedLine {
             layout: styled_text.layout().clone(),
+            #[cfg(test)]
+            runs: vec![rendered_run],
+            source_anchor: true,
             source_mappings: vec![SourceMapping {
                 rendered_index: 0,
                 source_index: source_range.start,
@@ -3483,12 +3498,26 @@ impl MarkdownElementBuilder {
         let text_align = self.text_style().text_align;
         let line = mem::take(&mut self.pending_line);
         if line.text.is_empty() {
+            if let Some(source_start) = line.source_start
+                && source_start < self.current_source_index
+            {
+                let anchor = self.render_source_anchor(source_start..self.current_source_index);
+                self.div_stack
+                    .last_mut()
+                    .unwrap()
+                    .extend([div().relative().child(anchor).into_any_element()]);
+            }
             return;
         }
 
+        #[cfg(test)]
+        let runs = line.runs.clone();
         let text = StyledText::new(line.text).with_runs(line.runs);
         self.rendered_lines.push(RenderedLine {
             layout: text.layout().clone(),
+            #[cfg(test)]
+            runs,
+            source_anchor: false,
             source_mappings: line.source_mappings,
             source_start: line.source_start.unwrap_or(self.current_source_index),
             source_end: self.current_source_index,
@@ -3514,6 +3543,9 @@ impl MarkdownElementBuilder {
 
 struct RenderedLine {
     layout: TextLayout,
+    #[cfg(test)]
+    runs: Vec<TextRun>,
+    source_anchor: bool,
     source_mappings: Vec<SourceMapping>,
     source_start: usize,
     source_end: usize,
@@ -3988,6 +4020,10 @@ impl RenderedText {
             }
 
             let text = line.layout.text();
+            if line.source_anchor {
+                accumulator.push('\n');
+                continue;
+            }
 
             let start = if range.start < line.source_start {
                 0
@@ -4106,6 +4142,46 @@ mod tests {
         render_markdown_with_code_span_link_style(markdown, style, |_, _| None, cx)
     }
 
+    fn render_markdown_with_themed_style(
+        markdown: &str,
+        font: MarkdownFont,
+        cx: &mut TestAppContext,
+    ) -> (RenderedText, Hsla) {
+        struct TestWindow;
+
+        impl Render for TestWindow {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+
+        ensure_theme_initialized(cx);
+
+        let (_, cx) = cx.add_window_view(|_, _| TestWindow);
+        let markdown_len = markdown.len();
+        let markdown = cx.new(|cx| Markdown::new(markdown.to_string().into(), None, None, cx));
+        cx.run_until_parked();
+
+        let base_color = Rc::new(std::cell::RefCell::new(None));
+        let (rendered, _) = cx.draw(Default::default(), size(px(600.0), px(600.0)), {
+            let base_color = base_color.clone();
+            move |window, cx| {
+                let style = MarkdownStyle::themed(font, window, cx);
+                *base_color.borrow_mut() = Some(style.base_text_style.to_run(markdown_len).color);
+
+                MarkdownElement::new(markdown, style).code_block_renderer(
+                    CodeBlockRenderer::Default {
+                        copy_button_visibility: CopyButtonVisibility::Hidden,
+                        wrap_button_visibility: WrapButtonVisibility::Hidden,
+                        border: false,
+                    },
+                )
+            }
+        });
+
+        (rendered.text, base_color.borrow().unwrap())
+    }
+
     fn ymd_preview_style() -> MarkdownStyle {
         MarkdownStyle {
             ymd: Some(YmdRenderOptions {
@@ -4115,6 +4191,11 @@ mod tests {
         }
     }
 
+    fn assert_ymd_run_style(run: &TextRun, style: gpui::HighlightStyle) {
+        assert_eq!(run.color, style.color.unwrap());
+        assert_eq!(run.background_color, style.background_color);
+    }
+
     #[gpui::test]
     fn test_ymd_background_markup_is_disabled_by_default(cx: &mut TestAppContext) {
         let markdown = "==🔴urgent==";
@@ -4122,6 +4203,47 @@ mod tests {
 
         assert_eq!(rendered.lines[0].layout.text(), markdown);
         assert_eq!(rendered.text_for_range(0..markdown.len()), markdown);
+        assert_eq!(rendered.lines[0].runs.len(), 1);
+        assert_eq!(rendered.lines[0].runs[0].background_color, None);
+    }
+
+    #[gpui::test]
+    fn test_ymd_line_foreground_is_disabled_by_default(cx: &mut TestAppContext) {
+        let markdown = "🔴 urgent";
+        let rendered = render_markdown(markdown, cx);
+
+        assert_eq!(rendered.lines[0].layout.text(), markdown);
+        assert_eq!(rendered.text_for_range(0..markdown.len()), markdown);
+        assert_eq!(rendered.lines[0].runs.len(), 1);
+        assert_eq!(
+            rendered.lines[0].runs[0].color,
+            MarkdownStyle::default()
+                .base_text_style
+                .to_run(markdown.len())
+                .color
+        );
+    }
+
+    #[gpui::test]
+    fn test_ymd_markup_is_disabled_for_agent_markdown_style(cx: &mut TestAppContext) {
+        let markdown = "🔴 ==urgent==";
+        let (rendered, base_color) =
+            render_markdown_with_themed_style(markdown, MarkdownFont::Agent, cx);
+
+        assert_eq!(rendered.lines[0].layout.text(), markdown);
+        assert_eq!(rendered.text_for_range(0..markdown.len()), markdown);
+        assert!(
+            rendered.lines[0]
+                .runs
+                .iter()
+                .all(|run| run.background_color.is_none())
+        );
+        assert!(
+            rendered.lines[0]
+                .runs
+                .iter()
+                .all(|run| run.color == base_color)
+        );
     }
 
     #[gpui::test]
@@ -4135,6 +4257,11 @@ mod tests {
         assert_eq!(rendered.lines[0].rendered_index_for_source_index(0), 0);
         assert_eq!(rendered.lines[0].rendered_index_for_source_index(6), 0);
         assert_eq!(rendered.lines[0].source_index_for_rendered_index(0), 6);
+        assert_eq!(rendered.lines[0].runs.len(), 1);
+        assert_ymd_run_style(
+            &rendered.lines[0].runs[0],
+            ymd::background_style(ymd::YmdColor::Red, Appearance::Light),
+        );
     }
 
     #[gpui::test]
@@ -4171,12 +4298,107 @@ mod tests {
     }
 
     #[gpui::test]
-    fn test_ymd_standalone_line_color_emoji_stays_visible_in_preview(cx: &mut TestAppContext) {
+    fn test_ymd_standalone_line_color_emoji_conceals_in_preview(cx: &mut TestAppContext) {
         let markdown = "🔴 urgent";
         let rendered = render_markdown_with_style(markdown, ymd_preview_style(), cx);
 
-        assert_eq!(rendered.lines[0].layout.text(), markdown);
-        assert_eq!(rendered.text_for_range(0..markdown.len()), markdown);
+        assert_eq!(rendered.lines[0].layout.text(), " urgent");
+        assert_eq!(rendered.text_for_range(0..markdown.len()), " urgent");
+        assert_eq!(rendered.lines[0].rendered_index_for_source_index(0), 0);
+        assert_eq!(rendered.lines[0].rendered_index_for_source_index(4), 0);
+        assert_eq!(rendered.lines[0].source_index_for_rendered_index(0), 4);
+        assert_eq!(rendered.lines[0].runs.len(), 1);
+        assert_ymd_run_style(
+            &rendered.lines[0].runs[0],
+            ymd::line_foreground_style(ymd::YmdColor::Red, Appearance::Light),
+        );
+    }
+
+    #[gpui::test]
+    fn test_ymd_fully_concealed_line_preserves_source_anchor_in_preview(cx: &mut TestAppContext) {
+        let markdown = "🔴";
+        let rendered = render_markdown_with_style(markdown, ymd_preview_style(), cx);
+
+        assert_eq!(rendered.lines.len(), 1);
+        assert_eq!(rendered.text_for_range(0..markdown.len()), "");
+        assert_eq!(rendered.surrounding_line_range(0), 0..markdown.len());
+        assert_eq!(rendered.lines[0].rendered_index_for_source_index(0), 0);
+        assert_eq!(rendered.lines[0].source_index_for_rendered_index(0), 0);
+    }
+
+    #[gpui::test]
+    fn test_ymd_heading_line_color_keeps_dots_visible_in_preview(cx: &mut TestAppContext) {
+        let markdown = "## 🟠⋯ Heading";
+        let rendered = render_markdown_with_style(markdown, ymd_preview_style(), cx);
+
+        assert_eq!(rendered.lines[0].layout.text(), "⋯ Heading");
+        assert_eq!(rendered.text_for_range(0..markdown.len()), "⋯ Heading");
+        assert_eq!(rendered.lines[0].rendered_index_for_source_index(0), 0);
+        assert_eq!(rendered.lines[0].rendered_index_for_source_index(7), 0);
+        assert_eq!(rendered.lines[0].source_index_for_rendered_index(0), 7);
+        assert_ymd_run_style(
+            &rendered.lines[0].runs[0],
+            ymd::line_foreground_style(ymd::YmdColor::Orange, Appearance::Light),
+        );
+    }
+
+    #[gpui::test]
+    fn test_ymd_background_overrides_line_foreground_in_preview(cx: &mut TestAppContext) {
+        let markdown = "🔴 ==urgent==";
+        let rendered = render_markdown_with_style(markdown, ymd_preview_style(), cx);
+
+        assert_eq!(rendered.lines[0].layout.text(), " urgent");
+        assert_eq!(rendered.text_for_range(0..markdown.len()), " urgent");
+        assert_eq!(rendered.lines[0].runs.len(), 2);
+        assert_eq!(rendered.lines[0].runs[0].len, " ".len());
+        assert_ymd_run_style(
+            &rendered.lines[0].runs[0],
+            ymd::line_foreground_style(ymd::YmdColor::Red, Appearance::Light),
+        );
+        assert_eq!(rendered.lines[0].runs[1].len, "urgent".len());
+        assert_ymd_run_style(
+            &rendered.lines[0].runs[1],
+            ymd::background_style(ymd::YmdColor::Default, Appearance::Light),
+        );
+    }
+
+    #[gpui::test]
+    fn test_ymd_inline_code_stays_literal_in_preview(cx: &mut TestAppContext) {
+        let markdown = "`🔴 literal` and `==🔴literal==`";
+        let rendered = render_markdown_with_style(markdown, ymd_preview_style(), cx);
+
+        assert_eq!(
+            rendered.lines[0].layout.text(),
+            "🔴 literal and ==🔴literal=="
+        );
+        assert_eq!(
+            rendered.text_for_range(0..markdown.len()),
+            "🔴 literal and ==🔴literal=="
+        );
+        assert!(
+            rendered.lines[0]
+                .runs
+                .iter()
+                .all(|run| run.background_color.is_none())
+        );
+    }
+
+    #[gpui::test]
+    fn test_ymd_fenced_code_stays_literal_in_preview(cx: &mut TestAppContext) {
+        let markdown = "```md\n🔴 literal\n==🔴literal==\n```";
+        let rendered = render_markdown_with_style(markdown, ymd_preview_style(), cx);
+
+        assert_eq!(
+            rendered.text_for_range(0..markdown.len()),
+            "🔴 literal\n==🔴literal=="
+        );
+        assert!(
+            rendered
+                .lines
+                .iter()
+                .flat_map(|line| line.runs.iter())
+                .all(|run| run.background_color.is_none())
+        );
     }
 
     #[gpui::test]
