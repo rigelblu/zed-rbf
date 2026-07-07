@@ -34992,6 +34992,73 @@ async fn test_ymd_replaces_thematic_breaks_with_blocks(cx: &mut gpui::TestAppCon
 }
 
 #[gpui::test]
+async fn test_ymd_replaces_star_rules_and_dotted_leaders_with_blocks(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    cx.set_state("ˇintro\n***\n...\n🟠...\noutro");
+    cx.run_until_parked();
+
+    cx.update_editor(|editor, _, _| {
+        let mut rules = editor
+            .ymd_thematic_break_blocks
+            .iter()
+            .map(|(row, (_, style, _))| (row.0, style.kind, style.color))
+            .collect::<Vec<_>>();
+        rules.sort_by_key(|(row, _, _)| *row);
+        assert_eq!(
+            rules,
+            vec![
+                (1, crate::ymd::YmdRuleKind::Long, None),
+                (2, crate::ymd::YmdRuleKind::DottedLeader, None),
+                (
+                    3,
+                    crate::ymd::YmdRuleKind::DottedLeader,
+                    Some(crate::ymd::YmdColor::Orange),
+                ),
+            ],
+        );
+    });
+
+    // Cursor-row reveal removes only the row the cursor lands on; the dotted
+    // leader block below remains inserted.
+    cx.update_editor(|editor, window, cx| {
+        editor.move_down(&MoveDown, window, cx);
+    });
+    cx.run_until_parked();
+    cx.update_editor(|editor, _, _| {
+        let mut rules = editor
+            .ymd_thematic_break_blocks
+            .iter()
+            .map(|(row, (_, style, _))| (row.0, style.kind, style.color))
+            .collect::<Vec<_>>();
+        rules.sort_by_key(|(row, _, _)| *row);
+        assert_eq!(
+            rules,
+            vec![
+                (2, crate::ymd::YmdRuleKind::DottedLeader, None),
+                (
+                    3,
+                    crate::ymd::YmdRuleKind::DottedLeader,
+                    Some(crate::ymd::YmdColor::Orange),
+                ),
+            ],
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_ymd_thematic_break_blocks_only_churn_changed_rows(cx: &mut gpui::TestAppContext) {
     init_test(cx, |_| {});
 
@@ -35013,7 +35080,7 @@ async fn test_ymd_thematic_break_blocks_only_churn_changed_rows(cx: &mut gpui::T
         let mut ids = editor
             .ymd_thematic_break_blocks
             .iter()
-            .map(|(row, id)| (row.0, *id))
+            .map(|(row, (id, _, _))| (row.0, *id))
             .collect::<Vec<_>>();
         ids.sort_by_key(|(row, _)| *row);
         ids
@@ -35034,7 +35101,7 @@ async fn test_ymd_thematic_break_blocks_only_churn_changed_rows(cx: &mut gpui::T
         editor
             .ymd_thematic_break_blocks
             .iter()
-            .map(|(row, id)| (row.0, *id))
+            .map(|(row, (id, _, _))| (row.0, *id))
             .collect::<Vec<_>>()
     });
     assert_eq!(ids_after.len(), 1);
@@ -35052,6 +35119,52 @@ async fn test_ymd_thematic_break_blocks_only_churn_changed_rows(cx: &mut gpui::T
             .unwrap(),
         "row 3's block id is preserved, not reinserted",
     );
+}
+
+#[gpui::test]
+async fn test_ymd_thematic_break_block_reinserts_when_same_style_range_changes(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx, |_| {});
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
+    cx.set_state("ˇintro\n***\noutro");
+    cx.run_until_parked();
+
+    let (id_before, range_before) = cx.update_editor(|editor, _, _| {
+        let (id, _, range) = editor
+            .ymd_thematic_break_blocks
+            .get(&MultiBufferRow(1))
+            .expect("off-cursor star rule should render as a block");
+        (*id, range.clone())
+    });
+    assert_eq!(range_before, 6..9);
+
+    cx.update_buffer(|buffer, cx| buffer.edit([(6..9, "****")], None, cx));
+    cx.run_until_parked();
+
+    let (id_after, range_after) = cx.update_editor(|editor, _, _| {
+        let (id, _, range) = editor
+            .ymd_thematic_break_blocks
+            .get(&MultiBufferRow(1))
+            .expect("edited off-cursor star rule should still render as a block");
+        (*id, range.clone())
+    });
+
+    assert!(
+        id_before != id_after,
+        "same-style marker edits must replace stale block anchors",
+    );
+    assert_eq!(range_after, 6..10);
 }
 
 #[gpui::test]
