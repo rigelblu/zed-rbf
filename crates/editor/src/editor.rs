@@ -463,7 +463,7 @@ struct YmdConcealCache {
     // width so aligned table columns do not drift in clean mode. Ranges absent
     // here fold with the default invisible placeholder.
     conceal_placeholders: HashMap<(usize, usize), FoldPlaceholder>,
-    thematic_break_ranges: Vec<Range<usize>>,
+    thematic_breaks: Vec<ymd::YmdRule>,
     thematic_break_rows: Vec<u32>,
 }
 
@@ -592,6 +592,42 @@ fn ymd_thematic_break_render() -> RenderBlock {
             )
             .into_any_element()
     })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct YmdRuleBlockStyle {
+    kind: ymd::YmdRuleKind,
+    color: Option<ymd::YmdColor>,
+}
+
+impl From<&ymd::YmdRule> for YmdRuleBlockStyle {
+    fn from(rule: &ymd::YmdRule) -> Self {
+        Self {
+            kind: rule.kind,
+            color: rule.color,
+        }
+    }
+}
+
+fn ymd_rule_render(style: YmdRuleBlockStyle) -> RenderBlock {
+    match style.kind {
+        ymd::YmdRuleKind::Long => ymd_thematic_break_render(),
+        ymd::YmdRuleKind::DottedLeader => Arc::new(move |cx: &mut BlockContext| {
+            let text_color = style.color.map_or(cx.theme().colors().text_muted, |color| {
+                ymd::line_foreground_color(color, cx.theme().appearance())
+            });
+            div()
+                .w_full()
+                .h(cx.line_height)
+                .flex()
+                .items_center()
+                .justify_start()
+                .pl(cx.line_height * (2. / 3.))
+                .text_color(text_color)
+                .child("•••")
+                .into_any_element()
+        }),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1365,7 +1401,8 @@ pub struct Editor {
     // stale key heals on the next refresh. Anchor-keying was considered and PARKED
     // — it touches the verified block mechanism, and the churn is acceptable until
     // rule-dense documents argue otherwise.
-    ymd_thematic_break_blocks: HashMap<MultiBufferRow, CustomBlockId>,
+    ymd_thematic_break_blocks:
+        HashMap<MultiBufferRow, (CustomBlockId, YmdRuleBlockStyle, Range<usize>)>,
     inlay_hints: Option<LspInlayHintData>,
     folding_newlines: Task<()>,
     select_next_is_case_sensitive: Option<bool>,
@@ -9783,6 +9820,7 @@ impl Editor {
     fn clear_ymd_thematic_break_blocks(&mut self, cx: &mut Context<Self>) {
         let block_ids = mem::take(&mut self.ymd_thematic_break_blocks)
             .into_values()
+            .map(|(block_id, _, _)| block_id)
             .collect::<HashSet<_>>();
         if !block_ids.is_empty() {
             self.remove_blocks(block_ids, None, cx);
@@ -9842,11 +9880,11 @@ impl Editor {
                         && cache.buffer_version == buffer_version)
                         .then(|| {
                             cache
-                                .thematic_break_ranges
+                                .thematic_breaks
                                 .iter()
                                 .cloned()
                                 .zip(cache.thematic_break_rows.iter().copied())
-                                .collect::<Vec<(Range<usize>, u32)>>()
+                                .collect::<Vec<(ymd::YmdRule, u32)>>()
                         })
                 });
 
@@ -9859,9 +9897,9 @@ impl Editor {
                 };
                 let breaks = ymd::scan_thematic_breaks(&text)
                     .into_iter()
-                    .map(|range| {
-                        let row = MultiBufferOffset(range.start).to_point(&snapshot).row;
-                        (range, row)
+                    .map(|rule| {
+                        let row = MultiBufferOffset(rule.range.start).to_point(&snapshot).row;
+                        (rule, row)
                     })
                     .collect::<Vec<_>>();
                 (snapshot, breaks)
@@ -9870,9 +9908,9 @@ impl Editor {
 
         let mut desired_breaks = breaks
             .into_iter()
-            .filter_map(|(range, row)| {
+            .filter_map(|(rule, row)| {
                 let row = MultiBufferRow(row);
-                (!cursor_rows.contains(&row) && !diff_rows.contains(&row)).then_some((row, range))
+                (!cursor_rows.contains(&row) && !diff_rows.contains(&row)).then_some((row, rule))
             })
             .collect::<Vec<_>>();
         desired_breaks.sort_by_key(|(row, _)| *row);
@@ -9889,6 +9927,7 @@ impl Editor {
             .collect::<Vec<_>>()
             .into_iter()
             .filter_map(|row| self.ymd_thematic_break_blocks.remove(&row))
+            .map(|(block_id, _, _)| block_id)
             .collect::<HashSet<_>>();
         if !block_ids_to_remove.is_empty() {
             self.remove_blocks(block_ids_to_remove, None, cx);
@@ -9896,26 +9935,35 @@ impl Editor {
 
         let mut rows_to_insert = Vec::new();
         let mut blocks = Vec::new();
-        for (row, range) in desired_breaks {
-            if self.ymd_thematic_break_blocks.contains_key(&row) {
+        for (row, rule) in desired_breaks {
+            let style = YmdRuleBlockStyle::from(&rule);
+            if let Some((_, existing_style, existing_range)) =
+                self.ymd_thematic_break_blocks.get(&row)
+                && *existing_style == style
+                && *existing_range == rule.range
+            {
                 continue;
             }
-            let start = snapshot.anchor_before(MultiBufferOffset(range.start));
-            let end = snapshot.anchor_after(MultiBufferOffset(range.end));
-            rows_to_insert.push(row);
+            if let Some((block_id, _, _)) = self.ymd_thematic_break_blocks.remove(&row) {
+                self.remove_blocks(HashSet::from_iter([block_id]), None, cx);
+            }
+            let start = snapshot.anchor_before(MultiBufferOffset(rule.range.start));
+            let end = snapshot.anchor_after(MultiBufferOffset(rule.range.end));
+            rows_to_insert.push((row, style, rule.range));
             blocks.push(BlockProperties {
                 placement: BlockPlacement::Replace(start..=end),
                 height: Some(1),
                 style: BlockStyle::Spacer,
-                render: ymd_thematic_break_render(),
+                render: ymd_rule_render(style),
                 priority: 0,
             });
         }
 
         if !blocks.is_empty() {
             let block_ids = self.insert_blocks(blocks, None, cx);
-            for (row, block_id) in rows_to_insert.into_iter().zip(block_ids) {
-                self.ymd_thematic_break_blocks.insert(row, block_id);
+            for ((row, style, range), block_id) in rows_to_insert.into_iter().zip(block_ids) {
+                self.ymd_thematic_break_blocks
+                    .insert(row, (block_id, style, range));
             }
         }
     }
@@ -10249,10 +10297,10 @@ impl Editor {
                         .row
                 })
                 .collect();
-            let thematic_break_ranges = ymd::scan_thematic_breaks(&text);
-            let thematic_break_rows = thematic_break_ranges
+            let thematic_breaks = ymd::scan_thematic_breaks(&text);
+            let thematic_break_rows = thematic_breaks
                 .iter()
-                .map(|range| MultiBufferOffset(range.start).to_point(&snapshot).row)
+                .map(|rule| MultiBufferOffset(rule.range.start).to_point(&snapshot).row)
                 .collect();
             self.ymd_conceal_cache = Some(YmdConcealCache {
                 buffer_id,
@@ -10263,7 +10311,7 @@ impl Editor {
                 checkbox_rows,
                 folded: HashSet::default(),
                 conceal_placeholders,
-                thematic_break_ranges,
+                thematic_breaks,
                 thematic_break_rows,
             });
         }

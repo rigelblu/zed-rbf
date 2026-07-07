@@ -42,7 +42,8 @@ I don't commit these to the repo, but I sync the latest versions to [Google Driv
 - `[label](url)` shows as an underlined label with the brackets and URL hidden; Cmd-click the label to open its destination in read mode — a web URL (a bare `google.com` works too), a relative file (opens as a buffer), or a directory (revealed in the project panel) — or move the cursor onto the line to reveal the raw link
 - `~~text~~` renders as struck-through text with the double-tilde markers concealed
 - `*text*` renders as italic text with the single-asterisk markers concealed, while `**bold**` stays distinct
-- `---` renders as a horizontal rule
+- `---` and `***` render as the same full-width horizontal rule
+- `...` renders as a softer section break: a muted, left-inset `•••` dotted leader, which a leading supported colour emoji such as `🟠...` colours
 
 > Block quotes get muted text plus a gutter border
 

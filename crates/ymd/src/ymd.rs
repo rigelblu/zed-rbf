@@ -35,6 +35,19 @@ pub struct YmdConceal {
     pub range: Range<usize>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum YmdRuleKind {
+    Long,
+    DottedLeader,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct YmdRule {
+    pub range: Range<usize>,
+    pub kind: YmdRuleKind,
+    pub color: Option<YmdColor>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct YmdBackgroundMarkup {
     pub range: Range<usize>,
@@ -244,9 +257,13 @@ pub fn background_style(color: YmdColor, appearance: Appearance) -> HighlightSty
     }
 }
 
+pub fn line_foreground_color(color: YmdColor, appearance: Appearance) -> Hsla {
+    color.line_foreground(appearance)
+}
+
 pub fn line_foreground_style(color: YmdColor, appearance: Appearance) -> HighlightStyle {
     HighlightStyle {
-        color: Some(color.line_foreground(appearance)),
+        color: Some(line_foreground_color(color, appearance)),
         ..Default::default()
     }
 }
@@ -330,7 +347,7 @@ fn frontmatter_skip_end(text: &str) -> usize {
         return 0;
     };
     let first_line_content_end = first_line.len() - usize::from(first_line.ends_with('\n'));
-    if !is_thematic_break_line(&text[..first_line_content_end]) {
+    if !is_frontmatter_delimiter_line(&text[..first_line_content_end]) {
         return 0;
     }
 
@@ -338,7 +355,7 @@ fn frontmatter_skip_end(text: &str) -> usize {
     for line in text[line_start..].split_inclusive('\n') {
         let line_end = line_start + line.len();
         let line_content_end = line_end - usize::from(line.ends_with('\n'));
-        if is_thematic_break_line(&text[line_start..line_content_end]) {
+        if is_frontmatter_delimiter_line(&text[line_start..line_content_end]) {
             return line_end;
         }
         line_start = line_end;
@@ -347,11 +364,48 @@ fn frontmatter_skip_end(text: &str) -> usize {
     first_line.len()
 }
 
-// A dash-only Markdown thematic break: up to 3 leading spaces, then a run of `-`
-// (>= 3 total) with optional interior spaces/tabs (so `- - -` qualifies). Walk Q2:
-// the `*`/`_` families are deliberately NOT recognized — only `-` renders as a
-// rule. Indented 4+ spaces (code) and any other character disqualify the line.
-fn is_thematic_break_line(line: &str) -> bool {
+fn line_rule(line: &str) -> Option<(YmdRuleKind, Option<YmdColor>)> {
+    let bytes = line.as_bytes();
+    let leading_spaces = bytes.iter().take_while(|byte| **byte == b' ').count();
+    if leading_spaces > 3 {
+        return None;
+    }
+
+    let line = &line[leading_spaces..];
+    let rule_content = line.trim_end_matches(|character| matches!(character, ' ' | '\t'));
+    if rule_content == "..." {
+        return Some((YmdRuleKind::DottedLeader, None));
+    }
+    if let Some((color, emoji_len)) = YmdColor::from_emoji(rule_content)
+        && &rule_content[emoji_len..] == "..."
+    {
+        return Some((YmdRuleKind::DottedLeader, Some(color)));
+    }
+
+    let bytes = line.as_bytes();
+    let marker = bytes
+        .iter()
+        .copied()
+        .find(|byte| !matches!(byte, b' ' | b'\t'))?;
+    if !matches!(marker, b'-' | b'*') {
+        return None;
+    }
+
+    let mut marker_count = 0;
+    for byte in bytes {
+        match *byte {
+            byte if byte == marker => marker_count += 1,
+            b' ' | b'\t' => {}
+            _ => return None,
+        }
+    }
+
+    (marker_count >= 3).then_some((YmdRuleKind::Long, None))
+}
+
+// YAML frontmatter stays dash-delimited. The wider YMD rule dialect deliberately
+// does not make top-of-file `...` or `***` behave like frontmatter.
+fn is_frontmatter_delimiter_line(line: &str) -> bool {
     let bytes = line.as_bytes();
     let leading_spaces = bytes.iter().take_while(|byte| **byte == b' ').count();
     if leading_spaces > 3 {
@@ -539,15 +593,13 @@ pub fn scan_images(text: &str) -> Vec<YmdImage> {
     images
 }
 
-// Byte ranges of Markdown thematic-break lines (`---`, `----`, spaced `- - -`)
-// that should render as a horizontal rule. Permanent dialect rule (walk Q2): only
-// the dash (`-`) family is recognized — `***` and `___` thematic breaks stay raw.
-// A leading run of break-shaped lines is skipped as YAML frontmatter delimiters
-// (see `frontmatter_skip_end`); the loose opener is a deliberate bet documented in
-// the brief. Each returned range covers the line's content (no trailing newline),
-// which the editor replaces with a `BlockPlacement::Replace` rule block.
-pub fn scan_thematic_breaks(text: &str) -> Vec<Range<usize>> {
-    let mut ranges = Vec::new();
+// Byte ranges of YMD rule-marker lines. `---`, `***`, and their longer/spaced
+// families render as long horizontal rules; a bare `...` renders as a softer
+// dotted leader. A leading dash-rule run is skipped as YAML frontmatter
+// delimiters (see `frontmatter_skip_end`). Each returned range covers the line's
+// content (no trailing newline), which the editor replaces with a block.
+pub fn scan_thematic_breaks(text: &str) -> Vec<YmdRule> {
+    let mut rules = Vec::new();
     let frontmatter_skip_end = frontmatter_skip_end(text);
     let fenced_code_ranges = fenced_code_block_ranges(text);
 
@@ -558,12 +610,18 @@ pub fn scan_thematic_breaks(text: &str) -> Vec<Range<usize>> {
         ) {
             return;
         }
-        if line_start >= frontmatter_skip_end && is_thematic_break_line(line_content) {
-            ranges.push(line_start..line_start + line_content.len());
+        if line_start >= frontmatter_skip_end
+            && let Some((kind, color)) = line_rule(line_content)
+        {
+            rules.push(YmdRule {
+                range: line_start..line_start + line_content.len(),
+                kind,
+                color,
+            });
         }
     });
 
-    ranges
+    rules
 }
 
 // Markdown block-quote lines (`>` with up to three leading spaces, nesting via
@@ -2176,13 +2234,89 @@ mod tests {
 
     #[test]
     fn scans_thematic_breaks() {
-        // The three accepted forms: a bare `---`, a longer `----`, and the spaced
-        // `- - -` (with up to 3 leading spaces). Each range covers the line content
-        // only, no trailing newline.
+        // Long rules accept the dash and star families. Each range covers the line
+        // content only, no trailing newline.
         assert_eq!(
             scan_thematic_breaks("text\n---\nmore\n  - - -\n----"),
-            vec![5..8, 14..21, 22..26]
+            vec![
+                YmdRule {
+                    range: 5..8,
+                    kind: YmdRuleKind::Long,
+                    color: None,
+                },
+                YmdRule {
+                    range: 14..21,
+                    kind: YmdRuleKind::Long,
+                    color: None,
+                },
+                YmdRule {
+                    range: 22..26,
+                    kind: YmdRuleKind::Long,
+                    color: None,
+                },
+            ]
         );
+        assert_eq!(
+            scan_thematic_breaks("***\n* * *\n****"),
+            vec![
+                YmdRule {
+                    range: 0..3,
+                    kind: YmdRuleKind::Long,
+                    color: None,
+                },
+                YmdRule {
+                    range: 4..9,
+                    kind: YmdRuleKind::Long,
+                    color: None,
+                },
+                YmdRule {
+                    range: 10..14,
+                    kind: YmdRuleKind::Long,
+                    color: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn scans_dotted_leader_rules() {
+        assert_eq!(
+            scan_thematic_breaks("text\n...\nmore"),
+            vec![YmdRule {
+                range: 5..8,
+                kind: YmdRuleKind::DottedLeader,
+                color: None,
+            }]
+        );
+        assert_eq!(
+            scan_thematic_breaks("text\n🟠...\nmore"),
+            vec![YmdRule {
+                range: 5..12,
+                kind: YmdRuleKind::DottedLeader,
+                color: Some(YmdColor::Orange),
+            }]
+        );
+        assert_eq!(
+            scan_thematic_breaks("text\n...\t \nmore"),
+            vec![YmdRule {
+                range: 5..10,
+                kind: YmdRuleKind::DottedLeader,
+                color: None,
+            }]
+        );
+        assert_eq!(
+            scan_thematic_breaks("text\n🟠... \t\nmore"),
+            vec![YmdRule {
+                range: 5..14,
+                kind: YmdRuleKind::DottedLeader,
+                color: Some(YmdColor::Orange),
+            }]
+        );
+        assert!(scan_thematic_breaks("....").is_empty());
+        assert!(scan_thematic_breaks("🟠....").is_empty());
+        assert!(scan_thematic_breaks("🟤...").is_empty());
+        assert!(scan_thematic_breaks(". . .").is_empty());
+        assert!(scan_thematic_breaks("... text").is_empty());
     }
 
     #[test]
@@ -2195,17 +2329,11 @@ mod tests {
     }
 
     #[test]
-    fn star_and_underscore_thematic_breaks_stay_raw() {
-        // PIN (walk Q2 — permanent dialect rule): only the dash (`-`) family renders
-        // as a rule. CommonMark also treats `***`, `___`, and their spaced/longer
-        // variants as thematic breaks, but this editor deliberately leaves them raw.
-        // If a future change ever recognizes `*`/`_`, this assertion fails first.
-        assert!(scan_thematic_breaks("***").is_empty());
+    fn underscore_thematic_breaks_stay_raw() {
+        // `***` is now a long rule, but `_` remains outside the YMD rule dialect.
         assert!(scan_thematic_breaks("___").is_empty());
-        assert!(scan_thematic_breaks("* * *").is_empty());
         assert!(scan_thematic_breaks("_____").is_empty());
-        // A dash break on a later line still renders — only the `*`/`_` lines are inert.
-        assert_eq!(scan_thematic_breaks("***\n---"), vec![4..7]);
+        assert!(scan_thematic_breaks("_ _ _").is_empty());
     }
 
     #[test]
@@ -2214,8 +2342,15 @@ mod tests {
         // delimiters are both skipped, and only a body `---` after them renders.
         let text = "---\ntitle: Test\n---\nbody\n---";
         let ranges = scan_thematic_breaks(text);
-        assert_eq!(ranges, vec![25..28]);
-        assert_eq!(&text[ranges[0].clone()], "---");
+        assert_eq!(
+            ranges,
+            vec![YmdRule {
+                range: 25..28,
+                kind: YmdRuleKind::Long,
+                color: None,
+            }]
+        );
+        assert_eq!(&text[ranges[0].range.clone()], "---");
     }
 
     #[test]
@@ -2225,8 +2360,15 @@ mod tests {
         // after the frontmatter close is NOT swallowed by the skip — it renders.
         let text = "---\nk: v\n---\n---\nx";
         let ranges = scan_thematic_breaks(text);
-        assert_eq!(ranges, vec![13..16]);
-        assert_eq!(&text[ranges[0].clone()], "---");
+        assert_eq!(
+            ranges,
+            vec![YmdRule {
+                range: 13..16,
+                kind: YmdRuleKind::Long,
+                color: None,
+            }]
+        );
+        assert_eq!(&text[ranges[0].range.clone()], "---");
     }
 
     #[test]
@@ -2237,10 +2379,47 @@ mod tests {
         // the closing delimiter. So a document that genuinely opens with a rule loses
         // BOTH that rule's replacement and the next one — only the third `---` renders.
         let text = "---\n---\n---";
-        assert_eq!(scan_thematic_breaks(text), vec![8..11]);
+        assert_eq!(
+            scan_thematic_breaks(text),
+            vec![YmdRule {
+                range: 8..11,
+                kind: YmdRuleKind::Long,
+                color: None,
+            }]
+        );
         // A non-break line 1 means no skip at all — every `---` renders.
         let text = "intro\n---\n---";
-        assert_eq!(scan_thematic_breaks(text), vec![6..9, 10..13]);
+        assert_eq!(
+            scan_thematic_breaks(text),
+            vec![
+                YmdRule {
+                    range: 6..9,
+                    kind: YmdRuleKind::Long,
+                    color: None,
+                },
+                YmdRule {
+                    range: 10..13,
+                    kind: YmdRuleKind::Long,
+                    color: None,
+                },
+            ]
+        );
+        assert_eq!(
+            scan_thematic_breaks("...\n---"),
+            vec![
+                YmdRule {
+                    range: 0..3,
+                    kind: YmdRuleKind::DottedLeader,
+                    color: None,
+                },
+                YmdRule {
+                    range: 4..7,
+                    kind: YmdRuleKind::Long,
+                    color: None,
+                },
+            ],
+            "a top-of-file dotted leader is not a YAML frontmatter opener",
+        );
     }
 
     #[test]
@@ -2285,7 +2464,7 @@ mod tests {
         assert!(
             scan_thematic_breaks(text)
                 .iter()
-                .all(|r| !range_overlaps_any(r, &fences))
+                .all(|rule| !range_overlaps_any(&rule.range, &fences))
         );
     }
 
