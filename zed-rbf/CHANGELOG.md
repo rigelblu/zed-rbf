@@ -6,6 +6,11 @@ title: "Zed RBF Changelog"
 
 ---
 
+# 🔵⋯ v0.55.0 (2026-07-27) — #zed-50
+- 2026-07-27 - feat (ux) | read `---` and `***` as the same full-width horizontal rule, and `...` as a muted left-inset `•••` dotted leader for a softer section break, with a leading color emoji such as `🟠...` coloring the dots [@zed-rbf]
+
+---
+
 # 🔵⋯ v0.54.0 (2026-07-06) — #zed-48, #zed-49
 - 2026-07-06 - fix (ux) | keep `Tags`, `Project Files`, and project directory sticky headers working together in the Project Panel [@zed-rbf]
 - 2026-07-06 - feat (ux) | show YMD heading labels cleanly in the Outline panel and outline picker, hiding heading markers and applying YMD color outside the active row [@zed-rbf]
