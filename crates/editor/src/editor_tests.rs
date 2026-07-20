@@ -36770,7 +36770,7 @@ async fn test_paste_image_in_markdown_writes_through_symlinked_directory(
         .await
         .expect("outside directory should be created");
     // The configured image directory `images` is a symlink whose real target lives
-    // outside the worktree. This mirrors a `.rb-drive` store symlinked into a
+    // outside the worktree. This mirrors a `rb-drive` store symlinked into a
     // project: the paste target stays lexically inside the worktree, so it must be
     // written through the symlink rather than rejected.
     fs.create_symlink(

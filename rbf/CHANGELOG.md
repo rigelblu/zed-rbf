@@ -6,6 +6,11 @@ title: "Zed RBF Changelog"
 
 ---
 
+# 🔵⋯ v0.55.1 (2026-07-27) — #zed-51
+- 2026-07-27 - fix (ux) | see files an external tool creates under a new directory stay nested beneath that one directory row in the File Explorer, instead of showing as flat path-prefixed rows [@zed-rbf]
+
+---
+
 # 🔵⋯ v0.55.0 (2026-07-27) — #zed-50
 - 2026-07-27 - feat (ux) | read `---` and `***` as the same full-width horizontal rule, and `...` as a muted left-inset `•••` dotted leader for a softer section break, with a leading color emoji such as `🟠...` coloring the dots [@zed-rbf]
 
