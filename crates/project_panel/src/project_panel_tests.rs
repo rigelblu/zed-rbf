@@ -118,6 +118,112 @@ async fn test_visible_list(cx: &mut gpui::TestAppContext) {
     );
 }
 
+#[cfg(unix)]
+#[gpui::test]
+async fn test_files_created_through_external_symlink_remain_nested(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let root = temp_dir.path().join("root");
+    let skills = root.join("dotfiles/rb-agents/skills");
+    std::fs::create_dir_all(skills.join("session-block-wrap-up")).unwrap();
+    std::fs::create_dir_all(skills.join("situation-conductor")).unwrap();
+    let claude_dir = temp_dir.path().join("home/.claude");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    std::os::unix::fs::symlink(&skills, claude_dir.join("skills")).unwrap();
+
+    let project = Project::example([root.as_path()], &mut cx.to_async()).await;
+    let worktree = project.read_with(cx, |project, cx| {
+        project
+            .worktrees(cx)
+            .next()
+            .expect("project should contain the temporary worktree")
+            .clone()
+    });
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+        .expect("workspace should be available");
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+    cx.update(|_, cx| {
+        let settings = *ProjectPanelSettings::get_global(cx);
+        ProjectPanelSettings::override_global(
+            ProjectPanelSettings {
+                auto_fold_dirs: true,
+                auto_reveal_entries: true,
+                ..settings
+            },
+            cx,
+        );
+    });
+
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+    toggle_expand_dir(&panel, "root/dotfiles/rb-agents/skills", cx);
+
+    select_path(&panel, "root/dotfiles/rb-agents/skills", cx);
+    panel.update_in(cx, |panel, window, cx| {
+        panel.unfold_directory(&UnfoldDirectory, window, cx);
+    });
+    cx.run_until_parked();
+
+    let linked_skill = claude_dir.join("skills/prj-wb-plan");
+    std::fs::create_dir_all(linked_skill.join("references")).unwrap();
+    std::fs::write(linked_skill.join("references/project-wb-plan.md"), "").unwrap();
+    worktree::WorktreeModelHandle::flush_fs_events(&worktree, &mut cx.cx).await;
+    cx.run_until_parked();
+
+    let reference_file = find_project_entry(
+        &panel,
+        "root/dotfiles/rb-agents/skills/prj-wb-plan/references/project-wb-plan.md",
+        cx,
+    )
+    .expect("externally created reference file should be scanned");
+    panel.update(cx, |panel, cx| {
+        panel.project.update(cx, |_, cx| {
+            cx.emit(project::Event::ActiveEntryChanged(Some(reference_file)))
+        })
+    });
+    cx.run_until_parked();
+
+    std::fs::write(linked_skill.join("README.md"), "").unwrap();
+    std::fs::write(linked_skill.join("SKILL.md"), "").unwrap();
+    worktree::WorktreeModelHandle::flush_fs_events(&worktree, &mut cx.cx).await;
+    cx.run_until_parked();
+
+    let skill_file = find_project_entry(
+        &panel,
+        "root/dotfiles/rb-agents/skills/prj-wb-plan/SKILL.md",
+        cx,
+    )
+    .expect("externally created skill file should be scanned");
+    panel.update(cx, |panel, cx| {
+        panel.project.update(cx, |_, cx| {
+            cx.emit(project::Event::ActiveEntryChanged(Some(skill_file)))
+        })
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        visible_entries_as_strings(&panel, 0..20, cx),
+        &[
+            "v root",
+            "    v dotfiles",
+            "        v rb-agents",
+            "            v skills",
+            "                v prj-wb-plan",
+            "                    v references",
+            "                          project-wb-plan.md",
+            "                      README.md",
+            "                      SKILL.md  <== selected  <== marked",
+            "                > session-block-wrap-up",
+            "                > situation-conductor",
+        ]
+    );
+}
+
 #[gpui::test]
 async fn test_opening_file(cx: &mut gpui::TestAppContext) {
     init_test_with_editor(cx);

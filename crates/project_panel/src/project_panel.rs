@@ -14,7 +14,10 @@ use editor::{
 };
 use file_icons::FileIcons;
 use fs::TrashId;
-use futures::{FutureExt as _, StreamExt as _, future::Shared};
+use futures::{
+    FutureExt as _, StreamExt as _,
+    future::{Shared, join_all},
+};
 use git;
 use git::status::GitSummary;
 use git_ui_core::file_diff_view::FileDiffView;
@@ -5378,6 +5381,17 @@ impl ProjectPanel {
             .visible_worktrees(cx)
             .map(|worktree| worktree.read(cx).snapshot())
             .collect();
+        let scans_complete = project
+            .visible_worktrees(cx)
+            .filter_map(|worktree| {
+                let worktree = worktree.read(cx);
+                if worktree.scan_id() == worktree.completed_scan_id() {
+                    None
+                } else {
+                    worktree.as_local().map(|worktree| worktree.scan_complete())
+                }
+            })
+            .collect::<Vec<_>>();
         let hide_root = settings.hide_root && visible_worktrees.len() == 1;
         let hide_hidden = settings.hide_hidden;
 
@@ -5628,7 +5642,7 @@ impl ProjectPanel {
                     new_state
                 })
                 .await;
-            this.update_in(cx, |this, window, cx| {
+            let updated = this.update_in(cx, |this, window, cx| {
                 this.state = new_state;
                 if let Some((worktree_id, entry_id)) = new_selected_entry {
                     this.selection = Some(SelectedEntry {
@@ -5664,8 +5678,14 @@ impl ProjectPanel {
                     this.autoscroll(cx);
                 }
                 cx.notify();
-            })
-            .ok();
+            });
+            if updated.is_ok() && !scans_complete.is_empty() {
+                join_all(scans_complete).await;
+                this.update_in(cx, |this, window, cx| {
+                    this.update_visible_entries(None, false, false, window, cx);
+                })
+                .ok();
+            }
         });
 
         self.update_visible_entries_task = UpdateVisibleEntriesTask {

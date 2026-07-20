@@ -234,7 +234,7 @@ rbf/scripts/install-local.sh \
 
 Verify the default installed app identity:
 ```sh
-"$HOME/Applications/Zed RBF.app/Contents/MacOS/zed" --system-specs
+"$HOME/Applications/Zed RBF.app/Contents/MacOS/zed-rbf" --system-specs
 ```
 
 For a custom `--install-dir` or `--name`, run `--system-specs` from that app bundle instead. The output should include a `Zed RBF: v...` line matching `rbf/RBF_VERSION` and preserve the upstream `Zed: ...` line.

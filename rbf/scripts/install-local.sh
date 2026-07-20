@@ -466,7 +466,7 @@ mkdir -p "$install_dir"
 install_destination="${install_dir}/${app_name}.app"
 destination="$install_destination"
 if [[ "$open_result" == "true" ]]; then
-  quit_running_app_before_relaunch "$bundle_id" "${destination}/Contents/MacOS/zed" "$quit_timeout_seconds"
+  quit_running_app_before_relaunch "$bundle_id" "${destination}/Contents/MacOS/zed-rbf" "$quit_timeout_seconds"
 fi
 install_temp_dir="$(mktemp -d "${install_dir}/.${app_name}.install.XXXXXX")"
 temporary_destination="${install_temp_dir}/${app_name}.app"
