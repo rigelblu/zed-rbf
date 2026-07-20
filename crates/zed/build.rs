@@ -84,7 +84,7 @@ fn main() {
 
     if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
         let rbf_version_path =
-            std::path::Path::new(&manifest_dir).join("../../zed-rbf/RBF_VERSION");
+            std::path::Path::new(&manifest_dir).join("../../rbf/RBF_VERSION");
         println!("cargo:rerun-if-changed={}", rbf_version_path.display());
 
         if let Ok(rbf_version) = std::fs::read_to_string(&rbf_version_path) {

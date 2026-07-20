@@ -13,16 +13,16 @@ rb-drive — not in this repo. Don't start cold; resume.
 # 🔵⋯ Where it lives (reference — the skills above resolve these for you)
 `prj-use` fills `<PROJECT_NAME>`. If a path here ever disagrees with reality, trust the skill.
 
-## 🟠⋯ Session block — `.rb-drive/.agents/workblock/<PROJECT_NAME>/`
+## 🟠⋯ Session block — `rb-drive/agents/workblock/<PROJECT_NAME>/`
 - **Core Memories:** `agents-core-memories.md`
 - **Turning Memories:** `agents-turning-memories.md`
 - **Find My Bearings:** `agents-find-my-bearings.md`
 - **Agent & Human Shared Understanding:** `agents-shared-understanding.md`
 - **What to pick up next session:** `agents-pickup.md`
 
-## 🟠⋯ Product — `.rb-drive/projects/<PROJECT_NAME>/06_plan-execute/`
+## 🟠⋯ Product — `rb-drive/projects/<PROJECT_NAME>/06_plan-execute/`
 - **Product/Feature Ship Plan:** `product-ship-plan.md`
 - **Released Features:** `product-ship-released.md`
 
-## 🟠⋯ Project — `.rb-drive/projects/<PROJECT_NAME>/06_plan-execute/`
+## 🟠⋯ Project — `rb-drive/projects/<PROJECT_NAME>/06_plan-execute/`
 - **Project Workblock Plan:** `project-wb-plan.md`

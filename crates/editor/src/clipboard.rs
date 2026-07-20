@@ -939,7 +939,7 @@ fn ensure_markdown_image_paste_path_within_worktree(
 ) -> Result<()> {
     // Containment is checked lexically rather than by canonicalizing through the
     // filesystem, so a paste target reached via a symlinked subdirectory (for
-    // example a `.rb-drive` store symlinked into the worktree) is not rejected for
+    // example a `rb-drive` store symlinked into the worktree) is not rejected for
     // resolving to its real location outside the worktree. `..` and absolute paste
     // directories are already rejected when the configured directory is parsed, so
     // a normalized write path can only leave the worktree through such a symlink.

@@ -6025,9 +6025,9 @@ impl Repository {
                         .filter_map(|(buffer_id, diff_state)| {
                             // Only the repo that OWNS a buffer (its innermost repo) may reload
                             // that buffer's base. Stripping the path naively against `this` repo
-                            // lets a parent claim a file in a nested repo (e.g. a `.rb-drive`
+                            // lets a parent claim a file in a nested repo (e.g. a `rb-drive`
                             // repo under the project): the path strips to a wrong
-                            // `.rb-drive/…`-prefixed value whose git read fails and clobbers the
+                            // `rb-drive/…`-prefixed value whose git read fails and clobbers the
                             // base with `None`. Reuse the innermost-repo resolution used on open.
                             let (owning_repo, repo_path) =
                                 git_store.repository_and_path_for_buffer_id(*buffer_id, cx)?;

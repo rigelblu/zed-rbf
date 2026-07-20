@@ -6,6 +6,11 @@ title: "Zed RBF Changelog"
 
 ---
 
+# 🔵⋯ v0.55.1 (2026-07-27) — #zed-51
+- 2026-07-27 - fix (ux) | see files an external tool creates under a new directory stay nested beneath that one directory row in the File Explorer, instead of showing as flat path-prefixed rows [@zed-rbf]
+
+---
+
 # 🔵⋯ v0.55.0 (2026-07-27) — #zed-50
 - 2026-07-27 - feat (ux) | read `---` and `***` as the same full-width horizontal rule, and `...` as a muted left-inset `•••` dotted leader for a softer section break, with a leading color emoji such as `🟠...` coloring the dots [@zed-rbf]
 
@@ -117,8 +122,8 @@ title: "Zed RBF Changelog"
 
 # 🔵⋯ v0.23.0 — #zed-23
 - Improved File History so it opens a file-scoped History view in the Git Panel instead of a separate graph tab
-- File-scoped History follows the file's own log (including renames), renders those rows without expand/collapse controls, and shows the full path in the scope-label tooltip
-- File-scoped History stays on Loading and self-refreshes while the log is still streaming, so entering the scope mid-load neither strands the panel nor shows commits that would preview blank diffs
+- File-scoped History lists only commits whose loaded diff includes the selected path, renders those rows without expand/collapse controls, and shows the full path in the scope-label tooltip
+- File-scoped History now renders validated rows incrementally and self-refreshes during graph loading so the panel does not get stuck waiting for a tab switch
 - File-scoped History keyboard navigation now updates one reusable file-diff preview instead of requiring a click or opening a tab for every selected commit
 - Project Panel directory selections no longer open empty file-scoped History or fall back to the active editor; File History remains a file-only action
 - Kept File History read-only: previewing active-file diffs does not checkout, restore, stage, or otherwise mutate the worktree
