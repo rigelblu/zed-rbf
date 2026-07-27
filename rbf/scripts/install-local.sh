@@ -8,7 +8,7 @@ cd "$repo_root"
 
 usage() {
   cat <<'USAGE'
-Usage: zed-rbf/scripts/install-local.sh [options]
+Usage: rbf/scripts/install-local.sh [options]
 
 Build and install the local zed-rbf macOS app bundle.
 
@@ -294,7 +294,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ "$(uname -s)" == "Darwin" ]] || fail "zed-rbf/scripts/install-local.sh only supports macOS"
+[[ "$(uname -s)" == "Darwin" ]] || fail "rbf/scripts/install-local.sh only supports macOS"
 [[ -n "$app_name" ]] || fail "--name cannot be empty"
 [[ "$app_name" != */* ]] || fail "--name cannot contain /"
 [[ -n "$bundle_id" ]] || fail "--bundle-id cannot be empty"

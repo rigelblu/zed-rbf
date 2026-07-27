@@ -1996,7 +1996,7 @@ impl Focusable for MessageEditor {
 }
 
 impl Render for MessageEditor {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .key_context("MessageEditor")
             .on_action(cx.listener(Self::chat))
@@ -2016,7 +2016,7 @@ impl Render for MessageEditor {
                     font_family: settings.buffer_font.family.clone(),
                     font_fallbacks: settings.buffer_font.fallbacks.clone(),
                     font_features: settings.buffer_font.features.clone(),
-                    font_size: settings.agent_buffer_font_size(cx).into(),
+                    font_size: settings.agent_buffer_font_size_for(window, cx).into(),
                     font_weight: settings.buffer_font.weight,
                     line_height: relative(settings.buffer_line_height.value()),
                     ..Default::default()

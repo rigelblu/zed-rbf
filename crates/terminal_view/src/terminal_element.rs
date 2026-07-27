@@ -934,7 +934,7 @@ impl Element for TerminalElement {
                 let hitbox = hitbox.unwrap();
                 let settings = ThemeSettings::get_global(cx).clone();
 
-                let buffer_font_size = settings.buffer_font_size(cx);
+                let buffer_font_size = settings.buffer_font_size_for(window, cx);
 
                 let terminal_settings = TerminalSettings::get_global(cx);
                 let minimum_contrast = terminal_settings.minimum_contrast;
@@ -964,11 +964,17 @@ impl Element for TerminalElement {
                     TerminalMode::Embedded { .. } => {
                         window.text_style().font_size.to_pixels(window.rem_size())
                     }
-                    TerminalMode::Standalone => terminal_settings
-                        .font_size
-                        .map_or(buffer_font_size, |size| {
-                            theme_settings::adjusted_font_size(size, cx)
-                        }),
+                    // A display profile's `terminal.font_size` outranks the global terminal
+                    // setting; with neither, the terminal falls back to the buffer font
+                    // size, which is itself already resolved for this window.
+                    TerminalMode::Standalone => settings
+                        .terminal_font_size_for(window, cx)
+                        .or_else(|| {
+                            terminal_settings
+                                .font_size
+                                .map(|size| theme_settings::adjusted_font_size(size, cx))
+                        })
+                        .unwrap_or(buffer_font_size),
                 };
 
                 let theme = cx.theme().clone();

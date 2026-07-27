@@ -6,6 +6,11 @@ title: "Zed RBF Changelog"
 
 ---
 
+# 🔵⋯ v0.56.0 (2026-07-27) — #zed-53
+- 2026-07-27 - feat (ux) | keep UI, buffer, terminal, and agent panel text at the right size on each display by naming display profiles in settings and assigning displays to them, with two windows on two displays rendering at their own sizes at the same time [@zed-rbf]
+
+---
+
 # 🔵⋯ v0.55.1 (2026-07-27) — #zed-51
 - 2026-07-27 - fix (ux) | see files an external tool creates under a new directory stay nested beneath that one directory row in the File Explorer, instead of showing as flat path-prefixed rows [@zed-rbf]
 

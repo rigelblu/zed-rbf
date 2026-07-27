@@ -4,7 +4,7 @@ title: "Zed RBF"
 
 This directory holds this flavour's docs, scripts, and version metadata.
 See [MAINTENANCE.md](MAINTENANCE.md) for maintenance and upstream-sync guidance.
-Use `zed-rbf/scripts/install-local.sh` to install the current build, and `zed-rbf/scripts/weekly-build.sh` to rebuild it weekly.
+Use `rbf/scripts/install-local.sh` to install the current build, and `rbf/scripts/weekly-build.sh` to rebuild it weekly.
 
 # 🔵⋯ Use
 This is for my personal use and shared publicly for those curious.
@@ -125,8 +125,42 @@ The configured order is the display order. `~` and `$VAR` expand. Missing paths 
 - Handle missing/unresolved tagged paths by showing them as explicit missing rows in the Tags section so they can be easily cleared
 - Keep `Tags`, `Project Files`, and project directory headers sticky together while scrolling the Project Panel
 
+## 🟠⋯ Display Profiles
+Name a set of font sizes and assign it to a display, so UI, buffer, terminal, and agent panel text stay the right size on each screen. Two windows on two displays render at their own sizes at the same time.
+
+```jsonc
+{
+  "display_profiles": {
+    "profiles": {
+      "laptop": {
+        "ui_font_size": 14,
+        "buffer_font_size": 14,
+        "terminal": { "font_size": 13 }
+      },
+      "big-monitor": {
+        "ui_font_size": 17,
+        "buffer_font_size": 18,
+        "agent_ui_font_size": 17,
+        "agent_buffer_font_size": 17
+      }
+    },
+    "assign": {
+      "Built-in Retina Display": "laptop",
+      "Studio Display": "big-monitor"
+    }
+  }
+}
+```
+
+- Every profile key is spelled exactly as the setting it overrides, and all are optional — a profile that sets only `ui_font_size` leaves the other surfaces untouched
+- `assign` keys are matched against a display's UUID first, then its human-readable name; two identical monitors report the same name, so a UUID entry is how you single one out
+- A display with no assignment keeps the top-level font settings, and without a `display_profiles` block nothing changes
+- Moving a window to another display re-applies that display's profile, discarding any manual `cmd +` adjustment
+- An assignment naming a profile that does not exist is logged as a warning and leaves that display on the global settings
+- There is no in-app display listing yet, so names have to come from the OS — on macOS, System Settings › Displays. A key that matches nothing is silent: that display just keeps the global sizes
+
 ## 🟠⋯ Versions
-- The fork version lives in `zed-rbf/RBF_VERSION`
+- The fork version lives in `rbf/RBF_VERSION`
 - `crates/zed/build.rs` injects it at build time as `ZED_RBF_VERSION`
 - Window titles show `(rbf v...)`, About identifies `Zed RBF v...`, and the bundled app binary's `--system-specs` output includes `Zed RBF: v...` alongside the upstream Zed version
 
@@ -175,7 +209,7 @@ cargo run --release  # Release build
 ## 🟠⋯ Install as Local App
 Run commands from the repository root:
 ```sh
-zed-rbf/scripts/install-local.sh --open
+rbf/scripts/install-local.sh --open
 ```
 
 Notes:
@@ -188,7 +222,7 @@ Notes:
 
 Temporary dogfood install:
 ```sh
-zed-rbf/scripts/install-local.sh \
+rbf/scripts/install-local.sh \
   --debug \
   --install-dir /private/tmp/zed-rbf-install-local/Applications \
   --name "Zed RBF Dogfood" \
@@ -200,24 +234,24 @@ Verify the default installed app identity:
 "$HOME/Applications/Zed RBF.app/Contents/MacOS/zed" --system-specs
 ```
 
-For a custom `--install-dir` or `--name`, run `--system-specs` from that app bundle instead. The output should include a `Zed RBF: v...` line matching `zed-rbf/RBF_VERSION` and preserve the upstream `Zed: ...` line.
+For a custom `--install-dir` or `--name`, run `--system-specs` from that app bundle instead. The output should include a `Zed RBF: v...` line matching `rbf/RBF_VERSION` and preserve the upstream `Zed: ...` line.
 
 ## 🟠⋯ Weekly Build
 After the checkout has been synced and conflicts are resolved, build and install it as the weekly app:
 ```sh
-zed-rbf/scripts/weekly-build.sh
+rbf/scripts/weekly-build.sh
 ```
 
 Preflight without installing:
 ```sh
-zed-rbf/scripts/weekly-build.sh --check-only
+rbf/scripts/weekly-build.sh --check-only
 ```
 
 Notes:
 - Refuses local working-copy changes unless `--allow-dirty` is passed
 - Refuses unresolved conflicts anywhere in the current rbf stack
 - Records provenance, preflight, and install output in `~/Library/Logs/zed-rbf-weekly-build.log` by default
-- Delegates app bundling, signing, and installation to `zed-rbf/scripts/install-local.sh`
+- Delegates app bundling, signing, and installation to `rbf/scripts/install-local.sh`
 
 # 🔵⋯ OS Compatability
 Linux and Windows use `ctrl` instead of `cmd`. (==🔴**HAVE NOT TESTED THIS**==)
@@ -238,19 +272,19 @@ cargo install cargo-bundle \
 
 Then rerun:
 ```sh
-zed-rbf/scripts/install-local.sh
+rbf/scripts/install-local.sh
 ```
 
 Use a distinct bundle id when you want macOS to treat a dogfood build as a separate app:
 ```sh
-zed-rbf/scripts/install-local.sh --name "Zed RBF Dogfood" --bundle-id dev.zed.Zed-RBF-Dogfood
+rbf/scripts/install-local.sh --name "Zed RBF Dogfood" --bundle-id dev.zed.Zed-RBF-Dogfood
 ```
 
 # 🔵⋯ Sync From Upstream
 Use MAINTENANCE for the sync flow. The short version:
 ```sh
-zed-rbf/scripts/upstream-sync.sh --check-only
-zed-rbf/scripts/upstream-sync.sh
+rbf/scripts/upstream-sync.sh --check-only
+rbf/scripts/upstream-sync.sh
 ```
 
 The command fetches `upstream`, reports divergence/classification, rebases the rbf stack onto `main@upstream`, reports conflicts bottom-up with per-file classification, runs the fork regression gates on clean rebases, and prints a `jj op restore` undo command for rebase/local-history changes.

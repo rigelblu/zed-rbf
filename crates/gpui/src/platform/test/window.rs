@@ -103,6 +103,22 @@ impl TestWindow {
         self.0.lock().resize_callback = Some(callback);
     }
 
+    /// Moves the window onto `display` and fires the move callback, exactly as the platform
+    /// does when a window is dragged between physical displays.
+    ///
+    /// The callback fires whether or not the display actually changed, because that is what
+    /// the real platform does — a drag within one display emits a move per frame.
+    pub fn simulate_move_to_display(&mut self, display: Rc<dyn PlatformDisplay>) {
+        let mut lock = self.0.lock();
+        lock.display = display;
+        let Some(mut callback) = lock.moved_callback.take() else {
+            return;
+        };
+        drop(lock);
+        callback();
+        self.0.lock().moved_callback = Some(callback);
+    }
+
     pub(crate) fn simulate_active_status_change(&self, active: bool) {
         let mut lock = self.0.lock();
         let Some(mut callback) = lock.active_status_change_callback.take() else {
