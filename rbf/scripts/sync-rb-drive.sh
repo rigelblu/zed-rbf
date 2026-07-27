@@ -17,8 +17,8 @@ Usage: rbf/scripts/sync-rb-drive.sh [--dry-run] <command>
 Mirror the rb-drive directory to a Google Drive destination with rsync.
 
 Commands:
-  remote      Back up rb-drive into rb-drive-remote/rb-drive/ (faithful private mirror).
-  public      Publish rb-drive contents (agents/, projects/) into rb-drive-public-share/ (VCS + secrets excluded).
+  remote      Back up rb-drive into .rb-drive-remote/rb-drive/ (faithful private mirror).
+  public      Publish rb-drive contents (agents/, projects/) into .rb-drive-public-share/ (VCS + secrets excluded).
 
 Options:
   -n, --dry-run  Show what rsync would change, without writing or deleting.
@@ -79,14 +79,14 @@ case "$subcommand" in
   remote)
     # No trailing slash: rsync copies the rb-drive directory itself, so the private
     # backup nests as <dest>/rb-drive/ — a faithful, low-churn mirror of the store.
-    dest="${repo_root}/rb-drive-remote/"
+    dest="${repo_root}/.rb-drive-remote/"
     src="${repo_root}/rb-drive"
     ;;
   public)
     # Trailing slash: rsync copies the CONTENTS, so agents/ and projects/ land directly
     # at the share root (no rb-drive/ level) for easy public browsing.
     rsync_opts+=("${public_excludes[@]}")
-    dest="${repo_root}/rb-drive-public-share/"
+    dest="${repo_root}/.rb-drive-public-share/"
     src="${repo_root}/rb-drive/"
     ;;
 esac
