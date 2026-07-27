@@ -62,11 +62,12 @@ use futures::{
 };
 use gpui::{
     Action, AnyEntity, AnyView, AnyWeakView, App, AsyncApp, AsyncWindowContext, Axis, Bounds,
-    Context, CursorStyle, Decorations, DragMoveEvent, Entity, EntityId, EventEmitter, FocusHandle,
-    Focusable, Global, HitboxBehavior, Hsla, KeyContext, Keystroke, ManagedView, MouseButton,
-    PathPromptOptions, Point, PromptLevel, Render, ResizeEdge, Size, Stateful, Subscription,
-    SystemWindowTabController, Task, TaskExt, Tiling, WeakEntity, WindowBounds, WindowHandle,
-    WindowId, WindowOptions, actions, canvas, point, relative, size, transparent_black,
+    Context, CursorStyle, Decorations, DisplayId, DragMoveEvent, Entity, EntityId, EventEmitter,
+    FocusHandle, Focusable, Global, HitboxBehavior, Hsla, KeyContext, Keystroke, ManagedView,
+    MouseButton, PathPromptOptions, Point, PromptLevel, Render, ResizeEdge, Size, Stateful,
+    Subscription, SystemWindowTabController, Task, TaskExt, Tiling, WeakEntity, WindowBounds,
+    WindowHandle, WindowId, WindowOptions, actions, canvas, point, relative, size,
+    transparent_black,
 };
 pub use history_manager::*;
 pub use item::{
@@ -1425,6 +1426,11 @@ pub struct Workspace {
     bounds: Bounds<Pixels>,
     pub centered_layout: bool,
     bounds_save_task_queued: Option<Task<()>>,
+    /// The display this workspace's window was on when it was last observed.
+    ///
+    /// Compared on every bounds change so a drag within one display costs one integer
+    /// comparison, and only a genuine move between displays does any work.
+    last_display_id: Option<DisplayId>,
     on_prompt_for_new_path: Option<PromptForNewPath>,
     on_prompt_for_open_path: Option<PromptForOpenPath>,
     terminal_provider: Option<Box<dyn TerminalProvider>>,
@@ -1791,6 +1797,12 @@ impl Workspace {
         let subscriptions = vec![
             cx.observe_window_activation(window, Self::on_window_activation_changed),
             cx.observe_window_bounds(window, move |this, window, cx| {
+                // Runs before the active-window guard: a window moved to another
+                // display must re-resolve its font size even while unfocused, which
+                // is the whole point of per-display profiles. The handler itself
+                // no-ops unless the display identity actually changed.
+                this.handle_possible_display_change(window, cx);
+
                 if !window.is_window_active() {
                     return;
                 }
@@ -1884,6 +1896,7 @@ impl Workspace {
             bounds: Default::default(),
             centered_layout: false,
             bounds_save_task_queued: None,
+            last_display_id: window.display_id(),
             on_prompt_for_new_path: None,
             on_prompt_for_open_path: None,
             terminal_provider: None,
@@ -6890,6 +6903,34 @@ impl Workspace {
     ) -> Option<Entity<SharedScreen>> {
         self.active_call()?
             .create_shared_screen(peer_id, pane, window, cx)
+    }
+
+    /// Reacts to this window having moved to a different display.
+    ///
+    /// Called from the window-bounds observer, which fires on every frame of a drag, so the
+    /// identity comparison must come before any other work — re-resolving font sizes per
+    /// frame would re-wrap the DisplayMap at frame rate.
+    ///
+    /// Font sizes themselves are not applied here: every surface re-resolves from its own
+    /// window when it renders, and the bounds change already refreshed the window. What does
+    /// belong here is the state that has no other owner — a manual `cmd +` adjustment is
+    /// discarded on arrival at a new display, so the arriving display's profile wins
+    /// outright and what is visible in settings.json stays the whole truth.
+    fn handle_possible_display_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let display_id = window.display_id();
+        if self.last_display_id == display_id {
+            return;
+        }
+        self.last_display_id = display_id;
+
+        // The set of connected displays may have changed along with this window's, as it
+        // does on a dock, undock, or monitor hot-plug.
+        theme_settings::refresh_display_profile_assignments(cx);
+
+        theme_settings::reset_ui_font_size(cx);
+        theme_settings::reset_buffer_font_size(cx);
+        theme_settings::reset_agent_ui_font_size(cx);
+        theme_settings::reset_agent_buffer_font_size(cx);
     }
 
     pub fn on_window_activation_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {

@@ -2579,6 +2579,16 @@ impl Window {
         self.platform_window.set_document_path(path);
     }
 
+    /// The identifier of the display on which the window is visible.
+    ///
+    /// Unlike [`Window::display`], this reads a field kept current by
+    /// [`Window::bounds_changed`] rather than enumerating every connected display, so it
+    /// is cheap enough to consult on a per-frame path. Use it to detect that a window has
+    /// moved between displays; use [`Window::display`] when the display itself is needed.
+    pub fn display_id(&self) -> Option<DisplayId> {
+        self.display_id
+    }
+
     /// Determine the display on which the window is visible.
     pub fn display(&self, cx: &App) -> Option<Rc<dyn PlatformDisplay>> {
         cx.platform

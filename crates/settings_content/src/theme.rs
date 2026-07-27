@@ -171,6 +171,49 @@ impl TryFrom<&ThemeColor> for gpui::Rgba {
     }
 }
 
+/// A named set of font sizes applied to windows on a particular display.
+///
+/// Every key is spelled exactly as the setting it overrides, so a reader who knows
+/// Zed's settings can read a profile without translation. All are optional — a
+/// profile that sets only `ui_font_size` leaves the other surfaces untouched.
+#[derive(Clone, PartialEq, Debug, Default, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct DisplayProfileContent {
+    /// The font size for text in the UI on this display.
+    pub ui_font_size: Option<FontSize>,
+    /// The font size for text buffers on this display.
+    pub buffer_font_size: Option<FontSize>,
+    /// Terminal overrides for this display.
+    pub terminal: Option<DisplayProfileTerminalContent>,
+    /// The font size for agent responses in the agent panel on this display.
+    pub agent_ui_font_size: Option<FontSize>,
+    /// The font size for user messages in the agent panel on this display.
+    pub agent_buffer_font_size: Option<FontSize>,
+}
+
+/// The terminal half of a display profile, shaped like the real `terminal` settings.
+#[derive(Clone, PartialEq, Debug, Default, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct DisplayProfileTerminalContent {
+    /// The terminal font size on this display.
+    pub font_size: Option<FontSize>,
+}
+
+/// Per-display font sizes: named profiles, plus which display gets which.
+///
+/// There is deliberately no `default` profile key — a display with no assignment
+/// falls to Zed's existing top-level font settings, which already answer "what size
+/// should text be".
+#[derive(Clone, PartialEq, Debug, Default, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct DisplayProfilesContent {
+    /// The profiles themselves, by name.
+    pub profiles: Option<HashMap<String, DisplayProfileContent>>,
+    /// Which display gets which profile.
+    ///
+    /// Keys are matched against a display's UUID first, then its human-readable name.
+    /// Two identical monitors report the same name, so a UUID entry is how you tell
+    /// them apart — which only works if it outranks the name entry that also matches.
+    pub assign: Option<HashMap<String, String>>,
+}
+
 /// Settings for rendering text in UI and text buffers.
 
 #[with_fallible_options]

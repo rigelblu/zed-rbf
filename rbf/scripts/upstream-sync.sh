@@ -5,7 +5,7 @@
 # Most conflicts land on upstream files carrying rbf hooks, but add/add and
 # delete/rename edge cases still need human judgment. This command classifies
 # and reports instead of auto-applying resolutions: port rbf hooks deliberately,
-# inspect unexpected fork-owned collisions, then finish with zed-rbf/scripts/weekly-build.sh.
+# inspect unexpected fork-owned collisions, then finish with rbf/scripts/weekly-build.sh.
 
 set -euo pipefail
 
@@ -15,7 +15,7 @@ log_path="$HOME/Library/Logs/zed-rbf-upstream-sync.log"
 
 usage() {
   cat <<'USAGE'
-Usage: zed-rbf/scripts/upstream-sync.sh [options]
+Usage: rbf/scripts/upstream-sync.sh [options]
 
 Fetch upstream zed-industries/zed, rebase the rbf stack onto its main, and
 report any conflicts with their divergence classification.
@@ -259,7 +259,7 @@ if [[ -z "$conflicted_revs" ]]; then
 
   log ""
   log "== verify =="
-  if ! run_logged bash zed-rbf/scripts/weekly-build.sh --check-only --log-path "$log_path"; then
+  if ! run_logged bash rbf/scripts/weekly-build.sh --check-only --log-path "$log_path"; then
     log "Error: weekly-build preflight failed after rebase. Undo rebase/local-history changes with: jj op restore $pre_op"
     exit 1
   fi
@@ -284,7 +284,7 @@ if [[ -z "$conflicted_revs" ]]; then
   fi
 
   log ""
-  log "Sync complete. Install the weekly app with: zed-rbf/scripts/weekly-build.sh"
+  log "Sync complete. Install the weekly app with: rbf/scripts/weekly-build.sh"
   exit 0
 fi
 
@@ -298,7 +298,7 @@ printf '%s' "$conflicted_revs" | while IFS= read -r rev; do
   while IFS= read -r file; do
     [[ -z "$file" ]] && continue
     if printf '%s' "$hooked_files" | grep -Fxq "$file"; then
-      log "  $file - rbf hook: accept upstream's new layout, port the hook (see zed-rbf/MAINTENANCE.md)"
+      log "  $file - rbf hook: accept upstream's new layout, port the hook (see rbf/MAINTENANCE.md)"
     elif printf '%s' "$owned_files" | grep -Fxq "$file"; then
       log "  $file - UNEXPECTED: upstream collided with a fork-owned file; inspect manually"
     elif printf '%s' "$deleted_files" | grep -Fxq "$file"; then
@@ -312,5 +312,5 @@ done
 log ""
 log "Resolve with: jj edit <rev>, fix the files, then continue up the stack."
 log "Undo rebase/local-history changes with: jj op restore $pre_op"
-log "After resolving all conflicts, rerun the gates: zed-rbf/scripts/weekly-build.sh --check-only && cargo check -p zed && cargo test -p editor ymd --lib && cargo test -p recent_projects --lib"
+log "After resolving all conflicts, rerun the gates: rbf/scripts/weekly-build.sh --check-only && cargo check -p zed && cargo test -p editor ymd --lib && cargo test -p recent_projects --lib"
 exit 1

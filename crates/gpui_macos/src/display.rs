@@ -105,6 +105,31 @@ impl PlatformDisplay for MacDisplay {
         ]))
     }
 
+    fn name(&self) -> Option<String> {
+        unsafe {
+            let screen = self.get_nsscreen();
+            if screen == nil {
+                return None;
+            }
+
+            let name: id = msg_send![screen, localizedName];
+            if name == nil {
+                return None;
+            }
+
+            let cstr: *const std::os::raw::c_char = msg_send![name, UTF8String];
+            if cstr.is_null() {
+                return None;
+            }
+
+            Some(
+                std::ffi::CStr::from_ptr(cstr)
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        }
+    }
+
     fn bounds(&self) -> Bounds<Pixels> {
         unsafe {
             // CGDisplayBounds is in "global display" coordinates, where 0 is

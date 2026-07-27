@@ -81,7 +81,7 @@ pub use keystroke::*;
 pub(crate) use test::*;
 
 #[cfg(any(test, feature = "test-support"))]
-pub use test::{TestDispatcher, TestScreenCaptureSource, TestScreenCaptureStream};
+pub use test::{TestDispatcher, TestDisplay, TestScreenCaptureSource, TestScreenCaptureStream};
 
 #[cfg(any(test, feature = "test-support"))]
 pub use threaded_dispatcher::ThreadedDispatcher;
@@ -336,6 +336,15 @@ pub trait PlatformDisplay: Debug {
     /// Returns a stable identifier for this display that can be persisted and used
     /// across system restarts.
     fn uuid(&self) -> Result<Uuid>;
+
+    /// Returns a human-readable name for this display, e.g. "Built-in Retina Display".
+    ///
+    /// Unlike [`PlatformDisplay::uuid`] this is not guaranteed to be unique — two
+    /// identical monitors report the same name — so it identifies a display for a
+    /// person, not for the system. Platforms that cannot supply one return `None`.
+    fn name(&self) -> Option<String> {
+        None
+    }
 
     /// Get the bounds for this display
     fn bounds(&self) -> Bounds<Pixels>;

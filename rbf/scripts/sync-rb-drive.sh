@@ -12,7 +12,7 @@ max_delete="${RB_DRIVE_MAX_DELETE:-100}"
 
 usage() {
   cat <<'USAGE'
-Usage: zed-rbf/scripts/sync-rb-drive.sh [--dry-run] <command>
+Usage: rbf/scripts/sync-rb-drive.sh [--dry-run] <command>
 
 Mirror the rb-drive directory to a Google Drive destination with rsync.
 

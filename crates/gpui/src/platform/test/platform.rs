@@ -1,12 +1,12 @@
 use crate::{
-    AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DevicePixels,
+    AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DevicePixels, DisplayId,
     DummyKeyboardMapper, ForegroundExecutor, Keymap, NoopTextSystem, PathPromptOptions, Platform,
     PlatformDisplay, PlatformHeadlessRenderer, PlatformKeyboardLayout, PlatformKeyboardMapper,
     PlatformTextSystem, PromptButton, ScreenCaptureFrame, ScreenCaptureSource, ScreenCaptureStream,
     SharedString, SourceMetadata, SystemNotification, SystemNotificationResponse, Task,
     TestDisplay, TestWindow, ThermalState, WindowAppearance, WindowParams, size,
 };
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use collections::VecDeque;
 use futures::channel::oneshot;
 use parking_lot::Mutex;
@@ -23,7 +23,7 @@ pub(crate) struct TestPlatform {
     foreground_executor: ForegroundExecutor,
 
     pub(crate) active_window: RefCell<Option<TestWindow>>,
-    active_display: Rc<dyn PlatformDisplay>,
+    displays: RefCell<Vec<Rc<dyn PlatformDisplay>>>,
     active_cursor: Mutex<CursorStyle>,
     current_clipboard_item: Mutex<Option<ClipboardItem>>,
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -134,7 +134,7 @@ impl TestPlatform {
             prompts: Default::default(),
             screen_capture_sources: Default::default(),
             active_cursor: Default::default(),
-            active_display: Rc::new(TestDisplay::new()),
+            displays: RefCell::new(vec![Rc::new(TestDisplay::new())]),
             active_window: Default::default(),
             expect_restart: Default::default(),
             current_clipboard_item: Mutex::new(None),
@@ -222,6 +222,19 @@ impl TestPlatform {
 
     pub(crate) fn set_screen_capture_sources(&self, sources: Vec<TestScreenCaptureSource>) {
         *self.screen_capture_sources.borrow_mut() = sources;
+    }
+
+    pub(crate) fn set_displays(&self, displays: Vec<Rc<dyn PlatformDisplay>>) {
+        *self.displays.borrow_mut() = displays;
+    }
+
+    /// The connected display with this id, or the primary display when `id` is `None`.
+    pub(crate) fn display_by_id(&self, id: Option<DisplayId>) -> Option<Rc<dyn PlatformDisplay>> {
+        let displays = self.displays.borrow();
+        match id {
+            Some(id) => displays.iter().find(|display| display.id() == id).cloned(),
+            None => displays.first().cloned(),
+        }
     }
 
     pub(crate) fn prompt(
@@ -363,11 +376,11 @@ impl Platform for TestPlatform {
     }
 
     fn displays(&self) -> Vec<std::rc::Rc<dyn crate::PlatformDisplay>> {
-        vec![self.active_display.clone()]
+        self.displays.borrow().clone()
     }
 
     fn primary_display(&self) -> Option<std::rc::Rc<dyn crate::PlatformDisplay>> {
-        Some(self.active_display.clone())
+        self.displays.borrow().first().cloned()
     }
 
     fn is_screen_capture_supported(&self) -> bool {
@@ -401,13 +414,10 @@ impl Platform for TestPlatform {
         params: WindowParams,
     ) -> anyhow::Result<Box<dyn crate::PlatformWindow>> {
         let renderer = self.headless_renderer_factory.as_ref().and_then(|f| f());
-        let window = TestWindow::new(
-            handle,
-            params,
-            self.weak.clone(),
-            self.active_display.clone(),
-            renderer,
-        );
+        let display = self
+            .display_by_id(params.display_id)
+            .context("no displays are connected, so no window can be opened")?;
+        let window = TestWindow::new(handle, params, self.weak.clone(), display, renderer);
         Ok(Box::new(window))
     }
 

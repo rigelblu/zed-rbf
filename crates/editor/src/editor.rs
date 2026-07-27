@@ -1289,6 +1289,15 @@ pub struct Editor {
     pixel_position_of_newest_cursor: Option<gpui::Point<Pixels>>,
     gutter_dimensions: GutterDimensions,
     style: Option<EditorStyle>,
+    /// The buffer font size this editor's window last resolved to — its display's profile
+    /// plus any manual `cmd +` adjustment.
+    ///
+    /// Held here because [`Editor::create_style`] has no `Window` and its result is cached
+    /// on the entity. Refreshed in `render`, which does have one, so an editor that was not
+    /// visible when the display changed still resolves correctly the moment it renders.
+    /// `None` means nothing has resolved a size for this editor yet, and the global buffer
+    /// font setting stands.
+    display_profile_buffer_font_size: Option<Pixels>,
     text_style_refinement: Option<TextStyleRefinement>,
     next_editor_action_id: EditorActionId,
     editor_actions: Rc<
@@ -2633,6 +2642,7 @@ impl Editor {
             expect_bounds_change: None,
             gutter_dimensions: GutterDimensions::default(),
             style: None,
+            display_profile_buffer_font_size: None,
             show_cursor_names: false,
             hovered_cursors: HashMap::default(),
             next_editor_action_id: EditorActionId::default(),
@@ -12256,6 +12266,28 @@ impl Editor {
         }
     }
 
+    /// Re-resolves this editor's buffer font size from the display its window is on, and
+    /// drops the cached style only when the size actually changed.
+    ///
+    /// The comparison is the whole performance guard for this feature: `bounds_changed`
+    /// fires every frame of a window drag and refreshes the window, so this runs at frame
+    /// rate. Everything it does before the comparison must stay cheap — resolution is
+    /// `window.display_id()` plus two map lookups, never an enumeration of connected
+    /// displays.
+    fn sync_display_profile_font_size(&mut self, window: &Window, cx: &mut Context<Self>) {
+        // Resolve through the full chain rather than reading the profile alone: the manual
+        // `cmd +` adjustment lives in a global that only the resolver consults, and reading
+        // just the profile here made that adjustment silently inert whenever a profile
+        // applied.
+        let resolved = Some(ThemeSettings::get_global(cx).buffer_font_size_for(window, cx));
+
+        if self.display_profile_buffer_font_size == resolved {
+            return;
+        }
+        self.display_profile_buffer_font_size = resolved;
+        self.style = None;
+    }
+
     fn create_style(&self, cx: &App) -> EditorStyle {
         let settings = ThemeSettings::get_global(cx);
 
@@ -12275,7 +12307,10 @@ impl Editor {
                 font_family: settings.buffer_font.family.clone(),
                 font_features: settings.buffer_font.features.clone(),
                 font_fallbacks: settings.buffer_font.fallbacks.clone(),
-                font_size: settings.buffer_font_size(cx).into(),
+                font_size: self
+                    .display_profile_buffer_font_size
+                    .unwrap_or_else(|| settings.buffer_font_size(cx))
+                    .into(),
                 font_weight: settings.buffer_font.weight,
                 line_height: relative(settings.buffer_line_height.value()),
                 ..Default::default()
@@ -13252,7 +13287,8 @@ impl Focusable for Editor {
 }
 
 impl Render for Editor {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_display_profile_font_size(window, cx);
         EditorElement::new(&cx.entity(), self.create_style(cx))
     }
 }

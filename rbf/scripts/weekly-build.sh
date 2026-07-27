@@ -8,7 +8,7 @@ cd "$repo_root"
 
 usage() {
   cat <<'USAGE'
-Usage: zed-rbf/scripts/weekly-build.sh [options]
+Usage: rbf/scripts/weekly-build.sh [options]
 
 Build and install the current synced, conflict-free zed-rbf checkout.
 
@@ -102,7 +102,7 @@ done
 
 command -v jj >/dev/null 2>&1 || fail "jj not found"
 command -v tee >/dev/null 2>&1 || fail "tee not found"
-[[ -x "${repo_root}/zed-rbf/scripts/install-local.sh" ]] || fail "missing executable zed-rbf/scripts/install-local.sh"
+[[ -x "${repo_root}/rbf/scripts/install-local.sh" ]] || fail "missing executable rbf/scripts/install-local.sh"
 
 mkdir -p "$(dirname "$log_path")"
 touch "$log_path"
@@ -186,7 +186,7 @@ if [[ "$check_only" == "true" ]]; then
 fi
 
 install_args=(
-  "${repo_root}/zed-rbf/scripts/install-local.sh"
+  "${repo_root}/rbf/scripts/install-local.sh"
   --install-dir "$install_dir"
   --name "$app_name"
   --bundle-id "$bundle_id"
