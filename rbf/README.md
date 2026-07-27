@@ -123,6 +123,7 @@ The configured order is the display order. `~` and `$VAR` expand. Missing paths 
 - View and manage tagged files in a dedicated Tags section at the top of the Project Panel, grouped by color with path context and drag/keyboard support
 - Toggle the Tags section between Tree View and Flat View via an ellipsis menu, with expandable/collapsible categories and context-menu controls to change/clear tags
 - Handle missing/unresolved tagged paths by showing them as explicit missing rows in the Tags section so they can be easily cleared
+- Resolve tagged files that live inside symlinked directories without expanding those directories first, while leaving symlinked trees with nothing tagged inside them unscanned
 - Keep `Tags`, `Project Files`, and project directory headers sticky together while scrolling the Project Panel
 
 ## 🟠⋯ Display Profiles
