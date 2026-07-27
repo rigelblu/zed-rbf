@@ -15,7 +15,7 @@ use editor::{
 };
 use feature_flags::{FeatureFlagAppExt, ProjectPanelUndoRedoFeatureFlag};
 use file_icons::FileIcons;
-use futures::{FutureExt as _, future::Shared};
+use futures::{FutureExt as _, StreamExt as _, future::Shared};
 use git;
 use git::status::GitSummary;
 use git_ui;
@@ -164,6 +164,13 @@ pub struct ProjectPanel {
     file_tag_view_mode: FileTagViewMode,
     collapsed_file_tag_groups: HashSet<FileTagColor>,
     file_tag_update_task: Shared<Task<()>>,
+    // Worktrees whose tagged paths have been handed to the scanner but whose scan has not
+    // finished. Until it does we have not actually looked for those files, so their rows must
+    // not claim `⚠ Missing` — see `TaggedFileRow::status_label`.
+    worktrees_awaiting_tag_scan: HashSet<WorktreeId>,
+    // Keyed by worktree so re-registering supersedes the task in flight rather than accumulating
+    // one per worktree-added event.
+    _tag_scan_registrations: HashMap<WorktreeId, Task<()>>,
     // We keep track of the mouse down state on entries so we don't flash the UI
     // in case a user clicks to open a file.
     mouse_down: bool,
@@ -212,12 +219,34 @@ struct TaggedFileRow {
     file_name: String,
     path_label: String,
     tooltip_label: String,
+    resolution_pending: bool,
 }
 
 impl TaggedFileRow {
     fn status_label(&self) -> Option<&'static str> {
-        self.entry_id.is_none().then_some("⚠ Missing")
+        // An unresolved row only earns `⚠ Missing` once we have actually looked. While its
+        // worktree is still scanning the tagged paths we know nothing, so we claim nothing.
+        (!self.resolution_pending && self.entry_id.is_none()).then_some("⚠ Missing")
     }
+}
+
+/// The visible worktree a tag belongs to, or `None` when its root is no longer open.
+///
+/// A `FileTagKey` stores its worktree as an absolute path string, so one comparison decides
+/// ownership everywhere it is asked. Keeping that comparison in a single place means a later
+/// change to the rule — canonicalization, trailing slashes, the re-keying that `#zed-44`'s
+/// move/rename slice will need — cannot fix one caller and silently miss the other.
+fn worktree_for_file_tag<'a>(
+    worktrees: &'a [Entity<Worktree>],
+    file_tag_key: &FileTagKey,
+    cx: &'a App,
+) -> Option<&'a Worktree> {
+    worktrees
+        .iter()
+        .map(|worktree| worktree.read(cx))
+        .find(|worktree| {
+            worktree.abs_path().to_string_lossy().as_ref() == file_tag_key.worktree_root.as_str()
+        })
 }
 
 #[derive(Clone)]
@@ -941,8 +970,12 @@ impl ProjectPanel {
                         this.update_visible_entries(None, false, false, window, cx);
                         cx.notify();
                     }
+                    project::Event::WorktreeAdded(_) => {
+                        this.register_tagged_paths_for_scan(cx);
+                        this.update_visible_entries(None, false, false, window, cx);
+                        cx.notify();
+                    }
                     project::Event::WorktreeUpdatedEntries(_, _)
-                    | project::Event::WorktreeAdded(_)
                     | project::Event::WorktreeOrderChanged => {
                         this.update_visible_entries(None, false, false, window, cx);
                         cx.notify();
@@ -1099,6 +1132,8 @@ impl ProjectPanel {
                 file_tag_view_mode: FileTagViewMode::default(),
                 collapsed_file_tag_groups: HashSet::default(),
                 file_tag_update_task: Task::ready(()).shared(),
+                worktrees_awaiting_tag_scan: HashSet::default(),
+                _tag_scan_registrations: HashMap::default(),
                 scroll_handle,
                 mouse_down: false,
                 hover_expand_task: None,
@@ -1119,6 +1154,9 @@ impl ProjectPanel {
                 undo_manager: UndoManager::new(workspace.weak_handle(), weak_project_panel, &cx),
             };
             this.update_visible_entries(None, false, false, window, cx);
+            // Worktrees already open when the panel is built never fire `WorktreeAdded`, because
+            // the subscription above is installed after they were added.
+            this.register_tagged_paths_for_scan(cx);
 
             this
         });
@@ -1641,63 +1679,130 @@ impl ProjectPanel {
         self.pending_file_tags.as_ref().unwrap_or(&self.file_tags)
     }
 
+    /// Hands every tagged file's own path to its worktree's scanner.
+    ///
+    /// The scanner will not descend into a directory whose symlink target lands outside the
+    /// worktree root unless `scan_symlinks` is `Always`, so tagged files under one are absent
+    /// from the snapshot until the user expands it. Registering the file path makes each of its
+    /// ancestors scannable for that descent, without pinning a subtree prefix the way registering
+    /// the parent directory would.
+    ///
+    /// Registration is per-session by nature: the scanner keys its record of scanned directories
+    /// by `ProjectEntryId`, which is minted afresh each launch.
+    fn register_tagged_paths_for_scan(&mut self, cx: &mut Context<Self>) {
+        let mut paths_by_worktree: HashMap<WorktreeId, Vec<Arc<RelPath>>> = HashMap::default();
+        {
+            let project = self.project.read(cx);
+            let worktrees = project.visible_worktrees(cx).collect::<Vec<_>>();
+            for file_tag_key in self.file_tags.tags.keys() {
+                let Ok(path) = RelPath::unix(file_tag_key.path.as_str()) else {
+                    continue;
+                };
+                let Some(worktree) = worktree_for_file_tag(&worktrees, file_tag_key, cx) else {
+                    continue;
+                };
+                // Registration only exists on local worktrees. On a remote one we can never
+                // look, so the row keeps the `⚠ Missing` cue rather than waiting forever.
+                if worktree.as_local().is_some() {
+                    paths_by_worktree
+                        .entry(worktree.id())
+                        .or_default()
+                        .push(path.into_arc());
+                }
+            }
+        }
+
+        for (worktree_id, paths) in paths_by_worktree {
+            let Some(worktree) = self.project.read(cx).worktree_for_id(worktree_id, cx) else {
+                continue;
+            };
+            let barriers = worktree.update(cx, |worktree, _| {
+                let worktree = worktree.as_local_mut()?;
+                Some(
+                    paths
+                        .into_iter()
+                        .map(|path| worktree.add_path_prefix_to_scan(path))
+                        .collect::<Vec<_>>(),
+                )
+            });
+            let Some(barriers) = barriers else {
+                continue;
+            };
+
+            self.worktrees_awaiting_tag_scan.insert(worktree_id);
+            let task = cx.spawn(async move |this, cx| {
+                // Every request was already sent, so the barriers are all in flight; awaiting them
+                // one after another still finishes when the last one fires. `LocalWorktree`'s own
+                // `expand_entry` awaits the same barrier this way (`worktree.rs:1932`).
+                for mut barrier in barriers {
+                    barrier.next().await;
+                }
+                this.update(cx, |this, cx| {
+                    this.worktrees_awaiting_tag_scan.remove(&worktree_id);
+                    // The Tags section resolves straight from the worktree at render time, so a
+                    // notify is enough — it does not wait on `UpdatedEntries`, which a scan
+                    // whose final diff is empty never emits.
+                    cx.notify();
+                })
+                .log_err();
+            });
+            self._tag_scan_registrations.insert(worktree_id, task);
+        }
+    }
+
     fn tagged_file_groups(&self, cx: &App) -> Vec<TaggedFileGroup> {
         let project = self.project.read(cx);
         let worktrees = project.visible_worktrees(cx).collect::<Vec<_>>();
         let mut rows = Vec::new();
 
-        'tags: for (file_tag_key, color) in &self.file_tags.tags {
+        for (file_tag_key, color) in &self.file_tags.tags {
             let Ok(path) = RelPath::unix(file_tag_key.path.as_str()) else {
                 continue;
             };
+            let Some(worktree) = worktree_for_file_tag(&worktrees, file_tag_key, cx) else {
+                continue;
+            };
 
-            for worktree in &worktrees {
-                let worktree = worktree.read(cx);
-                if worktree.abs_path().to_string_lossy().as_ref()
-                    != file_tag_key.worktree_root.as_str()
-                {
-                    continue;
-                }
+            let entry = worktree
+                .entry_for_path(path)
+                .filter(|entry| entry.is_file());
+            let root_name = worktree.root_name().as_unix_str();
+            let path_label = if root_name.is_empty() {
+                file_tag_key.path.clone()
+            } else if file_tag_key.path.is_empty() {
+                root_name.to_string()
+            } else {
+                format!("{root_name}/{}", file_tag_key.path)
+            };
+            let file_name = path
+                .file_name()
+                .map(str::to_string)
+                .unwrap_or_else(|| file_tag_key.path.clone());
+            let tooltip_label = if file_tag_key.path.is_empty() {
+                file_tag_key.worktree_root.clone()
+            } else {
+                format!("{}/{}", file_tag_key.worktree_root, file_tag_key.path)
+            };
+            let resolution_pending =
+                entry.is_none() && self.worktrees_awaiting_tag_scan.contains(&worktree.id());
+            let tooltip_label = if entry.is_some() || resolution_pending {
+                tooltip_label
+            } else {
+                format!("⚠ Missing: {tooltip_label}")
+            };
 
-                let entry = worktree
-                    .entry_for_path(path)
-                    .filter(|entry| entry.is_file());
-                let root_name = worktree.root_name().as_unix_str();
-                let path_label = if root_name.is_empty() {
-                    file_tag_key.path.clone()
-                } else if file_tag_key.path.is_empty() {
-                    root_name.to_string()
-                } else {
-                    format!("{root_name}/{}", file_tag_key.path)
-                };
-                let file_name = path
-                    .file_name()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| file_tag_key.path.clone());
-                let tooltip_label = if file_tag_key.path.is_empty() {
-                    file_tag_key.worktree_root.clone()
-                } else {
-                    format!("{}/{}", file_tag_key.worktree_root, file_tag_key.path)
-                };
-                let tooltip_label = if entry.is_some() {
-                    tooltip_label
-                } else {
-                    format!("⚠ Missing: {tooltip_label}")
-                };
-
-                rows.push((
-                    *color,
-                    TaggedFileRow {
-                        worktree_id: worktree.id(),
-                        entry_id: entry.map(|entry| entry.id),
-                        file_tag_key: file_tag_key.clone(),
-                        file_name,
-                        path_label,
-                        tooltip_label,
-                    },
-                ));
-                continue 'tags;
-            }
+            rows.push((
+                *color,
+                TaggedFileRow {
+                    worktree_id: worktree.id(),
+                    entry_id: entry.map(|entry| entry.id),
+                    file_tag_key: file_tag_key.clone(),
+                    file_name,
+                    path_label,
+                    tooltip_label,
+                    resolution_pending,
+                },
+            ));
         }
 
         FileTagColor::ALL
@@ -7309,6 +7414,10 @@ impl ProjectPanel {
                 .to_owned()
         });
         let status_label = row.status_label();
+        // Muting is a claim that the row is degraded, so it tracks the `⚠ Missing` cue rather
+        // than `entry_id`. A row still waiting on its scan renders exactly like a healthy one and
+        // simply is not clickable yet, so nothing visibly changes when it resolves.
+        let is_missing = status_label.is_some();
         let dragged_selection = row.entry_id.map(|entry_id| DraggedSelection {
             active_selection: SelectedEntry {
                 worktree_id: row.worktree_id,
@@ -7411,7 +7520,7 @@ impl ProjectPanel {
                             .child(
                                 Label::new(row.file_name)
                                     .single_line()
-                                    .when(!is_resolved, |this| this.color(Color::Muted)),
+                                    .when(is_missing, |this| this.color(Color::Muted)),
                             )
                             .when_some(status_label, |this, status_label| {
                                 this.child(

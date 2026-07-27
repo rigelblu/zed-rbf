@@ -11805,6 +11805,304 @@ async fn test_file_tags_show_missing_rows_as_unresolved_and_clearable(
     });
 }
 
+/// A tag inside a directory whose symlink target lands outside the worktree root must resolve
+/// without the user expanding that directory first.
+///
+/// The scanner leaves such a directory unscanned under the default `scan_symlinks: "expanded"`,
+/// so before this fix the row reported `⚠ Missing` for a file that was present on disk, and
+/// refused to open.
+///
+/// The tag is set in memory and registration is driven directly. Do not "restore" this to seeding
+/// the key-value store for production fidelity — that is where this test started, and it made both
+/// new tests fail in the full parallel suite while passing under a filtered single-threaded run.
+/// `KeyValueStore::global` is a process-wide `LazyLock` (`crates/db/src/kvp.rs`), so a persisted
+/// tag races every other file-tag test's `clear_file_tags_for_test`.
+#[gpui::test]
+async fn test_file_tags_in_external_symlink_dir_resolve_without_expanding(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+    clear_file_tags_for_test(cx).await;
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            "project": {
+                "src": {
+                    "main.rs": "",
+                },
+            },
+            "outside": {
+                "notes.md": "",
+            },
+        }),
+    )
+    .await;
+    // Points out of the worktree root, so the scanner marks it external and leaves it unloaded.
+    fs.create_symlink("/root/project/linked".as_ref(), "../outside".into())
+        .await
+        .unwrap();
+
+    let seeded_key = FileTagKey {
+        worktree_root: "/root/project".to_string(),
+        path: "linked/notes.md".to_string(),
+    };
+
+    let project = Project::test(fs.clone(), ["/root/project".as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+        .expect("workspace should be available");
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+
+    // The tag is set in memory and registration is driven directly, rather than persisted and
+    // picked up by `ProjectPanel::new`. `KeyValueStore::global` is a process-wide `LazyLock`
+    // shared by the whole test binary (`crates/db/src/kvp.rs:243`), so a seeded tag races with
+    // every other file-tag test's `clear_file_tags_for_test`. Driving registration here also
+    // keeps the pending window observable: the insert into `worktrees_awaiting_tag_scan` is
+    // synchronous, while the removal cannot run until the executor is pumped below.
+    panel.update(cx, |panel, cx| {
+        panel
+            .file_tags
+            .set_color(seeded_key.clone(), FileTagColor::Red);
+        panel.register_tagged_paths_for_scan(cx);
+    });
+
+    // We have not looked yet, so the row must make no claim. Asserting this *before*
+    // `run_until_parked` is what stops the pending state from being deletable with every test
+    // still green — without it, hardwiring `resolution_pending` to false would bring back the
+    // startup flash of `⚠ Missing` on healthy files unnoticed.
+    let pending_row = panel.update(cx, |panel, cx| {
+        panel
+            .tagged_file_groups(cx)
+            .into_iter()
+            .find(|group| group.color == FileTagColor::Red)
+            .expect("red group should exist while the scan is in flight")
+            .rows
+            .into_iter()
+            .find(|row| row.file_tag_key == seeded_key)
+            .expect("tagged row should be present while the scan is in flight")
+    });
+    assert_eq!(pending_row.entry_id, None);
+    assert!(
+        pending_row.resolution_pending,
+        "the row's worktree is still scanning its tagged paths"
+    );
+    assert_eq!(
+        pending_row.status_label(),
+        None,
+        "an unchecked row must not claim the file is missing"
+    );
+    assert_eq!(
+        pending_row.tooltip_label, "/root/project/linked/notes.md",
+        "the pending tooltip must not carry the missing prefix either"
+    );
+
+    cx.run_until_parked();
+
+    let row = panel.update(cx, |panel, cx| {
+        panel
+            .tagged_file_groups(cx)
+            .into_iter()
+            .find(|group| group.color == FileTagColor::Red)
+            .expect("red group should exist")
+            .rows
+            .into_iter()
+            .find(|row| row.file_tag_key == seeded_key)
+            .expect("tagged row should be present")
+    });
+
+    assert!(
+        row.entry_id.is_some(),
+        "a tagged file behind an external symlink should resolve without expanding the directory"
+    );
+    assert_eq!(row.status_label(), None);
+    assert!(!row.resolution_pending);
+    assert_eq!(row.tooltip_label, "/root/project/linked/notes.md");
+
+    // Registration must not turn into an eager scan of every symlink: a sibling external symlink
+    // with nothing tagged inside it stays unscanned, which is what `scan_symlinks: "expanded"`
+    // is for.
+    fs.create_symlink("/root/project/untagged".as_ref(), "../outside".into())
+        .await
+        .unwrap();
+    cx.run_until_parked();
+    panel.update(cx, |panel, cx| {
+        let worktree = panel
+            .project
+            .read(cx)
+            .visible_worktrees(cx)
+            .next()
+            .expect("worktree should exist");
+        let worktree = worktree.read(cx);
+        assert!(
+            worktree
+                .entry_for_path(rel_path("untagged/notes.md"))
+                .is_none(),
+            "an external symlink with no tagged file inside it should not be scanned"
+        );
+    });
+
+    panel.update(cx, |panel, _cx| {
+        assert!(
+            panel.worktrees_awaiting_tag_scan.is_empty(),
+            "no worktree should stay stuck waiting on its tag scan"
+        );
+    });
+}
+
+/// Registration must also run for a worktree added *after* the panel was built.
+///
+/// `ProjectPanel::new` covers worktrees already open; `project::Event::WorktreeAdded` covers the
+/// rest. Both are one-line call sites, and dropping either regresses silently — this test is the
+/// guard for the second. It deliberately does not observe the pending window: awaiting the
+/// worktree-add pumps the executor, so only the settled outcome is asserted here.
+#[gpui::test]
+async fn test_file_tags_register_for_worktree_added_after_panel(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    clear_file_tags_for_test(cx).await;
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            "project": {
+                "src": { "main.rs": "" },
+            },
+            "later": {
+                "src": { "lib.rs": "" },
+            },
+            "outside": {
+                "notes.md": "",
+            },
+        }),
+    )
+    .await;
+    fs.create_symlink("/root/later/linked".as_ref(), "../outside".into())
+        .await
+        .unwrap();
+
+    let project = Project::test(fs.clone(), ["/root/project".as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+        .expect("workspace should be available");
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+
+    // Tagged before its worktree exists, so `ProjectPanel::new` cannot have registered it.
+    let seeded_key = FileTagKey {
+        worktree_root: "/root/later".to_string(),
+        path: "linked/notes.md".to_string(),
+    };
+    panel.update(cx, |panel, _cx| {
+        panel
+            .file_tags
+            .set_color(seeded_key.clone(), FileTagColor::Green);
+    });
+
+    let (_worktree, _) = project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree("/root/later", true, cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+
+    let row = panel.update(cx, |panel, cx| {
+        panel
+            .tagged_file_groups(cx)
+            .into_iter()
+            .find(|group| group.color == FileTagColor::Green)
+            .expect("green group should exist")
+            .rows
+            .into_iter()
+            .find(|row| row.file_tag_key == seeded_key)
+            .expect("tagged row should be present")
+    });
+
+    assert!(
+        row.entry_id.is_some(),
+        "the `WorktreeAdded` hook should have registered the tagged path for scanning"
+    );
+    assert_eq!(row.status_label(), None);
+}
+
+/// A tag pointing at a path that genuinely is not there must still say so — the honest case
+/// `v0.48.3` built the cue for, which the pending state must not swallow.
+#[gpui::test]
+async fn test_file_tags_absent_path_still_reports_missing_after_registration(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+    clear_file_tags_for_test(cx).await;
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            "project": {
+                "src": {
+                    "main.rs": "",
+                },
+            },
+            "outside": {},
+        }),
+    )
+    .await;
+    fs.create_symlink("/root/project/linked".as_ref(), "../outside".into())
+        .await
+        .unwrap();
+
+    let seeded_key = FileTagKey {
+        worktree_root: "/root/project".to_string(),
+        path: "linked/gone.md".to_string(),
+    };
+
+    let project = Project::test(fs.clone(), ["/root/project".as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+        .expect("workspace should be available");
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+
+    // In memory rather than persisted — see the sibling test for why the process-global key-value
+    // store cannot be relied on across a parallel test binary.
+    panel.update(cx, |panel, cx| {
+        panel
+            .file_tags
+            .set_color(seeded_key.clone(), FileTagColor::Blue);
+        panel.register_tagged_paths_for_scan(cx);
+    });
+    cx.run_until_parked();
+
+    let row = panel.update(cx, |panel, cx| {
+        panel
+            .tagged_file_groups(cx)
+            .into_iter()
+            .find(|group| group.color == FileTagColor::Blue)
+            .expect("blue group should exist")
+            .rows
+            .into_iter()
+            .find(|row| row.file_tag_key == seeded_key)
+            .expect("tagged row should be present")
+    });
+
+    assert_eq!(row.entry_id, None);
+    assert!(
+        !row.resolution_pending,
+        "registration has settled, so the row is no longer pending"
+    );
+    assert_eq!(row.status_label(), Some("⚠ Missing"));
+    assert_eq!(row.tooltip_label, "⚠ Missing: /root/project/linked/gone.md");
+}
+
 #[gpui::test]
 async fn test_file_tags_context_menu_selects_tagged_row(cx: &mut gpui::TestAppContext) {
     init_test(cx);

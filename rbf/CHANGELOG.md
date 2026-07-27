@@ -6,6 +6,11 @@ title: "Zed RBF Changelog"
 
 ---
 
+# 🔵⋯ v0.56.1 (2026-07-28) — #zed-56
+- 2026-07-28 - fix (ux) | see tagged files in a symlinked directory without expanding it first, instead of the Tags section reporting files that are sitting on disk as `⚠ Missing` and refusing to open them [@zed-rbf]
+
+---
+
 # 🔵⋯ v0.56.0 (2026-07-27) — #zed-53
 - 2026-07-27 - feat (ux) | keep UI, buffer, terminal, and agent panel text at the right size on each display by naming display profiles in settings and assigning displays to them, with two windows on two displays rendering at their own sizes at the same time [@zed-rbf]
 
