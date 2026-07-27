@@ -234,6 +234,13 @@ pub struct SettingsContent {
     /// Configuration of the terminal in Zed.
     pub terminal: Option<TerminalSettingsContent>,
 
+    /// Per-display font sizes — named profiles, plus which display gets which.
+    ///
+    /// Without this, font sizes are global and identical on every display. With it,
+    /// each window renders at the sizes of the display it is on, so two windows on
+    /// two displays are correct at the same time.
+    pub display_profiles: Option<DisplayProfilesContent>,
+
     pub title_bar: Option<TitleBarSettingsContent>,
 
     /// Whether or not to enable Vim mode.

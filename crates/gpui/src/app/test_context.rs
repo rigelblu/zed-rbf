@@ -1,11 +1,12 @@
 use crate::{
     Action, AnyView, AnyWindowHandle, App, AppCell, AppContext, AsyncApp, AvailableSpace,
-    BackgroundExecutor, BorrowAppContext, Bounds, Capslock, ClipboardItem, DrawPhase, Drawable,
-    Element, Empty, EntityId, EventEmitter, ForegroundExecutor, Global, InputEvent, Keystroke,
-    Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Pixels, Platform, Point, Render, Result, Size, Task, TestDispatcher, TestPlatform,
-    TestScreenCaptureSource, TestWindow, TextSystem, VisualContext, Window, WindowBounds,
-    WindowHandle, WindowOptions, app::GpuiMode, window::ElementArenaScope,
+    BackgroundExecutor, BorrowAppContext, Bounds, Capslock, ClipboardItem, DisplayId, DrawPhase,
+    Drawable, Element, Empty, EntityId, EventEmitter, ForegroundExecutor, Global, InputEvent,
+    Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Platform, PlatformDisplay, Point, Render, Result, Size, Task,
+    TestDispatcher, TestDisplay, TestPlatform, TestScreenCaptureSource, TestWindow, TextSystem,
+    VisualContext, Window, WindowBounds, WindowHandle, WindowOptions, app::GpuiMode,
+    window::ElementArenaScope,
 };
 use anyhow::{anyhow, bail};
 use futures::{Stream, StreamExt, channel::oneshot};
@@ -374,6 +375,39 @@ impl TestAppContext {
     /// Simulates the user resizing the window to the new size.
     pub fn simulate_window_resize(&self, window_handle: AnyWindowHandle, size: Size<Pixels>) {
         self.test_window(window_handle).simulate_resize(size);
+    }
+
+    /// Replaces the set of connected displays.
+    ///
+    /// Windows opened afterwards land on the first display unless
+    /// [`crate::WindowOptions::display_id`] names another. Existing windows keep the display
+    /// they were opened on — use [`Self::simulate_window_move_to_display`] to move one.
+    pub fn set_displays(&self, displays: Vec<Rc<TestDisplay>>) {
+        self.test_platform.set_displays(
+            displays
+                .into_iter()
+                .map(|display| display as Rc<dyn PlatformDisplay>)
+                .collect(),
+        );
+    }
+
+    /// Simulates the user dragging a window onto the display with this id.
+    ///
+    /// Fires the platform move callback the same way a real drag does, so the window
+    /// observes the change through its ordinary bounds-changed path. Panics if no connected
+    /// display has this id, since that is a mistake in the test rather than a state the
+    /// platform can produce.
+    pub fn simulate_window_move_to_display(
+        &self,
+        window_handle: AnyWindowHandle,
+        display_id: DisplayId,
+    ) {
+        let display = self
+            .test_platform
+            .display_by_id(Some(display_id))
+            .unwrap_or_else(|| panic!("no connected display has id {display_id:?}"));
+        self.test_window(window_handle)
+            .simulate_move_to_display(display);
     }
 
     /// Returns true if there's an alert dialog open.

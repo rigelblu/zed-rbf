@@ -7,6 +7,7 @@ use gpui::{
     App, Context, Font, FontFallbacks, FontStyle, Global, Pixels, SharedString, Subscription,
     Window, px,
 };
+use gpui_util::ResultExt as _;
 use refineable::Refineable;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -87,6 +88,11 @@ pub struct ThemeSettings {
     pub ui_density: UiDensity,
     /// The amount of fading applied to unnecessary code.
     pub unnecessary_code_fade: f32,
+    /// Named per-display font sizes, and which display gets which.
+    ///
+    /// Absent unless the user authors a `display_profiles` block, in which case every
+    /// font size below is a fallback for displays that block does not assign.
+    pub display_profiles: Option<settings::DisplayProfilesContent>,
 }
 
 /// Returns the name of the default theme for the given [`Appearance`].
@@ -123,6 +129,21 @@ impl Global for AgentBufferFontSize {}
 pub struct GitCommitBufferFontSize(Pixels);
 
 impl Global for GitCommitBufferFontSize {}
+
+/// The display profile each connected display resolves to, by display id.
+///
+/// Kept as a precomputed map rather than resolved on demand because the alternative puts
+/// [`App::displays`] — a `CGGetActiveDisplayList` syscall and one allocation per connected
+/// display — on the render path, which reads font sizes many times per frame. This is
+/// rebuilt only when the display configuration or the `display_profiles` settings change.
+///
+/// Public so surfaces that apply font size imperatively rather than at render — the agent
+/// panel's diff editors are the one such case — can observe it and re-apply when a display
+/// change re-resolves the assignments.
+#[derive(Default)]
+pub struct DisplayProfileAssignments(HashMap<gpui::DisplayId, SharedString>);
+
+impl Global for DisplayProfileAssignments {}
 
 /// Represents the selection of a theme, which can be either static or dynamic.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -416,6 +437,112 @@ impl ThemeSettings {
             .unwrap_or_else(|| self.buffer_font_size(cx))
     }
 
+    /// Returns the display profile that applies to `window`, if the display it is on is
+    /// assigned one that exists.
+    ///
+    /// Resolution is two map lookups against the precomputed
+    /// [`DisplayProfileAssignments`], so this is cheap enough to call while rendering.
+    pub fn display_profile_for(
+        &self,
+        window: &Window,
+        cx: &App,
+    ) -> Option<&settings::DisplayProfileContent> {
+        let display_id = window.display_id()?;
+        let profile_name = cx
+            .try_global::<DisplayProfileAssignments>()?
+            .0
+            .get(&display_id)?;
+        self.display_profiles
+            .as_ref()?
+            .profiles
+            .as_ref()?
+            .get(profile_name.as_ref())
+    }
+
+    /// The size a display profile sets for `window`, before any manual adjustment.
+    fn ui_font_size_base(&self, window: &Window, cx: &App) -> Pixels {
+        self.display_profile_for(window, cx)
+            .and_then(|profile| profile.ui_font_size)
+            .map(|size| size.into_gpui())
+            .unwrap_or(self.ui_font_size)
+    }
+
+    /// The size a display profile sets for `window`, before any manual adjustment.
+    fn buffer_font_size_base(&self, window: &Window, cx: &App) -> Pixels {
+        self.display_profile_for(window, cx)
+            .and_then(|profile| profile.buffer_font_size)
+            .map(|size| size.into_gpui())
+            .unwrap_or(self.buffer_font_size)
+    }
+
+    /// Returns the UI font size for `window`, resolved through its display's profile.
+    ///
+    /// A manual `cmd +` / `cmd -` adjustment applies as a **delta on top of** whatever this
+    /// window resolved, not as an absolute that replaces it. The globals holding those
+    /// adjustments are app-wide, so treating one as absolute would collapse every window to
+    /// a single size the moment the user pressed `cmd +` — which is exactly the promise this
+    /// feature exists to keep. As a delta, two windows on two displays each step from their
+    /// own profile and stay correctly differentiated.
+    pub fn ui_font_size_for(&self, window: &Window, cx: &App) -> Pixels {
+        let adjustment = cx
+            .try_global::<UiFontSize>()
+            .map_or(px(0.), |adjusted| adjusted.0 - self.ui_font_size);
+        clamp_font_size(self.ui_font_size_base(window, cx) + adjustment)
+    }
+
+    /// Returns the buffer font size for `window`, resolved through its display's profile.
+    ///
+    /// A manual adjustment applies as a delta; see [`Self::ui_font_size_for`].
+    pub fn buffer_font_size_for(&self, window: &Window, cx: &App) -> Pixels {
+        let adjustment = cx
+            .try_global::<BufferFontSize>()
+            .map_or(px(0.), |adjusted| adjusted.0 - self.buffer_font_size);
+        clamp_font_size(self.buffer_font_size_base(window, cx) + adjustment)
+    }
+
+    /// Returns the agent panel response font size for `window`, resolved through its
+    /// display's profile. Falls back to the window's UI font size if unset everywhere.
+    pub fn agent_ui_font_size_for(&self, window: &Window, cx: &App) -> Pixels {
+        let base = self
+            .display_profile_for(window, cx)
+            .and_then(|profile| profile.agent_ui_font_size)
+            .map(|size| size.into_gpui())
+            .or(self.agent_ui_font_size)
+            .unwrap_or_else(|| self.ui_font_size_base(window, cx));
+        let settings_baseline = self.agent_ui_font_size.unwrap_or(self.ui_font_size);
+        let adjustment = cx
+            .try_global::<AgentUiFontSize>()
+            .map_or(px(0.), |adjusted| adjusted.0 - settings_baseline);
+        clamp_font_size(base + adjustment)
+    }
+
+    /// Returns the agent panel user-message font size for `window`, resolved through its
+    /// display's profile. Falls back to the window's buffer font size if unset everywhere.
+    pub fn agent_buffer_font_size_for(&self, window: &Window, cx: &App) -> Pixels {
+        let base = self
+            .display_profile_for(window, cx)
+            .and_then(|profile| profile.agent_buffer_font_size)
+            .map(|size| size.into_gpui())
+            .or(self.agent_buffer_font_size)
+            .unwrap_or_else(|| self.buffer_font_size_base(window, cx));
+        let settings_baseline = self.agent_buffer_font_size.unwrap_or(self.buffer_font_size);
+        let adjustment = cx
+            .try_global::<AgentBufferFontSize>()
+            .map_or(px(0.), |adjusted| adjusted.0 - settings_baseline);
+        clamp_font_size(base + adjustment)
+    }
+
+    /// Returns the terminal font size for `window` when its display's profile sets one.
+    ///
+    /// Terminal font size lives in `TerminalSettings` rather than here, so this reports
+    /// only the profile's override and leaves the fallback chain to the caller.
+    pub fn terminal_font_size_for(&self, window: &Window, cx: &App) -> Option<Pixels> {
+        self.display_profile_for(window, cx)
+            .and_then(|profile| profile.terminal.as_ref())
+            .and_then(|terminal| terminal.font_size)
+            .map(|size| clamp_font_size(size.into_gpui()))
+    }
+
     pub fn git_commit_buffer_font_size(&self, cx: &App) -> Pixels {
         cx.try_global::<GitCommitBufferFontSize>()
             .map(|size| size.0)
@@ -566,16 +693,69 @@ pub fn setup_ui_font(window: &mut Window, cx: &mut App) -> gpui::Font {
     let (ui_font, ui_font_size) = {
         let theme_settings = ThemeSettings::get_global(cx);
         let font = theme_settings.ui_font.clone();
-        (font, theme_settings.ui_font_size(cx))
+        (font, theme_settings.ui_font_size_for(window, cx))
     };
 
     window.set_rem_size(ui_font_size);
     ui_font
 }
 
+/// Recomputes which display profile each connected display resolves to.
+///
+/// A display matches on its name first and its UUID second: names are what people write in
+/// settings, and a UUID is what tells apart two identical monitors reporting one name. A
+/// display that matches nothing is simply absent from the map, and windows on it keep the
+/// existing global font settings.
+///
+/// Call this whenever the connected displays change or `display_profiles` is edited — it
+/// reads every connected display, so it must not run on a render or window-drag path.
+pub fn refresh_display_profile_assignments(cx: &mut App) {
+    let Some(display_profiles) = ThemeSettings::get_global(cx).display_profiles.clone() else {
+        cx.set_global(DisplayProfileAssignments::default());
+        return;
+    };
+    let assign = display_profiles.assign.unwrap_or_default();
+    let profiles = display_profiles.profiles.unwrap_or_default();
+
+    let mut assignments = HashMap::default();
+    for display in cx.displays() {
+        // UUID is checked first so it can do the job it exists for. Two identical monitors
+        // report one name, and singling one out means writing its UUID — which only works
+        // if a UUID entry outranks the name entry that also matches it.
+        let matched = display
+            .uuid()
+            .log_err()
+            .and_then(|uuid| assign.get_key_value(&uuid.to_string()))
+            .or_else(|| display.name().and_then(|name| assign.get_key_value(&name)));
+        let Some((display_key, profile_name)) = matched else {
+            continue;
+        };
+
+        // An unmatched display is a normal state — a monitor can simply be unplugged — but
+        // an assignment naming a profile that does not exist is always a typo.
+        if !profiles.contains_key(profile_name) {
+            log::warn!(
+                "display_profiles: display {display_key:?} is assigned profile \
+                 {profile_name:?}, which no profile defines; that display keeps the global \
+                 font settings"
+            );
+            continue;
+        }
+
+        assignments.insert(display.id(), SharedString::from(profile_name.clone()));
+    }
+
+    cx.set_global(DisplayProfileAssignments(assignments));
+}
+
 /// Sets the adjusted UI font size.
+///
+/// Steps in settings space, not in any one window's resolved space: the resolvers read this
+/// global as a *delta* from the settings value and add it to whatever each window's display
+/// profile gave it. Stepping from a window's resolved size here would fold that window's
+/// profile into the delta and shift every other window by it.
 pub fn adjust_ui_font_size(cx: &mut App, f: impl FnOnce(Pixels) -> Pixels) {
-    let ui_font_size = ThemeSettings::get_global(cx).ui_font_size(cx);
+    let ui_font_size = ThemeSettings::get_global(cx).ui_font_size;
     let adjusted_size = cx
         .try_global::<UiFontSize>()
         .map_or(ui_font_size, |adjusted_size| adjusted_size.0);
@@ -593,7 +773,8 @@ pub fn reset_ui_font_size(cx: &mut App) {
 
 /// Sets the adjusted font size of agent responses in the agent panel.
 pub fn adjust_agent_ui_font_size(cx: &mut App, f: impl FnOnce(Pixels) -> Pixels) {
-    let agent_ui_font_size = ThemeSettings::get_global(cx).agent_ui_font_size(cx);
+    let settings = ThemeSettings::get_global(cx);
+    let agent_ui_font_size = settings.agent_ui_font_size.unwrap_or(settings.ui_font_size);
     let adjusted_size = cx
         .try_global::<AgentUiFontSize>()
         .map_or(agent_ui_font_size, |adjusted_size| adjusted_size.0);
@@ -611,7 +792,10 @@ pub fn reset_agent_ui_font_size(cx: &mut App) {
 
 /// Sets the adjusted font size of user messages in the agent panel.
 pub fn adjust_agent_buffer_font_size(cx: &mut App, f: impl FnOnce(Pixels) -> Pixels) {
-    let agent_buffer_font_size = ThemeSettings::get_global(cx).agent_buffer_font_size(cx);
+    let settings = ThemeSettings::get_global(cx);
+    let agent_buffer_font_size = settings
+        .agent_buffer_font_size
+        .unwrap_or(settings.buffer_font_size);
     let adjusted_size = cx
         .try_global::<AgentBufferFontSize>()
         .map_or(agent_buffer_font_size, |adjusted_size| adjusted_size.0);
@@ -663,6 +847,7 @@ fn font_fallbacks_from_settings(
 
 impl settings::Settings for ThemeSettings {
     fn from_settings(content: &settings::SettingsContent) -> Self {
+        let display_profiles = content.display_profiles.clone();
         let content = &content.theme;
         let theme_selection: ThemeSelection = content.theme.clone().unwrap().into();
         let icon_theme_selection: IconThemeSelection = content.icon_theme.clone().unwrap().into();
@@ -711,6 +896,183 @@ impl settings::Settings for ThemeSettings {
             icon_theme: icon_theme_selection,
             ui_density: ui_density_from_settings(content.ui_density.unwrap_or_default()),
             unnecessary_code_fade: content.unnecessary_code_fade.unwrap().0.clamp(0.0, 0.9),
+            display_profiles,
         }
+    }
+}
+
+#[cfg(test)]
+mod display_profile_tests {
+    use super::*;
+    use gpui::{AppContext as _, DisplayId, Empty, TestAppContext, TestDisplay, WindowOptions};
+    use settings::{DisplayProfileContent, DisplayProfilesContent, FontSize, SettingsStore};
+    use std::rc::Rc;
+    use uuid::Uuid;
+
+    const LAPTOP_UUID: &str = "00000000-0000-0000-0000-0000000000a1";
+    const STUDIO_UUID: &str = "00000000-0000-0000-0000-0000000000b2";
+
+    fn display(id: u64, name: Option<&str>, uuid: &str) -> Rc<TestDisplay> {
+        Rc::new(TestDisplay::new_with(
+            DisplayId::new(id),
+            name.map(str::to_owned),
+            Uuid::parse_str(uuid).unwrap(),
+        ))
+    }
+
+    /// Installs the settings store and the theme settings that read from it.
+    ///
+    /// `SettingsStore::test` *returns* a store rather than installing one, so the global
+    /// has to be set explicitly; `theme_settings::init` is what registers `ThemeSettings`
+    /// and seeds the assignment map.
+    fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            crate::init(theme::LoadThemes::JustBase, cx);
+        });
+    }
+
+    /// Writes a `display_profiles` block whose profiles each set only `ui_font_size`, then
+    /// recomputes the assignments the way the real display-change path does.
+    fn write_profiles(cx: &mut TestAppContext, profiles: &[(&str, f32)], assign: &[(&str, &str)]) {
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |content| {
+                content.display_profiles = Some(DisplayProfilesContent {
+                    profiles: Some(
+                        profiles
+                            .iter()
+                            .map(|(name, size)| {
+                                (
+                                    name.to_string(),
+                                    DisplayProfileContent {
+                                        ui_font_size: Some(FontSize(*size)),
+                                        ..Default::default()
+                                    },
+                                )
+                            })
+                            .collect(),
+                    ),
+                    assign: Some(
+                        assign
+                            .iter()
+                            .map(|(display, profile)| (display.to_string(), profile.to_string()))
+                            .collect(),
+                    ),
+                });
+            });
+        });
+        cx.update(refresh_display_profile_assignments);
+    }
+
+    /// The UI font size a window opened on `display_id` resolves to.
+    fn ui_font_size_on(cx: &mut TestAppContext, display_id: u64) -> Pixels {
+        let window = cx
+            .update(|cx| {
+                cx.open_window(
+                    WindowOptions {
+                        display_id: Some(DisplayId::new(display_id)),
+                        ..Default::default()
+                    },
+                    |_, cx| cx.new(|_| Empty),
+                )
+            })
+            .unwrap();
+        window
+            .update(cx, |_, window, cx| {
+                ThemeSettings::get_global(cx).ui_font_size_for(window, cx)
+            })
+            .unwrap()
+    }
+
+    /// The UI font size with no profile applied — the value every fallback lands on.
+    fn global_ui_font_size(cx: &mut TestAppContext) -> Pixels {
+        cx.update(|cx| ThemeSettings::get_global(cx).ui_font_size(cx))
+    }
+
+    #[gpui::test]
+    fn display_profile_resolves_by_name(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.set_displays(vec![display(1, Some("Test Display A"), LAPTOP_UUID)]);
+        write_profiles(cx, &[("laptop", 21.)], &[("Test Display A", "laptop")]);
+
+        assert_eq!(ui_font_size_on(cx, 1), px(21.));
+    }
+
+    #[gpui::test]
+    fn display_profile_uuid_outranks_name(cx: &mut TestAppContext) {
+        init_test(cx);
+        // Two displays reporting one name is the duplicate-hardware case: the name entry
+        // covers both, and a uuid entry is the only way to tell one of them apart.
+        cx.set_displays(vec![
+            display(1, Some("Duplicate Display"), LAPTOP_UUID),
+            display(2, Some("Duplicate Display"), STUDIO_UUID),
+        ]);
+        write_profiles(
+            cx,
+            &[("shared", 15.), ("singled-out", 23.)],
+            &[
+                ("Duplicate Display", "shared"),
+                (STUDIO_UUID, "singled-out"),
+            ],
+        );
+
+        assert_eq!(ui_font_size_on(cx, 1), px(15.));
+        assert_eq!(ui_font_size_on(cx, 2), px(23.));
+    }
+
+    #[gpui::test]
+    fn manual_adjustment_layers_on_each_display_profile(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.set_displays(vec![
+            display(1, Some("Small Display"), LAPTOP_UUID),
+            display(2, Some("Big Display"), STUDIO_UUID),
+        ]);
+        write_profiles(
+            cx,
+            &[("small", 13.), ("big", 25.)],
+            &[("Small Display", "small"), ("Big Display", "big")],
+        );
+
+        assert_eq!(ui_font_size_on(cx, 1), px(13.));
+        assert_eq!(ui_font_size_on(cx, 2), px(25.));
+
+        // One `cmd +`. It must move both windows by one step relative to their own
+        // profile — not pin both to a single absolute size, and not be swallowed
+        // entirely by the profile, which is the defect this guards.
+        cx.update(|cx| adjust_ui_font_size(cx, |size| size + px(1.0)));
+
+        assert_eq!(ui_font_size_on(cx, 1), px(14.));
+        assert_eq!(ui_font_size_on(cx, 2), px(26.));
+    }
+
+    #[gpui::test]
+    fn display_profile_fallback_when_display_is_unassigned(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.set_displays(vec![
+            display(1, Some("Assigned Display"), LAPTOP_UUID),
+            display(2, Some("Unassigned Display"), STUDIO_UUID),
+        ]);
+        write_profiles(cx, &[("laptop", 21.)], &[("Assigned Display", "laptop")]);
+
+        assert_eq!(ui_font_size_on(cx, 2), global_ui_font_size(cx));
+    }
+
+    #[gpui::test]
+    fn display_profile_fallback_when_assignment_names_a_missing_profile(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.set_displays(vec![display(1, Some("Test Display A"), LAPTOP_UUID)]);
+        write_profiles(cx, &[("laptop", 21.)], &[("Test Display A", "typo")]);
+
+        assert_eq!(ui_font_size_on(cx, 1), global_ui_font_size(cx));
+    }
+
+    #[gpui::test]
+    fn display_profile_fallback_when_block_is_absent(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.set_displays(vec![display(1, Some("Test Display A"), LAPTOP_UUID)]);
+        cx.update(refresh_display_profile_assignments);
+
+        assert_eq!(ui_font_size_on(cx, 1), global_ui_font_size(cx));
     }
 }

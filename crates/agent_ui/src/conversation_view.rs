@@ -55,7 +55,7 @@ use std::time::Instant;
 use std::{rc::Rc, time::Duration};
 use terminal_view::terminal_panel::TerminalPanel;
 use text::Anchor;
-use theme_settings::{AgentBufferFontSize, AgentUiFontSize};
+use theme_settings::{AgentBufferFontSize, AgentUiFontSize, DisplayProfileAssignments};
 use ui::{
     Callout, CircularProgress, CommonAnimationExt, ContextMenu, ContextMenuEntry, CopyButton,
     DecoratedIcon, DiffStat, Disclosure, Divider, DividerColor, IconDecoration, IconDecorationKind,
@@ -768,6 +768,13 @@ impl ConversationView {
             cx.observe_global_in::<SettingsStore>(window, Self::invalidate_mermaid_caches),
             cx.observe_global_in::<AgentUiFontSize>(window, Self::agent_ui_font_size_changed),
             cx.observe_global_in::<AgentBufferFontSize>(window, Self::agent_ui_font_size_changed),
+            // Diff editors carry a baked text style rather than resolving at render, so a
+            // display change has to reach them explicitly. Re-resolving the assignments is
+            // what a display change does, so observing that covers it.
+            cx.observe_global_in::<DisplayProfileAssignments>(
+                window,
+                Self::agent_ui_font_size_changed,
+            ),
             cx.subscribe_in(
                 &agent_server_store,
                 window,
@@ -2901,13 +2908,13 @@ impl ConversationView {
         }
     }
 
-    fn agent_ui_font_size_changed(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn agent_ui_font_size_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(entry_view_state) = self
             .active_thread()
             .map(|active| active.read(cx).entry_view_state.clone())
         {
             entry_view_state.update(cx, |entry_view_state, cx| {
-                entry_view_state.agent_ui_font_size_changed(cx);
+                entry_view_state.agent_ui_font_size_changed(window, cx);
             });
         }
     }

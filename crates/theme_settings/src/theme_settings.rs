@@ -28,11 +28,12 @@ pub use crate::schema::{
 };
 use crate::settings::adjust_buffer_font_size;
 pub use crate::settings::{
-    AgentBufferFontSize, AgentUiFontSize, BufferLineHeight, FontFamilyName,
-    GitCommitBufferFontSize, IconThemeName, IconThemeSelection, ThemeAppearanceMode, ThemeName,
-    ThemeSelection, ThemeSettings, adjust_agent_buffer_font_size, adjust_agent_ui_font_size,
-    adjust_git_commit_buffer_font_size, adjust_ui_font_size, adjusted_font_size,
-    appearance_to_mode, clamp_font_size, default_theme, observe_buffer_font_size_adjustment,
+    AgentBufferFontSize, AgentUiFontSize, BufferLineHeight, DisplayProfileAssignments,
+    FontFamilyName, GitCommitBufferFontSize, IconThemeName, IconThemeSelection,
+    ThemeAppearanceMode, ThemeName, ThemeSelection, ThemeSettings, adjust_agent_buffer_font_size,
+    adjust_agent_ui_font_size, adjust_git_commit_buffer_font_size, adjust_ui_font_size,
+    adjusted_font_size, appearance_to_mode, clamp_font_size, default_theme,
+    observe_buffer_font_size_adjustment, refresh_display_profile_assignments,
     reset_agent_buffer_font_size, reset_agent_ui_font_size, reset_buffer_font_size,
     reset_git_commit_buffer_font_size, reset_ui_font_size, set_icon_theme, set_mode, set_theme,
     setup_ui_font,
@@ -97,6 +98,9 @@ pub fn init(themes_to_load: LoadThemes, cx: &mut App) {
         settings.experimental_theme_overrides.clone(),
         settings.theme_overrides.clone(),
     );
+    let mut prev_display_profiles = settings.display_profiles.clone();
+
+    refresh_display_profile_assignments(cx);
 
     cx.observe_global::<SettingsStore>(move |cx| {
         let settings = ThemeSettings::get_global(cx);
@@ -112,6 +116,15 @@ pub fn init(themes_to_load: LoadThemes, cx: &mut App) {
             settings.experimental_theme_overrides.clone(),
             settings.theme_overrides.clone(),
         );
+        let display_profiles = settings.display_profiles.clone();
+
+        if display_profiles != prev_display_profiles {
+            prev_display_profiles = display_profiles;
+            // Editing the block live must take effect without a restart; every window
+            // re-resolves on its next render, which `refresh_windows` forces.
+            refresh_display_profile_assignments(cx);
+            cx.refresh_windows();
+        }
 
         if buffer_font_size_settings != prev_buffer_font_size_settings {
             prev_buffer_font_size_settings = buffer_font_size_settings;

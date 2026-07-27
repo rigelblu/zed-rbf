@@ -13,7 +13,7 @@ rb-drive — not in this repo. Don't start cold; resume.
 # 🔵⋯ Where it lives (reference — the skills above resolve these for you)
 `prj-use` fills `<PROJECT_NAME>`. If a path here ever disagrees with reality, trust the skill.
 
-## 🟠⋯ Session block — `rb-drive/agents/workblock/<PROJECT_NAME>/`
+## 🟠⋯ Session block — `rb-drive/agents/<PROJECT_NAME>/`
 - **Core Memories:** `agents-core-memories.md`
 - **Turning Memories:** `agents-turning-memories.md`
 - **Find My Bearings:** `agents-find-my-bearings.md`
