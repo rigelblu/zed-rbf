@@ -125,6 +125,8 @@ The configured order is the display order. `~` and `$VAR` expand. Missing paths 
 - Handle missing/unresolved tagged paths by showing them as explicit missing rows in the Tags section so they can be easily cleared
 - Resolve tagged files that live inside symlinked directories without expanding those directories first, while leaving symlinked trees with nothing tagged inside them unscanned
 - Keep `Tags`, `Project Files`, and project directory headers sticky together while scrolling the Project Panel
+- Keep every tagged file that fits sitting still above the divider while the project tree scrolls underneath it, so the shortcuts stay reachable during exactly the deep browsing that used to hide them; wheel and trackpad anywhere in the panel scroll Project Files, and tag content taller than the space above the divider and `Project Files` header is outside that guarantee
+- Drag that divider to choose how much room Tags gets, down to just its label and up to its own natural height, so the project tree can have the panel when that is what you are working in; the height is remembered per workspace, and double-clicking the divider hands sizing back to Tags. The divider has no visible grip — hovering it turns the pointer into a resize cursor. Dragging cannot reveal tag content that is already outside the guarantee above, since Tags is never given less room than the panel can spare
 
 ## 🟠⋯ Display Profiles
 Name a set of font sizes and assign it to a display, so UI, buffer, terminal, and agent panel text stay the right size on each screen. Two windows on two displays render at their own sizes at the same time.
@@ -161,7 +163,7 @@ Name a set of font sizes and assign it to a display, so UI, buffer, terminal, an
 - There is no in-app display listing yet, so names have to come from the OS — on macOS, System Settings › Displays. A key that matches nothing is silent: that display just keeps the global sizes
 
 ## 🟠⋯ Versions
-- The fork version lives in `rbf/RBF_VERSION`
+- The fork version lives in `rbf/VERSION`
 - `crates/zed/build.rs` injects it at build time as `ZED_RBF_VERSION`
 - Window titles show `(rbf v...)`, About identifies `Zed RBF v...`, and the bundled app binary's `--system-specs` output includes `Zed RBF: v...` alongside the upstream Zed version
 

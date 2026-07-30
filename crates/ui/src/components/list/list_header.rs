@@ -98,6 +98,22 @@ impl ListHeader {
         self.dock = dock.into();
         self
     }
+
+    /// The height this header lays out at when no explicit height is set, for callers that must
+    /// agree with it exactly rather than approximately — the Project Panel sizes its Tags drag
+    /// floor from this so the divider stops at the label instead of over it. Public because the
+    /// alternative is each caller restating the density rule, which drifts silently the moment
+    /// this one changes: a floor a few pixels off the header looks like a slightly misplaced
+    /// divider forever, and nothing fails to reveal it.
+    ///
+    /// Named `default_height` rather than `height` because the builder setter above owns that
+    /// name; a method and an associated function cannot share one.
+    pub fn default_height(cx: &App) -> Rems {
+        match theme::theme_settings(cx).ui_density(cx) {
+            UiDensity::Comfortable => rems(1.25),
+            _ => rems(1.75),
+        }
+    }
 }
 
 impl Toggleable for ListHeader {
@@ -109,7 +125,7 @@ impl Toggleable for ListHeader {
 
 impl RenderOnce for ListHeader {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let ui_density = theme::theme_settings(cx).ui_density(cx);
+        let height = Self::default_height(cx);
 
         h_flex()
             .id(self.label.clone())
@@ -119,11 +135,8 @@ impl RenderOnce for ListHeader {
             .child(
                 div()
                     .map(|this| match self.height {
-                        Some(height) => this.h(height),
-                        None => match ui_density {
-                            UiDensity::Comfortable => this.h_5(),
-                            _ => this.h_7(),
-                        },
+                        Some(explicit_height) => this.h(explicit_height),
+                        None => this.h(height),
                     })
                     .when(self.inset, |this| this.px_2())
                     .when(self.selected, |this| {
