@@ -20,7 +20,7 @@ use std::{
 };
 use util::{path, paths::PathStyle, rel_path::rel_path};
 use workspace::{
-    AppState, ItemHandle, MultiWorkspace, Pane, Workspace,
+    AppState, ItemHandle, MultiWorkspace, Pane, Workspace, WorkspaceId,
     item::{Item, ProjectItem, test::TestItem},
     register_project_item,
 };
@@ -12172,7 +12172,7 @@ async fn test_file_tags_context_menu_selects_tagged_row(cx: &mut gpui::TestAppCo
 }
 
 #[gpui::test]
-async fn test_file_tags_selection_scrolls_tagged_rows(cx: &mut gpui::TestAppContext) {
+async fn test_file_tags_remain_visible_while_project_files_scroll(cx: &mut gpui::TestAppContext) {
     init_test(cx);
     clear_file_tags_for_test(cx).await;
 
@@ -12197,57 +12197,543 @@ async fn test_file_tags_selection_scrolls_tagged_rows(cx: &mut gpui::TestAppCont
     let panel = workspace.update_in(cx, ProjectPanel::new);
     cx.run_until_parked();
 
+    toggle_expand_dir(&panel, "root/src", cx);
+
     let main_file_entry_id =
         set_file_tag_for_test(&panel, "root/src/main.rs", FileTagColor::Red, cx);
     let lib_file_entry_id =
         set_file_tag_for_test(&panel, "root/src/lib.rs", FileTagColor::Blue, cx);
-    let (red_tagged_file_row, blue_tagged_file_row) = panel.update(cx, |panel, cx| {
+    let blue_tagged_file_row = panel.update(cx, |panel, cx| {
         let rows = panel.visible_tagged_file_rows(cx);
-        let red = rows
-            .iter()
-            .find(|row| row.entry_id == Some(main_file_entry_id))
-            .expect("tagged main.rs row should be present")
-            .clone();
-        let blue = rows
-            .iter()
+        rows.into_iter()
             .find(|row| row.entry_id == Some(lib_file_entry_id))
             .expect("tagged lib.rs row should be present")
-            .clone();
-        (red, blue)
     });
 
     panel.update(cx, |panel, cx| {
-        let red_tagged_file_list_index = panel
-            .tagged_file_row_list_index(&red_tagged_file_row.file_tag_key, cx)
-            .expect("red tagged row should have a list index");
-        let blue_tagged_file_list_index = panel
-            .tagged_file_row_list_index(&blue_tagged_file_row.file_tag_key, cx)
-            .expect("blue tagged row should have a list index");
+        panel.selection = Some(SelectedEntry {
+            worktree_id: blue_tagged_file_row.worktree_id,
+            entry_id: main_file_entry_id,
+        });
+        panel.file_tag_selection = None;
         assert!(
-            red_tagged_file_list_index < panel.project_entry_list_index(0, cx),
-            "red tagged row should be in the scrollable Tags prefix"
+            !panel.file_tag_list_items(cx).is_empty(),
+            "tagged rows should render in the fixed Tags region"
         );
+        let project_entry_index = panel
+            .index_for_selection(SelectedEntry {
+                worktree_id: blue_tagged_file_row.worktree_id,
+                entry_id: main_file_entry_id,
+            })
+            .map(|(_, _, index)| index);
+        // Anti-vacuity: both sides are `Option`, so `None == None` would satisfy the comparison
+        // below without either index space ever being resolved.
         assert!(
-            blue_tagged_file_list_index < panel.project_entry_list_index(0, cx),
-            "blue tagged row should be in the scrollable Tags prefix"
+            project_entry_index.is_some(),
+            "the project entry must resolve an index, or the comparison below proves nothing"
+        );
+        assert_eq!(
+            project_entry_index,
+            panel.selected_project_entry_list_index(cx),
+            "Project Files should use its own list-local index space"
         );
 
+        let initial_offset = point(px(-7.), px(-19.));
+        panel
+            .scroll_handle
+            .0
+            .borrow()
+            .base_handle
+            .set_offset(initial_offset);
+        panel
+            .scroll_handle
+            .scroll_to_item_strict(1, ScrollStrategy::Bottom);
+        let deferred_scroll = panel
+            .scroll_handle
+            .0
+            .borrow()
+            .deferred_scroll_to_item
+            .expect("test setup should have a deferred Project Files scroll");
+
         panel.select_tagged_file_row(blue_tagged_file_row.clone(), cx);
+        let scroll_state = panel.scroll_handle.0.borrow();
+        assert_eq!(scroll_state.base_handle.offset(), initial_offset);
         assert_eq!(
-            panel
-                .scroll_handle
-                .0
-                .borrow()
+            scroll_state
                 .deferred_scroll_to_item
-                .expect("tagged-row selection should request a scroll")
+                .expect("tagged selection should preserve deferred Project Files scroll")
                 .item_index,
-            blue_tagged_file_list_index
+            deferred_scroll.item_index
+        );
+    });
+
+    panel.update_in(cx, |panel, window, cx| {
+        panel.scroll_cursor_top(&ScrollCursorTop, window, cx);
+        panel.scroll_cursor_center(&ScrollCursorCenter, window, cx);
+        panel.scroll_cursor_bottom(&ScrollCursorBottom, window, cx);
+
+        let scroll_state = panel.scroll_handle.0.borrow();
+        assert_eq!(scroll_state.base_handle.offset(), point(px(-7.), px(-19.)));
+        assert_eq!(
+            scroll_state
+                .deferred_scroll_to_item
+                .expect("tagged scroll-cursor commands should preserve deferred scroll")
+                .item_index,
+            1
+        );
+    });
+
+    panel.update_in(cx, |panel, window, cx| {
+        assert_eq!(panel.file_tag_view_mode, FileTagViewMode::Tree);
+        panel.toggle_file_tag_group(FileTagColor::Blue, cx);
+        assert!(
+            !panel
+                .visible_tagged_file_rows(cx)
+                .iter()
+                .any(|row| row.entry_id == Some(lib_file_entry_id)),
+            "collapsing the selected tag's group should hide its row"
+        );
+        assert!(
+            panel
+                .selection
+                .and_then(|selection| panel.index_for_selection(selection))
+                .is_some(),
+            "the backing project row must be indexable, or the no-op assertions below \
+             pass whether or not selection provenance is honoured"
+        );
+        assert_eq!(
+            panel.selected_project_entry_list_index(cx),
+            None,
+            "a hidden tag row should still own its selection"
+        );
+
+        panel.scroll_cursor_top(&ScrollCursorTop, window, cx);
+        panel.scroll_cursor_center(&ScrollCursorCenter, window, cx);
+        panel.scroll_cursor_bottom(&ScrollCursorBottom, window, cx);
+
+        let scroll_state = panel.scroll_handle.0.borrow();
+        assert_eq!(
+            scroll_state.base_handle.offset(),
+            point(px(-7.), px(-19.)),
+            "no scroll-cursor command should write the base offset directly"
+        );
+        // The load-bearing assertion: `scroll_to_item_strict` only records a deferred
+        // request, so a command that escaped the provenance guard would overwrite this
+        // item index with the backing project row's. The base offset above moves later,
+        // during prepaint, and cannot change inside this closure either way.
+        assert_eq!(
+            scroll_state
+                .deferred_scroll_to_item
+                .expect("a collapsed selected tag group should preserve deferred scroll")
+                .item_index,
+            1
+        );
+    });
+
+    panel.update_in(cx, |panel, window, cx| {
+        panel
+            .reveal_entry(project.clone(), lib_file_entry_id, false, window, cx)
+            .expect("revealing a tagged project file should succeed");
+    });
+    cx.run_until_parked();
+
+    panel.update(cx, |panel, cx| {
+        assert!(
+            panel.file_tag_selection.is_none(),
+            "revealing a project row must release tag provenance"
+        );
+        assert!(
+            panel.selected_project_entry_list_index(cx).is_some(),
+            "a revealed row must be scrollable by Project Files again"
+        );
+    });
+
+    panel.update(cx, |panel, cx| {
+        panel.toggle_file_tag_group(FileTagColor::Blue, cx);
+    });
+
+    let current_offset = point(px(-7.), px(-19.));
+    let max_offset = point(px(80.), px(120.));
+    let delta = point(px(-5.), px(-11.));
+    assert_eq!(
+        project_files_scroll_offset(current_offset, max_offset, delta, px(0.)),
+        current_offset,
+        "wheel input at zero Project Files height should preserve both offsets"
+    );
+    assert_eq!(
+        project_files_scroll_offset(current_offset, max_offset, delta, px(100.)),
+        current_offset + delta,
+        "wheel input should move only the Project Files offset when its viewport is visible"
+    );
+
+    panel.update(cx, |panel, cx| {
+        panel.file_tags = FileTagStore::default();
+        assert!(
+            panel.file_tag_list_items(cx).is_empty(),
+            "zero tags should render no fixed Tags region or separator"
+        );
+    });
+}
+
+/// The drag floor is only as trustworthy as the height it is derived from, and that derivation is
+/// a two-arm match on UI density. Asserting the floor against `tags_header_height` — as the drag
+/// test must — can never catch a wrong constant, because it compares the function to itself. So
+/// pin both arms to absolute rem multiples here: swapping them, or corrupting either literal,
+/// fails. The default test density is `Default`, so without the override the `Comfortable` arm
+/// that ships to real users would never execute at all.
+#[gpui::test]
+async fn test_tags_header_height_pins_both_density_arms(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let window = cx.add_window(|_, _| Empty);
+    let mut cx = VisualTestContext::from_window(window.into(), cx);
+
+    cx.update(|window, cx| {
+        let rem_size = window.rem_size();
+        assert_eq!(
+            ProjectPanel::tags_header_height(window, cx),
+            rem_size * 1.75,
+            "at the default density the Tags header is 1.75rem, matching `ListHeader`'s `h_7`"
+        );
+
+        let mut settings = ThemeSettings::get_global(cx).clone();
+        settings.ui_density = theme::UiDensity::Comfortable;
+        <ThemeSettings as settings::Settings>::override_global(settings, cx);
+
+        assert_eq!(
+            ProjectPanel::tags_header_height(window, cx),
+            rem_size * 1.25,
+            "at Comfortable density the Tags header is 1.25rem, matching `ListHeader`'s `h_5`"
+        );
+        // Anti-vacuity: the two arms must actually differ, or both assertions above would hold for
+        // a derivation that ignored density entirely.
+        assert_ne!(
+            rem_size * 1.75,
+            rem_size * 1.25,
+            "the two density arms must be distinguishable for this test to have content"
+        );
+    });
+}
+
+/// The stored pin is deliberately left un-clamped, so the floor exists at render or not at all.
+/// A pin below the header height reaches that path two ways this test stands in for: a value
+/// written by an earlier build whose floor was zero, and a value stored on a display whose rem
+/// size is smaller than the current one. Asserted against drawn pixels rather than the model,
+/// because the model is exactly what does *not* hold the clamp.
+#[gpui::test]
+async fn test_sub_header_pin_renders_clamped_to_the_tags_header(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    clear_file_tags_for_test(cx).await;
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "src": { "lib.rs": "", "main.rs": "" } }))
+        .await;
+    let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+        .expect("workspace should be available");
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+    set_file_tag_for_test(&panel, "root/src/lib.rs", FileTagColor::Blue, cx);
+
+    panel.update_in(cx, |panel, window, cx| {
+        let header_height = ProjectPanel::tags_header_height(window, cx);
+
+        assert_eq!(
+            panel.tags_rendered_max_height(window, cx),
+            None,
+            "an unpinned region must impose no upper bound, leaving it at natural height"
+        );
+
+        // A height no build should ever have produced, standing in for one already on disk.
+        panel.tags_pinned_height = Some(px(1.));
+        assert_eq!(
+            panel.tags_rendered_max_height(window, cx),
+            Some(header_height),
+            "a pin below the header height must render bounded at the header, not at the stored value"
+        );
+        assert_eq!(
+            panel.tags_pinned_height,
+            Some(px(1.)),
+            "the clamp belongs to rendering; the stored pin must survive it untouched"
+        );
+
+        // Anti-vacuity: a clamp that returned the header height unconditionally would satisfy the
+        // assertion above, so a pin above the floor must pass through unchanged.
+        let above_floor = header_height + px(120.);
+        panel.tags_pinned_height = Some(above_floor);
+        assert_eq!(
+            panel.tags_rendered_max_height(window, cx),
+            Some(above_floor),
+            "a pin above the floor must be used as stored rather than snapped to the header"
         );
     });
 }
 
 #[gpui::test]
-fn test_file_tags_allow_sticky_section_headers(cx: &mut gpui::TestAppContext) {
+async fn test_tags_divider_pins_and_unpins_height(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    clear_file_tags_for_test(cx).await;
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "src": { "lib.rs": "", "main.rs": "" } }))
+        .await;
+    let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+        .expect("workspace should be available");
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+    // The divider only exists while Tags has rows, and pinning is refused without them.
+    set_file_tag_for_test(&panel, "root/src/lib.rs", FileTagColor::Blue, cx);
+
+    // Tall enough that the panel-height cap never fires except where a case below asks it to.
+    let panel_bounds = gpui::Bounds {
+        origin: gpui::point(px(0.), px(50.)),
+        size: gpui::size(px(300.), px(600.)),
+    };
+
+    panel.update_in(cx, |panel, window, cx| {
+        assert_eq!(
+            panel.tags_pinned_height, None,
+            "an untouched panel must stay at natural height, which is the pre-slice behaviour"
+        );
+
+        panel.set_tags_pinned_height(px(200.), panel_bounds, window, cx);
+        assert_eq!(
+            panel.tags_pinned_height,
+            Some(px(150.)),
+            "the pin is the pointer's distance below the panel's top edge"
+        );
+
+        // Anti-vacuity: a second, different pointer must yield a different height, or the
+        // assertion above would also pass for a helper that stored a constant.
+        panel.set_tags_pinned_height(px(310.), panel_bounds, window, cx);
+        assert_eq!(
+            panel.tags_pinned_height,
+            Some(px(260.)),
+            "the pin must track the pointer rather than latch a single value"
+        );
+
+        // Dragging far below the panel keeps asking for a taller pin while nothing moves on
+        // screen, because the pin is an upper bound. Cap it at the panel so a height recorded
+        // against invisible space cannot reappear as a jump once enough files are tagged.
+        panel.set_tags_pinned_height(px(5000.), panel_bounds, window, cx);
+        assert_eq!(
+            panel.tags_pinned_height,
+            Some(panel_bounds.size.height),
+            "a drag past the panel's bottom must cap at the panel rather than store what it asked"
+        );
+        // Anti-vacuity: the cap must be the panel's height rather than any constant, so a taller
+        // panel has to produce a correspondingly taller cap.
+        let taller = gpui::Bounds {
+            origin: panel_bounds.origin,
+            size: gpui::size(px(300.), px(900.)),
+        };
+        panel.set_tags_pinned_height(px(5000.), taller, window, cx);
+        assert_eq!(
+            panel.tags_pinned_height,
+            Some(px(900.)),
+            "the cap must follow the panel's height rather than latch one value"
+        );
+
+        // Dragging above the panel's top edge asks for a negative height. The Tags header is the
+        // floor, not zero: the divider comes up to the label and stops rather than over it.
+        let header_height = ProjectPanel::tags_header_height(window, cx);
+        // Anti-vacuity: a floor of zero would satisfy the assertion below for the old behaviour
+        // too, so the floor has to be a real height before the assertion means anything.
+        assert!(
+            header_height > px(0.),
+            "the Tags header must have a real height for the floor assertion to have content"
+        );
+        panel.set_tags_pinned_height(px(10.), panel_bounds, window, cx);
+        assert_eq!(
+            panel.tags_pinned_height,
+            Some(header_height),
+            "dragging past the top stops at the Tags header instead of collapsing over it"
+        );
+
+        // A drag marks itself, so a release reporting two clicks because the press landed inside
+        // the double-click interval cannot discard the resize it just performed.
+        assert!(
+            panel.tags_divider_dragged_since_mouse_down,
+            "setting a pinned height is a drag and must mark itself as one"
+        );
+        let dragged_height = panel.tags_pinned_height;
+        assert!(
+            !panel.handle_tags_divider_mouse_up(2, cx),
+            "a release that follows a drag must not be consumed as a double-click"
+        );
+        assert_eq!(
+            panel.tags_pinned_height, dragged_height,
+            "a drag begun inside the double-click interval must survive its own release"
+        );
+        assert!(
+            !panel.tags_divider_dragged_since_mouse_down,
+            "the drag marker must clear on release, or the next real double-click is swallowed"
+        );
+        // Anti-vacuity control: with no drag in between, the same two-click release must still
+        // reset — otherwise the assertion above would hold for a guard that disabled reset outright.
+        assert!(
+            panel.handle_tags_divider_mouse_up(2, cx),
+            "a genuine double-click with no drag must still be consumed"
+        );
+        assert_eq!(
+            panel.tags_pinned_height, None,
+            "a genuine double-click must still return Tags to its natural height"
+        );
+
+        panel.set_tags_pinned_height(px(200.), panel_bounds, window, cx);
+        panel.tags_divider_dragged_since_mouse_down = false;
+        assert!(
+            !panel.handle_tags_divider_mouse_up(1, cx),
+            "a single click must not reset the height"
+        );
+        assert_eq!(
+            panel.tags_pinned_height,
+            Some(px(150.)),
+            "only a double-click resets; one click leaves the pin alone"
+        );
+
+        panel.unpin_tags_height(cx);
+        assert_eq!(
+            panel.tags_pinned_height, None,
+            "double-clicking the divider drops the pin rather than restoring some other height"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_tags_pinned_height_round_trips_for_the_project(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    clear_file_tags_for_test(cx).await;
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "src": { "lib.rs": "" } }))
+        .await;
+    let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+        .expect("workspace should be available");
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+    set_file_tag_for_test(&panel, "root/src/lib.rs", FileTagColor::Blue, cx);
+
+    // Anti-vacuity: with no resolvable key both persist and load return early, so every
+    // assertion below would hold for a panel that never touched the store at all.
+    panel.update_in(cx, |panel, window, cx| {
+        assert!(
+            panel.tags_pinned_height_key(cx).is_some(),
+            "this project must resolve a storage key, or the round trip below proves nothing"
+        );
+        panel.set_tags_pinned_height(
+            px(180.),
+            gpui::Bounds {
+                origin: gpui::point(px(0.), px(30.)),
+                size: gpui::size(px(300.), px(600.)),
+            },
+            window,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    // Reload through the path that actually ships: a freshly constructed panel for the same
+    // workspace. Reading the store directly would exercise a test-only entry point and would stay
+    // green even if construction never restored the pin, or if the two key-derivation paths
+    // disagreed — which is exactly the hazard of having two of them.
+    let reopened = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+    reopened.update(cx, |panel, _| {
+        assert_eq!(
+            panel.tags_pinned_height,
+            Some(px(150.)),
+            "a newly opened panel must restore the height pinned for this project"
+        );
+    });
+
+    panel.update(cx, |panel, cx| panel.unpin_tags_height(cx));
+    cx.run_until_parked();
+
+    let reopened_after_unpin = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+    reopened_after_unpin.update(cx, |panel, _| {
+        assert_eq!(
+            panel.tags_pinned_height, None,
+            "unpinning must clear the stored value, not leave the old height behind"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_tags_pinned_height_is_scoped_to_its_own_project(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    clear_file_tags_for_test(cx).await;
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "src": { "lib.rs": "" } }))
+        .await;
+    let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+        .expect("workspace should be available");
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+
+    let other_project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+    let other_window =
+        cx.add_window(|window, cx| MultiWorkspace::test_new(other_project.clone(), window, cx));
+    let other_workspace = other_window
+        .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+        .expect("second workspace should be available");
+
+    // Cover the branch that actually ships. `Workspace::test_new` leaves `database_id` unset, so
+    // without these the whole test runs on the `session_id` fallback — and `Session::test()` mints
+    // a fresh uuid per workspace, while production shares one app-wide session id. That harness
+    // difference would make this assertion pass for a reason that does not exist in the product.
+    workspace.update(cx, |workspace, _| {
+        workspace.set_database_id(WorkspaceId::from_i64(3))
+    });
+    other_workspace.update(cx, |workspace, _| {
+        // Any distinct id stands for a second saved project, which is the case the pin is scoped
+        // for.
+        workspace.set_database_id(WorkspaceId::from_i64(7))
+    });
+
+    // The key must distinguish workspaces. A derivation that returned one constant would still
+    // pass a round-trip test, while silently making the height global — the thing decision 4
+    // forbids.
+    let (key, other_key) = (
+        panel.update(cx, |panel, cx| panel.tags_pinned_height_key(cx)),
+        other_workspace.update(cx, |workspace, _| {
+            ProjectPanel::tags_pinned_height_key_for(workspace)
+        }),
+    );
+    assert!(key.is_some(), "this project must resolve a storage key");
+    assert_ne!(
+        key, other_key,
+        "two saved workspaces must not share one pinned height"
+    );
+    // Anti-vacuity: both keys must come from `database_id`, not from the session fallback that
+    // would differ here for a harness-only reason.
+    assert_eq!(
+        key.as_deref(),
+        Some("3"),
+        "the key must be the workspace's database id, not the session fallback"
+    );
+    assert_eq!(other_key.as_deref(), Some("7"));
+}
+
+#[gpui::test]
+fn test_project_files_allow_sticky_ancestors(cx: &mut gpui::TestAppContext) {
     init_test(cx);
 
     let settings = cx.read(|cx| *ProjectPanelSettings::get_global(cx));
@@ -12278,24 +12764,6 @@ fn test_file_tags_allow_sticky_section_headers(cx: &mut gpui::TestAppContext) {
         true,
         scrolled_offset,
     ));
-
-    assert_eq!(
-        sticky_section_for_visible_range(1..12, 7),
-        Some(StickyProjectPanelSection::Tags)
-    );
-    assert_eq!(
-        sticky_section_for_visible_range(6..14, 7),
-        Some(StickyProjectPanelSection::ProjectFiles {
-            project_entry_index: Some(0),
-        })
-    );
-    assert_eq!(
-        sticky_section_for_visible_range(12..20, 7),
-        Some(StickyProjectPanelSection::ProjectFiles {
-            project_entry_index: Some(5),
-        })
-    );
-    assert_eq!(sticky_section_for_visible_range(0..8, 0), None);
 }
 
 #[gpui::test]

@@ -23,13 +23,13 @@ use git_ui::file_diff_view::FileDiffView;
 use gpui::{
     Action, Anchor, AnyElement, App, AsyncWindowContext, Bounds,
     ClipboardEntry as GpuiClipboardEntry, ClipboardItem, Context, CursorStyle, DismissEvent, Div,
-    DragMoveEvent, ElementId, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable,
+    DragMoveEvent, ElementId, Empty, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable,
     FontWeight, Hsla, InteractiveElement, KeyContext, ListHorizontalSizingBehavior,
     ListSizingBehavior, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent,
-    ParentElement, PathPromptOptions, Pixels, Point, PromptLevel, Render, ScrollStrategy, Stateful,
-    Styled, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, actions, anchored,
-    deferred, div, hsla, linear_color_stop, linear_gradient, point, px, size, transparent_white,
-    uniform_list,
+    MouseUpEvent, ParentElement, PathPromptOptions, Pixels, Point, PromptLevel, Render,
+    ScrollStrategy, Stateful, Styled, Subscription, Task, UniformListScrollHandle, WeakEntity,
+    Window, actions, anchored, deferred, div, hsla, linear_color_stop, linear_gradient, point, px,
+    size, transparent_white, uniform_list,
 };
 use language::DiagnosticSeverity;
 use menu::{Confirm, SelectFirst, SelectLast, SelectNext, SelectPrevious};
@@ -163,6 +163,16 @@ pub struct ProjectPanel {
     pending_file_tags: Option<FileTagStore>,
     file_tag_view_mode: FileTagViewMode,
     collapsed_file_tag_groups: HashSet<FileTagColor>,
+    // `None` means Tags renders at its natural height, exactly as it did before this slice.
+    // A drag pins an explicit height here; double-clicking the divider clears it again. The
+    // stored value is never clamped in place — clamping happens at render, so a window that
+    // is briefly too short, or content that briefly shrinks, cannot destroy the chosen height.
+    tags_pinned_height: Option<Pixels>,
+    // Holds the in-flight write so the next one cancels it; see `persist_tags_pinned_height`.
+    persist_tags_pinned_height_task: Task<()>,
+    // Set by the divider drag, cleared on mouse-down and mouse-up, so a release that reports two
+    // clicks because a drag began inside the double-click interval does not undo that drag.
+    tags_divider_dragged_since_mouse_down: bool,
     file_tag_update_task: Shared<Task<()>>,
     // Worktrees whose tagged paths have been handed to the scanner but whose scan has not
     // finished. Until it does we have not actually looked for those files, so their rows must
@@ -262,7 +272,6 @@ enum FileTagListItem {
         color: FileTagColor,
         row: TaggedFileRow,
     },
-    ProjectFilesHeader,
 }
 
 #[derive(Clone, Debug)]
@@ -275,6 +284,26 @@ enum FileTagOperation {
         key: FileTagKey,
     },
 }
+
+/// Dragged while resizing the Tags region. Carries nothing: the new height is derived from the
+/// pointer's distance below the panel's top edge, and Tags is the panel's first child, so that
+/// distance *is* the height.
+struct DraggedTagsDivider;
+
+impl Render for DraggedTagsDivider {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
+}
+
+/// How far either side of the divider still accepts the drag. The zone reaches further up into
+/// Tags than down so it never swallows clicks meant for the one-row `Project Files` header.
+const TAGS_DIVIDER_GRAB_ABOVE: Pixels = px(4.);
+const TAGS_DIVIDER_GRAB_BELOW: Pixels = px(2.);
+
+/// Scoped KVP namespace holding the per-project pinned Tags height, keyed by workspace id the
+/// same way the dock keys panel sizes.
+const TAGS_PINNED_HEIGHT_KEY: &str = "project_panel_tags_pinned_height";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum FileTagViewMode {
@@ -1131,6 +1160,9 @@ impl ProjectPanel {
                 pending_file_tags: None,
                 file_tag_view_mode: FileTagViewMode::default(),
                 collapsed_file_tag_groups: HashSet::default(),
+                tags_pinned_height: None,
+                persist_tags_pinned_height_task: Task::ready(()),
+                tags_divider_dragged_since_mouse_down: false,
                 file_tag_update_task: Task::ready(()).shared(),
                 worktrees_awaiting_tag_scan: HashSet::default(),
                 _tag_scan_registrations: HashMap::default(),
@@ -1157,6 +1189,7 @@ impl ProjectPanel {
             // Worktrees already open when the panel is built never fire `WorktreeAdded`, because
             // the subscription above is installed after they were added.
             this.register_tagged_paths_for_scan(cx);
+            this.load_tags_pinned_height_for(workspace, cx);
 
             this
         });
@@ -1844,6 +1877,149 @@ impl ProjectPanel {
         }
     }
 
+    /// The pin is scoped per project, keyed the same way the dock keys panel sizes, because tag
+    /// counts differ per project and one global height would be right in one and wrong in the rest.
+    /// Derived from a borrowed `Workspace` rather than the weak handle, because the panel is
+    /// constructed inside `workspace.update_in`, where reading that entity again panics.
+    fn tags_pinned_height_key_for(workspace: &Workspace) -> Option<String> {
+        workspace
+            .database_id()
+            .map(|id| i64::from(id).to_string())
+            .or(workspace.session_id())
+    }
+
+    fn tags_pinned_height_key(&self, cx: &App) -> Option<String> {
+        let workspace = self.workspace.upgrade()?;
+        let workspace = workspace.read(cx);
+        Self::tags_pinned_height_key_for(workspace)
+    }
+
+    /// Held in a field rather than detached, so assigning cancels the previous write. A drag emits
+    /// one of these per mouse move, and detaching them raced two ways: a stale height could land
+    /// last, and — worse — a drag write completing after `unpin_tags_height`'s delete resurrected
+    /// the pin, so an unpin silently failed to survive restart. One write in flight, newest last.
+    fn persist_tags_pinned_height(&mut self, cx: &mut Context<Self>) {
+        let Some(key) = self.tags_pinned_height_key(cx) else {
+            return;
+        };
+        let value = self.tags_pinned_height.map(|height| f32::from(height));
+        let key_value_store = db::kvp::KeyValueStore::global(cx);
+        self.persist_tags_pinned_height_task = cx.background_spawn(async move {
+            let scope = key_value_store.scoped(TAGS_PINNED_HEIGHT_KEY);
+            match value {
+                Some(height) => scope.write(key, height.to_string()).await,
+                None => scope.delete(key).await,
+            }
+            .log_err();
+        });
+    }
+
+    /// Runs during construction, where the caller already holds the `Workspace` borrow — reading
+    /// that entity again from the weak handle would panic, since `ProjectPanel::new` is itself
+    /// inside `workspace.update_in`.
+    fn load_tags_pinned_height_for(&mut self, workspace: &Workspace, cx: &mut Context<Self>) {
+        let Some(key) = Self::tags_pinned_height_key_for(workspace) else {
+            return;
+        };
+        self.tags_pinned_height = db::kvp::KeyValueStore::global(cx)
+            .scoped(TAGS_PINNED_HEIGHT_KEY)
+            .read(&key)
+            .log_err()
+            .flatten()
+            .and_then(|raw| raw.parse::<f32>().log_err())
+            // A stored height that is negative, NaN, or infinite would survive into `max_h` and
+            // collapse Tags on every launch with nothing on screen explaining why. Both `NaN` and
+            // `inf` parse successfully, so rejecting them here is not theoretical.
+            .filter(|height| height.is_finite() && *height >= 0.)
+            .map(px);
+    }
+
+    /// The floor the drag stops at: the Tags header's own height, so the divider comes up to the
+    /// label and never over it. Asked of `ListHeader` rather than restated here, so the floor can
+    /// never disagree with the header it is measuring. Resolved against the window's rem size on
+    /// every call because this fork scales rem per display — a floor cached in pixels would be
+    /// wrong the moment the window moves to another monitor.
+    fn tags_header_height(window: &Window, cx: &App) -> Pixels {
+        ui::ListHeader::height(cx).to_pixels(window.rem_size())
+    }
+
+    /// The upper bound the Tags region renders under, or `None` while unpinned. Split out of the
+    /// element tree because that is the only place the floor is applied to a stored pin, and an
+    /// element tree cannot be asserted against here — the divider's `deferred` handle makes a
+    /// manual `cx.draw` fight the window's own draw cycle. Render calls this, so the two cannot
+    /// disagree.
+    fn tags_rendered_max_height(&self, window: &Window, cx: &App) -> Option<Pixels> {
+        self.tags_pinned_height
+            .map(|height| height.max(Self::tags_header_height(window, cx)))
+    }
+
+    /// Pin Tags to the height the pointer is sitting at. `panel_top` is the panel's own top edge;
+    /// Tags is its first child, so the distance between them is the height the user is asking for.
+    /// The header row is the floor: Tags can be dragged down to just its label — zero tag rows —
+    /// but never past it, so the region always says what it is and stays recoverable.
+    fn set_tags_pinned_height(
+        &mut self,
+        pointer_y: Pixels,
+        panel_bounds: Bounds<Pixels>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        // The drag lives in app state while the Tags container and its handle are gated on there
+        // being tags at all. If a background scan clears the last tag mid-drag, the container stops
+        // being the panel's first child and every further pointer position measures against the
+        // wrong origin — so stop pinning rather than persist a height computed from nothing.
+        // Asked of `tagged_file_groups` rather than `file_tag_list_items`, which is empty exactly
+        // when groups is: this runs on every mouse move of a drag, and building the list items
+        // formats a path label and a tooltip per tag just to answer a boolean.
+        if self.tagged_file_groups(cx).is_empty() {
+            return;
+        }
+        // Capped at the panel's own height because the pin is a `max_h`: dragging below the last
+        // tag keeps growing and persisting a height while nothing moves on screen, and a pin
+        // recorded against space the user could not see reappears as an unexplained jump once
+        // enough files are tagged to reach it. The panel is not the content height — a pin between
+        // the two still records more than was visible — but it removes the runaway case without
+        // adding a measurement to a flex tree whose shrink priority is load-bearing.
+        self.tags_divider_dragged_since_mouse_down = true;
+        let header_height = Self::tags_header_height(window, cx);
+        // `max` before `clamp` because a panel shorter than its own header would otherwise give
+        // `clamp` a min above its max, which panics.
+        let max_height = panel_bounds.size.height.max(header_height);
+        let height = (pointer_y - panel_bounds.top()).clamp(header_height, max_height);
+        if self.tags_pinned_height != Some(height) {
+            self.tags_pinned_height = Some(height);
+            self.persist_tags_pinned_height(cx);
+            cx.notify();
+        }
+    }
+
+    /// Decide what a release on the divider means, and report whether it was consumed. Lifted out
+    /// of the element tree so the click-count race can be tested at all: the gesture needs input
+    /// injection to reproduce by hand, and this environment has none.
+    ///
+    /// macOS counts clicks by the time and proximity of the mouse-*down* and does not reset because
+    /// a drag happened in between, so a press-and-drag begun inside the double-click interval
+    /// releases reporting two clicks. Treating that as a double-click would discard the resize the
+    /// user just performed, silently, with nothing on screen explaining it.
+    fn handle_tags_divider_mouse_up(&mut self, click_count: usize, cx: &mut Context<Self>) -> bool {
+        let dragged = std::mem::take(&mut self.tags_divider_dragged_since_mouse_down);
+        if click_count == 2 && !dragged {
+            self.unpin_tags_height(cx);
+            return true;
+        }
+        false
+    }
+
+    /// Drop the pin so Tags returns to its natural height — the pre-slice behavior. This is what
+    /// double-clicking the divider does; there is no "default height" to restore to, only the
+    /// absence of a pin.
+    fn unpin_tags_height(&mut self, cx: &mut Context<Self>) {
+        if self.tags_pinned_height.take().is_some() {
+            self.persist_tags_pinned_height(cx);
+            cx.notify();
+        }
+    }
+
     fn toggle_file_tag_group(&mut self, color: FileTagColor, cx: &mut Context<Self>) {
         if !self.collapsed_file_tag_groups.insert(color) {
             self.collapsed_file_tag_groups.remove(&color);
@@ -1958,12 +2134,7 @@ impl ProjectPanel {
                 }
             }
         }
-        items.push(FileTagListItem::ProjectFilesHeader);
         items
-    }
-
-    fn file_tag_list_item_count(&self, cx: &App) -> usize {
-        self.file_tag_list_items(cx).len()
     }
 
     fn project_entry_count(&self) -> usize {
@@ -1974,48 +2145,51 @@ impl ProjectPanel {
             .sum()
     }
 
-    fn project_entry_list_index(&self, project_entry_index: usize, cx: &App) -> usize {
-        self.file_tag_list_item_count(cx) + project_entry_index
+    fn max_width_list_item_index(&self) -> Option<usize> {
+        self.state.max_width_item_index
     }
 
-    fn max_width_list_item_index(&self, cx: &App) -> Option<usize> {
-        self.state
-            .max_width_item_index
-            .map(|index| self.project_entry_list_index(index, cx))
-    }
-
-    fn tagged_file_row_list_index(&self, file_tag_key: &FileTagKey, cx: &App) -> Option<usize> {
-        self.file_tag_list_items(cx)
-            .into_iter()
-            .position(|item| matches!(item, FileTagListItem::TaggedFileRow { row, .. } if &row.file_tag_key == file_tag_key))
-    }
-
-    fn selected_list_index(&self, cx: &App) -> Option<usize> {
-        if let Some(tagged_file_row) = self.selected_tagged_file_row(cx) {
-            self.tagged_file_row_list_index(&tagged_file_row.file_tag_key, cx)
-        } else {
-            self.selection
-                .and_then(|selection| self.index_for_selection(selection))
-                .map(|(_, _, index)| self.project_entry_list_index(index, cx))
+    fn selected_project_entry_list_index(&self, cx: &App) -> Option<usize> {
+        if self.selection_originates_in_tags(cx) {
+            return None;
         }
+
+        self.selection
+            .and_then(|selection| self.index_for_selection(selection))
+            .map(|(_, _, index)| index)
     }
 
-    fn project_entry_index_for_list_index(&self, index: usize, cx: &App) -> Option<usize> {
-        index.checked_sub(self.file_tag_list_item_count(cx))
-    }
-
-    fn project_entry_at_list_index(
-        &self,
-        index: usize,
-        cx: &App,
-    ) -> Option<(WorktreeId, GitEntryRef<'_>)> {
-        self.entry_at_index(self.project_entry_index_for_list_index(index, cx)?)
+    fn project_entry_at_list_index(&self, index: usize) -> Option<(WorktreeId, GitEntryRef<'_>)> {
+        self.entry_at_index(index)
     }
 
     fn selected_tagged_file_row(&self, cx: &App) -> Option<TaggedFileRow> {
+        self.tagged_file_row_holding_selection(|| self.visible_tagged_file_rows(cx))
+    }
+
+    /// Whether the current selection was made in Tags, regardless of whether that
+    /// tag row is rendered right now. Collapsing the selected row's group in Tree
+    /// view hides the row without moving the selection out of Tags, so Project
+    /// Files must not claim the backing entry as its own selection.
+    fn selection_originates_in_tags(&self, cx: &App) -> bool {
+        self.tagged_file_row_holding_selection(|| {
+            self.tagged_file_groups(cx)
+                .into_iter()
+                .flat_map(|group| group.rows)
+                .collect()
+        })
+        .is_some()
+    }
+
+    /// `rows` stays lazy so an unselected panel — the common case on every
+    /// selection change and on each step `scroll_up`/`scroll_down` dispatches —
+    /// never pays to rebuild the tag model.
+    fn tagged_file_row_holding_selection(
+        &self,
+        rows: impl FnOnce() -> Vec<TaggedFileRow>,
+    ) -> Option<TaggedFileRow> {
         let selected_file_tag_key = self.file_tag_selection.as_ref()?;
-        let row = self
-            .visible_tagged_file_rows(cx)
+        let row = rows()
             .into_iter()
             .find(|row| &row.file_tag_key == selected_file_tag_key)?;
 
@@ -2041,17 +2215,6 @@ impl ProjectPanel {
         });
         self.file_tag_selection = Some(row.file_tag_key);
         self.marked_entries.clear();
-        if let Some(index) = self
-            .file_tag_selection
-            .as_ref()
-            .and_then(|key| self.tagged_file_row_list_index(key, cx))
-        {
-            self.scroll_handle.scroll_to_item_with_offset(
-                index,
-                ScrollStrategy::Center,
-                self.sticky_items_count,
-            );
-        }
         cx.notify();
     }
 
@@ -3660,7 +3823,7 @@ impl ProjectPanel {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(index) = self.selected_list_index(cx) {
+        if let Some(index) = self.selected_project_entry_list_index(cx) {
             self.scroll_handle
                 .scroll_to_item_strict(index, ScrollStrategy::Center);
             cx.notify();
@@ -3668,7 +3831,7 @@ impl ProjectPanel {
     }
 
     fn scroll_cursor_top(&mut self, _: &ScrollCursorTop, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(index) = self.selected_list_index(cx) {
+        if let Some(index) = self.selected_project_entry_list_index(cx) {
             self.scroll_handle
                 .scroll_to_item_strict(index, ScrollStrategy::Top);
             cx.notify();
@@ -3681,7 +3844,7 @@ impl ProjectPanel {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(index) = self.selected_list_index(cx) {
+        if let Some(index) = self.selected_project_entry_list_index(cx) {
             self.scroll_handle
                 .scroll_to_item_strict(index, ScrollStrategy::Bottom);
             cx.notify();
@@ -4018,7 +4181,7 @@ impl ProjectPanel {
     }
 
     fn autoscroll(&mut self, cx: &mut Context<Self>) {
-        if let Some(index) = self.selected_list_index(cx) {
+        if let Some(index) = self.selected_project_entry_list_index(cx) {
             self.scroll_handle.scroll_to_item_with_offset(
                 index,
                 ScrollStrategy::Center,
@@ -5273,6 +5436,10 @@ impl ProjectPanel {
                         worktree_id,
                         entry_id,
                     });
+                    // The caller is selecting a project row outright, so a tag row
+                    // pointing at the same file no longer owns the selection. Leaving
+                    // it set would let tag provenance suppress this reveal's autoscroll.
+                    this.file_tag_selection = None;
                 }
                 let elapsed = now.elapsed();
                 if this.last_reported_update.elapsed() > Duration::from_secs(3600) {
@@ -6752,7 +6919,6 @@ impl ProjectPanel {
                             && let Some((_, _, index)) =
                                 project_panel.index_for_entry(entry_id, worktree_id)
                         {
-                            let index = project_panel.project_entry_list_index(index, cx);
                             project_panel
                                 .scroll_handle
                                 .scroll_to_item_strict_with_offset(
@@ -7226,7 +7392,6 @@ impl ProjectPanel {
                 };
                 self.render_file_tag_row_with_indent(color, row, indent_level, cx)
             }
-            FileTagListItem::ProjectFilesHeader => self.render_project_files_header(),
         }
     }
 
@@ -7251,31 +7416,6 @@ impl ProjectPanel {
                     .child(self.render_file_tag_view_mode_menu(cx)),
             )
             .into_any_element()
-    }
-
-    fn render_sticky_section_header(
-        &self,
-        header: AnyElement,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        div()
-            .w_full()
-            .bg(cx.theme().colors().panel_background)
-            .child(header)
-            .into_any_element()
-    }
-
-    fn render_sticky_tags_header(&self, cx: &mut Context<Self>) -> AnyElement {
-        let tagged_file_count = self
-            .tagged_file_groups(cx)
-            .iter()
-            .map(|group| group.rows.len())
-            .sum::<usize>();
-        self.render_sticky_section_header(self.render_file_tag_header(tagged_file_count, cx), cx)
-    }
-
-    fn render_sticky_project_files_header(&self, cx: &mut Context<Self>) -> AnyElement {
-        self.render_sticky_section_header(self.render_project_files_header(), cx)
     }
 
     fn render_file_tag_view_mode_menu(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -7684,6 +7824,7 @@ impl ProjectPanel {
                 worktree_id,
                 entry_id,
             });
+            self.file_tag_selection = None;
             self.marked_entries.clear();
             self.marked_entries.push(SelectedEntry {
                 worktree_id,
@@ -7751,7 +7892,7 @@ impl ProjectPanel {
                 child_count += 1;
             }
 
-            let start = self.project_entry_list_index(ix + 1, cx);
+            let start = ix + 1;
             let end = start + child_count;
 
             let visible_worktree = &self.state.visible_entries[worktree_ix];
@@ -7790,47 +7931,10 @@ impl ProjectPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> SmallVec<[AnyElement; 8]> {
-        match child.kind {
-            StickyProjectPanelCandidateKind::Sentinel => SmallVec::new(),
-            StickyProjectPanelCandidateKind::TagsSection => {
-                let mut elements = SmallVec::new();
-                elements.push(self.render_sticky_tags_header(cx));
-                return elements;
-            }
-            StickyProjectPanelCandidateKind::ProjectFilesSection {
-                project_entry_index,
-            } => {
-                if let Some(project_entry_index) = project_entry_index {
-                    return self.render_project_sticky_entries(project_entry_index, window, cx);
-                } else {
-                    let mut elements = SmallVec::new();
-                    elements.push(self.render_sticky_tags_header(cx));
-                    elements.push(self.render_sticky_project_files_header(cx));
-                    return elements;
-                }
-            }
-            StickyProjectPanelCandidateKind::ProjectEntry { index } => {
-                return self.render_project_sticky_entries(index, window, cx);
-            }
-        }
-    }
-
-    fn render_project_sticky_entries(
-        &self,
-        child_index: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> SmallVec<[AnyElement; 8]> {
-        let mut elements = SmallVec::new();
-        if self.file_tag_list_item_count(cx) > 0 {
-            elements.push(self.render_sticky_tags_header(cx));
-            elements.push(self.render_sticky_project_files_header(cx));
-        }
-
         let project = self.project.read(cx);
 
-        let Some((worktree_id, entry_ref)) = self.entry_at_index(child_index) else {
-            return elements;
+        let Some((worktree_id, entry_ref)) = self.entry_at_index(child.index) else {
+            return SmallVec::new();
         };
 
         let Some(visible) = self
@@ -7839,11 +7943,11 @@ impl ProjectPanel {
             .iter()
             .find(|worktree| worktree.worktree_id == worktree_id)
         else {
-            return elements;
+            return SmallVec::new();
         };
 
         let Some(worktree) = project.worktree_for_id(worktree_id, cx) else {
-            return elements;
+            return SmallVec::new();
         };
         let worktree = worktree.read(cx).snapshot();
 
@@ -7870,7 +7974,7 @@ impl ProjectPanel {
         }
 
         if sticky_parents.is_empty() {
-            return elements;
+            return SmallVec::new();
         }
 
         sticky_parents.reverse();
@@ -7891,65 +7995,54 @@ impl ProjectPanel {
 
         // already checked if non empty above
         let last_item_index = sticky_parents.len() - 1;
-        elements.extend(sticky_parents.iter().enumerate().map(|(index, entry)| {
-            let git_status = git_summaries_by_id
-                .get(&entry.id)
-                .copied()
-                .unwrap_or_default();
-            let sticky_details = Some(StickyDetails {
-                sticky_index: index,
-            });
-            let details = self.details_for_entry(
-                entry,
-                worktree_id,
-                root_name,
-                paths,
-                git_status,
-                sticky_details,
-                window,
-                cx,
-            );
-            self.render_entry(entry.id, details, window, cx)
-                .when(index == last_item_index, |this| {
-                    let shadow_color_top = hsla(0.0, 0.0, 0.0, 0.1);
-                    let shadow_color_bottom = hsla(0.0, 0.0, 0.0, 0.);
-                    let sticky_shadow = div()
-                        .absolute()
-                        .left_0()
-                        .bottom_neg_1p5()
-                        .h_1p5()
-                        .w_full()
-                        .bg(linear_gradient(
-                            0.,
-                            linear_color_stop(shadow_color_top, 1.),
-                            linear_color_stop(shadow_color_bottom, 0.),
-                        ));
-                    this.child(sticky_shadow)
-                })
-                .into_any()
-        }));
-        elements
+        sticky_parents
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let git_status = git_summaries_by_id
+                    .get(&entry.id)
+                    .copied()
+                    .unwrap_or_default();
+                let sticky_details = Some(StickyDetails {
+                    sticky_index: index,
+                });
+                let details = self.details_for_entry(
+                    entry,
+                    worktree_id,
+                    root_name,
+                    paths,
+                    git_status,
+                    sticky_details,
+                    window,
+                    cx,
+                );
+                self.render_entry(entry.id, details, window, cx)
+                    .when(index == last_item_index, |this| {
+                        let shadow_color_top = hsla(0.0, 0.0, 0.0, 0.1);
+                        let shadow_color_bottom = hsla(0.0, 0.0, 0.0, 0.);
+                        let sticky_shadow = div()
+                            .absolute()
+                            .left_0()
+                            .bottom_neg_1p5()
+                            .h_1p5()
+                            .w_full()
+                            .bg(linear_gradient(
+                                0.,
+                                linear_color_stop(shadow_color_top, 1.),
+                                linear_color_stop(shadow_color_bottom, 0.),
+                            ));
+                        this.child(sticky_shadow)
+                    })
+                    .into_any()
+            })
+            .collect()
     }
 }
 
 #[derive(Clone)]
 struct StickyProjectPanelCandidate {
-    kind: StickyProjectPanelCandidateKind,
+    index: usize,
     depth: usize,
-}
-
-#[derive(Clone)]
-enum StickyProjectPanelCandidateKind {
-    Sentinel,
-    TagsSection,
-    ProjectFilesSection { project_entry_index: Option<usize> },
-    ProjectEntry { index: usize },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum StickyProjectPanelSection {
-    Tags,
-    ProjectFiles { project_entry_index: Option<usize> },
 }
 
 impl StickyCandidate for StickyProjectPanelCandidate {
@@ -7975,22 +8068,39 @@ fn should_show_sticky_entries(
     panel_settings.sticky_scroll && is_scrollable && scroll_offset.y < px(0.)
 }
 
-fn sticky_section_for_visible_range(
-    range: Range<usize>,
-    file_tag_list_item_count: usize,
-) -> Option<StickyProjectPanelSection> {
-    let project_files_header_index = file_tag_list_item_count.checked_sub(1)?;
-    let project_range_start = range.start.saturating_sub(file_tag_list_item_count);
-    let project_range_end = range.end.saturating_sub(file_tag_list_item_count);
-    let project_entry_index =
-        (project_range_start < project_range_end).then_some(project_range_start);
+fn project_files_scroll_offset(
+    current_offset: Point<Pixels>,
+    max_offset: Point<Pixels>,
+    delta: Point<Pixels>,
+    viewport_height: Pixels,
+) -> Point<Pixels> {
+    if viewport_height <= px(0.) {
+        return current_offset;
+    }
 
-    if range.start < project_files_header_index {
-        Some(StickyProjectPanelSection::Tags)
-    } else {
-        Some(StickyProjectPanelSection::ProjectFiles {
-            project_entry_index,
-        })
+    (current_offset + delta).clamp(&max_offset.neg(), &Point::default())
+}
+
+fn handle_project_files_scroll_wheel(
+    scroll_handle: &UniformListScrollHandle,
+    event: &gpui::ScrollWheelEvent,
+    window: &mut Window,
+    entity_id: gpui::EntityId,
+    cx: &mut App,
+) {
+    let state = scroll_handle.0.borrow();
+    let base_handle = &state.base_handle;
+    let current_offset = base_handle.offset();
+    let new_offset = project_files_scroll_offset(
+        current_offset,
+        base_handle.max_offset(),
+        event.delta.pixel_delta(window.line_height()),
+        base_handle.bounds().size.height,
+    );
+
+    if new_offset != current_offset {
+        base_handle.set_offset(new_offset);
+        cx.notify(entity_id);
     }
 }
 
@@ -8002,6 +8112,18 @@ impl Render for ProjectPanel {
         } else {
             Vec::new()
         };
+        let rendered_file_tag_list_items = file_tag_list_items
+            .iter()
+            .cloned()
+            .map(|item| self.render_file_tag_list_item(item, cx))
+            .collect::<Vec<_>>();
+        // Applied here as well as at the drag, and permanently so: the floor is derived from the
+        // window's rem size, so a pin stored at the floor on a 16px-rem display is *below* the
+        // floor on a 24px-rem one, and `ui_density` is editable at runtime. Clamping on the way out
+        // is the only place that stays correct across both. It also heals sub-floor heights an
+        // earlier dogfood build of this slice wrote while zero was still the floor — but that is
+        // the transient reason, not the reason this clamp exists.
+        let tags_header_height = Self::tags_header_height(window, cx);
         let project = self.project.read(cx);
         let panel_settings = ProjectPanelSettings::get_global(cx);
         let indent_size = panel_settings.indent_size;
@@ -8016,8 +8138,8 @@ impl Render for ProjectPanel {
         let is_local = project.is_local();
 
         if has_worktree {
-            let item_count = file_tag_list_items.len() + self.project_entry_count();
-            let max_width_item_index = self.max_width_list_item_index(cx);
+            let item_count = self.project_entry_count();
+            let max_width_item_index = self.max_width_list_item_index();
 
             fn handle_drag_move<T: 'static>(
                 this: &mut ProjectPanel,
@@ -8167,41 +8289,146 @@ impl Render for ProjectPanel {
                         .on_action(cx.listener(Self::download_from_remote))
                 })
                 .track_focus(&self.focus_handle(cx))
+                // Registered on the panel root, not the divider, so the pointer stays inside the
+                // handler's element for the whole drag. `e.bounds` is this root's bounds, and Tags
+                // is its first child, so pointer-minus-top is the height being asked for.
+                .on_drag_move(cx.listener(
+                    move |this, e: &DragMoveEvent<DraggedTagsDivider>, window, cx| {
+                        this.set_tags_pinned_height(e.event.position.y, e.bounds, window, cx);
+                    },
+                ))
                 .child(
                     v_flex()
+                        .size_full()
+                        .min_h_0()
+                        .when(!file_tag_list_items.is_empty(), |this| {
+                            this.child(
+                                v_flex()
+                                    .w_full()
+                                    // Deliberately NOT `flex_none`. When the window is too short,
+                                    // the priority order comes from the siblings, not from any
+                                    // shrink factor set here: the `Project Files` header is
+                                    // `flex_none` so it never yields, and the tree below is
+                                    // `flex_1` — whose `flex_basis: 0%` gives it a scaled shrink
+                                    // factor of zero — so it surrenders its grow allotment first.
+                                    // Tags then absorbs the remaining deficit. The stored pin is
+                                    // untouched throughout and reapplies when space returns.
+                                    // Changing the tree to `flex_auto` would silently invert this
+                                    // and starve Tags before the tree.
+                                    .overflow_hidden()
+                                    // The floor is a property of the region, not of the drag.
+                                    // `overflow_hidden` zeroes the automatic minimum size, so
+                                    // without this a short enough window shrinks Tags past its own
+                                    // header and clips the label — the state the drag floor exists
+                                    // to prevent, reached by another route. Ordered above `max_h`
+                                    // so a pin can never argue the height below it either.
+                                    .min_h(tags_header_height)
+                                    // `max_h` rather than `h`: content shorter than the pin keeps
+                                    // its natural height, so a pin can never open empty space below
+                                    // the last tag. That is the upper bound, for free.
+                                    .when_some(
+                                        self.tags_rendered_max_height(window, cx),
+                                        |this, height| this.max_h(height),
+                                    )
+                                    .on_scroll_wheel({
+                                        let scroll_handle = self.scroll_handle.clone();
+                                        let entity_id = cx.entity().entity_id();
+                                        move |event, window, cx| {
+                                            handle_project_files_scroll_wheel(
+                                                &scroll_handle,
+                                                event,
+                                                window,
+                                                entity_id,
+                                                cx,
+                                            );
+                                        }
+                                    })
+                                    .children(rendered_file_tag_list_items),
+                            )
+                        })
                         .child(
-                            uniform_list("entries", item_count, {
+                            div()
+                                .relative()
+                                .w_full()
+                                .flex_none()
+                                .when(!file_tag_list_items.is_empty(), |this| {
+                                    this.border_t_1()
+                                        .border_color(cx.theme().colors().border)
+                                        // The divider keeps its resting appearance; the affordance
+                                        // is the cursor. `deferred` + `occlude` keep this above the
+                                        // rows it overlaps so the drag wins over a row click.
+                                        .child(deferred(
+                                            div()
+                                                .id("tags-divider-resize-handle")
+                                                .absolute()
+                                                .top(-TAGS_DIVIDER_GRAB_ABOVE)
+                                                .left_0()
+                                                .w_full()
+                                                .h(TAGS_DIVIDER_GRAB_ABOVE + TAGS_DIVIDER_GRAB_BELOW)
+                                                .cursor(CursorStyle::ResizeUpDown)
+                                                .on_drag(DraggedTagsDivider, |_, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    cx.new(|_| DraggedTagsDivider)
+                                                })
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                                                        this.tags_divider_dragged_since_mouse_down =
+                                                            false;
+                                                        cx.stop_propagation();
+                                                    }),
+                                                )
+                                                .on_mouse_up(
+                                                    MouseButton::Left,
+                                                    cx.listener(
+                                                        |this, e: &MouseUpEvent, _, cx| {
+                                                            if this.handle_tags_divider_mouse_up(
+                                                                e.click_count,
+                                                                cx,
+                                                            ) {
+                                                                cx.stop_propagation();
+                                                            }
+                                                        },
+                                                    ),
+                                                )
+                                                .occlude(),
+                                        ))
+                                })
+                                .on_scroll_wheel({
+                                    let scroll_handle = self.scroll_handle.clone();
+                                    let entity_id = cx.entity().entity_id();
+                                    move |event, window, cx| {
+                                        handle_project_files_scroll_wheel(
+                                            &scroll_handle,
+                                            event,
+                                            window,
+                                            entity_id,
+                                            cx,
+                                        );
+                                    }
+                                })
+                                .child(self.render_project_files_header()),
+                        )
+                        .child(
+                            v_flex()
+                                .w_full()
+                                .flex_1()
+                                .min_h_0()
+                                .child(uniform_list("entries", item_count, {
                                 cx.processor(|this, range: Range<usize>, window, cx| {
                                     this.rendered_entries_len = range.end - range.start;
                                     let mut items = Vec::with_capacity(this.rendered_entries_len);
-                                    let file_tag_list_items = this.file_tag_list_items(cx);
-                                    let file_tag_items_end =
-                                        range.end.min(file_tag_list_items.len());
-                                    for item in file_tag_list_items
-                                        [range.start.min(file_tag_items_end)..file_tag_items_end]
-                                        .iter()
-                                        .cloned()
-                                    {
-                                        items.push(this.render_file_tag_list_item(item, cx));
-                                    }
-
-                                    let project_range_start =
-                                        range.start.saturating_sub(file_tag_list_items.len());
-                                    let project_range_end =
-                                        range.end.saturating_sub(file_tag_list_items.len());
-                                    if project_range_start < project_range_end {
-                                        this.for_each_visible_entry(
-                                            project_range_start..project_range_end,
-                                            window,
-                                            cx,
-                                            &mut |id, details, window, cx| {
-                                                items.push(
-                                                    this.render_entry(id, details, window, cx)
-                                                        .into_any_element(),
-                                                );
-                                            },
-                                        );
-                                    }
+                                    this.for_each_visible_entry(
+                                        range,
+                                        window,
+                                        cx,
+                                        &mut |id, details, window, cx| {
+                                            items.push(
+                                                this.render_entry(id, details, window, cx)
+                                                    .into_any_element(),
+                                            );
+                                        },
+                                    );
                                     items
                                 })
                             })
@@ -8216,22 +8443,8 @@ impl Render for ProjectPanel {
                                         |this, range, window, cx| {
                                             let mut items =
                                                 SmallVec::with_capacity(range.end - range.start);
-                                            let file_tag_list_item_count =
-                                                this.file_tag_list_item_count(cx);
-                                            let file_tag_items_end =
-                                                range.end.min(file_tag_list_item_count);
-                                            items.extend(
-                                                (range.start.min(file_tag_items_end)
-                                                    ..file_tag_items_end)
-                                                    .map(|_| 0),
-                                            );
-                                            let project_range_start = range
-                                                .start
-                                                .saturating_sub(file_tag_list_item_count);
-                                            let project_range_end =
-                                                range.end.saturating_sub(file_tag_list_item_count);
                                             this.iter_visible_entries(
-                                                project_range_start..project_range_end,
+                                                range,
                                                 window,
                                                 cx,
                                                 &mut |entry, _, entries, _, _| {
@@ -8254,7 +8467,7 @@ impl Render for ProjectPanel {
                                                 let ix = active_indent_guide.offset.y;
                                                 let Some((target_entry, worktree)) = maybe!({
                                                     let (worktree_id, entry) =
-                                                        this.project_entry_at_list_index(ix, cx)?;
+                                                        this.project_entry_at_list_index(ix)?;
                                                     let worktree = this
                                                         .project
                                                         .read(cx)
@@ -8343,57 +8556,18 @@ impl Render for ProjectPanel {
                                     |this, range, window, cx| {
                                         let mut items =
                                             SmallVec::with_capacity(range.end - range.start);
-                                        let file_tag_list_item_count =
-                                            this.file_tag_list_item_count(cx);
-                                        let project_range_start =
-                                            range.start.saturating_sub(file_tag_list_item_count);
-                                        let project_range_end =
-                                            range.end.saturating_sub(file_tag_list_item_count);
-
-                                        if let Some(section) = sticky_section_for_visible_range(
-                                            range.clone(),
-                                            file_tag_list_item_count,
-                                        ) {
-                                            let section_kind = match section {
-                                                StickyProjectPanelSection::Tags => {
-                                                    StickyProjectPanelCandidateKind::TagsSection
-                                                }
-                                                StickyProjectPanelSection::ProjectFiles {
-                                                    project_entry_index,
-                                                } => {
-                                                    StickyProjectPanelCandidateKind::ProjectFilesSection {
-                                                        project_entry_index,
-                                                    }
-                                                }
-                                            };
-                                            items.push(StickyProjectPanelCandidate {
-                                                kind: StickyProjectPanelCandidateKind::Sentinel,
-                                                depth: 2,
-                                            });
-                                            items.push(StickyProjectPanelCandidate {
-                                                kind: section_kind,
-                                                depth: 0,
-                                            });
-                                        }
-
                                         this.iter_visible_entries(
-                                            project_range_start..project_range_end,
+                                            range,
                                             window,
                                             cx,
                                             &mut |entry, index, entries, _, _| {
                                                 let (depth, _) =
                                                     Self::calculate_depth_and_difference(
                                                         entry, entries,
-                                                    );
+                                                );
                                                 items.push(StickyProjectPanelCandidate {
-                                                    kind: StickyProjectPanelCandidateKind::ProjectEntry {
-                                                        index,
-                                                    },
-                                                    depth: if file_tag_list_item_count > 0 {
-                                                        depth + 1
-                                                    } else {
-                                                        depth
-                                                    },
+                                                    index,
+                                                    depth,
                                                 });
                                             },
                                         );
@@ -8470,18 +8644,13 @@ impl Render for ProjectPanel {
                                     let scroll_handle = self.scroll_handle.clone();
                                     let entity_id = cx.entity().entity_id();
                                     move |event, window, cx| {
-                                        let state = scroll_handle.0.borrow();
-                                        let base_handle = &state.base_handle;
-                                        let current_offset = base_handle.offset();
-                                        let max_offset = base_handle.max_offset();
-                                        let delta = event.delta.pixel_delta(window.line_height());
-                                        let new_offset = (current_offset + delta)
-                                            .clamp(&max_offset.neg(), &Point::default());
-
-                                        if new_offset != current_offset {
-                                            base_handle.set_offset(new_offset);
-                                            cx.notify(entity_id);
-                                        }
+                                        handle_project_files_scroll_wheel(
+                                            &scroll_handle,
+                                            event,
+                                            window,
+                                            entity_id,
+                                            cx,
+                                        );
                                     }
                                 })
                                 .when(
@@ -8617,23 +8786,23 @@ impl Render for ProjectPanel {
                                     ))
                                 }),
                         )
-                        .size_full(),
-                )
-                .custom_scrollbars(
-                    {
-                        let mut scrollbars =
-                            Scrollbars::for_settings::<ProjectPanelScrollbarProxy>()
-                                .tracked_scroll_handle(&self.scroll_handle);
-                        if horizontal_scroll {
-                            scrollbars = scrollbars.with_track_along(
-                                ScrollAxes::Horizontal,
-                                cx.theme().colors().panel_background,
-                            );
-                        }
-                        scrollbars.notify_content()
-                    },
-                    window,
-                    cx,
+                                .custom_scrollbars(
+                                    {
+                                        let mut scrollbars =
+                                            Scrollbars::for_settings::<ProjectPanelScrollbarProxy>()
+                                                .tracked_scroll_handle(&self.scroll_handle);
+                                        if horizontal_scroll {
+                                            scrollbars = scrollbars.with_track_along(
+                                                ScrollAxes::Horizontal,
+                                                cx.theme().colors().panel_background,
+                                            );
+                                        }
+                                        scrollbars.notify_content()
+                                    },
+                                    window,
+                                    cx,
+                                ),
+                        )
                 )
                 .children(self.context_menu.as_ref().map(|(menu, position, _)| {
                     deferred(

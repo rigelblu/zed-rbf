@@ -6,6 +6,12 @@ title: "Zed RBF Changelog"
 
 ---
 
+# 🔵⋯ v0.57.0 (2026-08-01) — #zed-58
+- 2026-07-31 - feat (ux) | keep every tagged file that fits sitting still above a divider while scrolling the project tree underneath it, instead of the Tags shortcuts scrolling away exactly when the deep tree is being browsed [@zed-rbf]
+- 2026-08-01 - feat (ux) | drag the divider between `Tags` and `Project Files` to choose how much room Tags gets — down to just its label, up to its own natural height — so the project tree can have the panel when that's what you're working in; the height is remembered per workspace, and double-clicking the divider hands sizing back to Tags [@zed-rbf]
+
+---
+
 # 🔵⋯ v0.56.1 (2026-07-28) — #zed-56
 - 2026-07-28 - fix (ux) | see tagged files in a symlinked directory without expanding it first, instead of the Tags section reporting files that are sitting on disk as `⚠ Missing` and refusing to open them [@zed-rbf]
 
