@@ -243,7 +243,10 @@ run_logged jj log -r "${fork_base}..${stack_tip}" --no-graph -T 'change_id.short
 
 log ""
 log "== rebase =="
-if ! run_logged jj rebase -b @ -d "$upstream_ref"; then
+# The rbf stack lives on the fork's main (jj trunk()), so jj marks it immutable.
+# Transplant-and-force-push is this fork's sync model; the merge-base check above
+# guarantees only fork commits are rewritten, so overriding immutability is safe.
+if ! run_logged jj rebase -b @ -d "$upstream_ref" --ignore-immutable; then
   log "Error: jj rebase failed. Undo rebase/local-history changes with: jj op restore $pre_op"
   exit 1
 fi
