@@ -8167,17 +8167,16 @@ impl GitPanel {
             // Leaving History resets its live query but keeps the accordion cache
             // (`commit_history_file_states` and the expanded commit), so a tab
             // round trip restores the expanded rows without reloading.
-            GitPanelTab::Changes | GitPanelTab::Compare => {
+            GitPanelTab::Changes => {
                 self.focus_handle.focus(window, cx);
                 self.set_commit_history(CommitHistory::Loading, cx);
                 self.commit_history_refresh_task.take();
                 self.focused_history_file_entry = None;
                 self._repo_subscriptions.clear();
             }
-            GitPanelTab::History => {
-                self.focus_handle.focus(window, cx);
-                self.load_commit_history(cx);
-            }
+            // Compare reads the same history Changes would discard, so it only takes
+            // focus. It shared the Changes arm until an unreachable duplicate below it
+            // was removed, which meant selecting Compare silently wiped that state.
             GitPanelTab::Compare => {
                 self.focus_handle.focus(window, cx);
             }
