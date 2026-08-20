@@ -342,6 +342,7 @@ impl BranchDiff {
         })
     }
 
+    #[allow(dead_code)] // wiring for the in-progress Compare tab
     pub(crate) fn new_with_branch_base(
         project: Entity<Project>,
         workspace: Entity<Workspace>,

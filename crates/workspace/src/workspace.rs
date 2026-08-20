@@ -9945,7 +9945,7 @@ pub async fn restore_multiworkspace(
     };
 
     restore_inactive_multiworkspace_members(
-        window_handle.clone(),
+        window_handle,
         &active_workspace,
         workspaces,
         app_state.clone(),
@@ -9984,7 +9984,6 @@ async fn restore_inactive_multiworkspace_members(
 
         match workspace.location {
             SerializedWorkspaceLocation::Local => {
-                let window_handle = window_handle.clone();
                 if let Err(err) = cx
                     .update(|cx| {
                         Workspace::new_local(

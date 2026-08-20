@@ -165,7 +165,6 @@ impl MultiWorkspace {
                                         label: label.clone(),
                                         is_active,
                                     };
-                                    let workspace = workspace.clone();
                                     let close_workspace = workspace.clone();
 
                                     h_flex()
@@ -399,7 +398,6 @@ fn workspace_tab_actions_menu(
                                 .disabled(!open_in_new_window_enabled)
                                 .handler({
                                     let new_window_workspace = new_window_workspace.clone();
-                                    let new_window_key = new_window_key.clone();
                                     move |window, cx| {
                                         new_window_workspace
                                             .update(cx, |multi_workspace, cx| {

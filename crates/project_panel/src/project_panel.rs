@@ -336,6 +336,10 @@ impl FileTagStore {
             .unwrap_or_default()
     }
 
+    // Whole-store overwrite, used by the persist/load round-trip test. Production writes
+    // go through `persist_operation`, which read-modify-writes inside a transaction so
+    // concurrent tag edits cannot clobber each other.
+    #[cfg(test)]
     async fn persist(&self, db: &db::kvp::KeyValueStore) -> Result<()> {
         db.scoped(Self::KVP_NAMESPACE)
             .write(Self::KVP_KEY.to_string(), self.to_json()?)
@@ -1644,8 +1648,6 @@ impl ProjectPanel {
             });
 
         if current_file_tag_color.is_some() {
-            let entity = entity.clone();
-            let file_tag_key = file_tag_key.clone();
             menu.separator()
                 .item(ContextMenuEntry::new("Clear Tag").handler(move |_, cx| {
                     entity.update(cx, |this, cx| {

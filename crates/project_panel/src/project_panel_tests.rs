@@ -139,7 +139,6 @@ async fn test_files_created_through_external_symlink_remain_nested(cx: &mut gpui
             .worktrees(cx)
             .next()
             .expect("project should contain the temporary worktree")
-            .clone()
     });
     let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
     let workspace = window

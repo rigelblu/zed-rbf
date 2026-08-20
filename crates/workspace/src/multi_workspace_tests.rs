@@ -1330,12 +1330,12 @@ async fn test_opened_workspace_tabs_serialize_for_restart_when_ai_is_disabled(
         .expect("first workspace should open");
     cx.run_until_parked();
 
-    let window = first_open.window.clone();
+    let window = first_open.window;
     cx.update(|cx| {
         Workspace::new_local(
             vec![PathBuf::from(path!("/project_b"))],
             app_state.clone(),
-            Some(window.clone()),
+            Some(window),
             None,
             None,
             OpenMode::Activate,
@@ -1439,12 +1439,12 @@ async fn test_app_quit_rebinds_workspace_tabs_for_restart_when_ai_is_disabled(
         .expect("first workspace should open");
     cx.run_until_parked();
 
-    let window = first_open.window.clone();
+    let window = first_open.window;
     cx.update(|cx| {
         Workspace::new_local(
             vec![PathBuf::from(path!("/project_b"))],
             app_state,
-            Some(window.clone()),
+            Some(window),
             None,
             None,
             OpenMode::Activate,

@@ -1073,10 +1073,7 @@ impl MultiWorkspace {
         let mut desired_group_keys = Vec::new();
         for workspace in &ordered_workspaces {
             let key = self.project_group_key_for_workspace(workspace, cx);
-            if !desired_group_keys
-                .iter()
-                .any(|existing_key| *existing_key == key)
-            {
+            if !desired_group_keys.contains(&key) {
                 desired_group_keys.push(key);
             }
         }

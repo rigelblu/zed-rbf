@@ -1112,6 +1112,11 @@ too_many_arguments = "allow"
 # We often have large enum variants yet we rarely actually bother with splitting them up.
 large_enum_variant = "allow"
 
+# Same judgement as `large_enum_variant`, applied to `Result::Err`: `dap::ErrorResponse`
+# alone accounts for ~160 hits across the debugger test suites, and shrinking a type that
+# is shared with the real adapter API is not a change we want forced by a lint.
+result_large_err = "allow"
+
 # Boolean expressions can be hard to read, requiring only the minimal form gets in the way
 nonminimal_bool = "allow"
 

@@ -6821,7 +6821,6 @@ impl GitPanel {
                             "Compare",
                             Some(Box::new(ActivateCompareTab)),
                             {
-                                let git_panel = git_panel.clone();
                                 move |window, cx| {
                                     git_panel
                                         .update(cx, |git_panel, cx| {
@@ -6906,7 +6905,7 @@ impl GitPanel {
             .unwrap_or_else(|| path.display(path_style).to_string());
         let full_path = path.display(path_style).to_string();
         let header_tooltip_path = full_path.clone();
-        let repo_history_tooltip_path = full_path.clone();
+        let repo_history_tooltip_path = full_path;
 
         h_flex()
             .px_2()
@@ -6926,7 +6925,6 @@ impl GitPanel {
                     )
                     .hoverable_tooltip(move |_, cx| {
                         Tooltip::with_meta("File History", None, header_tooltip_path.clone(), cx)
-                            .into()
                     }),
             )
             .child(
@@ -7108,7 +7106,7 @@ impl GitPanel {
                                 ))
                             })
                             .trigger_with_tooltip(
-                                Button::new("git-panel-compare-base", base_label.clone())
+                                Button::new("git-panel-compare-base", base_label)
                                     .style(ButtonStyle::Subtle)
                                     .label_size(LabelSize::Small)
                                     .start_icon(
@@ -10364,6 +10362,7 @@ impl GitPanel {
         self.active_repository.as_ref()
     }
 
+    #[allow(dead_code)] // wiring for the in-progress Compare tab
     pub(crate) fn compare_base(&self) -> Option<&DiffBase> {
         self.compare_base.as_ref()
     }
