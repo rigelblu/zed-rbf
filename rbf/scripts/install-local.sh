@@ -55,18 +55,31 @@ set_plist_string() {
   /usr/libexec/PlistBuddy -c "Add :${key} string ${value}" "$plist"
 }
 
-running_app_pids_for_executable() {
-  local app_executable="$1"
+running_app_pids_for_bundle() {
+  local app_bundle="${1%/}"
+  local macos_dir="${app_bundle}/Contents/MacOS/"
 
-  ps -axww -o pid= -o command= | awk -v app_executable="$app_executable" '
+  # Match every process running out of the bundle rather than one named executable.
+  # The binary has been renamed before (zed -> zed-rbf), and a guard keyed on the
+  # name fails open in exactly the case it exists for: an older build still running
+  # under the previous name.
+  ps -axww -o pid= -o command= | awk -v prefix="$macos_dir" '
     {
       pid = $1
       sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", $0)
-      if ($0 == app_executable || index($0, app_executable " ") == 1) {
+      if (index($0, prefix) == 1) {
         print pid
       }
     }
   '
+}
+
+installed_bundle_identifier() {
+  local app_bundle="$1"
+  local plist="${app_bundle}/Contents/Info.plist"
+
+  [[ -f "$plist" ]] || return 0
+  /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$plist" 2>/dev/null || true
 }
 
 request_app_quit() {
@@ -81,41 +94,50 @@ APPLESCRIPT
 }
 
 wait_for_app_exit() {
-  local target_bundle_id="$1"
-  local app_executable="$2"
-  local timeout_seconds="$3"
+  local app_bundle="$1"
+  local timeout_seconds="$2"
   local deadline=$((SECONDS + timeout_seconds))
   local pids
 
   while true; do
-    pids="$(running_app_pids_for_executable "$app_executable")"
+    pids="$(running_app_pids_for_bundle "$app_bundle")"
     if [[ -z "$pids" ]]; then
       return
     fi
     if (( SECONDS >= deadline )); then
-      fail "timed out waiting for app with bundle identifier $target_bundle_id to quit; still running pid(s): ${pids//$'\n'/, }"
+      fail "timed out waiting for $app_bundle to quit; still running pid(s): ${pids//$'\n'/, } — quit it manually and re-run"
     fi
     sleep 1
   done
 }
 
-quit_running_app_before_relaunch() {
-  local target_bundle_id="$1"
-  local app_executable="$2"
-  local timeout_seconds="$3"
+# Replacing a bundle underneath a live process leaves macOS validating a code
+# signature that no longer matches what is on disk. The process keeps running, but
+# brokered services stop working — the out-of-process open/save panel dies on
+# connect, and TCC grants are revoked — until the app is relaunched. So this runs
+# on every install, not just the --open path that relaunches afterwards.
+quit_running_app_before_install() {
+  local app_bundle="$1"
+  local timeout_seconds="$2"
   local pids
+  local target_bundle_id
 
-  pids="$(running_app_pids_for_executable "$app_executable")"
+  pids="$(running_app_pids_for_bundle "$app_bundle")"
   if [[ -z "$pids" ]]; then
     return
   fi
 
-  echo "Requesting quit for running app with bundle identifier: $target_bundle_id"
+  # Quit the identifier the INSTALLED bundle declares, not the one this build
+  # carries: the two differ whenever --bundle-id changed since that app was built.
+  target_bundle_id="$(installed_bundle_identifier "$app_bundle")"
+  [[ -n "$target_bundle_id" ]] || fail "cannot read CFBundleIdentifier from $app_bundle; quit the running app manually and re-run"
+
+  echo "Quitting running app before install: $app_bundle ($target_bundle_id)"
   if ! request_app_quit "$target_bundle_id" >/dev/null; then
     fail "failed to request quit for running app with bundle identifier $target_bundle_id"
   fi
   echo "Waiting for running app to exit"
-  wait_for_app_exit "$target_bundle_id" "$app_executable" "$timeout_seconds"
+  wait_for_app_exit "$app_bundle" "$timeout_seconds"
 }
 
 download_and_unpack() {
@@ -302,9 +324,10 @@ done
 [[ -f "$cargo_toml" ]] || fail "missing $cargo_toml"
 command -v cargo >/dev/null 2>&1 || fail "cargo not found"
 command -v rustc >/dev/null 2>&1 || fail "rustc not found"
-if [[ "$open_result" == "true" ]]; then
-  command -v /usr/bin/osascript >/dev/null 2>&1 || fail "osascript not found"
-fi
+# Needed on every run now, not just --open: quitting a running app before replacing
+# its bundle is unconditional.
+command -v /usr/bin/osascript >/dev/null 2>&1 || fail "osascript not found"
+command -v codesign >/dev/null 2>&1 || fail "codesign not found"
 [[ -x /usr/libexec/PlistBuddy ]] || fail "PlistBuddy not found"
 
 host_triple="$(rustc -vV | sed -n 's/^host: //p')"
@@ -457,17 +480,21 @@ chmod +x "$git_cache"
 git_target="${app_path}/Contents/MacOS/git"
 cp "$git_cache" "$git_target"
 
-if command -v codesign >/dev/null 2>&1; then
-  echo "Ad-hoc signing ${app_path}"
-  codesign --force --deep --sign - "$app_path" >/dev/null
-fi
+entitlements_source="${repo_root}/crates/zed/resources/zed.entitlements"
+[[ -f "$entitlements_source" ]] || fail "missing entitlements: $entitlements_source"
+entitlements_target="${app_path}/Contents/Resources/zed.entitlements"
+# Signing without entitlements produces an app that runs but is quietly stripped of
+# file access, JIT, and device permissions. associated-domains is the one entry an
+# ad-hoc signature cannot carry — it is bound to a real Team ID — so drop it and keep
+# the rest, matching what script/bundle-mac does for unsigned local bundles.
+sed '/com.apple.developer.associated-domains/,+1d' "$entitlements_source" > "$entitlements_target"
+echo "Ad-hoc signing ${app_path}"
+codesign --force --deep --entitlements "$entitlements_target" --sign - "$app_path" >/dev/null
 
 mkdir -p "$install_dir"
 install_destination="${install_dir}/${app_name}.app"
 destination="$install_destination"
-if [[ "$open_result" == "true" ]]; then
-  quit_running_app_before_relaunch "$bundle_id" "${destination}/Contents/MacOS/zed-rbf" "$quit_timeout_seconds"
-fi
+quit_running_app_before_install "$destination" "$quit_timeout_seconds"
 install_temp_dir="$(mktemp -d "${install_dir}/.${app_name}.install.XXXXXX")"
 temporary_destination="${install_temp_dir}/${app_name}.app"
 install_backup="${install_temp_dir}/previous.app"

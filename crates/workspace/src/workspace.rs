@@ -3061,28 +3061,33 @@ impl Workspace {
             let abs_path = cx.prompt_for_paths(path_prompt_options);
 
             cx.spawn_in(window, async move |workspace, cx| {
-                let Ok(result) = abs_path.await else {
-                    return Ok(());
+                // A dropped channel means the platform never fired the dialog's completion
+                // handler, so the failure carries no message of its own. Route it through the
+                // same fallback as a reported failure — returning early here would leave the
+                // action looking like it simply did nothing.
+                let reported_error = match abs_path.await {
+                    Ok(Ok(selection)) => {
+                        tx.send(selection).ok();
+                        return anyhow::Ok(());
+                    }
+                    Ok(Err(err)) => Some(err),
+                    Err(oneshot::Canceled) => None,
                 };
 
-                match result {
-                    Ok(result) => {
-                        tx.send(result).ok();
+                let rx = workspace.update_in(cx, |workspace, window, cx| {
+                    match reported_error {
+                        Some(err) => workspace
+                            .show_error(workspace_error::PortalError::new(err.to_string()), cx),
+                        None => workspace.show_error(workspace_error::SystemPathPromptError, cx),
                     }
-                    Err(err) => {
-                        let rx = workspace.update_in(cx, |workspace, window, cx| {
-                            workspace
-                                .show_error(workspace_error::PortalError::new(err.to_string()), cx);
-                            let prompt = workspace.on_prompt_for_open_path.take().unwrap();
-                            let rx = prompt(workspace, lister, window, cx);
-                            workspace.on_prompt_for_open_path = Some(prompt);
-                            rx
-                        })?;
-                        if let Ok(path) = rx.await {
-                            tx.send(path).ok();
-                        }
-                    }
-                };
+                    let prompt = workspace.on_prompt_for_open_path.take().unwrap();
+                    let rx = prompt(workspace, lister, window, cx);
+                    workspace.on_prompt_for_open_path = Some(prompt);
+                    rx
+                })?;
+                if let Ok(path) = rx.await {
+                    tx.send(path).ok();
+                }
                 anyhow::Ok(())
             })
             .detach();
@@ -3124,26 +3129,35 @@ impl Workspace {
                     .unwrap_or_else(|| PathBuf::from(""));
                 cx.prompt_for_new_path(&relative_to, suggested_name.as_deref())
             })?;
-            let abs_path = match abs_path.await? {
-                Ok(path) => path,
-                Err(err) => {
-                    let rx = workspace.update_in(cx, |workspace, window, cx| {
-                        workspace
-                            .show_error(workspace_error::PortalError::new(err.to_string()), cx);
-
-                        let prompt = workspace.on_prompt_for_new_path.take().unwrap();
-                        let rx = prompt(workspace, lister, suggested_name, window, cx);
-                        workspace.on_prompt_for_new_path = Some(prompt);
-                        rx
-                    })?;
-                    if let Ok(path) = rx.await {
-                        tx.send(path).ok();
-                    }
+            // A dropped channel means the platform never fired the dialog's completion
+            // handler, so the failure carries no message of its own. Route it through the
+            // same fallback as a reported failure; propagating it with `?` would only bury
+            // it in a detached task, where nothing surfaces it.
+            let reported_error = match abs_path.await {
+                Ok(Ok(abs_path)) => {
+                    tx.send(abs_path.map(|path| vec![path])).ok();
                     return anyhow::Ok(());
                 }
+                Ok(Err(err)) => Some(err),
+                Err(oneshot::Canceled) => None,
             };
 
-            tx.send(abs_path.map(|path| vec![path])).ok();
+            let rx = workspace.update_in(cx, |workspace, window, cx| {
+                match reported_error {
+                    Some(err) => {
+                        workspace.show_error(workspace_error::PortalError::new(err.to_string()), cx)
+                    }
+                    None => workspace.show_error(workspace_error::SystemPathPromptError, cx),
+                }
+
+                let prompt = workspace.on_prompt_for_new_path.take().unwrap();
+                let rx = prompt(workspace, lister, suggested_name, window, cx);
+                workspace.on_prompt_for_new_path = Some(prompt);
+                rx
+            })?;
+            if let Ok(path) = rx.await {
+                tx.send(path).ok();
+            }
             anyhow::Ok(())
         })
         .detach();

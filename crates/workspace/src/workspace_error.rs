@@ -202,3 +202,33 @@ impl WorkspaceError for PortalError {
         )
     }
 }
+
+/// The platform's file dialog never opened: its completion handler was dropped
+/// without ever firing, so there is no message from the dialog to report.
+///
+/// Distinct from [`PortalError`], which carries a failure the dialog was able to
+/// describe. Severity is [`ErrorSeverity::Error`] rather than `Critical` because
+/// the caller recovers by falling back to Zed's own path picker.
+pub struct SystemPathPromptError;
+
+impl WorkspaceError for SystemPathPromptError {
+    fn primary_message(&self) -> SharedString {
+        "The system file dialog didn't open".into()
+    }
+
+    fn secondary_message(&self) -> Option<SharedString> {
+        Some(
+            "Opening Zed's file picker instead. On macOS this usually means the app bundle was \
+             replaced while running — quit and reopen Zed to restore it."
+                .into(),
+        )
+    }
+
+    fn primary_action(&self) -> ErrorAction {
+        ErrorAction::dismiss()
+    }
+
+    fn severity(&self) -> ErrorSeverity {
+        ErrorSeverity::Error
+    }
+}
