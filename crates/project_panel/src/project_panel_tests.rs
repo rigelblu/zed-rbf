@@ -12994,6 +12994,25 @@ async fn test_file_tags_context_menu_selects_tagged_row(cx: &mut gpui::TestAppCo
     });
 }
 
+#[test]
+fn test_file_tag_menu_color_indicators() {
+    let untagged_choices = ProjectPanel::file_tag_menu_choices(None);
+    assert_eq!(
+        untagged_choices.map(|(color, _)| color.label()),
+        ["Red", "Orange", "Yellow", "Green", "Blue", "Purple"]
+    );
+    assert!(untagged_choices.into_iter().all(|(_, selected)| !selected));
+
+    let blue_choices = ProjectPanel::file_tag_menu_choices(Some(FileTagColor::Blue));
+    assert_eq!(
+        blue_choices
+            .into_iter()
+            .filter_map(|(color, selected)| selected.then_some(color))
+            .collect::<Vec<_>>(),
+        vec![FileTagColor::Blue]
+    );
+}
+
 #[gpui::test]
 async fn test_file_tags_remain_visible_while_project_files_scroll(cx: &mut gpui::TestAppContext) {
     init_test(cx);

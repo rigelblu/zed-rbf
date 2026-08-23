@@ -1628,17 +1628,15 @@ impl ProjectPanel {
         current_file_tag_color: Option<FileTagColor>,
         entity: Entity<Self>,
     ) -> ContextMenu {
-        let menu = FileTagColor::ALL
+        let menu = Self::file_tag_menu_choices(current_file_tag_color)
             .into_iter()
-            .fold(menu, |menu, file_tag_color| {
+            .fold(menu, |menu, (file_tag_color, selected)| {
                 let entity = entity.clone();
                 let file_tag_key = file_tag_key.clone();
                 menu.item(
                     ContextMenuEntry::new(file_tag_color.label())
-                        .toggle(
-                            IconPosition::Start,
-                            current_file_tag_color == Some(file_tag_color),
-                        )
+                        .leading_color_indicator(Color::Custom(file_tag_color.color()))
+                        .toggle(IconPosition::End, selected)
                         .handler(move |_, cx| {
                             entity.update(cx, |this, cx| {
                                 this.set_file_tag(file_tag_key.clone(), file_tag_color, cx);
@@ -1648,15 +1646,24 @@ impl ProjectPanel {
             });
 
         if current_file_tag_color.is_some() {
-            menu.separator()
-                .item(ContextMenuEntry::new("Clear Tag").handler(move |_, cx| {
-                    entity.update(cx, |this, cx| {
-                        this.clear_file_tag(&file_tag_key, cx);
-                    });
-                }))
+            menu.separator().item(
+                ContextMenuEntry::new("Clear Tag")
+                    .reserve_leading_indicator_space()
+                    .handler(move |_, cx| {
+                        entity.update(cx, |this, cx| {
+                            this.clear_file_tag(&file_tag_key, cx);
+                        });
+                    }),
+            )
         } else {
             menu
         }
+    }
+
+    fn file_tag_menu_choices(
+        current_file_tag_color: Option<FileTagColor>,
+    ) -> [(FileTagColor, bool); 6] {
+        FileTagColor::ALL.map(|color| (color, current_file_tag_color == Some(color)))
     }
 
     fn file_tag_key_for_worktree_entry(worktree: &Worktree, entry: &Entry) -> Option<FileTagKey> {

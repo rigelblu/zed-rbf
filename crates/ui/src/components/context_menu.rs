@@ -1,6 +1,6 @@
 use crate::{
-    ButtonCommon, ButtonStyle, IconButtonShape, KeyBinding, List, ListItem, ListSeparator,
-    ListSubHeader, Tooltip, prelude::*, utils::WithRemSize,
+    ButtonCommon, ButtonStyle, IconButtonShape, Indicator, KeyBinding, List, ListItem,
+    ListSeparator, ListSubHeader, Tooltip, prelude::*, utils::WithRemSize,
 };
 use gpui::{
     Action, Anchor, AnyElement, App, Bounds, DismissEvent, Entity, EventEmitter, FocusHandle,
@@ -81,6 +81,7 @@ impl ContextMenuItem {
 
 pub struct ContextMenuEntry {
     toggle: Option<(IconPosition, bool)>,
+    leading_indicator: Option<ContextMenuEntryLeadingIndicator>,
     label: SharedString,
     icon: Option<IconName>,
     custom_icon_path: Option<SharedString>,
@@ -99,10 +100,24 @@ pub struct ContextMenuEntry {
     show_end_slot_on_hover: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ContextMenuEntryLeadingIndicator {
+    Reserved,
+    Dot(Color),
+}
+
+fn context_menu_entry_accessibility(toggle: Option<(IconPosition, bool)>) -> (Role, Option<bool>) {
+    match toggle {
+        Some((_, checked)) => (Role::MenuItemCheckBox, Some(checked)),
+        None => (Role::MenuItem, None),
+    }
+}
+
 impl ContextMenuEntry {
     pub fn new(label: impl Into<SharedString>) -> Self {
         ContextMenuEntry {
             toggle: None,
+            leading_indicator: None,
             label: label.into(),
             icon: None,
             custom_icon_path: None,
@@ -163,6 +178,16 @@ impl ContextMenuEntry {
 
     pub fn toggle(mut self, toggle_position: IconPosition, toggled: bool) -> Self {
         self.toggle = Some((toggle_position, toggled));
+        self
+    }
+
+    pub fn leading_color_indicator(mut self, color: Color) -> Self {
+        self.leading_indicator = Some(ContextMenuEntryLeadingIndicator::Dot(color));
+        self
+    }
+
+    pub fn reserve_leading_indicator_space(mut self) -> Self {
+        self.leading_indicator = Some(ContextMenuEntryLeadingIndicator::Reserved);
         self
     }
 
@@ -558,6 +583,7 @@ impl ContextMenu {
     ) -> Self {
         self.items.push(ContextMenuItem::Entry(ContextMenuEntry {
             toggle: None,
+            leading_indicator: None,
             label: label.into(),
             handler: Rc::new(move |_, window, cx| handler(window, cx)),
             secondary_handler: None,
@@ -589,6 +615,7 @@ impl ContextMenu {
     ) -> Self {
         self.items.push(ContextMenuItem::Entry(ContextMenuEntry {
             toggle: None,
+            leading_indicator: None,
             label: label.into(),
             handler: Rc::new(move |_, window, cx| handler(window, cx)),
             secondary_handler: None,
@@ -620,6 +647,7 @@ impl ContextMenu {
     ) -> Self {
         self.items.push(ContextMenuItem::Entry(ContextMenuEntry {
             toggle: None,
+            leading_indicator: None,
             label: label.into(),
             handler: Rc::new(move |_, window, cx| handler(window, cx)),
             secondary_handler: None,
@@ -664,6 +692,7 @@ impl ContextMenu {
     ) -> Self {
         self.items.push(ContextMenuItem::Entry(ContextMenuEntry {
             toggle: Some((position, toggled)),
+            leading_indicator: None,
             label: label.into(),
             handler: Rc::new(move |_, window, cx| handler(window, cx)),
             secondary_handler: None,
@@ -768,6 +797,7 @@ impl ContextMenu {
             } else {
                 None
             },
+            leading_indicator: None,
             label: label.into(),
             action: Some(action.boxed_clone()),
             handler: Rc::new(move |context, window, cx| {
@@ -801,6 +831,7 @@ impl ContextMenu {
     ) -> Self {
         self.items.push(ContextMenuItem::Entry(ContextMenuEntry {
             toggle: None,
+            leading_indicator: None,
             label: label.into(),
             action: Some(action.boxed_clone()),
             handler: Rc::new(move |context, window, cx| {
@@ -838,6 +869,7 @@ impl ContextMenu {
     ) -> Self {
         self.items.push(ContextMenuItem::Entry(ContextMenuEntry {
             toggle: None,
+            leading_indicator: None,
             label: label.into(),
             action: Some(action.boxed_clone()),
             handler: Rc::new(move |_, window, cx| {
@@ -1870,6 +1902,7 @@ impl ContextMenu {
     ) -> impl IntoElement {
         let ContextMenuEntry {
             toggle,
+            leading_indicator,
             label,
             handler,
             icon,
@@ -1981,6 +2014,7 @@ impl ContextMenu {
         };
 
         let aside_trigger_bounds = self.aside_trigger_bounds.clone();
+        let (aria_role, aria_checked) = context_menu_entry_accessibility(*toggle);
 
         div()
             .id(("context-menu-child", ix))
@@ -2017,12 +2051,8 @@ impl ContextMenu {
                     .group_name("label_container")
                     .inset(true)
                     .disabled(*disabled)
-                    .aria_role(if toggle.is_some() {
-                        Role::MenuItemCheckBox
-                    } else {
-                        Role::MenuItem
-                    })
-                    .when_some(*toggle, |item, (_, checked)| item.aria_checked(checked))
+                    .aria_role(aria_role)
+                    .when_some(aria_checked, |item, checked| item.aria_checked(checked))
                     .when(is_active_descendant, |item| item.aria_active_descendant())
                     .aria_label(label.clone())
                     .when_some(keyboard_shortcut, |item, keyboard_shortcut| {
@@ -2107,6 +2137,7 @@ impl ContextMenu {
                     .when_some(*toggle, |list_item, (position, toggled)| {
                         let contents = div()
                             .flex_none()
+                            .debug_selector(|| format!("MENU_ITEM_TOGGLE-{label}"))
                             .child(
                                 Icon::new(icon.unwrap_or(IconName::Check))
                                     .color(icon_color)
@@ -2117,6 +2148,39 @@ impl ContextMenu {
                         match position {
                             IconPosition::Start => list_item.start_slot(contents),
                             IconPosition::End => list_item.end_slot(contents),
+                        }
+                    })
+                    .when_some(*leading_indicator, |list_item, leading_indicator| {
+                        let indicator = div()
+                            .flex_none()
+                            .debug_selector(|| format!("MENU_ITEM_INDICATOR-{label}"))
+                            .child(Indicator::dot().color(match leading_indicator {
+                                ContextMenuEntryLeadingIndicator::Reserved => Color::Default,
+                                ContextMenuEntryLeadingIndicator::Dot(color) => color,
+                            }))
+                            .when(
+                                leading_indicator == ContextMenuEntryLeadingIndicator::Reserved,
+                                |indicator| indicator.invisible(),
+                            );
+
+                        if let Some((IconPosition::Start, toggled)) = toggle {
+                            list_item.start_slot(
+                                h_flex()
+                                    .gap_1p5()
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .child(
+                                                Icon::new(icon.unwrap_or(IconName::Check))
+                                                    .color(icon_color)
+                                                    .size(*icon_size),
+                                            )
+                                            .when(!toggled, |toggle| toggle.invisible()),
+                                    )
+                                    .child(indicator),
+                            )
+                        } else {
+                            list_item.start_slot(indicator)
                         }
                     })
                     .child(
@@ -2483,6 +2547,74 @@ mod tests {
     use gpui::TestAppContext;
 
     use super::*;
+
+    #[gpui::test]
+    fn context_menu_entry_renders_leading_indicator_with_end_toggle(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let selected_entry = ContextMenuEntry::new("Blue")
+            .leading_color_indicator(Color::Info)
+            .toggle(IconPosition::End, true);
+
+        assert_eq!(
+            selected_entry.leading_indicator,
+            Some(ContextMenuEntryLeadingIndicator::Dot(Color::Info))
+        );
+        assert_eq!(selected_entry.toggle, Some((IconPosition::End, true)));
+        assert_eq!(
+            context_menu_entry_accessibility(selected_entry.toggle),
+            (Role::MenuItemCheckBox, Some(true))
+        );
+
+        let unselected_entry = ContextMenuEntry::new("Red")
+            .leading_color_indicator(Color::Error)
+            .toggle(IconPosition::End, false);
+        assert_eq!(
+            context_menu_entry_accessibility(unselected_entry.toggle),
+            (Role::MenuItemCheckBox, Some(false))
+        );
+
+        let clear_entry = ContextMenuEntry::new("Clear Tag").reserve_leading_indicator_space();
+        assert_eq!(
+            clear_entry.leading_indicator,
+            Some(ContextMenuEntryLeadingIndicator::Reserved)
+        );
+        assert_eq!(clear_entry.toggle, None);
+        assert_eq!(
+            context_menu_entry_accessibility(clear_entry.toggle),
+            (Role::MenuItem, None)
+        );
+
+        let ordinary_entry = ContextMenuEntry::new("Ordinary");
+        assert_eq!(ordinary_entry.leading_indicator, None);
+        assert_eq!(ordinary_entry.toggle, None);
+
+        let cx = cx.add_empty_window();
+        let context_menu = cx.update(|window, cx| {
+            ContextMenu::build(window, cx, |menu, _, _| {
+                menu.item(selected_entry)
+                    .item(unselected_entry)
+                    .item(clear_entry)
+                    .item(ordinary_entry)
+            })
+        });
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(px(320.), px(240.)),
+            |_, _| context_menu.into_any_element(),
+        );
+
+        assert!(cx.debug_bounds("MENU_ITEM_INDICATOR-Blue").is_some());
+        assert!(cx.debug_bounds("MENU_ITEM_TOGGLE-Blue").is_some());
+        assert!(cx.debug_bounds("MENU_ITEM_INDICATOR-Red").is_some());
+        assert!(cx.debug_bounds("MENU_ITEM_TOGGLE-Red").is_some());
+        assert!(cx.debug_bounds("MENU_ITEM_INDICATOR-Clear Tag").is_some());
+        assert!(cx.debug_bounds("MENU_ITEM_INDICATOR-Ordinary").is_none());
+    }
 
     #[test]
     fn submenu_safety_threshold_tracks_open_direction() {
