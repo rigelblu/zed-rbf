@@ -59,10 +59,10 @@ cargo test -p project --test integration
 - `cargo check --workspace` does **not** compile `#[cfg(test)]` code. Four defects lived only there.
 
 # 🔵⋯ Fork Version
-`RBF_VERSION` lives in this directory. `crates/zed/build.rs` injects it at build time as `ZED_RBF_VERSION`.
+`VERSION` lives in this directory. `crates/zed/build.rs` injects it at build time as `ZED_RBF_VERSION`.
 
 To bump the visible fork version:
-1. Edit `rbf/RBF_VERSION`.
+1. Edit `rbf/VERSION`.
 2. Rebuild the app.
 3. Verify with the bundled app binary, for example `"$HOME/Applications/Zed RBF.app/Contents/MacOS/zed-rbf" --system-specs`.
 

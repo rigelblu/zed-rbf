@@ -6,6 +6,14 @@ title: "Zed RBF Changelog"
 
 ---
 
+# 🔵⋯ v0.61.0 (2026-08-24) — #zed-60, #zed-61, #zed-63
+- 2026-08-20 - fix (ux) | open files and folders from File → Open and ⌘O again after installing a new build over a running app, instead of the macOS panel beachballing and never appearing [@zed-rbf]
+- 2026-08-20 - fix (ux) | keep the loaded commit history when switching to the Git panel's Compare tab, instead of Compare silently running the Changes reset and discarding it [@zed-rbf]
+- 2026-08-24 - feat (ux) | see each tag's color as a dot beside its name when choosing one, with a check still marking the tag already applied, instead of picking from names alone [@zed-rbf]
+- Note: `v0.58.0`, `v0.59.0`, and `v0.60.0` were reserved at design time and never cut. `#zed-62` (keep `./script/clippy` green) also ships here but is developer-only, so it carries no entry.
+
+---
+
 # 🔵⋯ v0.57.0 (2026-08-01) — #zed-58
 - 2026-07-31 - feat (ux) | keep every tagged file that fits sitting still above a divider while scrolling the project tree underneath it, instead of the Tags shortcuts scrolling away exactly when the deep tree is being browsed [@zed-rbf]
 - 2026-08-01 - feat (ux) | drag the divider between `Tags` and `Project Files` to choose how much room Tags gets — down to just its label, up to its own natural height — so the project tree can have the panel when that's what you're working in; the height is remembered per workspace, and double-clicking the divider hands sizing back to Tags [@zed-rbf]

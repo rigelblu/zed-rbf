@@ -122,6 +122,7 @@ The configured order is the display order. `~` and `$VAR` expand. Missing paths 
 - Mark important files with lightweight Zed-local color tags from the Project Panel file-row workflow, visible as markers on file rows
 - View and manage tagged files in a dedicated Tags section at the top of the Project Panel, grouped by color with path context and drag/keyboard support
 - Toggle the Tags section between Tree View and Flat View via an ellipsis menu, with expandable/collapsible categories and context-menu controls to change/clear tags
+- See each tag's color as a dot beside its name in both tag-choice menus — the nested `Tag File` submenu and the direct Tags-row menu — with a check still marking the tag already applied, so choosing a color never means remembering the palette; `Clear Tag` keeps an empty dot slot so its label stays aligned
 - Handle missing/unresolved tagged paths by showing them as explicit missing rows in the Tags section so they can be easily cleared
 - Resolve tagged files that live inside symlinked directories without expanding those directories first, while leaving symlinked trees with nothing tagged inside them unscanned
 - Keep `Tags`, `Project Files`, and project directory headers sticky together while scrolling the Project Panel
@@ -237,7 +238,7 @@ Verify the default installed app identity:
 "$HOME/Applications/Zed RBF.app/Contents/MacOS/zed-rbf" --system-specs
 ```
 
-For a custom `--install-dir` or `--name`, run `--system-specs` from that app bundle instead. The output should include a `Zed RBF: v...` line matching `rbf/RBF_VERSION` and preserve the upstream `Zed: ...` line.
+For a custom `--install-dir` or `--name`, run `--system-specs` from that app bundle instead. The output should include a `Zed RBF: v...` line matching `rbf/VERSION` and preserve the upstream `Zed: ...` line.
 
 ## 🟠⋯ Weekly Build
 After the checkout has been synced and conflicts are resolved, build and install it as the weekly app:
