@@ -432,6 +432,28 @@ pub trait SerializableItem: Item {
         cx: &mut Context<Self>,
     ) -> Option<Task<Result<()>>>;
 
+    fn checkpoint(
+        &mut self,
+        workspace: &mut Workspace,
+        item_id: ItemId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        self.serialize(workspace, item_id, false, window, cx)
+            .unwrap_or_else(|| Task::ready(Ok(())))
+    }
+
+    fn checkpoint_in_transaction(
+        &mut self,
+        workspace: &mut Workspace,
+        item_id: ItemId,
+        _transaction: db::sqlez::thread_safe_connection::WriteTransaction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        self.checkpoint(workspace, item_id, window, cx)
+    }
+
     fn should_serialize(&self, event: &Self::Event) -> bool;
 }
 
@@ -444,6 +466,19 @@ pub trait SerializableItemHandle: ItemHandle {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<Task<Result<()>>>;
+    fn checkpoint(
+        &self,
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<()>>;
+    fn checkpoint_in_transaction(
+        &self,
+        workspace: &mut Workspace,
+        transaction: db::sqlez::thread_safe_connection::WriteTransaction,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<()>>;
     fn should_serialize(&self, event: &dyn Any, cx: &App) -> bool;
 }
 
@@ -464,6 +499,35 @@ where
     ) -> Option<Task<Result<()>>> {
         self.update(cx, |this, cx| {
             this.serialize(workspace, cx.entity_id().as_u64(), closing, window, cx)
+        })
+    }
+
+    fn checkpoint(
+        &self,
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        self.update(cx, |this, cx| {
+            this.checkpoint(workspace, cx.entity_id().as_u64(), window, cx)
+        })
+    }
+
+    fn checkpoint_in_transaction(
+        &self,
+        workspace: &mut Workspace,
+        transaction: db::sqlez::thread_safe_connection::WriteTransaction,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        self.update(cx, |this, cx| {
+            this.checkpoint_in_transaction(
+                workspace,
+                cx.entity_id().as_u64(),
+                transaction,
+                window,
+                cx,
+            )
         })
     }
 

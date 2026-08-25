@@ -24,7 +24,7 @@ use language::{
     proto::serialize_anchor as serialize_text_anchor,
 };
 use lsp::DiagnosticSeverity;
-use multi_buffer::{BufferOffset, MultiBufferOffset, PathKey};
+use multi_buffer::{BufferOffset, MultiBufferOffset, PathKey, ToOffset as _};
 use project::{
     File, Project, ProjectItem as _, ProjectPath, git_store::GitStore, lsp_store::FormatTrigger,
     project_settings::ProjectSettings, search::SearchQuery,
@@ -1514,6 +1514,210 @@ impl SerializableItem for Editor {
         }))
     }
 
+    fn checkpoint(
+        &mut self,
+        workspace: &mut Workspace,
+        item_id: ItemId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        self.serialize_selections = Task::ready(());
+        self.serialize_folds = Task::ready(());
+        self.scroll_manager.cancel_pending_save();
+
+        let Some(buffer_task) = self.serialize(workspace, item_id, false, window, cx) else {
+            return Task::ready(Ok(()));
+        };
+        let Some(workspace_id) = workspace.database_id() else {
+            return Task::ready(Err(anyhow!("workspace has no durable persistence id")));
+        };
+
+        let buffer_snapshot = self.buffer().read(cx).snapshot(cx);
+        let selections = self
+            .selections
+            .disjoint_anchors_arc()
+            .iter()
+            .map(|selection| {
+                (
+                    selection.start.to_offset(&buffer_snapshot).0,
+                    selection.end.to_offset(&buffer_snapshot).0,
+                )
+            })
+            .collect::<Vec<_>>();
+        let display_snapshot = self
+            .display_map
+            .update(cx, |display_map, cx| display_map.snapshot(cx));
+        let scroll_anchor = self.scroll_manager.native_anchor(&display_snapshot, cx);
+        let scroll_top_row = scroll_anchor.top_row(&buffer_snapshot);
+        let folds =
+            display_snapshot
+                .buffer_snapshot()
+                .as_singleton()
+                .and_then(|single_buffer_snapshot| {
+                    let file_path = self.buffer().read(cx).as_singleton().and_then(|buffer| {
+                        project::File::from_dyn(buffer.read(cx).file())
+                            .map(|file| Arc::<Path>::from(file.abs_path(cx)))
+                    })?;
+                    Some((
+                        file_path,
+                        crate::fold::serialized_folds_for_persistence(
+                            &display_snapshot,
+                            single_buffer_snapshot,
+                        ),
+                    ))
+                });
+        let db = EditorDb::global(cx);
+
+        cx.spawn_in(window, async move |_this, _cx| {
+            buffer_task.await?;
+            db.save_editor_selections(item_id, workspace_id, selections)
+                .await
+                .with_context(|| {
+                    format!(
+                        "persisting exact editor selections for editor {item_id}, workspace {workspace_id:?}"
+                    )
+                })?;
+            db.save_scroll_position(
+                item_id,
+                workspace_id,
+                scroll_top_row,
+                scroll_anchor.offset.x,
+                scroll_anchor.offset.y,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "persisting exact scroll position for editor {item_id}, workspace {workspace_id:?}"
+                )
+            })?;
+            if let Some((file_path, folds)) = folds {
+                if folds.is_empty() {
+                    db.delete_file_folds(workspace_id, file_path)
+                        .await
+                        .with_context(|| {
+                            format!("deleting exact file folds for workspace {workspace_id:?}")
+                        })?;
+                } else {
+                    db.save_file_folds(workspace_id, file_path, folds)
+                        .await
+                        .with_context(|| {
+                            format!("persisting exact file folds for workspace {workspace_id:?}")
+                        })?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn checkpoint_in_transaction(
+        &mut self,
+        workspace: &mut Workspace,
+        item_id: ItemId,
+        transaction: db::sqlez::thread_safe_connection::WriteTransaction,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        self.serialize_selections = Task::ready(());
+        self.serialize_folds = Task::ready(());
+        self.scroll_manager.cancel_pending_save();
+
+        let Some(buffer_serialization) = self.buffer_serialization else {
+            return Task::ready(Ok(()));
+        };
+        let Some(project) = self.project.clone() else {
+            return Task::ready(Ok(()));
+        };
+        let Some(workspace_id) = workspace.database_id() else {
+            return Task::ready(Err(anyhow!("workspace has no durable persistence id")));
+        };
+        let Some(buffer) = self.buffer().read(cx).as_singleton() else {
+            return Task::ready(Ok(()));
+        };
+
+        let abs_path = buffer.read(cx).file().and_then(|file| {
+            let worktree_id = file.worktree_id(cx);
+            project
+                .read(cx)
+                .worktree_for_id(worktree_id, cx)
+                .map(|worktree| worktree.read(cx).absolutize(file.path()))
+                .or_else(|| {
+                    let full_path = file.full_path(cx);
+                    let project_path = project.read(cx).find_project_path(&full_path, cx)?;
+                    project.read(cx).absolute_path(&project_path, cx)
+                })
+        });
+        let is_dirty = buffer.read(cx).is_dirty();
+        let mtime = buffer.read(cx).saved_mtime();
+        let buffer_snapshot = buffer.read(cx).snapshot();
+        let multi_buffer_snapshot = self.buffer().read(cx).snapshot(cx);
+        let selections = self
+            .selections
+            .disjoint_anchors_arc()
+            .iter()
+            .map(|selection| {
+                (
+                    selection.start.to_offset(&multi_buffer_snapshot).0,
+                    selection.end.to_offset(&multi_buffer_snapshot).0,
+                )
+            })
+            .collect::<Vec<_>>();
+        let display_snapshot = self
+            .display_map
+            .update(cx, |display_map, cx| display_map.snapshot(cx));
+        let scroll_anchor = self.scroll_manager.native_anchor(&display_snapshot, cx);
+        let scroll_top_row = scroll_anchor.top_row(&multi_buffer_snapshot);
+        let folds =
+            display_snapshot
+                .buffer_snapshot()
+                .as_singleton()
+                .and_then(|single_buffer_snapshot| {
+                    let file_path = self.buffer().read(cx).as_singleton().and_then(|buffer| {
+                        project::File::from_dyn(buffer.read(cx).file())
+                            .map(|file| Arc::<Path>::from(file.abs_path(cx)))
+                    })?;
+                    Some((
+                        file_path,
+                        crate::fold::serialized_folds_for_persistence(
+                            &display_snapshot,
+                            single_buffer_snapshot,
+                        ),
+                    ))
+                });
+
+        cx.background_spawn(async move {
+            let (contents, language) =
+                if buffer_serialization == BufferSerialization::All && is_dirty {
+                    (
+                        Some(buffer_snapshot.text()),
+                        buffer_snapshot
+                            .language()
+                            .map(|language| language.name().to_string()),
+                    )
+                } else {
+                    (None, None)
+                };
+            let serialized_editor = SerializedEditor {
+                abs_path,
+                contents,
+                language,
+                mtime,
+            };
+            EditorDb::save_exact_editor_in_transaction(
+                &transaction,
+                item_id,
+                workspace_id,
+                serialized_editor,
+                selections,
+                scroll_top_row,
+                scroll_anchor.offset.x,
+                scroll_anchor.offset.y,
+                folds,
+            )
+            .await
+            .context("persisting exact editor state")
+        })
+    }
+
     fn should_serialize(&self, event: &Self::Event) -> bool {
         self.should_serialize_buffer()
             && matches!(
@@ -2704,6 +2908,146 @@ mod tests {
             })
             .await
             .unwrap()
+    }
+
+    #[gpui::test]
+    async fn test_exact_checkpoint_persists_editor_restoration_metadata_without_debounce(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx, |_| {});
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "file.rs": "fn first() {\n    one();\n    two();\n}\nfn second() {}\n",
+            }),
+        )
+        .await;
+        let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+        let buffer = match project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(path!("/root/file.rs"), cx)
+            })
+            .await
+        {
+            Ok(buffer) => buffer,
+            Err(error) => panic!("failed to open editor test buffer: {error:#}"),
+        };
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        workspace.update(cx, |workspace, _| workspace.set_random_database_id());
+        let editor = cx.new_window_entity(|window, cx| {
+            let mut editor = Editor::for_buffer(buffer, Some(project), window, cx);
+            editor.set_should_serialize(true, cx);
+            editor
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(editor.clone()), None, true, window, cx);
+        });
+        let initial_serialization = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.flush_serialization(window, cx)
+        });
+        initial_serialization.await;
+
+        editor.update_in(cx, |editor, window, cx| {
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_ranges([Point::new(1, 4)..Point::new(2, 7)]);
+            });
+            editor.fold_ranges(vec![Point::new(0, 0)..Point::new(3, 1)], false, window, cx);
+            editor.set_scroll_position(point(2.0, 1.0), window, cx);
+        });
+
+        let (
+            item_id,
+            workspace_id,
+            expected_selections,
+            expected_scroll,
+            expected_folds,
+            file_path,
+        ) = editor.update_in(cx, |editor, _window, cx| {
+            let item_id = cx.entity_id().as_u64();
+            let workspace_id = match workspace.read(cx).database_id() {
+                Some(workspace_id) => workspace_id,
+                None => panic!("test workspace lost its database id"),
+            };
+            let buffer_snapshot = editor.buffer().read(cx).snapshot(cx);
+            let expected_selections = editor
+                .selections
+                .disjoint_anchors_arc()
+                .iter()
+                .map(|selection| {
+                    (
+                        selection.start.to_offset(&buffer_snapshot).0,
+                        selection.end.to_offset(&buffer_snapshot).0,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let display_snapshot = editor
+                .display_map
+                .update(cx, |display_map, cx| display_map.snapshot(cx));
+            let scroll_anchor = editor.scroll_manager.native_anchor(&display_snapshot, cx);
+            let expected_scroll = (
+                scroll_anchor.top_row(&buffer_snapshot),
+                scroll_anchor.offset.x,
+                scroll_anchor.offset.y,
+            );
+            let single_buffer_snapshot = match display_snapshot.buffer_snapshot().as_singleton() {
+                Some(snapshot) => snapshot,
+                None => panic!("editor test buffer stopped being a singleton"),
+            };
+            let expected_folds = crate::fold::serialized_folds_for_persistence(
+                &display_snapshot,
+                single_buffer_snapshot,
+            )
+            .into_iter()
+            .map(|(start, end, start_fingerprint, end_fingerprint)| {
+                (start, end, Some(start_fingerprint), Some(end_fingerprint))
+            })
+            .collect::<Vec<_>>();
+            let file_path = match editor.buffer().read(cx).as_singleton().and_then(|buffer| {
+                project::File::from_dyn(buffer.read(cx).file())
+                    .map(|file| Arc::<Path>::from(file.abs_path(cx)))
+            }) {
+                Some(file_path) => file_path,
+                None => panic!("editor test buffer lost its file path"),
+            };
+            (
+                item_id,
+                workspace_id,
+                expected_selections,
+                expected_scroll,
+                expected_folds,
+                file_path,
+            )
+        });
+
+        let checkpoint = workspace.update_in(cx, |workspace, window, cx| {
+            workspace::SerializableItemHandle::checkpoint(&editor, workspace, window, cx)
+        });
+        if let Err(error) = checkpoint.await {
+            panic!("editor exact checkpoint failed: {error:#}");
+        }
+
+        let db = cx.update(|_, cx| EditorDb::global(cx));
+        let stored_selections = match db.get_editor_selections(item_id, workspace_id) {
+            Ok(selections) => selections,
+            Err(error) => panic!("failed to read exact editor selections: {error:#}"),
+        };
+        assert_eq!(stored_selections, expected_selections);
+        let stored_scroll = match db.get_scroll_position(item_id, workspace_id) {
+            Ok(Some(scroll)) => scroll,
+            Ok(None) => panic!("exact checkpoint stored no scroll position"),
+            Err(error) => panic!("failed to read exact scroll position: {error:#}"),
+        };
+        assert_eq!(stored_scroll, expected_scroll);
+        let stored_folds = match db.get_file_folds(workspace_id, &file_path) {
+            Ok(folds) => folds,
+            Err(error) => panic!("failed to read exact editor folds: {error:#}"),
+        };
+        assert_eq!(stored_folds, expected_folds);
     }
 
     #[gpui::test]

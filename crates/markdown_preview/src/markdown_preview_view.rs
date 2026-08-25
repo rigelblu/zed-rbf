@@ -1916,6 +1916,52 @@ impl SerializableItem for MarkdownPreviewView {
         }))
     }
 
+    fn checkpoint_in_transaction(
+        &mut self,
+        workspace: &mut Workspace,
+        item_id: ItemId,
+        transaction: db::sqlez::thread_safe_connection::WriteTransaction,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let Some(workspace_id) = workspace.database_id() else {
+            return Task::ready(Ok(()));
+        };
+        let Some(editor) = self
+            .active_editor
+            .as_ref()
+            .map(|editor| editor.editor.clone())
+        else {
+            return Task::ready(Ok(()));
+        };
+        let Some(buffer) = editor.read(cx).buffer().read(cx).as_singleton() else {
+            return Task::ready(Ok(()));
+        };
+        let Some(file) = buffer.read(cx).file() else {
+            return Task::ready(Ok(()));
+        };
+        let worktree_id = file.worktree_id(cx);
+        let Some(worktree) = workspace
+            .project()
+            .read(cx)
+            .worktree_for_id(worktree_id, cx)
+        else {
+            return Task::ready(Ok(()));
+        };
+        let abs_path = worktree.read(cx).absolutize(file.path());
+        let mode = self.mode.to_db();
+        cx.background_spawn(async move {
+            persistence::MarkdownPreviewDb::save_preview_in_transaction(
+                &transaction,
+                item_id,
+                workspace_id,
+                abs_path,
+                mode,
+            )
+            .await
+        })
+    }
+
     fn should_serialize(&self, event: &Self::Event) -> bool {
         matches!(
             event,
@@ -1928,6 +1974,7 @@ impl SerializableItem for MarkdownPreviewView {
 mod persistence {
     use std::path::PathBuf;
 
+    use anyhow::Result;
     use db::{
         query,
         sqlez::{domain::Domain, thread_safe_connection::ThreadSafeConnection},
@@ -1957,6 +2004,23 @@ mod persistence {
     db::static_connection!(MarkdownPreviewDb, [WorkspaceDb]);
 
     impl MarkdownPreviewDb {
+        pub async fn save_preview_in_transaction(
+            transaction: &db::sqlez::thread_safe_connection::WriteTransaction,
+            item_id: ItemId,
+            workspace_id: WorkspaceId,
+            abs_path: PathBuf,
+            mode: i64,
+        ) -> Result<()> {
+            transaction
+                .write(move |connection| {
+                    connection.exec_bound(sql!(
+                        INSERT OR REPLACE INTO markdown_previews(item_id, workspace_id, abs_path, mode)
+                        VALUES (?1, ?2, ?3, ?4)
+                    ))?((item_id, workspace_id, abs_path, mode))
+                })
+                .await?
+        }
+
         query! {
             pub async fn save_preview(
                 item_id: ItemId,

@@ -241,6 +241,86 @@ impl EditorDb {
         }
     }
 
+    pub(crate) async fn save_exact_editor_in_transaction(
+        transaction: &db::sqlez::thread_safe_connection::WriteTransaction,
+        item_id: ItemId,
+        workspace_id: WorkspaceId,
+        serialized_editor: SerializedEditor,
+        selections: Vec<(usize, usize)>,
+        scroll_top_row: u32,
+        scroll_horizontal_offset: f64,
+        scroll_vertical_offset: f64,
+        folds: Option<(Arc<Path>, Vec<(usize, usize, String, String)>)>,
+    ) -> Result<()> {
+        transaction
+            .write(move |conn| {
+                conn.exec_bound(sql!(
+                    INSERT INTO editors
+                        (item_id, workspace_id, path, buffer_path, contents, language, mtime_seconds, mtime_nanos)
+                    VALUES
+                        (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                    ON CONFLICT DO UPDATE SET
+                        item_id = ?1,
+                        workspace_id = ?2,
+                        path = ?3,
+                        buffer_path = ?4,
+                        contents = ?5,
+                        language = ?6,
+                        mtime_seconds = ?7,
+                        mtime_nanos = ?8;
+                ))?((item_id, workspace_id, serialized_editor))?;
+
+                conn.exec_bound(sql!(
+                    DELETE FROM editor_selections
+                    WHERE editor_id = ?1 AND workspace_id = ?2;
+                ))?((item_id, workspace_id))?;
+                for (start, end) in selections {
+                    conn.exec_bound(sql!(
+                        INSERT OR IGNORE INTO editor_selections
+                            (editor_id, workspace_id, start, end)
+                        VALUES (?1, ?2, ?3, ?4);
+                    ))?((item_id, workspace_id, start, end))?;
+                }
+
+                conn.exec_bound(sql!(
+                    UPDATE OR IGNORE editors
+                    SET
+                        scroll_top_row = ?3,
+                        scroll_horizontal_offset = ?4,
+                        scroll_vertical_offset = ?5
+                    WHERE item_id = ?1 AND workspace_id = ?2;
+                ))?((
+                    item_id,
+                    workspace_id,
+                    scroll_top_row,
+                    scroll_horizontal_offset,
+                    scroll_vertical_offset,
+                ))?;
+
+                if let Some((file_path, folds)) = folds {
+                    conn.exec_bound(sql!(
+                        DELETE FROM file_folds WHERE workspace_id = ?1 AND path = ?2;
+                    ))?((workspace_id, file_path.as_ref()))?;
+                    for (start, end, start_fingerprint, end_fingerprint) in folds {
+                        conn.exec_bound(sql!(
+                            INSERT INTO file_folds
+                                (workspace_id, path, start, end, start_fingerprint, end_fingerprint)
+                            VALUES (?1, ?2, ?3, ?4, ?5, ?6);
+                        ))?((
+                            workspace_id,
+                            file_path.as_ref(),
+                            start,
+                            end,
+                            start_fingerprint,
+                            end_fingerprint,
+                        ))?;
+                    }
+                }
+                Ok(())
+            })
+            .await?
+    }
+
     query! {
         pub async fn save_serialized_editor(item_id: ItemId, workspace_id: WorkspaceId, serialized_editor: SerializedEditor) -> Result<()> {
             INSERT INTO editors

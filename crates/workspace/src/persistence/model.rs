@@ -114,6 +114,110 @@ pub struct MultiWorkspaceState {
     pub project_groups: Vec<SerializedProjectGroup>,
     #[serde(default)]
     pub sidebar_state: Option<String>,
+    /// Which saved configuration this window was following when the session ended.
+    ///
+    /// Only an association. Reattached after an ordinary restore when the restored
+    /// membership, order, and active workspace still match that configuration; it can
+    /// never move or recreate workspaces on its own, so a mismatched or lost set simply
+    /// starts unnamed with every saved configuration still reachable.
+    #[serde(default)]
+    pub active_configuration_id: Option<WorkspaceConfigurationId>,
+}
+
+/// A durable identifier for a saved workspace configuration.
+///
+/// Independent of session and window, so a configuration outlives quit, relaunch, and
+/// bundle replacement.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub struct WorkspaceConfigurationId(Uuid);
+
+impl WorkspaceConfigurationId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+/// One workspace referenced by a configuration.
+///
+/// Holds a reference and a diagnostic path snapshot, never pane or editor content: every
+/// configuration naming a workspace sees that workspace's one latest serialized state.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkspaceConfigurationMember {
+    pub workspace_id: WorkspaceId,
+    /// Normalized identity paths as of the last checkpoint, in the lexicographic order
+    /// `PathList` itself uses for equality.
+    ///
+    /// Diagnostic only. It names an unavailable member in an error, and locates an
+    /// already-existing exact row whose id changed under duplicate-row cleanup. It never
+    /// carries authority to open these paths as a fresh folder-only workspace.
+    #[serde(default)]
+    pub identity_paths: Vec<PathBuf>,
+}
+
+/// A durable named set of workspaces for one window.
+///
+/// Owns membership, vertical-tab order, and which member is active. It does not own the
+/// members' pane or editor layouts.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkspaceConfiguration {
+    pub id: WorkspaceConfigurationId,
+    pub name: String,
+    /// Members in vertical-tab order.
+    pub members: Vec<WorkspaceConfigurationMember>,
+    pub active_member: Option<WorkspaceId>,
+}
+
+/// The schema version this build writes and is willing to read.
+pub const WORKSPACE_CONFIGURATION_SCHEMA_VERSION: u32 = 1;
+
+/// Every saved configuration, stored as one versioned value.
+///
+/// One value keeps a whole-collection replace atomic, so a partly-applied write cannot
+/// leave configurations disagreeing with one another.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkspaceConfigurationCollection {
+    pub schema_version: u32,
+    pub configurations: Vec<WorkspaceConfiguration>,
+}
+
+impl Default for WorkspaceConfigurationCollection {
+    fn default() -> Self {
+        Self {
+            schema_version: WORKSPACE_CONFIGURATION_SCHEMA_VERSION,
+            configurations: Vec::new(),
+        }
+    }
+}
+
+impl WorkspaceConfigurationCollection {
+    pub fn find(&self, id: WorkspaceConfigurationId) -> Option<&WorkspaceConfiguration> {
+        self.configurations
+            .iter()
+            .find(|configuration| configuration.id == id)
+    }
+
+    /// Names are compared case-insensitively on their trimmed form, so `Daily` and
+    /// ` daily ` cannot both exist.
+    pub fn find_by_name(&self, name: &str) -> Option<&WorkspaceConfiguration> {
+        let name = name.trim();
+        self.configurations
+            .iter()
+            .find(|configuration| configuration.name.eq_ignore_ascii_case(name))
+    }
+
+    /// Every workspace row any configuration still refers to.
+    ///
+    /// Recent cleanup consults this so a configuration cannot be hollowed out into a set
+    /// of folders with no saved editor state.
+    pub fn referenced_workspace_ids(&self) -> collections::HashSet<WorkspaceId> {
+        self.configurations
+            .iter()
+            .flat_map(|configuration| configuration.members.iter())
+            .map(|member| member.workspace_id)
+            .collect()
+    }
 }
 
 /// The serialized state of a single MultiWorkspace window from a previous session:
@@ -334,6 +438,56 @@ impl SerializedPaneGroup {
             }
         }
     }
+
+    #[async_recursion(?Send)]
+    pub(crate) async fn deserialize_strict(
+        self,
+        project: &Entity<Project>,
+        workspace_id: WorkspaceId,
+        workspace: WeakEntity<Workspace>,
+        cx: &mut AsyncWindowContext,
+    ) -> Result<(Member, Option<Entity<Pane>>, Vec<Box<dyn ItemHandle>>)> {
+        match self {
+            SerializedPaneGroup::Group {
+                axis,
+                children,
+                flexes,
+            } => {
+                let mut current_active_pane = None;
+                let mut members = Vec::with_capacity(children.len());
+                let mut items = Vec::new();
+                for child in children {
+                    let (member, active_pane, child_items) = child
+                        .deserialize_strict(project, workspace_id, workspace.clone(), cx)
+                        .await?;
+                    members.push(member);
+                    items.extend(child_items);
+                    current_active_pane = current_active_pane.or(active_pane);
+                }
+                anyhow::ensure!(!members.is_empty(), "saved pane group is empty");
+                let member = if members.len() == 1 {
+                    members.remove(0)
+                } else {
+                    Member::Axis(PaneAxis::load(axis.0, members, flexes))
+                };
+                Ok((member, current_active_pane, items))
+            }
+            SerializedPaneGroup::Pane(serialized_pane) => {
+                let pane = workspace.update_in(cx, |workspace, window, cx| {
+                    workspace.add_pane(window, cx).downgrade()
+                })?;
+                let active = serialized_pane.active;
+                let items = serialized_pane
+                    .deserialize_to_strict(project, &pane, workspace_id, workspace.clone(), cx)
+                    .await
+                    .context("could not strictly deserialize pane")?;
+                let pane = pane
+                    .upgrade()
+                    .context("strictly restored pane was released")?;
+                Ok((Member::Pane(pane.clone()), active.then_some(pane), items))
+            }
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Default, Clone)]
@@ -414,6 +568,66 @@ impl SerializedPane {
         })?;
 
         anyhow::Ok(items)
+    }
+
+    pub async fn deserialize_to_strict(
+        &self,
+        project: &Entity<Project>,
+        pane: &WeakEntity<Pane>,
+        workspace_id: WorkspaceId,
+        workspace: WeakEntity<Workspace>,
+        cx: &mut AsyncWindowContext,
+    ) -> Result<Vec<Box<dyn ItemHandle>>> {
+        let mut item_tasks = Vec::with_capacity(self.children.len());
+        let mut active_item_index = None;
+        let mut preview_item_index = None;
+        for (index, item) in self.children.iter().enumerate() {
+            let project = project.clone();
+            item_tasks.push(pane.update_in(cx, |_, window, cx| {
+                SerializableItemRegistry::deserialize(
+                    &item.kind,
+                    project,
+                    workspace.clone(),
+                    workspace_id,
+                    item.item_id,
+                    window,
+                    cx,
+                )
+            })?);
+            if item.active {
+                active_item_index = Some(index);
+            }
+            if item.preview {
+                preview_item_index = Some(index);
+            }
+        }
+
+        let mut items = Vec::with_capacity(item_tasks.len());
+        for item in futures::future::join_all(item_tasks).await {
+            let item = item?;
+            pane.update_in(cx, |pane, window, cx| {
+                pane.add_item(item.clone(), true, true, None, window, cx);
+            })?;
+            items.push(item);
+        }
+
+        if let Some(active_item_index) = active_item_index {
+            pane.update_in(cx, |pane, window, cx| {
+                pane.activate_item(active_item_index, false, false, window, cx);
+            })?;
+        }
+        if let Some(preview_item_index) = preview_item_index {
+            pane.update(cx, |pane, cx| {
+                if let Some(item) = pane.item_for_index(preview_item_index) {
+                    pane.set_preview_item_id(Some(item.item_id()), cx);
+                }
+            })?;
+        }
+        pane.update(cx, |pane, _| {
+            pane.set_pinned_count(self.pinned_count.min(items.len()));
+        })?;
+
+        Ok(items)
     }
 }
 

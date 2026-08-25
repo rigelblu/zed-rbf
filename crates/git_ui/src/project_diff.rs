@@ -674,6 +674,29 @@ pub(crate) mod persistence {
     db::static_connection!(ProjectDiffDb, [WorkspaceDb]);
 
     impl ProjectDiffDb {
+        pub async fn save_project_diff_base_in_transaction(
+            transaction: &db::sqlez::thread_safe_connection::WriteTransaction,
+            item_id: ItemId,
+            workspace_id: WorkspaceId,
+            diff_base: DiffBase,
+        ) -> anyhow::Result<()> {
+            transaction
+                .write(move |connection| {
+                    let sql_statement = sql!(
+                        INSERT OR REPLACE INTO project_diffs(item_id, workspace_id, diff_base) VALUES (?, ?, ?)
+                    );
+                    let diff_base = serde_json::to_string(&diff_base)?;
+                    let mut query = connection
+                        .exec_bound::<(ItemId, WorkspaceId, String)>(sql_statement)?;
+                    query((item_id, workspace_id, diff_base)).with_context(|| {
+                        format!(
+                            "exec_bound failed to execute or parse for: {sql_statement}"
+                        )
+                    })
+                })
+                .await?
+        }
+
         pub async fn save_project_diff_base(
             &self,
             item_id: ItemId,

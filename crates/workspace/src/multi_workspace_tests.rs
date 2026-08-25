@@ -2,8 +2,11 @@ use std::path::PathBuf;
 
 use super::*;
 use crate::item::test::TestItem;
+use crate::multi_workspace::WorkspaceConfigurationSwitchTestStage;
+use crate::persistence::WorkspaceConfigurationStore;
 use agent_settings::AgentSettings;
 use client::proto;
+use db::kvp::KeyValueStore;
 use fs::{FakeFs, Fs};
 use gpui::{IntoElement, MouseButton, TestAppContext, VisualTestContext, WindowId, div};
 use project::DisableAiSettings;
@@ -18,7 +21,34 @@ fn init_test(cx: &mut TestAppContext) {
         cx.set_global(settings_store);
         theme_settings::init(theme::LoadThemes::JustBase, cx);
         DisableAiSettings::register(cx);
+        WorkspaceConfigurationStore::init(cx);
     });
+}
+
+async fn reset_workspace_configuration_store(cx: &mut TestAppContext) {
+    let kvp = cx.update(|cx| KeyValueStore::global(cx));
+    if let Err(error) = kvp
+        .scoped("workspace_configurations")
+        .delete("collection".to_string())
+        .await
+    {
+        panic!("failed to reset workspace configurations: {error:#}");
+    }
+    cx.update(WorkspaceConfigurationStore::reload_for_tests);
+}
+
+async fn set_configuration_kvp_query_only(kvp: &KeyValueStore, query_only: bool) {
+    let query = if query_only {
+        "PRAGMA query_only = ON"
+    } else {
+        "PRAGMA query_only = OFF"
+    };
+    if let Err(error) = kvp
+        .write(move |connection| connection.exec(query).and_then(|mut statement| statement()))
+        .await
+    {
+        panic!("failed to change configuration KVP query_only state: {error:#}");
+    }
 }
 
 fn setup_multi_workspace<'a>(
@@ -45,6 +75,874 @@ fn setup_multi_workspace<'a>(
     cx.run_until_parked();
 
     (multi_workspace, cx)
+}
+
+fn workspace_configuration(
+    id: crate::persistence::model::WorkspaceConfigurationId,
+    cx: &mut VisualTestContext,
+) -> Option<crate::persistence::model::WorkspaceConfiguration> {
+    cx.update(|_window, cx| {
+        WorkspaceConfigurationStore::global(cx)
+            .configuration(id)
+            .cloned()
+    })
+}
+
+fn workspace_configuration_store_is_empty(cx: &mut VisualTestContext) -> bool {
+    cx.update(|_window, cx| {
+        WorkspaceConfigurationStore::global(cx)
+            .configurations()
+            .is_empty()
+    })
+}
+
+fn strict_restore_fixture(
+    workspace_id: WorkspaceId,
+    path: &str,
+    center_group: crate::persistence::model::SerializedPaneGroup,
+) -> crate::persistence::model::SerializedWorkspace {
+    crate::persistence::model::SerializedWorkspace {
+        id: workspace_id,
+        paths: PathList::new(&[PathBuf::from(path)]),
+        identity_paths: Some(PathList::new(&[PathBuf::from(path)])),
+        location: crate::persistence::model::SerializedWorkspaceLocation::Local,
+        center_group,
+        window_bounds: Default::default(),
+        display: Default::default(),
+        docks: Default::default(),
+        bookmarks: Default::default(),
+        breakpoints: Default::default(),
+        centered_layout: false,
+        session_id: None,
+        window_id: None,
+        user_toolchains: Default::default(),
+    }
+}
+
+async fn seed_workspace_configuration(
+    name: &str,
+    members: &[(WorkspaceId, &str)],
+    active_member: WorkspaceId,
+    cx: &mut VisualTestContext,
+) -> crate::persistence::model::WorkspaceConfigurationId {
+    let db = cx.update(|_window, cx| WorkspaceDb::global(cx));
+    for (workspace_id, path) in members {
+        db.save_workspace_checked(strict_restore_fixture(
+            *workspace_id,
+            path,
+            crate::persistence::model::SerializedPaneGroup::Pane(
+                crate::persistence::model::SerializedPane::new(Vec::new(), true, 0),
+            ),
+        ))
+        .await
+        .expect("failed to seed workspace configuration member");
+    }
+    cx.update(|_window, cx| {
+        WorkspaceConfigurationStore::mutate_global(
+            crate::persistence::WorkspaceConfigurationMutation::Create {
+                name: name.to_string(),
+                members: members
+                    .iter()
+                    .map(|(workspace_id, path)| {
+                        crate::persistence::model::WorkspaceConfigurationMember {
+                            workspace_id: *workspace_id,
+                            identity_paths: vec![PathBuf::from(path)],
+                        }
+                    })
+                    .collect(),
+                active_member: Some(active_member),
+            },
+            cx,
+        )
+    })
+    .await
+    .expect("failed to seed workspace configuration")
+    .id
+}
+
+#[gpui::test]
+async fn workspace_configuration_strict_restore_stays_detached(cx: &mut TestAppContext) {
+    init_test(cx);
+    let app_state = cx.update(AppState::test);
+    let fs = app_state.fs.as_fake();
+    fs.insert_tree(path!("/project-a"), json!({})).await;
+    fs.insert_tree(path!("/project-b"), json!({})).await;
+
+    let open = cx
+        .update(|cx| {
+            Workspace::new_local(
+                vec![PathBuf::from(path!("/project-a"))],
+                app_state.clone(),
+                None,
+                None,
+                None,
+                OpenMode::Activate,
+                cx,
+            )
+        })
+        .await;
+    let open = match open {
+        Ok(open) => open,
+        Err(error) => panic!("failed to open the outgoing workspace: {error:#}"),
+    };
+    let window = open.window;
+    let outgoing_workspace = open.workspace;
+    let target_id = WorkspaceId(9001);
+    let serialized = strict_restore_fixture(
+        target_id,
+        path!("/project-b"),
+        crate::persistence::model::SerializedPaneGroup::Pane(
+            crate::persistence::model::SerializedPane::new(Vec::new(), true, 0),
+        ),
+    );
+
+    let prepared = cx
+        .update(|cx| Workspace::prepare_local_strict(serialized, app_state.clone(), window, cx))
+        .await;
+    let prepared = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => panic!("strict target preparation failed: {error:#}"),
+    };
+
+    window
+        .read_with(cx, |multi_workspace, _cx| {
+            assert_eq!(multi_workspace.workspaces().count(), 1);
+            assert_eq!(multi_workspace.workspace(), &outgoing_workspace);
+            assert!(
+                multi_workspace
+                    .workspaces()
+                    .all(|workspace| workspace != &prepared)
+            );
+        })
+        .expect("the outgoing window closed during target preparation");
+    prepared.read_with(cx, |workspace, cx| {
+        assert_eq!(workspace.database_id(), Some(target_id));
+        assert_eq!(
+            PathList::new(&workspace.root_paths(cx)),
+            PathList::new(&[path!("/project-b")])
+        );
+        assert_eq!(workspace.panes().len(), 1);
+    });
+    let db = cx.update(|cx| WorkspaceDb::global(cx));
+    assert!(
+        db.workspace_for_id(target_id).is_none(),
+        "detached preparation must not serialize or create history"
+    );
+}
+
+#[gpui::test]
+async fn workspace_configuration_strict_restore_failure_changes_nothing(cx: &mut TestAppContext) {
+    init_test(cx);
+    let app_state = cx.update(AppState::test);
+    let fs = app_state.fs.as_fake();
+    fs.insert_tree(path!("/project-a"), json!({})).await;
+    fs.insert_tree(path!("/project-b"), json!({})).await;
+
+    let open = cx
+        .update(|cx| {
+            Workspace::new_local(
+                vec![PathBuf::from(path!("/project-a"))],
+                app_state.clone(),
+                None,
+                None,
+                None,
+                OpenMode::Activate,
+                cx,
+            )
+        })
+        .await;
+    let open = match open {
+        Ok(open) => open,
+        Err(error) => panic!("failed to open the outgoing workspace: {error:#}"),
+    };
+    let window = open.window;
+    let outgoing_workspace = open.workspace;
+    let target_id = WorkspaceId(9002);
+    let serialized = strict_restore_fixture(
+        target_id,
+        path!("/project-b"),
+        crate::persistence::model::SerializedPaneGroup::Pane(
+            crate::persistence::model::SerializedPane::new(
+                vec![crate::persistence::model::SerializedItem::new(
+                    "Missing Strict Restore Descriptor",
+                    1,
+                    true,
+                    false,
+                )],
+                true,
+                0,
+            ),
+        ),
+    );
+
+    let result = cx
+        .update(|cx| Workspace::prepare_local_strict(serialized, app_state, window, cx))
+        .await;
+    let error = match result {
+        Ok(_) => panic!("strict restoration unexpectedly ignored a missing item descriptor"),
+        Err(error) => error,
+    };
+    assert!(format!("{error:#}").contains("cannot deserialize"));
+    window
+        .read_with(cx, |multi_workspace, _cx| {
+            assert_eq!(multi_workspace.workspaces().count(), 1);
+            assert_eq!(multi_workspace.workspace(), &outgoing_workspace);
+        })
+        .expect("the outgoing window closed after failed target preparation");
+    let db = cx.update(|cx| WorkspaceDb::global(cx));
+    assert!(db.workspace_for_id(target_id).is_none());
+}
+
+#[gpui::test]
+async fn test_switch_workspace_configuration_restores_exact_state(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    for path in ["/project-a", "/project-b", "/project-c", "/project-d"] {
+        fs.insert_tree(path, json!({})).await;
+    }
+    let project_a = Project::test(fs.clone(), ["/project-a".as_ref()], cx).await;
+    let project_b = Project::test(fs.clone(), ["/project-b".as_ref()], cx).await;
+    reset_workspace_configuration_store(cx).await;
+
+    let (multi_workspace, cx) = setup_multi_workspace(&[project_a, project_b], cx);
+    let outgoing_ids = multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace
+            .ordered_workspaces(cx)
+            .into_iter()
+            .map(|workspace| {
+                workspace.update(cx, |workspace, _cx| workspace.set_random_database_id());
+                workspace.read(cx).database_id().expect("workspace id")
+            })
+            .collect::<Vec<_>>()
+    });
+    let outgoing_active = multi_workspace
+        .read_with(cx, |multi_workspace, cx| {
+            multi_workspace.workspace().read(cx).database_id()
+        })
+        .expect("outgoing active workspace id");
+    let session_id = multi_workspace
+        .read_with(cx, |multi_workspace, cx| {
+            multi_workspace.workspace().read(cx).session_id()
+        })
+        .expect("outgoing workspace session id");
+    let save = multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.save_configuration_as("Outgoing".to_string(), cx)
+    });
+    let outgoing_configuration_id = match save.await {
+        Ok(id) => id,
+        Err(error) => panic!("failed to save outgoing configuration: {error:#}"),
+    };
+
+    let target_c = WorkspaceId(9101);
+    let target_d = WorkspaceId(9102);
+    let db = cx.update(|_window, cx| WorkspaceDb::global(cx));
+    for (id, path) in [(target_c, "/project-c"), (target_d, "/project-d")] {
+        if let Err(error) = db
+            .save_workspace_checked(strict_restore_fixture(
+                id,
+                path,
+                crate::persistence::model::SerializedPaneGroup::Pane(
+                    crate::persistence::model::SerializedPane::new(Vec::new(), true, 0),
+                ),
+            ))
+            .await
+        {
+            panic!("failed to seed target workspace: {error:#}");
+        }
+    }
+    let create_target = cx.update(|_window, cx| {
+        WorkspaceConfigurationStore::mutate_global(
+            crate::persistence::WorkspaceConfigurationMutation::Create {
+                name: "Target".to_string(),
+                members: vec![
+                    crate::persistence::model::WorkspaceConfigurationMember {
+                        workspace_id: target_d,
+                        identity_paths: vec![PathBuf::from("/project-d")],
+                    },
+                    crate::persistence::model::WorkspaceConfigurationMember {
+                        workspace_id: target_c,
+                        identity_paths: vec![PathBuf::from("/project-c")],
+                    },
+                ],
+                active_member: Some(target_c),
+            },
+            cx,
+        )
+    });
+    let target_configuration_id = match create_target.await {
+        Ok(commit) => commit.id,
+        Err(error) => panic!("failed to create target configuration: {error:#}"),
+    };
+    let window_id =
+        multi_workspace.read_with(cx, |multi_workspace, _cx| multi_workspace.test_window_id());
+
+    let switch = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.switch_workspace_configuration(target_configuration_id, window, cx)
+    });
+    if let Err(error) = switch.await {
+        panic!("workspace configuration switch failed: {error:#}");
+    }
+    let removal_tasks = multi_workspace.update(cx, |multi_workspace, _cx| {
+        multi_workspace.take_pending_removal_tasks()
+    });
+    futures::future::join_all(removal_tasks).await;
+
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(multi_workspace.test_window_id(), window_id);
+        assert_eq!(
+            multi_workspace
+                .ordered_workspaces(cx)
+                .iter()
+                .map(|workspace| workspace.read(cx).database_id().expect("target id"))
+                .collect::<Vec<_>>(),
+            vec![target_d, target_c]
+        );
+        assert_eq!(
+            multi_workspace.workspace().read(cx).database_id(),
+            Some(target_c)
+        );
+        assert_eq!(
+            multi_workspace.active_configuration_id(),
+            Some(target_configuration_id)
+        );
+    });
+    let outgoing_configuration = workspace_configuration(outgoing_configuration_id, cx)
+        .expect("outgoing configuration disappeared");
+    assert_eq!(
+        outgoing_configuration
+            .members
+            .iter()
+            .map(|member| member.workspace_id)
+            .collect::<Vec<_>>(),
+        outgoing_ids
+    );
+    assert_eq!(outgoing_configuration.active_member, Some(outgoing_active));
+    let restored_session = db
+        .last_session_workspace_locations(&session_id, None, fs.as_ref())
+        .await
+        .expect("failed to query the outgoing session after switching");
+    assert!(
+        restored_session
+            .iter()
+            .all(|workspace| !outgoing_ids.contains(&workspace.workspace_id)),
+        "outgoing workspaces must not reappear on ordinary relaunch"
+    );
+}
+
+#[gpui::test]
+async fn test_switch_workspace_configuration_rolls_back(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    for path in ["/project-a", "/project-b", "/project-c"] {
+        fs.insert_tree(path, json!({})).await;
+    }
+    let project_a = Project::test(fs.clone(), ["/project-a".as_ref()], cx).await;
+    let project_b = Project::test(fs, ["/project-b".as_ref()], cx).await;
+    reset_workspace_configuration_store(cx).await;
+
+    let (multi_workspace, cx) = setup_multi_workspace(&[project_a, project_b], cx);
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        for workspace in multi_workspace.workspaces() {
+            workspace.update(cx, |workspace, _cx| workspace.set_random_database_id());
+        }
+    });
+    let save = multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.save_configuration_as("Outgoing".to_string(), cx)
+    });
+    let outgoing_configuration_id = match save.await {
+        Ok(id) => id,
+        Err(error) => panic!("failed to save outgoing configuration: {error:#}"),
+    };
+    let before = multi_workspace.read_with(cx, |multi_workspace, cx| {
+        (
+            multi_workspace
+                .ordered_workspaces(cx)
+                .iter()
+                .map(Entity::entity_id)
+                .collect::<Vec<_>>(),
+            multi_workspace.workspace().entity_id(),
+        )
+    });
+
+    let missing_id = WorkspaceId(9201);
+    let valid_id = WorkspaceId(9202);
+    let db = cx.update(|_window, cx| WorkspaceDb::global(cx));
+    for (id, path) in [(missing_id, "/missing-project"), (valid_id, "/project-c")] {
+        if let Err(error) = db
+            .save_workspace_checked(strict_restore_fixture(
+                id,
+                path,
+                crate::persistence::model::SerializedPaneGroup::Pane(
+                    crate::persistence::model::SerializedPane::new(Vec::new(), true, 0),
+                ),
+            ))
+            .await
+        {
+            panic!("failed to seed rollback target: {error:#}");
+        }
+    }
+    let create_configuration =
+        |name: &str, workspace_id, path: &str, cx: &mut VisualTestContext| {
+            cx.update(|_window, cx| {
+                WorkspaceConfigurationStore::mutate_global(
+                    crate::persistence::WorkspaceConfigurationMutation::Create {
+                        name: name.to_string(),
+                        members: vec![crate::persistence::model::WorkspaceConfigurationMember {
+                            workspace_id,
+                            identity_paths: vec![PathBuf::from(path)],
+                        }],
+                        active_member: Some(workspace_id),
+                    },
+                    cx,
+                )
+            })
+        };
+    let missing_configuration_id =
+        create_configuration("Missing", missing_id, "/missing-project", cx)
+            .await
+            .expect("missing target configuration fixture")
+            .id;
+    let valid_configuration_id = create_configuration("Valid", valid_id, "/project-c", cx)
+        .await
+        .expect("valid target configuration fixture")
+        .id;
+
+    let missing_switch = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.switch_workspace_configuration(missing_configuration_id, window, cx)
+    });
+    assert!(missing_switch.await.is_err());
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(
+            multi_workspace
+                .ordered_workspaces(cx)
+                .iter()
+                .map(Entity::entity_id)
+                .collect::<Vec<_>>(),
+            before.0
+        );
+        assert_eq!(multi_workspace.workspace().entity_id(), before.1);
+        assert_eq!(
+            multi_workspace.active_configuration_id(),
+            Some(outgoing_configuration_id)
+        );
+    });
+
+    cx.update(|_window, cx| WorkspaceConfigurationStore::set_write_failure_for_tests(true, cx));
+    let failed_commit = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.switch_workspace_configuration(valid_configuration_id, window, cx)
+    });
+    let failed_commit_error = match failed_commit.await {
+        Ok(()) => panic!("forced configuration write failure unexpectedly switched"),
+        Err(error) => error,
+    };
+    assert!(
+        format!("{failed_commit_error:#}").contains("forced workspace configuration write failure"),
+        "unexpected switch failure: {failed_commit_error:#}"
+    );
+    cx.update(|_window, cx| WorkspaceConfigurationStore::set_write_failure_for_tests(false, cx));
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(
+            multi_workspace
+                .ordered_workspaces(cx)
+                .iter()
+                .map(Entity::entity_id)
+                .collect::<Vec<_>>(),
+            before.0
+        );
+        assert_eq!(multi_workspace.workspace().entity_id(), before.1);
+        assert_eq!(
+            multi_workspace.active_configuration_id(),
+            Some(outgoing_configuration_id)
+        );
+        assert!(multi_workspace.configuration_checkpoint_error().is_some());
+    });
+}
+
+#[gpui::test]
+async fn workspace_configuration_concurrency_restarts_after_outgoing_stage_drift(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    for path in ["/project-a", "/project-b", "/project-target"] {
+        fs.insert_tree(path, json!({})).await;
+    }
+    let project_a = Project::test(fs.clone(), ["/project-a".as_ref()], cx).await;
+    let project_b = Project::test(fs, ["/project-b".as_ref()], cx).await;
+    reset_workspace_configuration_store(cx).await;
+
+    let (multi_workspace, cx) = setup_multi_workspace(&[project_a], cx);
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace
+            .workspace()
+            .update(cx, |workspace, _cx| workspace.set_random_database_id());
+    });
+    let outgoing_configuration_id = multi_workspace
+        .update(cx, |multi_workspace, cx| {
+            multi_workspace.save_configuration_as("Outgoing".to_string(), cx)
+        })
+        .await
+        .expect("failed to save outgoing configuration");
+    let target_workspace_id = WorkspaceId(9401);
+    let target_configuration_id = seed_workspace_configuration(
+        "Target",
+        &[(target_workspace_id, "/project-target")],
+        target_workspace_id,
+        cx,
+    )
+    .await;
+    let (target_staged, resume_switch) = multi_workspace.update(cx, |multi_workspace, _cx| {
+        multi_workspace.pause_configuration_switch_for_test(
+            WorkspaceConfigurationSwitchTestStage::TargetStaged,
+        )
+    });
+
+    let switch = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.switch_workspace_configuration(target_configuration_id, window, cx)
+    });
+    target_staged
+        .await
+        .expect("switch ended before the staged-target barrier");
+    let added_workspace_id = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        let workspace = multi_workspace.test_add_workspace(project_b, window, cx);
+        workspace.update(cx, |workspace, _cx| workspace.set_random_database_id());
+        workspace
+            .read(cx)
+            .database_id()
+            .expect("added workspace id")
+    });
+    cx.run_until_parked();
+    resume_switch
+        .send(())
+        .expect("switch dropped the staged-target barrier");
+    switch
+        .await
+        .expect("switch did not restart after outgoing stage drift");
+
+    let outgoing_configuration = workspace_configuration(outgoing_configuration_id, cx)
+        .expect("outgoing configuration disappeared");
+    assert!(
+        outgoing_configuration
+            .members
+            .iter()
+            .any(|member| member.workspace_id == added_workspace_id),
+        "the restarted outgoing snapshot must include the workspace added during staging"
+    );
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(
+            multi_workspace.workspace().read(cx).database_id(),
+            Some(target_workspace_id)
+        );
+        assert_eq!(
+            multi_workspace.active_configuration_id(),
+            Some(target_configuration_id)
+        );
+    });
+}
+
+#[gpui::test]
+async fn workspace_configuration_concurrency_ignores_unrelated_store_change_before_commit(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    for path in ["/project-a", "/project-target"] {
+        fs.insert_tree(path, json!({})).await;
+    }
+    let project = Project::test(fs, ["/project-a".as_ref()], cx).await;
+    reset_workspace_configuration_store(cx).await;
+
+    let (multi_workspace, cx) = setup_multi_workspace(&[project], cx);
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace
+            .workspace()
+            .update(cx, |workspace, _cx| workspace.set_random_database_id());
+    });
+    let outgoing_configuration_id = multi_workspace
+        .update(cx, |multi_workspace, cx| {
+            multi_workspace.save_configuration_as("Outgoing".to_string(), cx)
+        })
+        .await
+        .expect("failed to save outgoing configuration");
+    let before_workspace = multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        multi_workspace.workspace().clone()
+    });
+    let target_workspace_id = WorkspaceId(9402);
+    let target_configuration_id = seed_workspace_configuration(
+        "Target",
+        &[(target_workspace_id, "/project-target")],
+        target_workspace_id,
+        cx,
+    )
+    .await;
+    let (before_commit, resume_switch) = multi_workspace.update(cx, |multi_workspace, _cx| {
+        multi_workspace.pause_configuration_switch_for_test(
+            WorkspaceConfigurationSwitchTestStage::BeforeCommit,
+        )
+    });
+
+    let switch = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.switch_workspace_configuration(target_configuration_id, window, cx)
+    });
+    before_commit
+        .await
+        .expect("switch ended before the final-commit barrier");
+    let concurrent_mutation = cx.update(|_window, cx| {
+        WorkspaceConfigurationStore::mutate_global(
+            crate::persistence::WorkspaceConfigurationMutation::Create {
+                name: "Concurrent".to_string(),
+                members: Vec::new(),
+                active_member: None,
+            },
+            cx,
+        )
+    });
+    concurrent_mutation
+        .await
+        .expect("failed to mutate the configuration store at the barrier");
+    resume_switch
+        .send(())
+        .expect("switch dropped the final-commit barrier");
+    switch
+        .await
+        .expect("an unrelated configuration mutation must not abort the target switch");
+    multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        assert_ne!(multi_workspace.workspace(), &before_workspace);
+        assert_eq!(
+            multi_workspace.active_configuration_id(),
+            Some(target_configuration_id)
+        );
+        assert!(!multi_workspace.configuration_switch_in_progress());
+    });
+    let configurations = cx.update(|_window, cx| {
+        WorkspaceConfigurationStore::global(cx)
+            .configurations()
+            .to_vec()
+    });
+    assert!(
+        configurations
+            .iter()
+            .any(|configuration| configuration.name == "Concurrent")
+    );
+    assert!(
+        configurations
+            .iter()
+            .any(|configuration| configuration.id == outgoing_configuration_id)
+    );
+}
+
+#[gpui::test]
+async fn workspace_configuration_final_gate_blocks_workspace_keyboard_actions(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    for path in ["/project-a", "/project-b", "/project-target"] {
+        fs.insert_tree(path, json!({})).await;
+    }
+    let project_a = Project::test(fs.clone(), ["/project-a".as_ref()], cx).await;
+    let project_b = Project::test(fs, ["/project-b".as_ref()], cx).await;
+    reset_workspace_configuration_store(cx).await;
+
+    let (multi_workspace, cx) = setup_multi_workspace(&[project_a, project_b], cx);
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        for workspace in multi_workspace.workspaces() {
+            workspace.update(cx, |workspace, _cx| workspace.set_random_database_id());
+        }
+    });
+    multi_workspace
+        .update(cx, |multi_workspace, cx| {
+            multi_workspace.save_configuration_as("Outgoing".to_string(), cx)
+        })
+        .await
+        .expect("failed to save outgoing configuration");
+    let target_workspace_id = WorkspaceId(9403);
+    let target_configuration_id = seed_workspace_configuration(
+        "Target",
+        &[(target_workspace_id, "/project-target")],
+        target_workspace_id,
+        cx,
+    )
+    .await;
+    let outgoing_active = multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        multi_workspace.workspace().entity_id()
+    });
+    let (before_commit, resume_switch) = multi_workspace.update(cx, |multi_workspace, _cx| {
+        multi_workspace.pause_configuration_switch_for_test(
+            WorkspaceConfigurationSwitchTestStage::BeforeCommit,
+        )
+    });
+
+    let switch = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.switch_workspace_configuration(target_configuration_id, window, cx)
+    });
+    before_commit
+        .await
+        .expect("switch ended before the final input gate");
+
+    cx.dispatch_action(NextProject);
+    cx.dispatch_action(PreviousProject);
+    cx.dispatch_action(SaveWorkspaceConfigurationAs);
+    cx.dispatch_action(SwitchWorkspaceConfiguration);
+    cx.run_until_parked();
+    multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        assert_eq!(multi_workspace.workspace().entity_id(), outgoing_active);
+        assert!(!multi_workspace.test_workspace_configuration_menu_is_deployed());
+    });
+
+    resume_switch
+        .send(())
+        .expect("switch dropped the final-commit barrier");
+    switch
+        .await
+        .expect("switch failed after releasing its gate");
+}
+
+#[gpui::test]
+async fn workspace_configuration_concurrency_aborts_when_foreign_window_acquires_target(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    for path in ["/project-a", "/project-foreign", "/project-target"] {
+        fs.insert_tree(path, json!({})).await;
+    }
+    let source_project = Project::test(fs.clone(), ["/project-a".as_ref()], cx).await;
+    let foreign_project = Project::test(fs, ["/project-foreign".as_ref()], cx).await;
+    reset_workspace_configuration_store(cx).await;
+    let foreign_multi_workspace = {
+        let (foreign_multi_workspace, _foreign_cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(foreign_project, window, cx));
+        foreign_multi_workspace
+    };
+    let (multi_workspace, cx) = setup_multi_workspace(&[source_project], cx);
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace
+            .workspace()
+            .update(cx, |workspace, _cx| workspace.set_random_database_id());
+    });
+    let outgoing_configuration_id = multi_workspace
+        .update(cx, |multi_workspace, cx| {
+            multi_workspace.save_configuration_as("Outgoing".to_string(), cx)
+        })
+        .await
+        .expect("failed to save outgoing configuration");
+    let before_workspace = multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        multi_workspace.workspace().clone()
+    });
+    let target_workspace_id = WorkspaceId(9403);
+    let target_configuration_id = seed_workspace_configuration(
+        "Target",
+        &[(target_workspace_id, "/project-target")],
+        target_workspace_id,
+        cx,
+    )
+    .await;
+    let (before_commit, resume_switch) = multi_workspace.update(cx, |multi_workspace, _cx| {
+        multi_workspace.pause_configuration_switch_for_test(
+            WorkspaceConfigurationSwitchTestStage::BeforeCommit,
+        )
+    });
+
+    let switch = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.switch_workspace_configuration(target_configuration_id, window, cx)
+    });
+    before_commit
+        .await
+        .expect("switch ended before the final-commit barrier");
+    foreign_multi_workspace.update(cx, |foreign_multi_workspace, cx| {
+        foreign_multi_workspace
+            .workspace()
+            .update(cx, |workspace, _cx| {
+                workspace.set_database_id(target_workspace_id)
+            });
+    });
+    resume_switch
+        .send(())
+        .expect("switch dropped the final-commit barrier");
+    let error = switch
+        .await
+        .expect_err("switch stole a target acquired by another window");
+    assert!(format!("{error:#}").contains("open in another window"));
+    multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        assert_eq!(multi_workspace.workspace(), &before_workspace);
+        assert_eq!(
+            multi_workspace.active_configuration_id(),
+            Some(outgoing_configuration_id)
+        );
+        assert!(!multi_workspace.configuration_switch_in_progress());
+    });
+}
+
+#[gpui::test]
+async fn workspace_configuration_ui_prompts_before_leaving_meaningful_unnamed_set(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    for path in ["/project-a", "/project-c"] {
+        fs.insert_tree(path, json!({})).await;
+    }
+    let project = Project::test(fs, ["/project-a".as_ref()], cx).await;
+    reset_workspace_configuration_store(cx).await;
+    let (multi_workspace, cx) = setup_multi_workspace(&[project], cx);
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace
+            .workspace()
+            .update(cx, |workspace, _| workspace.set_random_database_id());
+    });
+    let outgoing_workspace =
+        multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+
+    let target_id = WorkspaceId(9301);
+    let db = cx.update(|_window, cx| WorkspaceDb::global(cx));
+    db.save_workspace_checked(strict_restore_fixture(
+        target_id,
+        "/project-c",
+        crate::persistence::model::SerializedPaneGroup::Pane(
+            crate::persistence::model::SerializedPane::new(Vec::new(), true, 0),
+        ),
+    ))
+    .await
+    .expect("failed to seed the unnamed-switch target workspace");
+    let target_configuration_id = cx
+        .update(|_window, cx| {
+            WorkspaceConfigurationStore::mutate_global(
+                crate::persistence::WorkspaceConfigurationMutation::Create {
+                    name: "Target".to_string(),
+                    members: vec![crate::persistence::model::WorkspaceConfigurationMember {
+                        workspace_id: target_id,
+                        identity_paths: vec![PathBuf::from("/project-c")],
+                    }],
+                    active_member: Some(target_id),
+                },
+                cx,
+            )
+        })
+        .await
+        .expect("failed to seed the unnamed-switch target configuration")
+        .id;
+
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.switch_workspace_configuration_from_ui(
+            target_configuration_id,
+            "Target".to_string(),
+            window,
+            cx,
+        );
+    });
+    assert!(cx.has_pending_prompt());
+    let (message, detail) = cx.pending_prompt().expect("unnamed switch prompt");
+    assert_eq!(message, "Save Current Workspace Configuration?");
+    assert!(detail.contains("Target"));
+
+    cx.simulate_prompt_answer("Cancel");
+    cx.run_until_parked();
+    multi_workspace.read_with(cx, |multi_workspace, _| {
+        assert_eq!(multi_workspace.workspace(), &outgoing_workspace);
+        assert_eq!(multi_workspace.active_configuration_id(), None);
+        assert!(!multi_workspace.configuration_switch_in_progress());
+    });
 }
 
 #[gpui::test]
@@ -716,6 +1614,97 @@ async fn test_workspace_tabs_render_management_menu(cx: &mut TestAppContext) {
         cx.debug_bounds("WORKSPACE-TAB-MENU-1").is_some(),
         "each workspace tab should expose a management menu",
     );
+}
+
+#[gpui::test]
+async fn workspace_configuration_ui_keeps_single_workspace_strip_and_switch_action_reachable(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    reset_workspace_configuration_store(cx).await;
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    let project = Project::test(fs, ["/root_a".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace
+            .workspace()
+            .update(cx, |workspace, _| workspace.set_random_database_id());
+    });
+
+    let save = multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.save_configuration_as("Daily".to_string(), cx)
+    });
+    save.await
+        .expect("failed to save the single-workspace UI fixture");
+    cx.run_until_parked();
+
+    cx.draw(
+        gpui::point(gpui::px(0.), gpui::px(0.)),
+        gpui::size(gpui::px(800.), gpui::px(600.)),
+        |_, _| multi_workspace.clone().into_any_element(),
+    );
+    let heading_bounds = cx
+        .debug_bounds("WORKSPACE-TABS-HEADING")
+        .expect("saved configuration should keep the workspace heading visible");
+    let trigger_content_bounds = cx
+        .debug_bounds("WORKSPACE-CONFIGURATION-TRIGGER-CONTENT")
+        .expect("workspace configuration trigger content should render");
+    assert!(
+        trigger_content_bounds.origin.x <= heading_bounds.origin.x + gpui::px(8.),
+        "workspace configuration heading content should be left-aligned"
+    );
+    assert!(cx.debug_bounds("WORKSPACE-TAB-0").is_some());
+
+    cx.dispatch_action(SwitchWorkspaceConfiguration);
+    cx.run_until_parked();
+    multi_workspace.read_with(cx, |multi_workspace, _| {
+        assert!(multi_workspace.test_workspace_configuration_menu_is_deployed());
+    });
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.workspace_configuration_menu_handle.hide(cx);
+    });
+}
+
+#[gpui::test]
+async fn workspace_configuration_ui_keeps_blocked_store_recovery_reachable(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    reset_workspace_configuration_store(cx).await;
+    let newer = format!(
+        r#"{{"schema_version":{},"configurations":[]}}"#,
+        crate::persistence::model::WORKSPACE_CONFIGURATION_SCHEMA_VERSION + 1
+    );
+    let kvp = cx.update(|cx| KeyValueStore::global(cx));
+    kvp.scoped("workspace_configurations")
+        .write("collection".to_string(), newer)
+        .await
+        .expect("failed to seed the blocked configuration store");
+    cx.update(WorkspaceConfigurationStore::reload_for_tests);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    let project = Project::test(fs, ["/root_a".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+
+    cx.draw(
+        gpui::point(gpui::px(0.), gpui::px(0.)),
+        gpui::size(gpui::px(800.), gpui::px(600.)),
+        |_, _| multi_workspace.clone().into_any_element(),
+    );
+    assert!(
+        cx.debug_bounds("WORKSPACE-TABS-HEADING").is_some(),
+        "a blocked store must keep its recovery menu reachable with one workspace"
+    );
+
+    cx.dispatch_action(SwitchWorkspaceConfiguration);
+    cx.run_until_parked();
+    multi_workspace.read_with(cx, |multi_workspace, _| {
+        assert!(multi_workspace.test_workspace_configuration_menu_is_deployed());
+    });
 }
 
 #[gpui::test]
@@ -1613,6 +2602,7 @@ async fn test_restore_multiworkspace_state_restores_project_groups_when_ai_is_di
         ],
         sidebar_open: true,
         sidebar_state: None,
+        active_configuration_id: None,
     };
     let fs = app_state.fs.clone();
     cx.update(|cx| {
@@ -1674,6 +2664,7 @@ async fn test_restore_multiworkspace_state_restores_project_groups_when_agent_is
         ],
         sidebar_open: true,
         sidebar_state: None,
+        active_configuration_id: None,
     };
     let fs = app_state.fs.clone();
     cx.update(|cx| {
@@ -1748,6 +2739,7 @@ async fn test_restore_multiworkspace_derives_missing_project_groups_for_restored
             ],
             sidebar_open: true,
             sidebar_state: None,
+            active_configuration_id: None,
         },
     };
 
@@ -1831,6 +2823,7 @@ async fn test_restore_multiworkspace_derives_project_groups_from_empty_state(
             project_groups: Vec::new(),
             sidebar_open: true,
             sidebar_state: None,
+            active_configuration_id: None,
         },
     };
 
@@ -1915,6 +2908,7 @@ async fn test_restore_multiworkspace_skips_inactive_remote_workspaces_without_li
             project_groups: Vec::new(),
             sidebar_open: true,
             sidebar_state: None,
+            active_configuration_id: None,
         },
     };
 
@@ -1969,6 +2963,7 @@ async fn test_restore_multiworkspace_state_restores_sidebar_when_ai_is_enabled(
         ],
         sidebar_open: true,
         sidebar_state: None,
+        active_configuration_id: None,
     };
     let fs = app_state.fs.clone();
     cx.update(|cx| {
@@ -2079,6 +3074,7 @@ async fn restore_inactive_workspaces_with_sidebar_ui_disabled(
             ],
             sidebar_open: true,
             sidebar_state: None,
+            active_configuration_id: None,
         },
     };
 
@@ -3464,4 +4460,518 @@ async fn test_nearest_retained_workspace_skips_disconnected_workspace(cx: &mut T
             "a disconnected workspace should not be selected as a fallback"
         );
     });
+}
+
+#[gpui::test]
+async fn workspace_configuration_checkpoint_save_as_and_live_changes(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/project-a", json!({})).await;
+    fs.insert_tree("/project-b", json!({})).await;
+    fs.insert_tree("/project-c", json!({})).await;
+    let project_a = Project::test(fs.clone(), ["/project-a".as_ref()], cx).await;
+    let project_b = Project::test(fs.clone(), ["/project-b".as_ref()], cx).await;
+    let project_c = Project::test(fs, ["/project-c".as_ref()], cx).await;
+    reset_workspace_configuration_store(cx).await;
+
+    let (multi_workspace, cx) = setup_multi_workspace(&[project_a, project_b], cx);
+    let (workspace_a, workspace_b) = multi_workspace.update(cx, |multi_workspace, cx| {
+        let workspaces = multi_workspace.ordered_workspaces(cx);
+        for workspace in &workspaces {
+            workspace.update(cx, |workspace, _cx| workspace.set_random_database_id());
+        }
+        let [workspace_a, workspace_b] = workspaces.as_slice() else {
+            panic!("expected exactly two workspaces");
+        };
+        (workspace_a.clone(), workspace_b.clone())
+    });
+
+    let save = multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.save_configuration_as("Daily".to_string(), cx)
+    });
+    let configuration_id = match save.await {
+        Ok(configuration_id) => configuration_id,
+        Err(error) => panic!("failed to save workspace configuration: {error:#}"),
+    };
+
+    let configuration = match workspace_configuration(configuration_id, cx) {
+        Some(configuration) => configuration,
+        None => panic!("saved workspace configuration was not published"),
+    };
+    let workspace_a_id = match workspace_a.read_with(cx, |workspace, _cx| workspace.database_id()) {
+        Some(workspace_id) => workspace_id,
+        None => panic!("workspace A lost its database id"),
+    };
+    let workspace_b_id = match workspace_b.read_with(cx, |workspace, _cx| workspace.database_id()) {
+        Some(workspace_id) => workspace_id,
+        None => panic!("workspace B lost its database id"),
+    };
+    let initial_active_id = multi_workspace.read_with(cx, |multi_workspace, cx| {
+        multi_workspace.workspace().read(cx).database_id()
+    });
+    let initial_active_id = match initial_active_id {
+        Some(workspace_id) => workspace_id,
+        None => panic!("the active workspace lost its database id"),
+    };
+    let (target_workspace, target_workspace_id) = if initial_active_id == workspace_a_id {
+        (workspace_b.clone(), workspace_b_id)
+    } else {
+        (workspace_a.clone(), workspace_a_id)
+    };
+    assert_eq!(
+        configuration
+            .members
+            .iter()
+            .map(|member| member.workspace_id)
+            .collect::<Vec<_>>(),
+        vec![workspace_a_id, workspace_b_id]
+    );
+    assert_eq!(configuration.active_member, Some(initial_active_id));
+    assert_eq!(
+        multi_workspace.read_with(cx, |multi_workspace, _cx| {
+            multi_workspace.active_configuration_id()
+        }),
+        Some(configuration_id)
+    );
+
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.activate(target_workspace, None, window, cx);
+    });
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        assert!(multi_workspace.move_workspace_tab_to_index(&workspace_b, 0, cx));
+    });
+    let checkpoint = multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.retry_configuration_checkpoint(cx)
+    });
+    if let Err(error) = checkpoint.await {
+        panic!("failed to checkpoint live workspace changes: {error:#}");
+    }
+
+    let configuration = match workspace_configuration(configuration_id, cx) {
+        Some(configuration) => configuration,
+        None => panic!("live workspace configuration disappeared"),
+    };
+    assert_eq!(
+        configuration
+            .members
+            .iter()
+            .map(|member| member.workspace_id)
+            .collect::<Vec<_>>(),
+        vec![workspace_b_id, workspace_a_id]
+    );
+    assert_eq!(configuration.active_member, Some(target_workspace_id));
+    assert_eq!(
+        multi_workspace.read_with(cx, |multi_workspace, _cx| {
+            multi_workspace
+                .configuration_checkpoint_error()
+                .map(str::to_string)
+        }),
+        None
+    );
+
+    let workspace_c = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_c, window, cx)
+    });
+    workspace_c.update(cx, |workspace, _cx| workspace.set_random_database_id());
+    let workspace_c_id = match workspace_c.read_with(cx, |workspace, _cx| workspace.database_id()) {
+        Some(workspace_id) => workspace_id,
+        None => panic!("workspace C lost its database id"),
+    };
+    let checkpoint = multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.retry_configuration_checkpoint(cx)
+    });
+    if let Err(error) = checkpoint.await {
+        panic!("failed to checkpoint an added workspace: {error:#}");
+    }
+    let configuration = match workspace_configuration(configuration_id, cx) {
+        Some(configuration) => configuration,
+        None => panic!("workspace configuration disappeared after add"),
+    };
+    assert_eq!(configuration.members.len(), 3);
+    assert!(
+        configuration
+            .members
+            .iter()
+            .any(|member| member.workspace_id == workspace_c_id)
+    );
+    assert_eq!(configuration.active_member, Some(workspace_c_id));
+
+    let close = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.close_workspace(&workspace_c, window, cx)
+    });
+    match close.await {
+        Ok(true) => {}
+        Ok(false) => panic!("workspace C was not closed"),
+        Err(error) => panic!("failed to close workspace C: {error:#}"),
+    }
+    let checkpoint = multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.retry_configuration_checkpoint(cx)
+    });
+    if let Err(error) = checkpoint.await {
+        panic!("failed to checkpoint a closed workspace: {error:#}");
+    }
+    let configuration = match workspace_configuration(configuration_id, cx) {
+        Some(configuration) => configuration,
+        None => panic!("workspace configuration disappeared after close"),
+    };
+    assert_eq!(configuration.members.len(), 2);
+    assert!(
+        configuration
+            .members
+            .iter()
+            .all(|member| member.workspace_id != workspace_c_id)
+    );
+}
+
+#[gpui::test]
+async fn workspace_configuration_checkpoint_save_as_publishes_nothing_after_source_drift(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/project-a", json!({})).await;
+    fs.insert_tree("/project-b", json!({})).await;
+    let project_a = Project::test(fs.clone(), ["/project-a".as_ref()], cx).await;
+    let project_b = Project::test(fs, ["/project-b".as_ref()], cx).await;
+    reset_workspace_configuration_store(cx).await;
+
+    let (multi_workspace, cx) = setup_multi_workspace(&[project_a], cx);
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace
+            .workspace()
+            .update(cx, |workspace, _cx| workspace.set_random_database_id());
+    });
+    let (configuration_created, resume_save) = multi_workspace
+        .update(cx, |multi_workspace, _cx| {
+            multi_workspace.pause_configuration_save_for_test()
+        });
+    let save = multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.save_configuration_as("Drifted".to_string(), cx)
+    });
+
+    configuration_created
+        .await
+        .expect("save ended before the final publication barrier");
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        let workspace = multi_workspace.test_add_workspace(project_b, window, cx);
+        workspace.update(cx, |workspace, _cx| workspace.set_random_database_id());
+    });
+    resume_save
+        .send(())
+        .expect("save dropped the final publication barrier");
+    let error = save
+        .await
+        .expect_err("save published a configuration after its source changed");
+    assert!(format!("{error:#}").contains("workspace set changed"));
+    assert!(workspace_configuration_store_is_empty(cx));
+    multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        assert_eq!(multi_workspace.active_configuration_id(), None);
+    });
+}
+
+#[gpui::test]
+async fn workspace_configuration_checkpoint_failure_is_stale_until_retry(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/project-a", json!({})).await;
+    fs.insert_tree("/project-b", json!({})).await;
+    let project_a = Project::test(fs.clone(), ["/project-a".as_ref()], cx).await;
+    let project_b = Project::test(fs, ["/project-b".as_ref()], cx).await;
+    reset_workspace_configuration_store(cx).await;
+
+    let (multi_workspace, cx) = setup_multi_workspace(&[project_a, project_b], cx);
+    let (workspace_a, workspace_b) = multi_workspace.update(cx, |multi_workspace, cx| {
+        let workspaces = multi_workspace.ordered_workspaces(cx);
+        for workspace in &workspaces {
+            workspace.update(cx, |workspace, _cx| workspace.set_random_database_id());
+        }
+        let [workspace_a, workspace_b] = workspaces.as_slice() else {
+            panic!("expected exactly two workspaces");
+        };
+        (workspace_a.clone(), workspace_b.clone())
+    });
+    let workspace_a_id = match workspace_a.read_with(cx, |workspace, _cx| workspace.database_id()) {
+        Some(workspace_id) => workspace_id,
+        None => panic!("workspace A lost its database id"),
+    };
+    let workspace_b_id = match workspace_b.read_with(cx, |workspace, _cx| workspace.database_id()) {
+        Some(workspace_id) => workspace_id,
+        None => panic!("workspace B lost its database id"),
+    };
+    let initial_active_id = multi_workspace.read_with(cx, |multi_workspace, cx| {
+        multi_workspace.workspace().read(cx).database_id()
+    });
+    let initial_active_id = match initial_active_id {
+        Some(workspace_id) => workspace_id,
+        None => panic!("the active workspace lost its database id"),
+    };
+    let (target_workspace, target_workspace_id) = if initial_active_id == workspace_a_id {
+        (workspace_b, workspace_b_id)
+    } else {
+        (workspace_a, workspace_a_id)
+    };
+    let save = multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.save_configuration_as("Recovery".to_string(), cx)
+    });
+    let configuration_id = match save.await {
+        Ok(configuration_id) => configuration_id,
+        Err(error) => panic!("failed to save initial workspace configuration: {error:#}"),
+    };
+
+    let workspace_db = cx.update(|_window, cx| WorkspaceDb::global(cx));
+    if let Err(error) = workspace_db.set_query_only_for_tests(true).await {
+        panic!("failed to force workspace checkpoint failure: {error:#}");
+    }
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.activate(target_workspace, None, window, cx);
+    });
+    let failed_checkpoint = multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.retry_configuration_checkpoint(cx)
+    });
+    assert!(failed_checkpoint.await.is_err());
+    if let Err(error) = workspace_db.set_query_only_for_tests(false).await {
+        panic!("failed to restore workspace database writes: {error:#}");
+    }
+
+    assert!(multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        multi_workspace.configuration_checkpoint_error().is_some()
+    }));
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.close_sidebar(window, cx);
+    });
+    cx.run_until_parked();
+    cx.draw(
+        gpui::point(gpui::px(0.), gpui::px(0.)),
+        gpui::size(gpui::px(800.), gpui::px(600.)),
+        |_, _| multi_workspace.clone().into_any_element(),
+    );
+    let heading_bounds = cx.debug_bounds("WORKSPACE-TABS-HEADING");
+    let trigger_bounds = cx.debug_bounds("WORKSPACE-CONFIGURATION-TRIGGER-CONTENT");
+    let stale_warning_bounds = cx.debug_bounds("WORKSPACE-CONFIGURATION-STALE-WARNING");
+    assert!(
+        stale_warning_bounds.is_some(),
+        "a stale active configuration must remain visibly marked without opening the menu; heading={heading_bounds:?}, trigger={trigger_bounds:?}"
+    );
+    let configuration = match workspace_configuration(configuration_id, cx) {
+        Some(configuration) => configuration,
+        None => panic!("failed live checkpoint removed the prior configuration"),
+    };
+    assert_eq!(configuration.active_member, Some(initial_active_id));
+
+    let retry = multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.retry_configuration_checkpoint(cx)
+    });
+    if let Err(error) = retry.await {
+        panic!("workspace configuration retry failed: {error:#}");
+    }
+    assert_eq!(
+        multi_workspace.read_with(cx, |multi_workspace, _cx| {
+            multi_workspace
+                .configuration_checkpoint_error()
+                .map(str::to_string)
+        }),
+        None
+    );
+    let configuration = match workspace_configuration(configuration_id, cx) {
+        Some(configuration) => configuration,
+        None => panic!("retried workspace configuration disappeared"),
+    };
+    assert_eq!(configuration.active_member, Some(target_workspace_id));
+}
+
+#[gpui::test]
+async fn workspace_configuration_checkpoint_save_as_write_failure_publishes_nothing(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/project-a", json!({})).await;
+    let project = Project::test(fs, ["/project-a".as_ref()], cx).await;
+    reset_workspace_configuration_store(cx).await;
+
+    let (multi_workspace, cx) = setup_multi_workspace(&[project], cx);
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        for workspace in multi_workspace.workspaces() {
+            workspace.update(cx, |workspace, _cx| workspace.set_random_database_id());
+        }
+    });
+    let kvp = cx.update(|_window, cx| KeyValueStore::global(cx));
+    set_configuration_kvp_query_only(&kvp, true).await;
+    let save = multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.save_configuration_as("Broken".to_string(), cx)
+    });
+    assert!(save.await.is_err());
+    set_configuration_kvp_query_only(&kvp, false).await;
+
+    assert_eq!(
+        multi_workspace.read_with(cx, |multi_workspace, _cx| {
+            multi_workspace.active_configuration_id()
+        }),
+        None
+    );
+    assert!(workspace_configuration_store_is_empty(cx));
+}
+
+#[gpui::test]
+async fn workspace_configuration_checkpoint_save_as_rejects_remote_members(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    let project = Project::test(fs, [], cx).await;
+    project.update(cx, |project, _cx| project.mark_as_collab_for_testing());
+    reset_workspace_configuration_store(cx).await;
+
+    let (multi_workspace, cx) = setup_multi_workspace(&[project], cx);
+    let save = multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.save_configuration_as("Remote".to_string(), cx)
+    });
+    let error = match save.await {
+        Ok(_) => panic!("remote workspace configuration was unexpectedly saved"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("local workspaces"));
+    assert_eq!(
+        multi_workspace.read_with(cx, |multi_workspace, _cx| {
+            multi_workspace.active_configuration_id()
+        }),
+        None
+    );
+    assert!(workspace_configuration_store_is_empty(cx));
+}
+
+#[gpui::test]
+async fn workspace_configuration_checkpoint_quit_retries_stale_configuration(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/project-a", json!({})).await;
+    fs.insert_tree("/project-b", json!({})).await;
+    let project_a = Project::test(fs.clone(), ["/project-a".as_ref()], cx).await;
+    let project_b = Project::test(fs, ["/project-b".as_ref()], cx).await;
+    reset_workspace_configuration_store(cx).await;
+
+    let (multi_workspace, cx) = setup_multi_workspace(&[project_a, project_b], cx);
+    let (target_workspace, target_workspace_id, window_id) =
+        multi_workspace.update(cx, |multi_workspace, cx| {
+            let workspaces = multi_workspace.ordered_workspaces(cx);
+            for workspace in &workspaces {
+                workspace.update(cx, |workspace, _cx| workspace.set_random_database_id());
+            }
+            let active_workspace = multi_workspace.workspace();
+            let target_workspace = match workspaces
+                .iter()
+                .find(|workspace| *workspace != active_workspace)
+            {
+                Some(workspace) => workspace.clone(),
+                None => panic!("expected a non-active workspace"),
+            };
+            let target_workspace_id = match target_workspace.read(cx).database_id() {
+                Some(workspace_id) => workspace_id,
+                None => panic!("target workspace lost its database id"),
+            };
+            (
+                target_workspace,
+                target_workspace_id,
+                multi_workspace.test_window_id(),
+            )
+        });
+    let save = multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.save_configuration_as("Quit Recovery".to_string(), cx)
+    });
+    let configuration_id = match save.await {
+        Ok(configuration_id) => configuration_id,
+        Err(error) => panic!("failed to save initial configuration: {error:#}"),
+    };
+
+    let workspace_db = cx.update(|_window, cx| WorkspaceDb::global(cx));
+    if let Err(error) = workspace_db.set_query_only_for_tests(true).await {
+        panic!("failed to force stale configuration: {error:#}");
+    }
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.activate(target_workspace, None, window, cx);
+    });
+    let failed_checkpoint = multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.retry_configuration_checkpoint(cx)
+    });
+    assert!(failed_checkpoint.await.is_err());
+    if let Err(error) = workspace_db.set_query_only_for_tests(false).await {
+        panic!("failed to restore workspace writes before quit: {error:#}");
+    }
+
+    assert!(multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        multi_workspace.configuration_checkpoint_error().is_some()
+    }));
+    assert_eq!(
+        multi_workspace.read_with(cx, |multi_workspace, cx| {
+            multi_workspace.workspace().read(cx).database_id()
+        }),
+        Some(target_workspace_id),
+        "the stale checkpoint must not revert the active workspace before quit"
+    );
+    let kvp = cx.update(|_window, cx| KeyValueStore::global(cx));
+
+    cx.executor().allow_parking();
+    let app = cx.cx.clone();
+    app.quit();
+
+    let configurations = kvp
+        .scoped("workspace_configurations")
+        .read("collection")
+        .ok()
+        .flatten()
+        .and_then(|json| {
+            serde_json::from_str::<crate::persistence::model::WorkspaceConfigurationCollection>(
+                &json,
+            )
+            .ok()
+        });
+    let configurations = match configurations {
+        Some(configurations) => configurations,
+        None => panic!("quit retry did not persist workspace configurations"),
+    };
+    let configuration = match configurations.find(configuration_id) {
+        Some(configuration) => configuration,
+        None => panic!("quit retry lost the workspace configuration"),
+    };
+    assert_eq!(configuration.active_member, Some(target_workspace_id));
+    let state_after_quit = kvp
+        .scoped("multi_workspace_state")
+        .read(&window_id.as_u64().to_string())
+        .ok()
+        .flatten()
+        .and_then(|json| serde_json::from_str::<MultiWorkspaceState>(&json).ok());
+    let state_after_quit = match state_after_quit {
+        Some(state) => state,
+        None => panic!("quit retry did not persist multi-workspace state"),
+    };
+    assert_eq!(
+        state_after_quit.active_configuration_id,
+        Some(configuration_id)
+    );
+}
+
+#[gpui::test]
+async fn workspace_configuration_checkpoint_quit_after_save(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/project-a", json!({})).await;
+    let project = Project::test(fs, ["/project-a".as_ref()], cx).await;
+    cx.update(WorkspaceConfigurationStore::init);
+
+    let (multi_workspace, cx) = setup_multi_workspace(&[project], cx);
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        for workspace in multi_workspace.workspaces() {
+            workspace.update(cx, |workspace, _cx| workspace.set_random_database_id());
+        }
+    });
+    let save = multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.save_configuration_as("Quit".to_string(), cx)
+    });
+    if let Err(error) = save.await {
+        panic!("failed to save the configuration before quit: {error:#}");
+    }
+    let app = cx.cx.clone();
+    app.quit();
 }

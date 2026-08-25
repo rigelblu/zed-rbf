@@ -190,6 +190,10 @@ impl ScrollManager {
         }
     }
 
+    pub(crate) fn cancel_pending_save(&mut self) {
+        self._save_scroll_position_task = Task::ready(());
+    }
+
     pub fn set_native_display_map_id(
         &mut self,
         display_map_id: EntityId,

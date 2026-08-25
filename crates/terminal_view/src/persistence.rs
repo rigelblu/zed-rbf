@@ -419,6 +419,47 @@ impl Domain for TerminalDb {
 db::static_connection!(TerminalDb, [WorkspaceDb]);
 
 impl TerminalDb {
+    pub(crate) async fn save_terminal_in_transaction(
+        transaction: &db::sqlez::thread_safe_connection::WriteTransaction,
+        item_id: ItemId,
+        workspace_id: WorkspaceId,
+        working_directory: Option<PathBuf>,
+        custom_title: Option<String>,
+    ) -> Result<()> {
+        transaction
+            .write(move |conn| {
+                if let Some(working_directory) = working_directory {
+                    let query = "INSERT INTO terminals(item_id, workspace_id, working_directory, working_directory_path)
+                        VALUES (?1, ?2, ?3, ?4)
+                        ON CONFLICT DO UPDATE SET
+                            item_id = ?1,
+                            workspace_id = ?2,
+                            working_directory = ?3,
+                            working_directory_path = ?4";
+                    let mut statement = Statement::prepare(conn, query)?;
+                    let mut next_index = statement.bind(&item_id, 1)?;
+                    next_index = statement.bind(&workspace_id, next_index)?;
+                    next_index = statement.bind(&working_directory, next_index)?;
+                    statement.bind(
+                        &working_directory.to_string_lossy().into_owned(),
+                        next_index,
+                    )?;
+                    statement.exec()?;
+                }
+
+                let query = "INSERT INTO terminals (item_id, workspace_id, custom_title)
+                    VALUES (?1, ?2, ?3)
+                    ON CONFLICT (workspace_id, item_id) DO UPDATE SET
+                        custom_title = excluded.custom_title";
+                let mut statement = Statement::prepare(conn, query)?;
+                let mut next_index = statement.bind(&item_id, 1)?;
+                next_index = statement.bind(&workspace_id, next_index)?;
+                statement.bind(&custom_title, next_index)?;
+                statement.exec()
+            })
+            .await?
+    }
+
     query! {
        pub async fn update_workspace_id(
             new_id: WorkspaceId,

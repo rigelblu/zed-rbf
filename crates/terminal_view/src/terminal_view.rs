@@ -1888,6 +1888,37 @@ impl SerializableItem for TerminalView {
         }))
     }
 
+    fn checkpoint_in_transaction(
+        &mut self,
+        _workspace: &mut Workspace,
+        item_id: workspace::ItemId,
+        transaction: db::sqlez::thread_safe_connection::WriteTransaction,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<()>> {
+        let terminal = self.terminal().read(cx);
+        if terminal.task().is_some() || !self.needs_serialize {
+            return Task::ready(Ok(()));
+        }
+        let Some(workspace_id) = self.workspace_id else {
+            return Task::ready(Ok(()));
+        };
+        let working_directory = terminal.working_directory();
+        let custom_title = self.custom_title.clone();
+        self.needs_serialize = false;
+
+        cx.background_spawn(async move {
+            TerminalDb::save_terminal_in_transaction(
+                &transaction,
+                item_id,
+                workspace_id,
+                working_directory,
+                custom_title,
+            )
+            .await
+        })
+    }
+
     fn should_serialize(&self, _: &Self::Event) -> bool {
         self.needs_serialize
     }

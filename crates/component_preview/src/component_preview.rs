@@ -875,6 +875,29 @@ impl SerializableItem for ComponentPreview {
         }))
     }
 
+    fn checkpoint_in_transaction(
+        &mut self,
+        _workspace: &mut Workspace,
+        item_id: ItemId,
+        transaction: db::sqlez::thread_safe_connection::WriteTransaction,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<()>> {
+        let active_page = self.active_page_id(cx);
+        let Some(workspace_id) = self.workspace_id else {
+            return Task::ready(Ok(()));
+        };
+        cx.background_spawn(async move {
+            ComponentPreviewDb::save_active_page_in_transaction(
+                &transaction,
+                item_id,
+                workspace_id,
+                active_page.0,
+            )
+            .await
+        })
+    }
+
     fn should_serialize(&self, event: &Self::Event) -> bool {
         matches!(event, ItemEvent::UpdateTab)
     }

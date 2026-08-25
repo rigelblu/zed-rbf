@@ -1,9 +1,9 @@
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use fs::Fs;
 
 use gpui::{
-    AnyView, App, Context, DragMoveEvent, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
-    ManagedView, MouseButton, Pixels, Render, ScrollHandle, Subscription, Task, TaskExt,
+    AnyView, App, AsyncApp, Context, DragMoveEvent, Entity, EntityId, EventEmitter, FocusHandle,
+    Focusable, ManagedView, MouseButton, Pixels, Render, ScrollHandle, Subscription, Task, TaskExt,
     WeakEntity, Window, WindowId, actions, deferred, px,
 };
 pub use project::ProjectGroupKey;
@@ -15,6 +15,7 @@ use std::cell::Cell;
 use std::future::Future;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::Duration;
 use ui::prelude::*;
 use util::ResultExt;
 use util::path_list::PathList;
@@ -22,15 +23,19 @@ use zed_actions::agents_sidebar::ToggleThreadSwitcher;
 
 use agent_settings::AgentSettings;
 use settings::SidebarDockPosition;
-use ui::{ContextMenu, right_click_menu};
+use ui::{ContextMenu, PopoverMenuHandle, right_click_menu};
 
 const SIDEBAR_RESIZE_HANDLE_SIZE: Pixels = px(6.0);
+const WORKSPACE_CONFIGURATION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 use crate::open_remote_project_with_existing_connection;
 use crate::{
     CloseIntent, CloseWindow, DockPosition, Event as WorkspaceEvent, Item, ModalView, OpenMode,
     Panel, Workspace, WorkspaceId, client_side_decorations,
-    persistence::model::MultiWorkspaceState,
+    persistence::{
+        WorkspaceConfigurationMutation, WorkspaceConfigurationStore,
+        model::{MultiWorkspaceState, WorkspaceConfigurationId, WorkspaceConfigurationMember},
+    },
 };
 
 actions!(
@@ -54,6 +59,16 @@ actions!(
         NewThread,
         /// Moves the active project to a new window.
         MoveProjectToNewWindow,
+    ]
+);
+
+actions!(
+    workspace,
+    [
+        /// Saves the current window's workspace configuration under a new name.
+        SaveWorkspaceConfigurationAs,
+        /// Opens the saved workspace configuration switcher.
+        SwitchWorkspaceConfiguration,
     ]
 );
 
@@ -299,6 +314,49 @@ struct HeldWorkspace {
     activated_at: Option<u64>,
 }
 
+struct WorkspaceConfigurationSnapshot {
+    generation: u64,
+    workspaces: Vec<Entity<Workspace>>,
+    members: Vec<WorkspaceConfigurationMember>,
+    active_member: Option<WorkspaceId>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkspaceConfigurationSwitchTestStage {
+    TargetStaged,
+    BeforeCommit,
+}
+
+#[cfg(test)]
+struct WorkspaceConfigurationSwitchTestPause {
+    stage: WorkspaceConfigurationSwitchTestStage,
+    reached: Option<futures::channel::oneshot::Sender<()>>,
+    resume: Option<futures::channel::oneshot::Receiver<()>>,
+}
+
+#[cfg(test)]
+struct WorkspaceConfigurationSaveTestPause {
+    reached: Option<futures::channel::oneshot::Sender<()>>,
+    resume: Option<futures::channel::oneshot::Receiver<()>>,
+}
+
+enum WorkspaceConfigurationTargetMember {
+    Live(Entity<Workspace>),
+    Serialized(crate::persistence::model::SerializedWorkspace),
+}
+
+#[derive(Debug)]
+struct WorkspaceConfigurationSwitchCanceled;
+
+impl std::fmt::Display for WorkspaceConfigurationSwitchCanceled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("workspace configuration switch canceled")
+    }
+}
+
+impl std::error::Error for WorkspaceConfigurationSwitchCanceled {}
+
 fn project_group_covers_workspace_key(
     group_key: &ProjectGroupKey,
     workspace_key: &ProjectGroupKey,
@@ -337,7 +395,23 @@ pub struct MultiWorkspace {
     pub(crate) workspace_tabs_scroll_handle: ScrollHandle,
     pub(crate) workspace_tabs_last_scrolled_workspace_id: Cell<Option<EntityId>>,
     pub(crate) workspace_tabs_last_scrolled_index: Cell<Option<usize>>,
+    pub(crate) workspace_configuration_menu_handle: PopoverMenuHandle<ContextMenu>,
     pending_removal_tasks: Vec<Task<()>>,
+    /// The saved configuration this window is currently following, if any.
+    ///
+    /// `None` means the current workspace set is unnamed: it is still fully usable, it
+    /// just has no durable record, so nothing is checkpointed on its behalf.
+    active_configuration_id: Option<WorkspaceConfigurationId>,
+    configuration_checkpoint_error: Option<String>,
+    workspace_configuration_generation: u64,
+    configuration_checkpoint_queue_tail: Option<Task<()>>,
+    configuration_switch_in_progress: bool,
+    configuration_switch_gate: Option<String>,
+    configuration_switch_gate_focus_handle: FocusHandle,
+    #[cfg(test)]
+    configuration_switch_test_pause: Option<WorkspaceConfigurationSwitchTestPause>,
+    #[cfg(test)]
+    configuration_save_test_pause: Option<WorkspaceConfigurationSaveTestPause>,
     _serialize_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
     previous_focus_handle: Option<FocusHandle>,
@@ -346,6 +420,872 @@ pub struct MultiWorkspace {
 impl EventEmitter<MultiWorkspaceEvent> for MultiWorkspace {}
 
 impl MultiWorkspace {
+    fn workspace_configuration_snapshot(&self, cx: &App) -> Result<WorkspaceConfigurationSnapshot> {
+        let workspaces = self.ordered_workspaces(cx);
+        let mut members = Vec::with_capacity(workspaces.len());
+        for workspace in &workspaces {
+            let workspace = workspace.read(cx);
+            anyhow::ensure!(
+                workspace.project().read(cx).is_local(),
+                "Workspace configurations can only contain local workspaces."
+            );
+            let workspace_id = workspace
+                .database_id()
+                .context("a workspace has no durable persistence id")?;
+            let identity_paths = workspace
+                .project_group_key(cx)
+                .path_list()
+                .paths()
+                .iter()
+                .map(|path| path.to_path_buf())
+                .collect();
+            members.push(WorkspaceConfigurationMember {
+                workspace_id,
+                identity_paths,
+            });
+        }
+
+        let active_member = self
+            .workspace()
+            .read(cx)
+            .database_id()
+            .context("the active workspace has no durable persistence id")?;
+        anyhow::ensure!(
+            members
+                .iter()
+                .any(|member| member.workspace_id == active_member),
+            "the active workspace is not part of the window's workspace set"
+        );
+
+        Ok(WorkspaceConfigurationSnapshot {
+            generation: self.workspace_configuration_generation,
+            workspaces,
+            members,
+            active_member: Some(active_member),
+        })
+    }
+
+    async fn exact_checkpoint_configuration_members(
+        workspaces: &[Entity<Workspace>],
+        cx: &mut AsyncApp,
+    ) -> Result<()> {
+        let mut tasks = Vec::with_capacity(workspaces.len());
+        for workspace in workspaces {
+            tasks.push(workspace.update(cx, |workspace, cx| workspace.checkpoint_exact(cx)));
+        }
+
+        let mut first_error = None;
+        for result in futures::future::join_all(tasks).await {
+            if let Err(error) = result
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn publish_configuration_checkpoint_result(
+        this: &WeakEntity<Self>,
+        configuration_id: WorkspaceConfigurationId,
+        generation: u64,
+        result: &Result<()>,
+        cx: &mut AsyncApp,
+    ) -> Result<()> {
+        let error = result.as_ref().err().map(|error| format!("{error:#}"));
+        let serialization = this.update(cx, |this, cx| {
+            if this.active_configuration_id != Some(configuration_id)
+                || this.workspace_configuration_generation != generation
+            {
+                return None;
+            }
+            this.configuration_checkpoint_error = error;
+            this.serialize(cx);
+            cx.notify();
+            Some(this.flush_serialization())
+        })?;
+        if let Some(serialization) = serialization {
+            serialization.await;
+        }
+        Ok(())
+    }
+
+    async fn checkpoint_configuration_snapshot(
+        this: &WeakEntity<Self>,
+        configuration_id: WorkspaceConfigurationId,
+        snapshot: WorkspaceConfigurationSnapshot,
+        workspace_row_reservation_id: uuid::Uuid,
+        cx: &mut AsyncApp,
+    ) -> Result<()> {
+        let result = async {
+            Self::exact_checkpoint_configuration_members(&snapshot.workspaces, cx).await?;
+            let still_current = this.read_with(cx, |this, _cx| {
+                this.active_configuration_id == Some(configuration_id)
+                    && this.workspace_configuration_generation == snapshot.generation
+            })?;
+            anyhow::ensure!(
+                still_current,
+                "the workspace set changed while its configuration was checkpointing"
+            );
+
+            cx.update(|cx| {
+                WorkspaceConfigurationStore::mutate_global(
+                    WorkspaceConfigurationMutation::Checkpoint {
+                        id: configuration_id,
+                        members: snapshot.members,
+                        active_member: snapshot.active_member,
+                    },
+                    cx,
+                )
+            })
+            .await?;
+            Ok(())
+        }
+        .await;
+
+        let publish_result = Self::publish_configuration_checkpoint_result(
+            this,
+            configuration_id,
+            snapshot.generation,
+            &result,
+            cx,
+        )
+        .await;
+        cx.update(|cx| {
+            WorkspaceConfigurationStore::release_workspace_rows(workspace_row_reservation_id, cx)
+        });
+        publish_result?;
+        result
+    }
+
+    fn enqueue_active_configuration_checkpoint(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let Some(configuration_id) = self.active_configuration_id else {
+            return Task::ready(Ok(()));
+        };
+        let generation = self.workspace_configuration_generation;
+        let snapshot = self.workspace_configuration_snapshot(cx);
+        let workspace_row_reservation_id = snapshot.as_ref().ok().map(|snapshot| {
+            WorkspaceConfigurationStore::reserve_workspace_rows(
+                snapshot.members.iter().map(|member| member.workspace_id),
+                cx,
+            )
+        });
+        let previous = self.configuration_checkpoint_queue_tail.take();
+        let (send_result, receive_result) = futures::channel::oneshot::channel();
+
+        let queued = cx.spawn(async move |this, cx| {
+            if let Some(previous) = previous {
+                previous.await;
+            }
+            let result = match snapshot {
+                Ok(snapshot) => match workspace_row_reservation_id {
+                    Some(workspace_row_reservation_id) => {
+                        Self::checkpoint_configuration_snapshot(
+                            &this,
+                            configuration_id,
+                            snapshot,
+                            workspace_row_reservation_id,
+                            cx,
+                        )
+                        .await
+                    }
+                    None => Err(anyhow::anyhow!(
+                        "workspace configuration checkpoint lost its row reservation"
+                    )),
+                },
+                Err(error) => {
+                    let result = Err(error);
+                    if let Err(error) = Self::publish_configuration_checkpoint_result(
+                        &this,
+                        configuration_id,
+                        generation,
+                        &result,
+                        cx,
+                    )
+                    .await
+                    {
+                        log::error!(
+                            "failed to publish workspace configuration checkpoint error: {error:#}"
+                        );
+                    }
+                    result
+                }
+            };
+            if send_result.send(result).is_err() {
+                log::debug!("workspace configuration checkpoint caller was dropped");
+            }
+        });
+        self.configuration_checkpoint_queue_tail = Some(queued);
+
+        cx.background_spawn(async move {
+            receive_result
+                .await
+                .context("workspace configuration checkpoint queue dropped the result")?
+        })
+    }
+
+    fn workspace_configuration_changed(&mut self, cx: &mut Context<Self>) {
+        self.workspace_configuration_generation += 1;
+        if self.active_configuration_id.is_some() {
+            self.enqueue_active_configuration_checkpoint(cx).detach();
+        }
+    }
+
+    pub fn save_configuration_as(
+        &mut self,
+        name: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<WorkspaceConfigurationId>> {
+        let snapshot = match self.workspace_configuration_snapshot(cx) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return Task::ready(Err(error)),
+        };
+        let workspace_row_reservation_id = WorkspaceConfigurationStore::reserve_workspace_rows(
+            snapshot.members.iter().map(|member| member.workspace_id),
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            let result = async {
+                Self::exact_checkpoint_configuration_members(&snapshot.workspaces, cx).await?;
+                let generation_is_current = this.read_with(cx, |this, _cx| {
+                    this.workspace_configuration_generation == snapshot.generation
+                })?;
+                anyhow::ensure!(
+                    generation_is_current,
+                    "the workspace set changed while the configuration was being saved"
+                );
+
+                #[cfg(test)]
+                Self::reach_configuration_save_test_pause(&this, cx).await?;
+
+                let expected_generation = snapshot.generation;
+                let validation_target = this.clone();
+                let commit = cx
+                    .update(|cx| {
+                        WorkspaceConfigurationStore::mutate_conditionally_global(
+                            move |cx| {
+                                let generation_is_current =
+                                    validation_target.read_with(cx, |this, _cx| {
+                                        this.workspace_configuration_generation
+                                            == expected_generation
+                                    })?;
+                                anyhow::ensure!(
+                                    generation_is_current,
+                                    "the workspace set changed while the configuration was being saved"
+                                );
+                                Ok(())
+                            },
+                            WorkspaceConfigurationMutation::Create {
+                                name,
+                                members: snapshot.members,
+                                active_member: snapshot.active_member,
+                            },
+                            cx,
+                        )
+                    })
+                    .await?;
+
+                let serialization = this.update(cx, |this, cx| {
+                    this.active_configuration_id = Some(commit.id);
+                    this.configuration_checkpoint_error = None;
+                    this.serialize(cx);
+                    cx.notify();
+                    this.flush_serialization()
+                })?;
+                serialization.await;
+                Ok(commit.id)
+            }
+            .await;
+            cx.update(|cx| {
+                WorkspaceConfigurationStore::release_workspace_rows(
+                    workspace_row_reservation_id,
+                    cx,
+                )
+            });
+            result
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_configuration_save_for_test(
+        &mut self,
+    ) -> (
+        futures::channel::oneshot::Receiver<()>,
+        futures::channel::oneshot::Sender<()>,
+    ) {
+        let (reached_sender, reached_receiver) = futures::channel::oneshot::channel();
+        let (resume_sender, resume_receiver) = futures::channel::oneshot::channel();
+        self.configuration_save_test_pause = Some(WorkspaceConfigurationSaveTestPause {
+            reached: Some(reached_sender),
+            resume: Some(resume_receiver),
+        });
+        (reached_receiver, resume_sender)
+    }
+
+    #[cfg(test)]
+    async fn reach_configuration_save_test_pause(
+        this: &WeakEntity<Self>,
+        cx: &mut AsyncApp,
+    ) -> Result<()> {
+        let resume = this.update(cx, |this, _cx| {
+            let Some(pause) = this.configuration_save_test_pause.as_mut() else {
+                return None;
+            };
+            if let Some(reached) = pause.reached.take() {
+                reached.send(()).ok();
+            }
+            pause.resume.take()
+        })?;
+        if let Some(resume) = resume {
+            resume
+                .await
+                .context("workspace configuration save test pause was dropped")?;
+            this.update(cx, |this, _cx| {
+                this.configuration_save_test_pause = None;
+            })?;
+        }
+        Ok(())
+    }
+
+    pub fn retry_configuration_checkpoint(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
+        self.enqueue_active_configuration_checkpoint(cx)
+    }
+
+    pub fn active_configuration_id(&self) -> Option<WorkspaceConfigurationId> {
+        self.active_configuration_id
+    }
+
+    pub fn configuration_checkpoint_error(&self) -> Option<&str> {
+        self.configuration_checkpoint_error.as_deref()
+    }
+
+    pub(crate) fn configuration_switch_in_progress(&self) -> bool {
+        self.configuration_switch_in_progress
+    }
+
+    pub(crate) fn workspace_configuration_switch_was_canceled(error: &anyhow::Error) -> bool {
+        error
+            .downcast_ref::<WorkspaceConfigurationSwitchCanceled>()
+            .is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_configuration_switch_for_test(
+        &mut self,
+        stage: WorkspaceConfigurationSwitchTestStage,
+    ) -> (
+        futures::channel::oneshot::Receiver<()>,
+        futures::channel::oneshot::Sender<()>,
+    ) {
+        let (reached_sender, reached_receiver) = futures::channel::oneshot::channel();
+        let (resume_sender, resume_receiver) = futures::channel::oneshot::channel();
+        self.configuration_switch_test_pause = Some(WorkspaceConfigurationSwitchTestPause {
+            stage,
+            reached: Some(reached_sender),
+            resume: Some(resume_receiver),
+        });
+        (reached_receiver, resume_sender)
+    }
+
+    #[cfg(test)]
+    async fn reach_configuration_switch_test_pause(
+        this: &WeakEntity<Self>,
+        stage: WorkspaceConfigurationSwitchTestStage,
+        cx: &mut gpui::AsyncWindowContext,
+    ) -> Result<()> {
+        let resume = this.update(cx, |this, _cx| {
+            let Some(pause) = this.configuration_switch_test_pause.as_mut() else {
+                return None;
+            };
+            if pause.stage != stage {
+                return None;
+            }
+            if let Some(reached) = pause.reached.take() {
+                reached.send(()).ok();
+            }
+            pause.resume.take()
+        })?;
+        if let Some(resume) = resume {
+            resume
+                .await
+                .context("workspace configuration switch test pause was dropped")?;
+            this.update(cx, |this, _cx| {
+                this.configuration_switch_test_pause = None;
+            })?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn unnamed_configuration_is_pristine_scratch(
+        &self,
+        window: &Window,
+        cx: &App,
+    ) -> bool {
+        if self.active_configuration_id.is_some() || self.held.len() != 1 {
+            return false;
+        }
+        let workspace = self.workspace().read(cx);
+        if !workspace.project().read(cx).is_local()
+            || !workspace
+                .project_group_key(cx)
+                .path_list()
+                .paths()
+                .is_empty()
+            || workspace.panes().len() != 1
+            || workspace.panes()[0].read(cx).items_len() != 0
+            || workspace.panes()[0].read(cx).has_restorable_items()
+        {
+            return false;
+        }
+        workspace.capture_dock_state(window, cx) == Default::default()
+    }
+
+    pub(crate) fn restore_configuration_association(
+        &mut self,
+        configuration_id: WorkspaceConfigurationId,
+        cx: &mut Context<Self>,
+    ) {
+        let matches = self
+            .workspace_configuration_snapshot(cx)
+            .ok()
+            .and_then(|snapshot| {
+                let store = WorkspaceConfigurationStore::global(cx);
+                store.configuration(configuration_id).map(|configuration| {
+                    configuration
+                        .members
+                        .iter()
+                        .map(|member| member.workspace_id)
+                        .eq(snapshot.members.iter().map(|member| member.workspace_id))
+                        && configuration.active_member == snapshot.active_member
+                })
+            })
+            .unwrap_or(false);
+        if matches {
+            self.active_configuration_id = Some(configuration_id);
+            self.configuration_checkpoint_error = None;
+            cx.notify();
+        }
+    }
+
+    fn resolve_workspace_configuration_target(
+        configuration: &crate::persistence::model::WorkspaceConfiguration,
+        source_window_id: WindowId,
+        cx: &App,
+    ) -> Result<Vec<WorkspaceConfigurationTargetMember>> {
+        let db = crate::persistence::WorkspaceDb::global(cx);
+        let mut target = Vec::with_capacity(configuration.members.len());
+        for member in &configuration.members {
+            let mut local_workspace = None;
+            for window in cx
+                .windows()
+                .into_iter()
+                .filter_map(|window| window.downcast::<MultiWorkspace>())
+            {
+                let multi_workspace = match window.read(cx) {
+                    Ok(multi_workspace) => multi_workspace,
+                    Err(_) => continue,
+                };
+                let matching_workspace = multi_workspace.workspaces().find(|workspace| {
+                    workspace.read(cx).database_id() == Some(member.workspace_id)
+                });
+                let Some(matching_workspace) = matching_workspace else {
+                    continue;
+                };
+                anyhow::ensure!(
+                    multi_workspace.window_id == source_window_id,
+                    "“{}” can’t be switched to because workspace “{}” is open in another window",
+                    configuration.name,
+                    Self::workspace_configuration_member_label(member)
+                );
+                local_workspace = Some(matching_workspace.clone());
+            }
+
+            if let Some(workspace) = local_workspace {
+                target.push(WorkspaceConfigurationTargetMember::Live(workspace));
+                continue;
+            }
+
+            let serialized_workspace = match db.workspace_for_id_checked(member.workspace_id)? {
+                Some(workspace) => workspace,
+                None => {
+                    let mut workspace = db
+                        .workspace_for_local_identity_paths_checked(&member.identity_paths)?
+                        .with_context(|| {
+                            format!(
+                                "“{}” can’t be restored because workspace “{}” no longer has saved editor state",
+                                configuration.name,
+                                Self::workspace_configuration_member_label(member)
+                            )
+                        })?;
+                    workspace.id = member.workspace_id;
+                    workspace
+                }
+            };
+            anyhow::ensure!(
+                serialized_workspace.location
+                    == crate::persistence::model::SerializedWorkspaceLocation::Local,
+                "workspace configurations currently support local workspaces only"
+            );
+            target.push(WorkspaceConfigurationTargetMember::Serialized(
+                serialized_workspace,
+            ));
+        }
+        Ok(target)
+    }
+
+    fn target_is_unowned_elsewhere(
+        configuration: &crate::persistence::model::WorkspaceConfiguration,
+        target: &[Entity<Workspace>],
+        source_window_id: WindowId,
+        cx: &App,
+    ) -> Result<()> {
+        for window in cx
+            .windows()
+            .into_iter()
+            .filter_map(|window| window.downcast::<MultiWorkspace>())
+        {
+            let multi_workspace = match window.read(cx) {
+                Ok(multi_workspace) => multi_workspace,
+                Err(_) => continue,
+            };
+            if multi_workspace.window_id == source_window_id {
+                continue;
+            }
+            for (workspace, member) in target.iter().zip(&configuration.members) {
+                let workspace = workspace.read(cx);
+                let workspace_id = workspace.database_id();
+                let workspace_identity = workspace.project_group_key(cx).path_list().clone();
+                anyhow::ensure!(
+                    !multi_workspace.workspaces().any(|candidate| {
+                        let candidate = candidate.read(cx);
+                        candidate.database_id() == workspace_id
+                            || candidate.project_group_key(cx).path_list() == &workspace_identity
+                    }),
+                    "“{}” can’t be switched to because workspace “{}” is open in another window",
+                    configuration.name,
+                    Self::workspace_configuration_member_label(member)
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn workspace_configuration_member_label(member: &WorkspaceConfigurationMember) -> String {
+        if member.identity_paths.is_empty() {
+            return "Untitled".to_string();
+        }
+
+        member
+            .identity_paths
+            .iter()
+            .map(|path| path.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn commit_workspace_configuration(
+        &mut self,
+        configuration_id: WorkspaceConfigurationId,
+        target: Vec<Entity<Workspace>>,
+        active_member: WorkspaceId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let active_workspace = target
+            .iter()
+            .find(|workspace| workspace.read(cx).database_id() == Some(active_member))
+            .cloned()
+            .context("the target configuration has no active workspace")?;
+        let previous = self.workspaces().cloned().collect::<Vec<_>>();
+
+        for workspace in &target {
+            if self.held_index(workspace).is_none() {
+                self.register_workspace(workspace, window, cx);
+            }
+        }
+
+        let mut project_groups = Vec::new();
+        for workspace in &target {
+            let key = workspace.read(cx).project_group_key(cx);
+            if !key.path_list().paths().is_empty()
+                && !project_groups
+                    .iter()
+                    .any(|group: &ProjectGroupState| group.key == key)
+            {
+                project_groups.push(ProjectGroupState {
+                    key,
+                    expanded: true,
+                });
+            }
+        }
+
+        self.held = target
+            .iter()
+            .map(|workspace| HeldWorkspace {
+                workspace: workspace.clone(),
+                pinned: true,
+                activated_at: (workspace == &active_workspace).then_some(0),
+            })
+            .collect();
+        self.project_groups = project_groups;
+        self.active_workspace_id.set(active_workspace.entity_id());
+        self.active_configuration_id = Some(configuration_id);
+        self.configuration_checkpoint_error = None;
+        self.workspace_configuration_generation += 1;
+
+        for workspace in &previous {
+            if !target.contains(workspace) {
+                cx.emit(MultiWorkspaceEvent::WorkspaceRemoved(workspace.entity_id()));
+                self.clear_workspace_session_binding(workspace, cx);
+            }
+        }
+        for workspace in &target {
+            if !previous.contains(workspace) {
+                cx.emit(MultiWorkspaceEvent::WorkspaceAdded(workspace.clone()));
+            }
+        }
+        cx.emit(MultiWorkspaceEvent::ProjectGroupsChanged);
+        cx.emit(MultiWorkspaceEvent::ActiveWorkspaceChanged {
+            source_workspace: None,
+        });
+        active_workspace.update(cx, |workspace, cx| {
+            workspace.refresh_window_state(window, cx);
+        });
+        self.serialize(cx);
+        self.focus_active_workspace(window, cx);
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn switch_workspace_configuration(
+        &mut self,
+        configuration_id: WorkspaceConfigurationId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        if self.active_configuration_id == Some(configuration_id)
+            && self.configuration_checkpoint_error.is_none()
+        {
+            return Task::ready(Ok(()));
+        }
+        if self.configuration_switch_in_progress {
+            return Task::ready(Err(anyhow::anyhow!(
+                "another workspace configuration switch is already in progress"
+            )));
+        }
+        let stale_checkpoint_retry = self
+            .configuration_checkpoint_error
+            .is_some()
+            .then(|| self.enqueue_active_configuration_checkpoint(cx));
+        let source_window_id = self.window_id;
+        let source_window = match window.window_handle().downcast::<MultiWorkspace>() {
+            Some(window) => window,
+            None => {
+                return Task::ready(Err(anyhow::anyhow!(
+                    "workspace configuration switch requires a multi-workspace window"
+                )));
+            }
+        };
+        let app_state = self.workspace().read(cx).app_state().clone();
+        self.configuration_switch_in_progress = true;
+        cx.notify();
+
+        cx.spawn_in(window, async move |this, cx| {
+            let result = async {
+                if let Some(stale_checkpoint_retry) = stale_checkpoint_retry {
+                    stale_checkpoint_retry
+                        .await
+                        .context("the active workspace configuration still has unsaved changes")?;
+                    if this.read_with(cx, |this, _cx| {
+                        this.active_configuration_id == Some(configuration_id)
+                    })? {
+                        return Ok(());
+                    }
+                }
+
+                loop {
+                    let (outgoing_configuration_id, outgoing_snapshot) =
+                        this.read_with(cx, |this, cx| {
+                            Ok::<_, anyhow::Error>((
+                                this.active_configuration_id,
+                                this.workspace_configuration_snapshot(cx)?,
+                            ))
+                        })??;
+                    let target_configuration = cx.update(|_window, cx| {
+                        WorkspaceConfigurationStore::global(cx)
+                            .configuration(configuration_id)
+                            .cloned()
+                            .context("that workspace configuration no longer exists")
+                    })??;
+                    let target_members = cx.update(|_window, cx| {
+                        Self::resolve_workspace_configuration_target(
+                            &target_configuration,
+                            source_window_id,
+                            cx,
+                        )
+                    })??;
+
+                    let mut target = Vec::with_capacity(target_members.len());
+                    for member in target_members {
+                        match member {
+                            WorkspaceConfigurationTargetMember::Live(workspace) => {
+                                target.push(workspace)
+                            }
+                            WorkspaceConfigurationTargetMember::Serialized(
+                                serialized_workspace,
+                            ) => {
+                                let prepared = cx.update(|_window, cx| {
+                                    Workspace::prepare_local_strict(
+                                        serialized_workspace,
+                                        app_state.clone(),
+                                        source_window,
+                                        cx,
+                                    )
+                                })?;
+                                target.push(prepared.await?);
+                            }
+                        }
+                    }
+
+                    #[cfg(test)]
+                    Self::reach_configuration_switch_test_pause(
+                        &this,
+                        WorkspaceConfigurationSwitchTestStage::TargetStaged,
+                        cx,
+                    )
+                    .await?;
+
+                    for workspace in &outgoing_snapshot.workspaces {
+                        let should_continue = workspace
+                            .update_in(cx, |workspace, window, cx| {
+                                workspace.prompt_to_save_or_discard_dirty_items(window, cx)
+                            })?
+                            .await?;
+                        if !should_continue {
+                            return Err(WorkspaceConfigurationSwitchCanceled.into());
+                        }
+                    }
+
+                    let outgoing_is_current = this.read_with(cx, |this, _cx| {
+                        this.workspace_configuration_generation == outgoing_snapshot.generation
+                    })?;
+                    if !outgoing_is_current {
+                        continue;
+                    }
+
+                    this.update_in(cx, |this, window, cx| {
+                        this.configuration_switch_gate = Some(target_configuration.name.clone());
+                        window.focus(&this.configuration_switch_gate_focus_handle, cx);
+                        cx.notify();
+                    })?;
+
+                    let exact_checkpoints = cx.update(|_window, cx| {
+                        outgoing_snapshot
+                            .workspaces
+                            .iter()
+                            .map(|workspace| {
+                                workspace.update(cx, |workspace, cx| workspace.checkpoint_exact(cx))
+                            })
+                            .collect::<Vec<_>>()
+                    })?;
+                    let mut first_error = None;
+                    for result in futures::future::join_all(exact_checkpoints).await {
+                        if let Err(error) = result
+                            && first_error.is_none()
+                        {
+                            first_error = Some(error);
+                        }
+                    }
+                    if let Some(error) = first_error {
+                        return Err(error);
+                    }
+
+                    if let Some(outgoing_configuration_id) = outgoing_configuration_id {
+                        let checkpoint = cx.update(|_window, cx| {
+                            WorkspaceConfigurationStore::mutate_global(
+                                WorkspaceConfigurationMutation::Checkpoint {
+                                    id: outgoing_configuration_id,
+                                    members: outgoing_snapshot.members.clone(),
+                                    active_member: outgoing_snapshot.active_member,
+                                },
+                                cx,
+                            )
+                        })?;
+                        match checkpoint.await {
+                            Ok(_) => {}
+                            Err(error) => {
+                                let message = format!("{error:#}");
+                                this.update(cx, |this, cx| {
+                                    this.configuration_checkpoint_error = Some(message);
+                                    this.serialize(cx);
+                                    cx.notify();
+                                })?;
+                                return Err(error);
+                            }
+                        }
+                    }
+
+                    let active_member = target_configuration
+                        .active_member
+                        .context("the target configuration has no active workspace")?;
+                    #[cfg(test)]
+                    Self::reach_configuration_switch_test_pause(
+                        &this,
+                        WorkspaceConfigurationSwitchTestStage::BeforeCommit,
+                        cx,
+                    )
+                    .await?;
+                    this.update_in(cx, |this, window, cx| {
+                        anyhow::ensure!(
+                            this.workspace_configuration_generation == outgoing_snapshot.generation,
+                            "the outgoing workspace set changed before switch commit"
+                        );
+                        let store = WorkspaceConfigurationStore::global(cx);
+                        let current_target = store
+                            .configuration(configuration_id)
+                            .context("the target workspace configuration disappeared")?;
+                        anyhow::ensure!(
+                            current_target == &target_configuration,
+                            "the target workspace configuration changed during restore"
+                        );
+                        Self::target_is_unowned_elsewhere(
+                            &target_configuration,
+                            &target,
+                            source_window_id,
+                            cx,
+                        )?;
+                        this.commit_workspace_configuration(
+                            configuration_id,
+                            target,
+                            active_member,
+                            window,
+                            cx,
+                        )
+                    })??;
+                    break Ok(());
+                }
+            }
+            .await;
+
+            let switch_failed = result.is_err();
+            this.update_in(cx, |this, window, cx| {
+                this.configuration_switch_in_progress = false;
+                this.configuration_switch_gate = None;
+                if switch_failed {
+                    this.focus_active_workspace(window, cx);
+                }
+                cx.notify();
+            })?;
+            result
+        })
+    }
+
     pub fn sidebar_side(&self, cx: &App) -> SidebarSide {
         self.sidebar
             .as_ref()
@@ -367,8 +1307,14 @@ impl MultiWorkspace {
             for task in std::mem::take(&mut this.pending_removal_tasks) {
                 task.detach();
             }
+            if let Some(task) = this.configuration_checkpoint_queue_tail.take() {
+                task.detach();
+            }
         });
-        let quit_subscription = cx.on_app_quit(Self::app_will_quit);
+        let quit_subscription = cx.on_app_quit_with_timeout(
+            WORKSPACE_CONFIGURATION_SHUTDOWN_TIMEOUT,
+            Self::app_will_quit,
+        );
         let settings_subscription = cx.observe_global_in::<settings::SettingsStore>(window, {
             let mut previous_retention_enabled = Self::retention_enabled_from_settings(cx);
             let mut previous_sidebar_ui_enabled = Self::sidebar_ui_enabled_from_settings(cx);
@@ -407,7 +1353,19 @@ impl MultiWorkspace {
             workspace_tabs_scroll_handle: ScrollHandle::new(),
             workspace_tabs_last_scrolled_workspace_id: Cell::new(None),
             workspace_tabs_last_scrolled_index: Cell::new(None),
+            workspace_configuration_menu_handle: PopoverMenuHandle::default(),
             pending_removal_tasks: Vec::new(),
+            active_configuration_id: None,
+            configuration_checkpoint_error: None,
+            workspace_configuration_generation: 0,
+            configuration_checkpoint_queue_tail: None,
+            configuration_switch_in_progress: false,
+            configuration_switch_gate: None,
+            configuration_switch_gate_focus_handle: cx.focus_handle(),
+            #[cfg(test)]
+            configuration_switch_test_pause: None,
+            #[cfg(test)]
+            configuration_save_test_pause: None,
             _serialize_task: None,
             _subscriptions: vec![
                 release_subscription,
@@ -599,6 +1557,9 @@ impl MultiWorkspace {
     }
 
     pub fn close_window(&mut self, _: &CloseWindow, window: &mut Window, cx: &mut Context<Self>) {
+        if self.configuration_switch_in_progress {
+            return;
+        }
         cx.spawn_in(window, async move |this, cx| {
             let workspaces = this.update(cx, |multi_workspace, _cx| {
                 multi_workspace.workspaces().cloned().collect::<Vec<_>>()
@@ -686,6 +1647,7 @@ impl MultiWorkspace {
         // The Project already emitted WorktreePathsChanged which the
         // sidebar handles for thread migration.
         self.rekey_project_group(old_key, &new_key, cx);
+        self.workspace_configuration_changed(cx);
         self.serialize(cx);
         cx.notify();
     }
@@ -1004,6 +1966,7 @@ impl MultiWorkspace {
         }
         self.project_groups.swap(index - 1, index);
         cx.emit(MultiWorkspaceEvent::ProjectGroupsChanged);
+        self.workspace_configuration_changed(cx);
         self.serialize(cx);
         cx.notify();
         true
@@ -1022,6 +1985,7 @@ impl MultiWorkspace {
         }
         self.project_groups.swap(index, index + 1);
         cx.emit(MultiWorkspaceEvent::ProjectGroupsChanged);
+        self.workspace_configuration_changed(cx);
         self.serialize(cx);
         cx.notify();
         true
@@ -1044,6 +2008,7 @@ impl MultiWorkspace {
         let target_index = target_index.min(self.project_groups.len());
         self.project_groups.insert(target_index, group);
         cx.emit(MultiWorkspaceEvent::ProjectGroupsChanged);
+        self.workspace_configuration_changed(cx);
         self.serialize(cx);
         cx.notify();
         true
@@ -1110,6 +2075,7 @@ impl MultiWorkspace {
         self.held = reordered_held;
 
         cx.emit(MultiWorkspaceEvent::ProjectGroupsChanged);
+        self.workspace_configuration_changed(cx);
         self.serialize(cx);
         cx.notify();
         true
@@ -1523,6 +2489,7 @@ impl MultiWorkspace {
             "Workspace Added",
             workspace_count = self.held.iter().filter(|held| held.pinned).count()
         );
+        self.workspace_configuration_changed(cx);
         cx.notify();
     }
 
@@ -1580,6 +2547,7 @@ impl MultiWorkspace {
         });
 
         cx.emit(MultiWorkspaceEvent::ActiveWorkspaceChanged { source_workspace });
+        self.workspace_configuration_changed(cx);
         self.serialize(cx);
         self.focus_active_workspace(window, cx);
         cx.notify();
@@ -1595,6 +2563,7 @@ impl MultiWorkspace {
         }
         let key = self.held[index].workspace.read(cx).project_group_key(cx);
         self.pin(index, key, cx);
+        self.workspace_configuration_changed(cx);
         self.serialize(cx);
         cx.notify();
     }
@@ -1617,6 +2586,7 @@ impl MultiWorkspace {
             held.pinned = false;
         }
         self.project_groups.clear();
+        self.workspace_configuration_changed(cx);
         cx.notify();
     }
 
@@ -1633,6 +2603,15 @@ impl MultiWorkspace {
             self.held.remove(index);
         }
         cx.emit(MultiWorkspaceEvent::WorkspaceRemoved(workspace.entity_id()));
+        self.workspace_configuration_changed(cx);
+        self.clear_workspace_session_binding(workspace, cx);
+    }
+
+    fn clear_workspace_session_binding(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        cx: &mut Context<Self>,
+    ) {
         workspace.update(cx, |workspace, _cx| {
             workspace.session_id.take();
             workspace._schedule_serialize_workspace.take();
@@ -1660,26 +2639,38 @@ impl MultiWorkspace {
         }
     }
 
+    fn multi_workspace_state(&self, cx: &App) -> MultiWorkspaceState {
+        MultiWorkspaceState {
+            active_workspace_id: self.workspace().read(cx).database_id(),
+            project_groups: self
+                .project_groups
+                .iter()
+                .map(|group| {
+                    crate::persistence::model::SerializedProjectGroup::from_group(
+                        &group.key,
+                        group.expanded,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            sidebar_open: self.sidebar_open,
+            sidebar_state: self.sidebar.as_ref().and_then(|s| s.serialized_state(cx)),
+            active_configuration_id: self
+                .configuration_checkpoint_error
+                .is_none()
+                .then_some(self.active_configuration_id)
+                .flatten(),
+        }
+    }
+
     pub fn serialize(&mut self, cx: &mut Context<Self>) {
+        let previous = self._serialize_task.take();
         self._serialize_task = Some(cx.spawn(async move |this, cx| {
+            if let Some(previous) = previous {
+                previous.await;
+            }
             let Some((window_id, state)) = this
                 .read_with(cx, |this, cx| {
-                    let state = MultiWorkspaceState {
-                        active_workspace_id: this.workspace().read(cx).database_id(),
-                        project_groups: this
-                            .project_groups
-                            .iter()
-                            .map(|group| {
-                                crate::persistence::model::SerializedProjectGroup::from_group(
-                                    &group.key,
-                                    group.expanded,
-                                )
-                            })
-                            .collect::<Vec<_>>(),
-                        sidebar_open: this.sidebar_open,
-                        sidebar_state: this.sidebar.as_ref().and_then(|s| s.serialized_state(cx)),
-                    };
-                    (this.window_id, state)
+                    (this.window_id, this.multi_workspace_state(cx))
                 })
                 .ok()
             else {
@@ -1703,27 +2694,100 @@ impl MultiWorkspace {
     /// version only drains pending tasks, which leaves stale rows split across window ids.
     fn app_will_quit(&mut self, cx: &mut Context<Self>) -> impl Future<Output = ()> + use<> {
         let mut tasks: Vec<Task<()>> = Vec::new();
-        if let Some(task) = self._serialize_task.take() {
+        let mut configuration_checkpoint = None;
+        let active_configuration_id = self.active_configuration_id;
+        if let Some(configuration_id) = active_configuration_id {
+            self.configuration_checkpoint_queue_tail.take();
+
+            let checkpoint = match self.workspace_configuration_snapshot(cx) {
+                Ok(snapshot) => {
+                    let exact_checkpoints = cx.with_window(cx.entity_id(), |window, cx| {
+                        snapshot
+                            .workspaces
+                            .iter()
+                            .map(|workspace| {
+                                workspace.update(cx, |workspace, cx| {
+                                    workspace.checkpoint_exact_for_shutdown(window, cx)
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    });
+                    match exact_checkpoints {
+                        Some(exact_checkpoints) => {
+                            let prerequisite = cx.background_spawn(async move {
+                                let mut first_error = None;
+                                for result in futures::future::join_all(exact_checkpoints).await {
+                                    if let Err(error) = result
+                                        && first_error.is_none()
+                                    {
+                                        first_error = Some(error);
+                                    }
+                                }
+                                match first_error {
+                                    Some(error) => Err(error),
+                                    None => Ok(()),
+                                }
+                            });
+                            WorkspaceConfigurationStore::checkpoint_after_for_shutdown(
+                                prerequisite,
+                                configuration_id,
+                                snapshot.members,
+                                snapshot.active_member,
+                                cx,
+                            )
+                        }
+                        None => Box::pin(async {
+                            Err(anyhow::anyhow!(
+                                "the workspace configuration window closed before shutdown checkpointing"
+                            ))
+                        }),
+                    }
+                }
+                Err(error) => Box::pin(async move { Err(error) }),
+            };
+
+            let previous_state_write = self._serialize_task.take();
+            let mut state = self.multi_workspace_state(cx);
+            let window_id = self.window_id;
+            let kvp = db::kvp::KeyValueStore::global(cx);
+            configuration_checkpoint = Some(async move {
+                if let Some(previous_state_write) = previous_state_write {
+                    previous_state_write.await;
+                }
+                match checkpoint.await {
+                    Ok(commit) => state.active_configuration_id = Some(commit.id),
+                    Err(error) => {
+                        state.active_configuration_id = None;
+                        log::error!(
+                            "failed to checkpoint workspace configuration on quit: {error:#}"
+                        );
+                    }
+                }
+                crate::persistence::write_multi_workspace_state(&kvp, window_id, state).await;
+            });
+        } else if let Some(task) = self._serialize_task.take() {
             tasks.push(task);
         }
         let session_id = self.workspace().read(cx).session_id();
         let window_id = self.window_id;
         let workspaces = self.workspaces().cloned().collect::<Vec<_>>();
-        let active_workspace = self.workspace().clone();
-        let active_workspace_id = active_workspace.entity_id();
-        let active_workspace_snapshot = cx.with_window(cx.entity_id(), |window, cx| {
-            active_workspace
-                .read(cx)
-                .shutdown_serialization_snapshot(window, cx)
-        });
+        if active_configuration_id.is_none() {
+            let active_workspace = self.workspace().clone();
+            let active_workspace_id = active_workspace.entity_id();
+            let active_workspace_snapshot = cx.with_window(cx.entity_id(), |window, cx| {
+                active_workspace
+                    .read(cx)
+                    .shutdown_serialization_snapshot(window, cx)
+            });
 
-        for workspace in &workspaces {
-            let snapshot = (workspace.entity_id() == active_workspace_id)
-                .then(|| active_workspace_snapshot.clone())
-                .flatten();
-            tasks.push(workspace.update(cx, |workspace, cx| {
-                workspace.flush_session_serialization_for_shutdown(window_id, snapshot, cx)
-            }));
+            for workspace in &workspaces {
+                let snapshot = (workspace.entity_id() == active_workspace_id)
+                    .then(|| active_workspace_snapshot.clone())
+                    .flatten();
+                tasks.push(workspace.update(cx, |workspace, cx| {
+                    workspace.flush_session_serialization_for_shutdown(window_id, snapshot, cx)
+                }));
+            }
         }
 
         let window_id = window_id.as_u64();
@@ -1742,6 +2806,9 @@ impl MultiWorkspace {
         tasks.extend(std::mem::take(&mut self.pending_removal_tasks));
 
         async move {
+            if let Some(configuration_checkpoint) = configuration_checkpoint {
+                configuration_checkpoint.await;
+            }
             futures::future::join_all(tasks).await;
         }
     }
@@ -2046,12 +3113,7 @@ impl MultiWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<bool>> {
-        self.remove(
-            [workspace.clone()],
-            RemovalIntent::CloseProject,
-            window,
-            cx,
-        )
+        self.remove([workspace.clone()], RemovalIntent::CloseProject, window, cx)
     }
 
     /// Returns `true` if any workspaces were actually removed.
@@ -2377,13 +3439,32 @@ impl Render for MultiWorkspace {
                 // which is the case this feature exists to serve. The thread actions
                 // inside the gate stay upstream's.
                 .on_action(cx.listener(|this: &mut Self, _: &NextProject, window, cx| {
-                    this.cycle_workspace_tab(true, window, cx);
+                    if !this.configuration_switch_in_progress {
+                        this.cycle_workspace_tab(true, window, cx);
+                    }
                 }))
                 .on_action(
                     cx.listener(|this: &mut Self, _: &PreviousProject, window, cx| {
-                        this.cycle_workspace_tab(false, window, cx);
+                        if !this.configuration_switch_in_progress {
+                            this.cycle_workspace_tab(false, window, cx);
+                        }
                     }),
                 )
+                .on_action(cx.listener(
+                    |this: &mut Self, _: &SaveWorkspaceConfigurationAs, window, cx| {
+                        if !this.configuration_switch_in_progress {
+                            this.show_save_workspace_configuration_as(window, cx);
+                        }
+                    },
+                ))
+                .on_action(cx.listener(
+                    |this: &mut Self, _: &SwitchWorkspaceConfiguration, window, cx| {
+                        if !this.configuration_switch_in_progress {
+                            let menu_handle = this.workspace_configuration_menu_handle.clone();
+                            window.defer(cx, move |window, cx| menu_handle.show(window, cx));
+                        }
+                    },
+                ))
                 .when(self.sidebar_ui_enabled(cx), |this| {
                     this.on_action(cx.listener(
                         |this: &mut Self, _: &ToggleWorkspaceSidebar, window, cx| {
@@ -2430,26 +3511,20 @@ impl Render for MultiWorkspace {
                         ))
                     })
                 })
-                .when(
-                    self.sidebar_open() && self.sidebar_ui_enabled(cx),
-                    |this| {
-                        this.on_drag_move(cx.listener(
-                            move |this: &mut Self,
-                                  e: &DragMoveEvent<DraggedSidebar>,
-                                  window,
-                                  cx| {
-                                if let Some(sidebar) = &this.sidebar {
-                                    let new_width = if sidebar_on_right {
-                                        window.bounds().size.width - e.event.position.x
-                                    } else {
-                                        e.event.position.x
-                                    };
-                                    sidebar.set_width(Some(new_width), cx);
-                                }
-                            },
-                        ))
-                    },
-                )
+                .when(self.sidebar_open() && self.sidebar_ui_enabled(cx), |this| {
+                    this.on_drag_move(cx.listener(
+                        move |this: &mut Self, e: &DragMoveEvent<DraggedSidebar>, window, cx| {
+                            if let Some(sidebar) = &this.sidebar {
+                                let new_width = if sidebar_on_right {
+                                    window.bounds().size.width - e.event.position.x
+                                } else {
+                                    e.event.position.x
+                                };
+                                sidebar.set_width(Some(new_width), cx);
+                            }
+                        },
+                    ))
+                })
                 // `#zed-37`: the tab strip sits above the sidebars and the workspace,
                 // so it spans the window and can extend the titlebar background.
                 .children(workspace_tabs)
@@ -2464,6 +3539,48 @@ impl Render for MultiWorkspace {
                 )
                 .children(right_sidebar)
                 .child(self.workspace().read(cx).modal_layer.clone())
+                .children(
+                    self.configuration_switch_gate
+                        .as_ref()
+                        .map(|configuration_name| {
+                            let configuration_name = configuration_name.clone();
+                            let focus_handle = self.configuration_switch_gate_focus_handle.clone();
+                            deferred(
+                                div()
+                                    .debug_selector(|| {
+                                        "SWITCHING-WORKSPACE-CONFIGURATION-GATE".to_string()
+                                    })
+                                    .absolute()
+                                    .size_full()
+                                    .inset_0()
+                                    .occlude()
+                                    .track_focus(&focus_handle)
+                                    .bg(cx.theme().colors().panel_background.opacity(0.8))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation();
+                                    })
+                                    .child(
+                                        v_flex()
+                                            .p_4()
+                                            .gap_1()
+                                            .rounded_md()
+                                            .border_1()
+                                            .border_color(cx.theme().colors().border)
+                                            .bg(cx.theme().colors().elevated_surface_background)
+                                            .child(Label::new("Switching Workspace Configuration…"))
+                                            .child(
+                                                Label::new(configuration_name)
+                                                    .size(LabelSize::Small)
+                                                    .color(Color::Muted),
+                                            ),
+                                    ),
+                            )
+                            .with_priority(3)
+                        }),
+                )
                 .children(self.sidebar_overlay.as_ref().map(|view| {
                     deferred(div().absolute().size_full().inset_0().occlude().child(
                         v_flex().h(px(0.0)).top_20().items_center().child(

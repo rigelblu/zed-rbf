@@ -839,8 +839,6 @@ impl Editor {
     }
 
     pub(super) fn folds_did_change(&mut self, cx: &mut Context<Self>) {
-        use text::ToOffset as _;
-
         if self.mode.is_minimap()
             || WorkspaceSettings::get(None, cx).restore_on_startup
                 == RestoreOnStartupBehavior::EmptyTab
@@ -878,39 +876,7 @@ impl Editor {
         };
 
         let background_executor = cx.background_executor().clone();
-        const FINGERPRINT_LEN: usize = 32;
-        let db_folds = user_folds_for_serialization(&display_snapshot)
-            .map(|fold| {
-                let start = fold
-                    .range
-                    .start
-                    .text_anchor_in(buffer_snapshot)
-                    .to_offset(buffer_snapshot);
-                let end = fold
-                    .range
-                    .end
-                    .text_anchor_in(buffer_snapshot)
-                    .to_offset(buffer_snapshot);
-
-                // Extract fingerprints - content at fold boundaries for validation on restore
-                // Both fingerprints must be INSIDE the fold to avoid capturing surrounding
-                // content that might change independently.
-                // start_fp: first min(32, fold_len) bytes of fold content
-                // end_fp: last min(32, fold_len) bytes of fold content
-                // Clip to character boundaries to handle multibyte UTF-8 characters.
-                let fold_len = end - start;
-                let start_fp_end = buffer_snapshot
-                    .clip_offset(start + std::cmp::min(FINGERPRINT_LEN, fold_len), Bias::Left);
-                let start_fp: String = buffer_snapshot
-                    .text_for_range(start..start_fp_end)
-                    .collect();
-                let end_fp_start = buffer_snapshot
-                    .clip_offset(end.saturating_sub(FINGERPRINT_LEN).max(start), Bias::Right);
-                let end_fp: String = buffer_snapshot.text_for_range(end_fp_start..end).collect();
-
-                (start, end, start_fp, end_fp)
-            })
-            .collect::<Vec<_>>();
+        let db_folds = serialized_folds_for_persistence(&display_snapshot, buffer_snapshot);
         let db = EditorDb::global(cx);
         self.serialize_folds = cx.background_spawn(async move {
             background_executor.timer(SERIALIZATION_THROTTLE_TIME).await;
@@ -1137,4 +1103,39 @@ pub(crate) fn user_folds_for_serialization(
     display_snapshot
         .folds_in_range(MultiBufferOffset(0)..display_snapshot.buffer_snapshot().len())
         .filter(|fold| !is_ymd_conceal_fold(fold))
+}
+
+pub(crate) fn serialized_folds_for_persistence(
+    display_snapshot: &DisplaySnapshot,
+    buffer_snapshot: &BufferSnapshot,
+) -> Vec<(usize, usize, String, String)> {
+    use text::ToOffset as _;
+
+    const FINGERPRINT_LEN: usize = 32;
+    user_folds_for_serialization(display_snapshot)
+        .map(|fold| {
+            let start = fold
+                .range
+                .start
+                .text_anchor_in(buffer_snapshot)
+                .to_offset(buffer_snapshot);
+            let end = fold
+                .range
+                .end
+                .text_anchor_in(buffer_snapshot)
+                .to_offset(buffer_snapshot);
+            let fold_len = end - start;
+            let start_fingerprint_end = buffer_snapshot
+                .clip_offset(start + std::cmp::min(FINGERPRINT_LEN, fold_len), Bias::Left);
+            let start_fingerprint = buffer_snapshot
+                .text_for_range(start..start_fingerprint_end)
+                .collect();
+            let end_fingerprint_start = buffer_snapshot
+                .clip_offset(end.saturating_sub(FINGERPRINT_LEN).max(start), Bias::Right);
+            let end_fingerprint = buffer_snapshot
+                .text_for_range(end_fingerprint_start..end)
+                .collect();
+            (start, end, start_fingerprint, end_fingerprint)
+        })
+        .collect()
 }

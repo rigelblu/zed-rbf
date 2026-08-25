@@ -34,9 +34,9 @@ pub use dock::Panel;
 pub use multi_workspace::{
     CloseWorkspaceSidebar, DraggedSidebar, FocusWorkspaceSidebar, MoveProjectToNewWindow,
     MultiWorkspace, MultiWorkspaceEvent, NewThread, NextProject, NextThread, PreviousProject,
-    PreviousThread, ProjectGroup, ProjectGroupKey, RemovalIntent, SerializedProjectGroupState,
-    Sidebar, SidebarEvent, SidebarHandle, SidebarRenderState, SidebarSide, ToggleWorkspaceSidebar,
-    sidebar_side_context_menu,
+    PreviousThread, ProjectGroup, ProjectGroupKey, RemovalIntent, SaveWorkspaceConfigurationAs,
+    SerializedProjectGroupState, Sidebar, SidebarEvent, SidebarHandle, SidebarRenderState,
+    SidebarSide, SwitchWorkspaceConfiguration, ToggleWorkspaceSidebar, sidebar_side_context_menu,
 };
 pub use path_list::{PathList, SerializedPathList};
 pub use remote::{
@@ -88,12 +88,12 @@ pub use pane_group::{
     SplitDirection,
 };
 pub use persistence::{
-    RecentWorkspace, WorkspaceDb, delete_unloaded_items,
+    RecentWorkspace, WorkspaceConfigurationStore, WorkspaceDb, delete_unloaded_items,
     model::{
         DockData, DockStructure, ItemId, MultiWorkspaceState, SerializedMultiWorkspace,
         SerializedProjectGroup, SerializedWorkspaceLocation, SessionWorkspace,
     },
-    read_serialized_multi_workspaces,
+    read_serialized_multi_workspaces, workspace_configuration_referenced_workspace_ids,
 };
 use persistence::{SerializedWindowBounds, model::SerializedWorkspace};
 use postage::stream::Stream;
@@ -796,6 +796,7 @@ pub fn init(app_state: Arc<AppState>, cx: &mut App) {
     theme_preview::init(cx);
     toast_layer::init(cx);
     history_manager::init(app_state.fs.clone(), cx);
+    WorkspaceConfigurationStore::init(cx);
 
     cx.on_action(|_: &CloseWindow, cx| Workspace::close_global(cx))
         .on_action(|_: &Reload, cx| reload(cx))
@@ -1435,7 +1436,7 @@ pub struct Workspace {
     on_prompt_for_open_path: Option<PromptForOpenPath>,
     terminal_provider: Option<Box<dyn TerminalProvider>>,
     debugger_provider: Option<Arc<dyn DebuggerProvider>>,
-    serializable_items_tx: UnboundedSender<Box<dyn SerializableItemHandle>>,
+    serializable_items_tx: UnboundedSender<ItemSerializationCommand>,
     _items_serializer: Task<Result<()>>,
     session_id: Option<String>,
     scheduled_tasks: Vec<Task<()>>,
@@ -1446,6 +1447,7 @@ pub struct Workspace {
     _panels_task: Option<Task<Result<()>>>,
     sidebar_focus_handle: Option<FocusHandle>,
     multi_workspace: Option<WeakEntity<MultiWorkspace>>,
+    detached_restore: bool,
     /// Shared with the parent `MultiWorkspace` and any sibling workspaces: holds
     /// the id of the single workspace currently presented in this OS window.
     /// `MultiWorkspace` is the only writer; workspaces only read it to decide
@@ -1455,6 +1457,13 @@ pub struct Workspace {
     active_workspace_id: Option<Rc<Cell<EntityId>>>,
     active_worktree_creation: ActiveWorktreeCreation,
     deferred_save_items: Vec<Box<dyn WeakItemHandle>>,
+}
+
+enum ItemSerializationCommand {
+    Serialize(Box<dyn SerializableItemHandle>),
+    SerializeWorkspace(oneshot::Sender<()>),
+    SaveWindowBounds(oneshot::Sender<()>),
+    CheckpointExact(oneshot::Sender<Result<()>>),
 }
 
 impl EventEmitter<Event> for Workspace {}
@@ -1789,7 +1798,7 @@ impl Workspace {
         }
 
         let (serializable_items_tx, serializable_items_rx) =
-            mpsc::unbounded::<Box<dyn SerializableItemHandle>>();
+            mpsc::unbounded::<ItemSerializationCommand>();
         let _items_serializer = cx.spawn_in(window, async move |this, cx| {
             Self::serialize_items(&this, serializable_items_rx, cx).await
         });
@@ -1813,8 +1822,8 @@ impl Workspace {
                     cx.background_executor()
                         .timer(Duration::from_millis(100))
                         .await;
-                    this.update_in(cx, |this, window, cx| {
-                        this.save_window_bounds(window, cx).detach();
+                    this.update_in(cx, |this, _window, cx| {
+                        this.save_window_bounds(cx).detach();
                         this.bounds_save_task_queued.take();
                     })
                     .ok();
@@ -1910,6 +1919,7 @@ impl Workspace {
             removing: false,
             sidebar_focus_handle: None,
             multi_workspace,
+            detached_restore: false,
             active_workspace_id: None,
             active_worktree_creation: ActiveWorktreeCreation::default(),
             open_in_dev_container: false,
@@ -2204,6 +2214,69 @@ impl Workspace {
                 workspace,
                 opened_items,
             })
+        })
+    }
+
+    pub(crate) fn prepare_local_strict(
+        serialized_workspace: SerializedWorkspace,
+        app_state: Arc<AppState>,
+        window: WindowHandle<MultiWorkspace>,
+        cx: &mut App,
+    ) -> Task<Result<Entity<Workspace>>> {
+        let project = Project::local(
+            app_state.client.clone(),
+            app_state.node_runtime.clone(),
+            app_state.user_store.clone(),
+            app_state.languages.clone(),
+            app_state.fs.clone(),
+            None,
+            Default::default(),
+            cx,
+        );
+
+        cx.spawn(async move |cx| {
+            anyhow::ensure!(
+                serialized_workspace.location == SerializedWorkspaceLocation::Local,
+                "workspace configurations currently support local workspaces only"
+            );
+            for path in serialized_workspace.paths.paths() {
+                anyhow::ensure!(
+                    app_state.fs.metadata(path).await?.is_some(),
+                    "workspace path {} is unavailable",
+                    path.display()
+                );
+                cx.update(|cx| Workspace::project_path_for_path(project.clone(), path, true, cx))
+                    .await
+                    .with_context(|| format!("preparing workspace path {}", path.display()))?;
+            }
+
+            project.update(cx, |project, cx| {
+                for (scope, toolchains) in &serialized_workspace.user_toolchains {
+                    for toolchain in toolchains {
+                        project.add_toolchain(toolchain.clone(), scope.clone(), cx);
+                    }
+                }
+            });
+
+            let workspace_id = serialized_workspace.id;
+            let centered_layout = serialized_workspace.centered_layout;
+            let workspace = window.update(cx, |_multi_workspace, window, cx| {
+                cx.new(|cx| {
+                    let mut workspace =
+                        Workspace::new(Some(workspace_id), project, app_state, window, cx);
+                    workspace.centered_layout = centered_layout;
+                    workspace.detached_restore = true;
+                    workspace
+                })
+            })?;
+
+            let restore = window.update(cx, |_multi_workspace, window, cx| {
+                workspace.update(cx, |_workspace, cx| {
+                    Workspace::load_workspace_strict(serialized_workspace, window, cx)
+                })
+            })?;
+            restore.await?;
+            Ok(workspace)
         })
     }
 
@@ -2656,6 +2729,7 @@ impl Workspace {
             status_bar.set_multi_workspace(multi_workspace.clone(), cx);
         });
         self.multi_workspace = Some(multi_workspace);
+        self.detached_restore = false;
         self.active_workspace_id = Some(active_workspace_id);
     }
 
@@ -6224,6 +6298,9 @@ impl Workspace {
     /// simply compare against our own id. A workspace with no shared cell (e.g.
     /// a plain test window) owns its window unconditionally.
     fn owns_window_chrome(&self) -> bool {
+        if self.detached_restore {
+            return false;
+        }
         match &self.active_workspace_id {
             Some(active_workspace_id) => active_workspace_id.get() == self.weak_self.entity_id(),
             None => true,
@@ -7034,7 +7111,7 @@ impl Workspace {
         self.session_id.clone()
     }
 
-    fn save_window_bounds(&self, window: &mut Window, cx: &mut App) -> Task<()> {
+    fn save_window_bounds_now(&self, window: &mut Window, cx: &mut App) -> Task<()> {
         let Some(display) = window.display(cx) else {
             return Task::ready(());
         };
@@ -7070,6 +7147,23 @@ impl Workspace {
         })
     }
 
+    fn save_window_bounds(&self, cx: &mut App) -> Task<()> {
+        let (send_result, receive_result) = oneshot::channel();
+        if let Err(error) = self
+            .serializable_items_tx
+            .unbounded_send(ItemSerializationCommand::SaveWindowBounds(send_result))
+        {
+            log::error!("failed to enqueue workspace bounds serialization: {error}");
+            return Task::ready(());
+        }
+
+        cx.background_spawn(async move {
+            if receive_result.await.is_err() {
+                log::debug!("workspace serializer dropped bounds serialization");
+            }
+        })
+    }
+
     /// Bypass the 200ms serialization throttle and write workspace state to
     /// the DB immediately. Returns a task the caller can await to ensure the
     /// write completes. Used by the quit handler so the most recent state
@@ -7079,7 +7173,7 @@ impl Workspace {
         self._serialize_workspace_task.take();
         self.bounds_save_task_queued.take();
 
-        let bounds_task = self.save_window_bounds(window, cx);
+        let bounds_task = self.save_window_bounds(cx);
         let serialize_task = self.serialize_workspace_internal(window, cx);
         cx.spawn(async move |_| {
             bounds_task.await;
@@ -7283,6 +7377,9 @@ impl Workspace {
     }
 
     fn serialize_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.detached_restore {
+            return;
+        }
         if self._schedule_serialize_workspace.is_none() {
             self._schedule_serialize_workspace =
                 Some(cx.spawn_in(window, async move |this, cx| {
@@ -7299,11 +7396,14 @@ impl Workspace {
         }
     }
 
-    fn serialize_workspace_internal(&self, window: &mut Window, cx: &mut App) -> Task<()> {
-        let Some(database_id) = self.database_id() else {
-            return Task::ready(());
-        };
-
+    fn build_serialized_workspace(
+        &self,
+        database_id: WorkspaceId,
+        location: SerializedWorkspaceLocation,
+        paths: PathList,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> SerializedWorkspace {
         fn serialize_pane_handle(
             pane_handle: &Entity<Pane>,
             window: &mut Window,
@@ -7358,56 +7458,93 @@ impl Workspace {
             }
         }
 
-        fn build_serialized_docks(
-            this: &Workspace,
-            window: &mut Window,
-            cx: &mut App,
-        ) -> DockStructure {
-            this.capture_dock_state(window, cx)
+        let bookmarks = self.project.update(cx, |project, cx| {
+            project
+                .bookmark_store()
+                .read(cx)
+                .all_serialized_bookmarks(cx)
+        });
+        let breakpoints = self.project.update(cx, |project, cx| {
+            project
+                .breakpoint_store()
+                .read(cx)
+                .all_source_breakpoints(cx)
+        });
+        let user_toolchains = self
+            .project
+            .read(cx)
+            .user_toolchains(cx)
+            .unwrap_or_default();
+
+        SerializedWorkspace {
+            id: database_id,
+            location,
+            paths,
+            identity_paths: Some(self.project_group_key(cx).path_list().clone()),
+            center_group: build_serialized_pane_group(&self.center.root, window, cx),
+            window_bounds: Some(SerializedWindowBounds(window.window_bounds())),
+            display: window.display(cx).and_then(|display| display.uuid().ok()),
+            docks: self.capture_dock_state(window, cx),
+            centered_layout: self.centered_layout,
+            session_id: self.session_id.clone(),
+            bookmarks,
+            breakpoints,
+            window_id: Some(window.window_handle().window_id().as_u64()),
+            user_toolchains,
         }
+    }
+
+    fn serialized_workspace_for_exact(
+        &self,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Result<SerializedWorkspace> {
+        let database_id = self
+            .database_id()
+            .context("workspace has no durable persistence id")?;
+        anyhow::ensure!(
+            self.project.read(cx).is_local(),
+            "exact workspace checkpoints only support local workspaces"
+        );
+        let paths = PathList::new(&self.root_paths(cx));
+        Ok(self.build_serialized_workspace(
+            database_id,
+            SerializedWorkspaceLocation::Local,
+            paths,
+            window,
+            cx,
+        ))
+    }
+
+    fn serialize_workspace_internal(&self, _window: &mut Window, cx: &mut App) -> Task<()> {
+        if self.detached_restore {
+            return Task::ready(());
+        }
+        let (send_result, receive_result) = oneshot::channel();
+        if let Err(error) = self
+            .serializable_items_tx
+            .unbounded_send(ItemSerializationCommand::SerializeWorkspace(send_result))
+        {
+            log::error!("failed to enqueue workspace serialization: {error}");
+            return Task::ready(());
+        }
+
+        cx.background_spawn(async move {
+            if receive_result.await.is_err() {
+                log::debug!("workspace serializer dropped workspace serialization");
+            }
+        })
+    }
+
+    fn serialize_workspace_now(&self, window: &mut Window, cx: &mut App) -> Task<()> {
+        let Some(database_id) = self.database_id() else {
+            return Task::ready(());
+        };
 
         match self.workspace_location(cx) {
             WorkspaceLocation::Location(location, paths) => {
-                let bookmarks = self.project.update(cx, |project, cx| {
-                    project
-                        .bookmark_store()
-                        .read(cx)
-                        .all_serialized_bookmarks(cx)
-                });
-
-                let breakpoints = self.project.update(cx, |project, cx| {
-                    project
-                        .breakpoint_store()
-                        .read(cx)
-                        .all_source_breakpoints(cx)
-                });
-                let user_toolchains = self
-                    .project
-                    .read(cx)
-                    .user_toolchains(cx)
-                    .unwrap_or_default();
-
-                let center_group = build_serialized_pane_group(&self.center.root, window, cx);
-                let docks = build_serialized_docks(self, window, cx);
-                let window_bounds = Some(SerializedWindowBounds(window.window_bounds()));
-                let identity_paths_hint = self.project_group_key(cx).path_list().clone();
-
-                let serialized_workspace = SerializedWorkspace {
-                    id: database_id,
-                    location,
-                    paths,
-                    identity_paths: Some(identity_paths_hint),
-                    center_group,
-                    window_bounds,
-                    display: Default::default(),
-                    docks,
-                    centered_layout: self.centered_layout,
-                    session_id: self.session_id.clone(),
-                    bookmarks,
-                    breakpoints,
-                    window_id: Some(window.window_handle().window_id().as_u64()),
-                    user_toolchains,
-                };
+                let serialized_workspace =
+                    self.build_serialized_workspace(database_id, location, paths, window, cx);
 
                 let db = WorkspaceDb::global(cx);
                 window.spawn(cx, async move |_| {
@@ -7418,7 +7555,7 @@ impl Workspace {
                 let window_bounds = SerializedWindowBounds(window.window_bounds());
                 let display = window.display(cx).and_then(|d| d.uuid().ok());
                 // Save dock state for empty local workspaces
-                let docks = build_serialized_docks(self, window, cx);
+                let docks = self.capture_dock_state(window, cx);
                 let db = WorkspaceDb::global(cx);
                 let kvp = db::kvp::KeyValueStore::global(cx);
                 window.spawn(cx, async move |_| {
@@ -7437,7 +7574,7 @@ impl Workspace {
             }
             WorkspaceLocation::None => {
                 // Save dock state for empty non-local workspaces
-                let docks = build_serialized_docks(self, window, cx);
+                let docks = self.capture_dock_state(window, cx);
                 let kvp = db::kvp::KeyValueStore::global(cx);
                 window.spawn(cx, async move |_| {
                     persistence::write_default_dock_state(&kvp, docks)
@@ -7468,6 +7605,9 @@ impl Workspace {
     }
 
     fn update_history(&self, cx: &mut App) {
+        if self.detached_restore {
+            return;
+        }
         let Some(id) = self.database_id() else {
             return;
         };
@@ -7484,32 +7624,56 @@ impl Workspace {
 
     async fn serialize_items(
         this: &WeakEntity<Self>,
-        items_rx: UnboundedReceiver<Box<dyn SerializableItemHandle>>,
+        items_rx: UnboundedReceiver<ItemSerializationCommand>,
         cx: &mut AsyncWindowContext,
     ) -> Result<()> {
         const CHUNK_SIZE: usize = 200;
 
-        let mut serializable_items = items_rx.ready_chunks(CHUNK_SIZE);
+        let mut commands = items_rx.ready_chunks(CHUNK_SIZE);
 
-        while let Some(items_received) = serializable_items.next().await {
-            let unique_items =
-                items_received
-                    .into_iter()
-                    .fold(HashMap::default(), |mut acc, item| {
-                        acc.entry(item.item_id()).or_insert(item);
-                        acc
-                    });
+        while let Some(commands_received) = commands.next().await {
+            let mut pending_items = HashMap::default();
 
-            // We use into_iter() here so that the references to the items are moved into
-            // the tasks and not kept alive while we're sleeping.
-            for (_, item) in unique_items.into_iter() {
-                if let Ok(Some(task)) = this.update_in(cx, |workspace, window, cx| {
-                    item.serialize(workspace, false, window, cx)
-                }) {
-                    cx.background_spawn(async move { task.await.log_err() })
-                        .detach();
+            for command in commands_received {
+                match command {
+                    ItemSerializationCommand::Serialize(item) => {
+                        pending_items.entry(item.item_id()).or_insert(item);
+                    }
+                    ItemSerializationCommand::SerializeWorkspace(completion) => {
+                        Self::serialize_item_batch(this, std::mem::take(&mut pending_items), cx)
+                            .await?;
+                        let task = this.update_in(cx, |workspace, window, cx| {
+                            workspace.serialize_workspace_now(window, cx)
+                        })?;
+                        task.await;
+                        if completion.send(()).is_err() {
+                            log::debug!("workspace serialization caller was dropped");
+                        }
+                    }
+                    ItemSerializationCommand::SaveWindowBounds(completion) => {
+                        Self::serialize_item_batch(this, std::mem::take(&mut pending_items), cx)
+                            .await?;
+                        let task = this.update_in(cx, |workspace, window, cx| {
+                            workspace.save_window_bounds_now(window, cx)
+                        })?;
+                        task.await;
+                        if completion.send(()).is_err() {
+                            log::debug!("workspace bounds serialization caller was dropped");
+                        }
+                    }
+                    ItemSerializationCommand::CheckpointExact(completion) => {
+                        Self::serialize_item_batch(this, std::mem::take(&mut pending_items), cx)
+                            .await?;
+
+                        let result = Self::serialize_exact_checkpoint(this, cx).await;
+                        if completion.send(result).is_err() {
+                            log::debug!("exact workspace checkpoint caller was dropped");
+                        }
+                    }
                 }
             }
+
+            Self::serialize_item_batch(this, pending_items, cx).await?;
 
             cx.background_executor()
                 .timer(SERIALIZATION_THROTTLE_TIME)
@@ -7519,12 +7683,176 @@ impl Workspace {
         Ok(())
     }
 
+    async fn serialize_item_batch(
+        this: &WeakEntity<Self>,
+        items: HashMap<EntityId, Box<dyn SerializableItemHandle>>,
+        cx: &mut AsyncWindowContext,
+    ) -> Result<()> {
+        let tasks = this.update_in(cx, |workspace, window, cx| {
+            items
+                .into_values()
+                .filter_map(|item| item.serialize(workspace, false, window, cx))
+                .collect::<Vec<_>>()
+        })?;
+
+        let results = futures::future::join_all(tasks).await;
+        for result in results {
+            result.log_err();
+        }
+        Ok(())
+    }
+
+    async fn serialize_exact_checkpoint(
+        this: &WeakEntity<Self>,
+        cx: &mut AsyncWindowContext,
+    ) -> Result<()> {
+        let db = cx.update(|_window, cx| WorkspaceDb::global(cx))?;
+        let transaction = db.begin_exact_checkpoint_transaction().await?;
+        let checkpoint = async {
+            let (tasks, serialized_workspace) =
+                this.update_in(cx, |workspace, window, cx| {
+                    let mut items = HashMap::default();
+                    for pane in &workspace.panes {
+                        for item in pane.read(cx).items() {
+                            if let Some(item) = item.to_serializable_item_handle(cx) {
+                                items.entry(item.item_id()).or_insert(item);
+                            }
+                        }
+                    }
+
+                    let tasks = items
+                        .into_values()
+                        .map(|item| {
+                            item.checkpoint_in_transaction(
+                                workspace,
+                                transaction.clone(),
+                                window,
+                                cx,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let serialized_workspace =
+                        workspace.serialized_workspace_for_exact(window, cx)?;
+                    Ok::<_, anyhow::Error>((tasks, serialized_workspace))
+                })??;
+
+            let results = futures::future::join_all(tasks).await;
+            let mut first_error = None;
+            for result in results {
+                if let Err(error) = result
+                    && first_error.is_none()
+                {
+                    first_error = Some(error);
+                }
+            }
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+            WorkspaceDb::save_workspace_in_transaction(&transaction, serialized_workspace).await
+        }
+        .await;
+
+        if let Err(error) = checkpoint {
+            if let Err(rollback_error) = transaction.rollback().await {
+                return Err(error.context(format!(
+                    "rolling back the exact workspace checkpoint also failed: {rollback_error:#}"
+                )));
+            }
+            return Err(error);
+        }
+        transaction.commit().await
+    }
+
+    pub(crate) fn checkpoint_exact(&mut self, cx: &mut App) -> Task<Result<()>> {
+        self._schedule_serialize_workspace.take();
+        self._serialize_workspace_task.take();
+        self.bounds_save_task_queued.take();
+
+        let (send_result, receive_result) = oneshot::channel();
+        if let Err(error) = self
+            .serializable_items_tx
+            .unbounded_send(ItemSerializationCommand::CheckpointExact(send_result))
+        {
+            return Task::ready(Err(anyhow!(
+                "failed to enqueue exact workspace checkpoint: {error}"
+            )));
+        }
+
+        cx.background_spawn(async move {
+            receive_result
+                .await
+                .context("workspace serializer dropped the exact checkpoint")?
+        })
+    }
+
+    pub(crate) fn checkpoint_exact_for_shutdown(
+        &mut self,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        self._schedule_serialize_workspace.take();
+        self._serialize_workspace_task.take();
+        self.bounds_save_task_queued.take();
+        self._items_serializer = Task::ready(Ok(()));
+
+        let db = WorkspaceDb::global(cx);
+        let (transaction, transaction_ready) = db.queue_exact_checkpoint_transaction();
+        let mut items = HashMap::default();
+        for pane in &self.panes {
+            for item in pane.read(cx).items() {
+                if let Some(item) = item.to_serializable_item_handle(cx) {
+                    items.entry(item.item_id()).or_insert(item);
+                }
+            }
+        }
+        let tasks = items
+            .into_values()
+            .map(|item| item.checkpoint_in_transaction(self, transaction.clone(), window, cx))
+            .collect::<Vec<_>>();
+        let serialized_workspace = match self.serialized_workspace_for_exact(window, cx) {
+            Ok(serialized_workspace) => serialized_workspace,
+            Err(error) => return Task::ready(Err(error)),
+        };
+
+        cx.background_spawn(async move {
+            transaction.activate()?;
+            transaction_ready.await?;
+            let mut first_error = None;
+            for result in futures::future::join_all(tasks).await {
+                if let Err(error) = result
+                    && first_error.is_none()
+                {
+                    first_error = Some(error);
+                }
+            }
+            if let Some(error) = first_error {
+                if let Err(rollback_error) = transaction.rollback().await {
+                    return Err(error.context(format!(
+                        "rolling back the exact workspace checkpoint also failed: {rollback_error:#}"
+                    )));
+                }
+                return Err(error);
+            }
+            if let Err(error) =
+                WorkspaceDb::save_workspace_in_transaction(&transaction, serialized_workspace).await
+            {
+                if let Err(rollback_error) = transaction.rollback().await {
+                    return Err(error.context(format!(
+                        "rolling back the exact workspace checkpoint also failed: {rollback_error:#}"
+                    )));
+                }
+                return Err(error);
+            }
+            transaction.commit().await
+        })
+    }
+
     pub(crate) fn enqueue_item_serialization(
         &mut self,
         item: Box<dyn SerializableItemHandle>,
     ) -> Result<()> {
         self.serializable_items_tx
-            .unbounded_send(item)
+            .unbounded_send(ItemSerializationCommand::Serialize(item))
             .map_err(|err| anyhow!("failed to send serializable item over channel: {err}"))
     }
 
@@ -7667,6 +7995,64 @@ impl Workspace {
                 .ok();
 
             Ok(opened_items)
+        })
+    }
+
+    fn load_workspace_strict(
+        serialized_workspace: SerializedWorkspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Task<Result<()>> {
+        cx.spawn_in(window, async move |workspace, cx| {
+            let project = workspace.read_with(cx, |workspace, _| workspace.project().clone())?;
+            let workspace_id = serialized_workspace.id;
+            let (center_group, active_pane, _items) = serialized_workspace
+                .center_group
+                .deserialize_strict(&project, workspace_id, workspace.clone(), cx)
+                .await?;
+
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.center = PaneGroup::with_root(center_group);
+                workspace.center.set_is_center(true);
+                workspace.center.mark_positions(cx);
+                workspace.panes = workspace.center.panes().into_iter().cloned().collect();
+                workspace.active_pane =
+                    active_pane.unwrap_or_else(|| workspace.center.first_pane());
+                workspace.last_active_center_pane = Some(workspace.active_pane.downgrade());
+
+                let docks = serialized_workspace.docks;
+                for (dock, serialized_dock) in [
+                    (&workspace.right_dock, docks.right),
+                    (&workspace.left_dock, docks.left),
+                    (&workspace.bottom_dock, docks.bottom),
+                ] {
+                    dock.update(cx, |dock, cx| {
+                        dock.serialized_dock = Some(serialized_dock);
+                        dock.restore_state(window, cx);
+                    });
+                }
+                cx.notify();
+            })?;
+
+            project
+                .update(cx, |project, cx| {
+                    project.bookmark_store().update(cx, |bookmark_store, cx| {
+                        bookmark_store.load_serialized_bookmarks(serialized_workspace.bookmarks, cx)
+                    })
+                })
+                .await?;
+            project
+                .update(cx, |project, cx| {
+                    project
+                        .breakpoint_store()
+                        .update(cx, |breakpoint_store, cx| {
+                            breakpoint_store
+                                .with_serialized_breakpoints(serialized_workspace.breakpoints, cx)
+                        })
+                })
+                .await?;
+
+            Ok(())
         })
     }
 
@@ -8240,18 +8626,11 @@ impl Workspace {
     pub fn toggle_centered_layout(
         &mut self,
         _: &ToggleCenteredLayout,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.centered_layout = !self.centered_layout;
-        if let Some(database_id) = self.database_id() {
-            let db = WorkspaceDb::global(cx);
-            let centered_layout = self.centered_layout;
-            cx.background_spawn(async move {
-                db.set_centered_layout(database_id, centered_layout).await
-            })
-            .detach_and_log_err(cx);
-        }
+        self.serialize_workspace(window, cx);
         cx.notify();
     }
 
@@ -10024,6 +10403,7 @@ pub async fn apply_restored_multiworkspace_state(
         sidebar_open,
         project_groups,
         sidebar_state,
+        active_configuration_id,
         ..
     } = state;
     let restore_workspace_membership =
@@ -10064,6 +10444,14 @@ pub async fn apply_restored_multiworkspace_state(
         window_handle
             .update(cx, |multi_workspace, _window, cx| {
                 multi_workspace.restore_project_groups(resolved_groups, cx);
+            })
+            .ok();
+    }
+
+    if let Some(configuration_id) = active_configuration_id {
+        window_handle
+            .update(cx, |multi_workspace, _window, cx| {
+                multi_workspace.restore_configuration_association(*configuration_id, cx);
             })
             .ok();
     }
@@ -11929,7 +12317,12 @@ fn load_legacy_panel_size(
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, rc::Rc, sync::Arc, time::Duration};
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+        sync::{Arc, atomic::Ordering},
+        time::Duration,
+    };
 
     use super::*;
     use crate::{
@@ -12654,6 +13047,337 @@ mod tests {
 
         // Preparing to close succeeds, even though serialization failed.
         assert!(task.await.unwrap());
+    }
+
+    #[gpui::test]
+    async fn test_exact_checkpoint_forms_ordered_serializer_cut(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(register_serializable_item::<TestItem>);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        workspace.update(cx, |workspace, _| workspace.set_random_database_id());
+
+        let trace = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let timeline_active = Rc::new(Cell::new(false));
+        let timeline_invocation = Rc::new(Cell::new(0));
+        let pre_receiver: Rc<RefCell<Option<oneshot::Receiver<()>>>> = Rc::new(RefCell::new(None));
+        let post_receiver: Rc<RefCell<Option<oneshot::Receiver<()>>>> = Rc::new(RefCell::new(None));
+        let executor = cx.background_executor.clone();
+        let item = cx.new({
+            let trace = trace.clone();
+            let timeline_active = timeline_active.clone();
+            let timeline_invocation = timeline_invocation.clone();
+            let pre_receiver = pre_receiver.clone();
+            let post_receiver = post_receiver.clone();
+            move |cx| {
+                TestItem::new(cx).with_serialize(move || {
+                    if !timeline_active.get() {
+                        return Some(Task::ready(Ok(())));
+                    }
+
+                    let invocation = timeline_invocation.get();
+                    timeline_invocation.set(invocation + 1);
+                    match invocation {
+                        0 => {
+                            let receiver = pre_receiver.borrow_mut().take();
+                            let trace = trace.clone();
+                            Some(executor.spawn(async move {
+                                trace.lock().push("pre-started");
+                                receiver
+                                    .context("pre-barrier gate was not installed")?
+                                    .await
+                                    .context("pre-barrier gate was dropped")?;
+                                trace.lock().push("pre-finished");
+                                Ok(())
+                            }))
+                        }
+                        1 => {
+                            trace.lock().push("exact");
+                            Some(Task::ready(Ok(())))
+                        }
+                        2 => {
+                            let receiver = post_receiver.borrow_mut().take();
+                            let trace = trace.clone();
+                            Some(executor.spawn(async move {
+                                trace.lock().push("post-started");
+                                receiver
+                                    .context("post-barrier gate was not installed")?
+                                    .await
+                                    .context("post-barrier gate was dropped")?;
+                                trace.lock().push("post-finished");
+                                Ok(())
+                            }))
+                        }
+                        _ => Some(Task::ready(Err(anyhow!(
+                            "unexpected serializer invocation after exact barrier"
+                        )))),
+                    }
+                })
+            }
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(item.clone()), None, true, window, cx);
+        });
+
+        let prime = workspace.update(cx, |workspace, cx| workspace.checkpoint_exact(cx));
+        if let Err(error) = prime.await {
+            panic!("failed to prime exact serialization: {error:#}");
+        }
+        cx.executor().advance_clock(SERIALIZATION_THROTTLE_TIME);
+        cx.run_until_parked();
+
+        let (pre_release, pre_gate) = oneshot::channel();
+        let (post_release, post_gate) = oneshot::channel();
+        *pre_receiver.borrow_mut() = Some(pre_gate);
+        *post_receiver.borrow_mut() = Some(post_gate);
+        timeline_invocation.set(0);
+        timeline_active.set(true);
+
+        let checkpoint = workspace.update(cx, |workspace, cx| {
+            if let Err(error) = workspace.enqueue_item_serialization(Box::new(item.clone())) {
+                panic!("failed to enqueue pre-barrier serialization: {error:#}");
+            }
+            let checkpoint = workspace.checkpoint_exact(cx);
+            if let Err(error) = workspace.enqueue_item_serialization(Box::new(item.clone())) {
+                panic!("failed to enqueue post-barrier serialization: {error:#}");
+            }
+            checkpoint
+        });
+        cx.run_until_parked();
+
+        assert_eq!(trace.lock().as_slice(), ["pre-started"]);
+        assert!(!checkpoint.is_ready());
+        assert!(pre_release.send(()).is_ok());
+        cx.run_until_parked();
+
+        assert_eq!(
+            trace.lock().as_slice(),
+            ["pre-started", "pre-finished", "exact", "post-started"]
+        );
+        assert!(checkpoint.is_ready());
+        let database_id = match workspace.read_with(cx, |workspace, _| workspace.database_id()) {
+            Some(database_id) => database_id,
+            None => panic!("test workspace lost its database id"),
+        };
+        let db = cx.update(|_, cx| WorkspaceDb::global(cx));
+        assert!(db.workspace_for_id(database_id).is_some());
+
+        assert!(post_release.send(()).is_ok());
+        cx.run_until_parked();
+        if let Err(error) = checkpoint.await {
+            panic!("exact checkpoint failed: {error:#}");
+        }
+        assert_eq!(
+            trace.lock().as_slice(),
+            [
+                "pre-started",
+                "pre-finished",
+                "exact",
+                "post-started",
+                "post-finished"
+            ]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_exact_checkpoint_serializes_every_open_item(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(register_serializable_item::<TestItem>);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        workspace.update(cx, |workspace, _| workspace.set_random_database_id());
+
+        let counters = (0..3).map(|_| Rc::new(Cell::new(0))).collect::<Vec<_>>();
+        let items = counters
+            .iter()
+            .map(|counter| {
+                cx.new({
+                    let counter = counter.clone();
+                    move |cx| {
+                        TestItem::new(cx).with_serialize(move || {
+                            counter.set(counter.get() + 1);
+                            Some(Task::ready(Ok(())))
+                        })
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        workspace.update_in(cx, |workspace, window, cx| {
+            for item in &items {
+                workspace.add_item_to_active_pane(Box::new(item.clone()), None, true, window, cx);
+            }
+        });
+
+        let prime = workspace.update(cx, |workspace, cx| workspace.checkpoint_exact(cx));
+        if let Err(error) = prime.await {
+            panic!("failed to prime exact serialization: {error:#}");
+        }
+        cx.executor().advance_clock(SERIALIZATION_THROTTLE_TIME);
+        cx.run_until_parked();
+        let baselines = counters
+            .iter()
+            .map(|counter| counter.get())
+            .collect::<Vec<_>>();
+
+        let checkpoint = workspace.update(cx, |workspace, cx| workspace.checkpoint_exact(cx));
+        if let Err(error) = checkpoint.await {
+            panic!("exact checkpoint failed: {error:#}");
+        }
+        for (counter, baseline) in counters.iter().zip(baselines) {
+            assert_eq!(counter.get(), baseline + 1);
+        }
+    }
+
+    #[gpui::test]
+    async fn test_exact_checkpoint_reports_async_item_failure(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(register_serializable_item::<TestItem>);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        workspace.update(cx, |workspace, _| {
+            workspace.set_random_database_id();
+            workspace.centered_layout = false;
+        });
+
+        let failure_active = Rc::new(Cell::new(false));
+        let failure_receiver: Rc<RefCell<Option<oneshot::Receiver<()>>>> =
+            Rc::new(RefCell::new(None));
+        let failure_started = Arc::new(AtomicBool::new(false));
+        let executor = cx.background_executor.clone();
+        let item = cx.new({
+            let failure_active = failure_active.clone();
+            let failure_receiver = failure_receiver.clone();
+            let failure_started = failure_started.clone();
+            move |cx| {
+                TestItem::new(cx).with_serialize(move || {
+                    if !failure_active.get() {
+                        return Some(Task::ready(Ok(())));
+                    }
+                    let receiver = failure_receiver.borrow_mut().take();
+                    let failure_started = failure_started.clone();
+                    Some(executor.spawn(async move {
+                        failure_started.store(true, Ordering::SeqCst);
+                        receiver
+                            .context("item-failure gate was not installed")?
+                            .await
+                            .context("item-failure gate was dropped")?;
+                        Err(anyhow!("exact item checkpoint witness failure"))
+                    }))
+                })
+            }
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
+        });
+
+        let prime = workspace.update(cx, |workspace, cx| workspace.checkpoint_exact(cx));
+        if let Err(error) = prime.await {
+            panic!("failed to prime exact serialization: {error:#}");
+        }
+        cx.executor().advance_clock(SERIALIZATION_THROTTLE_TIME);
+        cx.run_until_parked();
+
+        workspace.update(cx, |workspace, _| {
+            workspace.centered_layout = true;
+        });
+        let (failure_release, failure_gate) = oneshot::channel();
+        *failure_receiver.borrow_mut() = Some(failure_gate);
+        failure_active.set(true);
+        let checkpoint = workspace.update(cx, |workspace, cx| workspace.checkpoint_exact(cx));
+        cx.run_until_parked();
+        assert!(failure_started.load(Ordering::SeqCst));
+        assert!(!checkpoint.is_ready());
+        assert!(failure_release.send(()).is_ok());
+
+        let error = match checkpoint.await {
+            Ok(()) => panic!("exact checkpoint accepted a failed item write"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("exact item checkpoint witness failure"));
+        let database_id = match workspace.read_with(cx, |workspace, _| workspace.database_id()) {
+            Some(database_id) => database_id,
+            None => panic!("test workspace lost its database id"),
+        };
+        let db = cx.update(|_, cx| WorkspaceDb::global(cx));
+        let stored = match db.workspace_for_id(database_id) {
+            Some(stored) => stored,
+            None => panic!("primed workspace row disappeared"),
+        };
+        assert!(!stored.centered_layout);
+
+        failure_active.set(false);
+        cx.executor().advance_clock(SERIALIZATION_THROTTLE_TIME);
+        cx.run_until_parked();
+        let retry = workspace.update(cx, |workspace, cx| workspace.checkpoint_exact(cx));
+        if let Err(error) = retry.await {
+            panic!("exact checkpoint coordinator did not recover: {error:#}");
+        }
+        let stored = match db.workspace_for_id(database_id) {
+            Some(stored) => stored,
+            None => panic!("retried workspace row disappeared"),
+        };
+        assert!(stored.centered_layout);
+    }
+
+    #[gpui::test]
+    async fn test_exact_checkpoint_reports_workspace_row_failure(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        workspace.update(cx, |workspace, _| {
+            workspace.set_random_database_id();
+            workspace.centered_layout = false;
+        });
+
+        let prime = workspace.update(cx, |workspace, cx| workspace.checkpoint_exact(cx));
+        if let Err(error) = prime.await {
+            panic!("failed to prime exact serialization: {error:#}");
+        }
+        cx.executor().advance_clock(SERIALIZATION_THROTTLE_TIME);
+        cx.run_until_parked();
+
+        let database_id = match workspace.read_with(cx, |workspace, _| workspace.database_id()) {
+            Some(database_id) => database_id,
+            None => panic!("test workspace lost its database id"),
+        };
+        let db = cx.update(|_, cx| WorkspaceDb::global(cx));
+        workspace.update(cx, |workspace, _| {
+            workspace.centered_layout = true;
+        });
+        WorkspaceDb::fail_next_workspace_write_for_tests(database_id);
+        let checkpoint = workspace.update(cx, |workspace, cx| workspace.checkpoint_exact(cx));
+        let result = checkpoint.await;
+
+        assert!(result.is_err());
+        let stored = match db.workspace_for_id(database_id) {
+            Some(stored) => stored,
+            None => panic!("primed workspace row disappeared"),
+        };
+        assert!(!stored.centered_layout);
+
+        cx.executor().advance_clock(SERIALIZATION_THROTTLE_TIME);
+        cx.run_until_parked();
+        let retry = workspace.update(cx, |workspace, cx| workspace.checkpoint_exact(cx));
+        if let Err(error) = retry.await {
+            panic!("exact checkpoint coordinator did not recover: {error:#}");
+        }
+        let stored = match db.workspace_for_id(database_id) {
+            Some(stored) => stored,
+            None => panic!("retried workspace row disappeared"),
+        };
+        assert!(stored.centered_layout);
     }
 
     #[gpui::test]

@@ -800,6 +800,32 @@ impl SerializableItem for BranchDiff {
         }))
     }
 
+    fn checkpoint_in_transaction(
+        &mut self,
+        workspace: &mut Workspace,
+        item_id: workspace::ItemId,
+        transaction: db::sqlez::thread_safe_connection::WriteTransaction,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let Some(workspace_id) = workspace.database_id() else {
+            return Task::ready(Ok(()));
+        };
+        let diff_base = self.diff_base(cx).clone();
+        if !diff_base.requires_tree_diff() {
+            return Task::ready(Ok(()));
+        }
+        cx.background_spawn(async move {
+            project_diff::persistence::ProjectDiffDb::save_project_diff_base_in_transaction(
+                &transaction,
+                item_id,
+                workspace_id,
+                diff_base,
+            )
+            .await
+        })
+    }
+
     fn should_serialize(&self, _: &Self::Event) -> bool {
         false
     }

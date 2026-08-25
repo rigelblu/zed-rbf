@@ -1371,6 +1371,10 @@ impl Pane {
         self.items.len()
     }
 
+    pub(crate) fn has_restorable_items(&self) -> bool {
+        !self.nav_history.0.lock().closed_stack.is_empty()
+    }
+
     pub fn items(&self) -> impl DoubleEndedIterator<Item = &Box<dyn ItemHandle>> {
         self.items.iter()
     }

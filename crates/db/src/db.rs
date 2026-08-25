@@ -226,13 +226,11 @@ async fn open_fallback_db<M: Migrator>() -> ThreadSafeConnection {
 
 #[cfg(any(test, feature = "test-support"))]
 pub async fn open_test_db<M: Migrator>(db_name: &str) -> ThreadSafeConnection {
-    use sqlez::thread_safe_connection::locking_queue;
-
     ThreadSafeConnection::builder::<M>(db_name, false)
         .with_db_initialization_query(DB_INITIALIZE_QUERY)
         .with_connection_initialize_query(CONNECTION_INITIALIZE_QUERY)
         // Serialize queued writes via a mutex and run them synchronously
-        .with_write_queue_constructor(locking_queue())
+        .with_locking_write_queue()
         .build()
         .await
         .unwrap()

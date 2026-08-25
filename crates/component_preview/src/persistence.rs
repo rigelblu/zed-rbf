@@ -26,6 +26,27 @@ impl Domain for ComponentPreviewDb {
 db::static_connection!(ComponentPreviewDb, [WorkspaceDb]);
 
 impl ComponentPreviewDb {
+    pub async fn save_active_page_in_transaction(
+        transaction: &db::sqlez::thread_safe_connection::WriteTransaction,
+        item_id: ItemId,
+        workspace_id: WorkspaceId,
+        active_page_id: String,
+    ) -> Result<()> {
+        transaction
+            .write(move |conn| {
+                let query = "INSERT INTO component_previews(item_id, workspace_id, active_page_id)
+                    VALUES (?1, ?2, ?3)
+                    ON CONFLICT DO UPDATE SET
+                        active_page_id = ?3";
+                let mut statement = Statement::prepare(conn, query)?;
+                let mut next_index = statement.bind(&item_id, 1)?;
+                next_index = statement.bind(&workspace_id, next_index)?;
+                statement.bind(&active_page_id, next_index)?;
+                statement.exec()
+            })
+            .await?
+    }
+
     pub async fn save_active_page(
         &self,
         item_id: ItemId,

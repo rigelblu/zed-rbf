@@ -7,8 +7,9 @@ use ui::{App, Context};
 use util::{ResultExt, paths::PathExt};
 
 use crate::{
-    NewWindow, SerializedWorkspaceLocation, WorkspaceId, path_list::PathList,
-    persistence::WorkspaceDb,
+    NewWindow, SerializedWorkspaceLocation, WorkspaceId,
+    path_list::PathList,
+    persistence::{WorkspaceConfigurationStore, WorkspaceDb},
 };
 
 pub fn init(fs: Arc<dyn Fs>, cx: &mut App) {
@@ -124,9 +125,14 @@ impl HistoryManager {
                     }
                 }
             }) {
-                for id in deleted_ids.iter() {
-                    db.delete_workspace_by_id(*id).await.log_err();
-                }
+                let delete_task = cx.update(|cx| {
+                    WorkspaceConfigurationStore::delete_unreferenced_workspace_rows_global(
+                        db,
+                        deleted_ids,
+                        cx,
+                    )
+                });
+                delete_task.await.log_err();
             }
         })
         .detach();

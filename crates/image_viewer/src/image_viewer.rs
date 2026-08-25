@@ -752,6 +752,31 @@ impl SerializableItem for ImageView {
         }))
     }
 
+    fn checkpoint_in_transaction(
+        &mut self,
+        workspace: &mut Workspace,
+        item_id: ItemId,
+        transaction: db::sqlez::thread_safe_connection::WriteTransaction,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<()>> {
+        let Some(workspace_id) = workspace.database_id() else {
+            return Task::ready(Ok(()));
+        };
+        let Some(image_path) = self.image_item.read(cx).abs_path(cx) else {
+            return Task::ready(Ok(()));
+        };
+        cx.background_spawn(async move {
+            persistence::ImageViewerDb::save_image_path_in_transaction(
+                &transaction,
+                item_id,
+                workspace_id,
+                image_path,
+            )
+            .await
+        })
+    }
+
     fn should_serialize(&self, _event: &Self::Event) -> bool {
         false
     }
@@ -1353,6 +1378,7 @@ mod tests {
 mod persistence {
     use std::path::PathBuf;
 
+    use anyhow::Result;
     use db::{
         query,
         sqlez::{domain::Domain, thread_safe_connection::ThreadSafeConnection},
@@ -1382,6 +1408,22 @@ mod persistence {
     db::static_connection!(ImageViewerDb, [WorkspaceDb]);
 
     impl ImageViewerDb {
+        pub async fn save_image_path_in_transaction(
+            transaction: &db::sqlez::thread_safe_connection::WriteTransaction,
+            item_id: ItemId,
+            workspace_id: WorkspaceId,
+            image_path: PathBuf,
+        ) -> Result<()> {
+            transaction
+                .write(move |connection| {
+                    connection.exec_bound(sql!(
+                        INSERT OR REPLACE INTO image_viewers(item_id, workspace_id, image_path)
+                        VALUES (?1, ?2, ?3)
+                    ))?((item_id, workspace_id, image_path))
+                })
+                .await?
+        }
+
         query! {
             pub async fn save_image_path(
                 item_id: ItemId,

@@ -8327,23 +8327,23 @@ impl ProjectPanel {
                     window,
                     cx,
                 )
-                    .when(index == last_item_index, |this| {
-                        let shadow_color_top = hsla(0.0, 0.0, 0.0, 0.1);
-                        let shadow_color_bottom = hsla(0.0, 0.0, 0.0, 0.);
-                        let sticky_shadow = div()
-                            .absolute()
-                            .left_0()
-                            .bottom_neg_1p5()
-                            .h_1p5()
-                            .w_full()
-                            .bg(linear_gradient(
-                                0.,
-                                linear_color_stop(shadow_color_top, 1.),
-                                linear_color_stop(shadow_color_bottom, 0.),
-                            ));
-                        this.child(sticky_shadow)
-                    })
-                    .into_any()
+                .when(index == last_item_index, |this| {
+                    let shadow_color_top = hsla(0.0, 0.0, 0.0, 0.1);
+                    let shadow_color_bottom = hsla(0.0, 0.0, 0.0, 0.);
+                    let sticky_shadow = div()
+                        .absolute()
+                        .left_0()
+                        .bottom_neg_1p5()
+                        .h_1p5()
+                        .w_full()
+                        .bg(linear_gradient(
+                            0.,
+                            linear_color_stop(shadow_color_top, 1.),
+                            linear_color_stop(shadow_color_bottom, 0.),
+                        ));
+                    this.child(sticky_shadow)
+                })
+                .into_any()
             })
             .collect()
     }

@@ -8,6 +8,9 @@ use std::{
     sync::Arc,
 };
 
+#[cfg(test)]
+use std::sync::LazyLock;
+
 use chrono::{DateTime, NaiveDateTime, Utc};
 use fs::Fs;
 
@@ -19,7 +22,10 @@ use db::{
     sqlez::{connection::Connection, domain::Domain},
     sqlez_macros::sql,
 };
-use gpui::{Axis, Bounds, Task, WindowBounds, WindowId, point, size};
+use gpui::{
+    AppContext as _, AsyncApp, Axis, BorrowAppContext as _, Bounds, Task, WindowBounds, WindowId,
+    point, size,
+};
 use project::{
     ProjectGroupKey,
     bookmark_store::SerializedBookmark,
@@ -60,6 +66,10 @@ use self::model::{DockStructure, SerializedWorkspaceLocation, SessionWorkspace};
 // > <..> the maximum value of a host parameter number is SQLITE_MAX_VARIABLE_NUMBER,
 // > which defaults to <..> 32766 for SQLite versions after 3.32.0.
 const MAX_QUERY_PLACEHOLDERS: usize = 32000;
+
+#[cfg(test)]
+static FAIL_NEXT_WORKSPACE_WRITE: LazyLock<parking_lot::Mutex<HashSet<WorkspaceId>>> =
+    LazyLock::new(Default::default);
 
 fn parse_timestamp(text: &str) -> DateTime<Utc> {
     NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S")
@@ -322,6 +332,534 @@ pub async fn write_multi_workspace_state(
             .await
             .log_err();
     }
+}
+
+/// The scoped-KVP namespace and key holding every saved workspace configuration.
+///
+/// One key, one value: a whole-collection replace is therefore atomic, so no write can
+/// leave two configurations disagreeing with each other.
+const WORKSPACE_CONFIGURATIONS_NAMESPACE: &str = "workspace_configurations";
+const WORKSPACE_CONFIGURATIONS_KEY: &str = "collection";
+
+/// What a read found in the configuration value.
+///
+/// The store distinguishes these because they call for different handling: an absent
+/// value can be replaced, while a value that could not be read or was written by a newer
+/// build must not be silently overwritten by this one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoredConfigurations {
+    /// A value this build wrote and understands, or no value at all.
+    Readable(model::WorkspaceConfigurationCollection),
+    /// A value whose `schema_version` is newer than this build writes.
+    TooNew { schema_version: u32 },
+    /// A value present but not parseable as a configuration collection.
+    Corrupt,
+    /// The scoped KVP read itself failed, so absence cannot be established safely.
+    ReadFailed,
+}
+
+fn stored_configurations_from_read_result(
+    read_result: Result<Option<String>>,
+) -> StoredConfigurations {
+    let json = match read_result {
+        Ok(Some(json)) => json,
+        Ok(None) => return StoredConfigurations::Readable(Default::default()),
+        Err(error) => {
+            log::error!("failed to read workspace configurations: {error:#}");
+            return StoredConfigurations::ReadFailed;
+        }
+    };
+
+    // Read the version before the body. A newer build is the case most likely to have
+    // changed the shape of everything around it, so parsing the whole value first would
+    // report its data as corrupt rather than as merely newer — and send the user chasing
+    // a log instead of an update.
+    #[derive(Deserialize)]
+    struct SchemaVersionProbe {
+        schema_version: u32,
+    }
+
+    if let Ok(SchemaVersionProbe { schema_version }) =
+        serde_json::from_str::<SchemaVersionProbe>(&json)
+        && schema_version > model::WORKSPACE_CONFIGURATION_SCHEMA_VERSION
+    {
+        return StoredConfigurations::TooNew { schema_version };
+    }
+
+    match serde_json::from_str::<model::WorkspaceConfigurationCollection>(&json) {
+        Ok(collection) => StoredConfigurations::Readable(collection),
+        Err(error) => {
+            log::error!("workspace configurations are unreadable: {error}");
+            StoredConfigurations::Corrupt
+        }
+    }
+}
+
+fn read_workspace_configurations(cx: &App) -> StoredConfigurations {
+    let kvp = KeyValueStore::global(cx);
+    stored_configurations_from_read_result(
+        kvp.scoped(WORKSPACE_CONFIGURATIONS_NAMESPACE)
+            .read(WORKSPACE_CONFIGURATIONS_KEY),
+    )
+}
+
+/// Why the store will not accept mutations.
+///
+/// Both variants mean the same thing to a caller — no configuration can be written — but
+/// they carry different copy, because only one of them is the user's fault to fix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreBlock {
+    /// A newer build wrote the stored value. Refusing every mutation is what keeps that
+    /// build's configurations intact across a rollback, which is the whole point of this
+    /// feature; overwriting them would be the exact loss it exists to prevent.
+    WrittenByNewerBuild { schema_version: u32 },
+    /// The stored value is present but unparseable, so applying a mutation to it would
+    /// mean guessing at what it used to hold.
+    Corrupt,
+    /// The stored value could not be read, so treating it as absent could erase it on the
+    /// next successful write.
+    ReadFailed,
+}
+
+impl StoreBlock {
+    pub fn user_facing_message(&self) -> String {
+        match self {
+            StoreBlock::WrittenByNewerBuild { .. } => {
+                "These workspace configurations were saved by a newer version of Zed RBF. \
+                 Update Zed RBF to use them again. They have not been changed."
+                    .to_string()
+            }
+            StoreBlock::Corrupt => "Saved workspace configurations couldn't be read. \
+                 They have not been changed. See the Zed log for details."
+                .to_string(),
+            StoreBlock::ReadFailed => "Saved workspace configurations couldn't be loaded. \
+                 They have not been changed. Retry after restarting Zed RBF."
+                .to_string(),
+        }
+    }
+}
+
+/// A typed change to one configuration.
+///
+/// Callers submit these rather than a whole replacement collection. That is what makes
+/// two windows checkpointing different configurations safe: each mutation is applied to
+/// the store's latest committed value at the moment it runs, so neither can carry a stale
+/// copy of the other's configuration back over it.
+#[derive(Debug, Clone)]
+pub enum WorkspaceConfigurationMutation {
+    Create {
+        name: String,
+        members: Vec<model::WorkspaceConfigurationMember>,
+        active_member: Option<WorkspaceId>,
+    },
+    Checkpoint {
+        id: model::WorkspaceConfigurationId,
+        members: Vec<model::WorkspaceConfigurationMember>,
+        active_member: Option<WorkspaceId>,
+    },
+}
+
+/// What a successful mutation produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreCommit {
+    pub id: model::WorkspaceConfigurationId,
+    /// The store generation after this commit. A switch captures the generation before it
+    /// stages anything and rechecks it at commit time, so a configuration edited during a
+    /// long stage aborts rather than committing against what it read.
+    pub generation: u64,
+}
+
+/// The one owner of every saved workspace configuration in this process.
+///
+/// All Zed windows share one `App`, so a single global here genuinely serializes every
+/// writer: there is no second process to race with.
+pub struct WorkspaceConfigurationStore {
+    /// The latest value this process committed, mirrored in memory so the menu can render
+    /// names without touching the database.
+    committed: model::WorkspaceConfigurationCollection,
+    generation: u64,
+    /// Set when the stored value must not be overwritten. Every mutation is refused while
+    /// it holds a value.
+    blocked: Option<StoreBlock>,
+    workspace_row_reservations: HashMap<Uuid, HashSet<WorkspaceId>>,
+    shutdown_committed: Arc<parking_lot::Mutex<model::WorkspaceConfigurationCollection>>,
+    shutdown_queue: Arc<futures::lock::Mutex<()>>,
+    /// Tail of the mutation queue.
+    ///
+    /// Each new mutation moves this into its own future and awaits it, rather than
+    /// replacing it — dropping a `Task` in GPUI cancels it, so replacing the tail would
+    /// silently discard a checkpoint the moment a second one arrived.
+    queue_tail: Option<Task<()>>,
+    #[cfg(test)]
+    fail_writes_for_tests: bool,
+}
+
+impl gpui::Global for WorkspaceConfigurationStore {}
+
+impl WorkspaceConfigurationStore {
+    pub fn init(cx: &mut App) {
+        if cx.try_global::<Self>().is_some() {
+            return;
+        }
+        cx.set_global(Self::load(cx));
+    }
+
+    pub fn global(cx: &App) -> &Self {
+        cx.global::<Self>()
+    }
+
+    pub fn try_global(cx: &App) -> Option<&Self> {
+        cx.try_global::<Self>()
+    }
+
+    fn load(cx: &App) -> Self {
+        let (committed, blocked) = Self::load_state(cx);
+        Self::new(committed, blocked)
+    }
+
+    fn load_state(cx: &App) -> (model::WorkspaceConfigurationCollection, Option<StoreBlock>) {
+        let (committed, blocked) = match read_workspace_configurations(cx) {
+            StoredConfigurations::Readable(collection) => (collection, None),
+            StoredConfigurations::TooNew { schema_version } => (
+                Default::default(),
+                Some(StoreBlock::WrittenByNewerBuild { schema_version }),
+            ),
+            StoredConfigurations::Corrupt => (Default::default(), Some(StoreBlock::Corrupt)),
+            StoredConfigurations::ReadFailed => (Default::default(), Some(StoreBlock::ReadFailed)),
+        };
+
+        (committed, blocked)
+    }
+
+    fn new(
+        committed: model::WorkspaceConfigurationCollection,
+        blocked: Option<StoreBlock>,
+    ) -> Self {
+        let shutdown_committed = Arc::new(parking_lot::Mutex::new(committed.clone()));
+        Self {
+            committed,
+            generation: 0,
+            blocked,
+            workspace_row_reservations: HashMap::default(),
+            shutdown_committed,
+            shutdown_queue: Arc::new(futures::lock::Mutex::new(())),
+            queue_tail: None,
+            #[cfg(test)]
+            fail_writes_for_tests: false,
+        }
+    }
+
+    /// Every saved configuration, from memory. Never touches the filesystem.
+    pub fn configurations(&self) -> &[model::WorkspaceConfiguration] {
+        &self.committed.configurations
+    }
+
+    pub fn configuration(
+        &self,
+        id: model::WorkspaceConfigurationId,
+    ) -> Option<&model::WorkspaceConfiguration> {
+        self.committed.find(id)
+    }
+
+    #[cfg(test)]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Why mutations are refused, when they are.
+    pub fn blocked(&self) -> Option<&StoreBlock> {
+        self.blocked.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_write_failure_for_tests(fail: bool, cx: &mut App) {
+        cx.global_mut::<Self>().fail_writes_for_tests = fail;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reload_for_tests(cx: &mut App) {
+        cx.set_global(Self::load(cx));
+    }
+
+    /// Every workspace row a configuration still refers to.
+    ///
+    /// Recent cleanup consults this so it cannot delete the exact state a saved
+    /// configuration depends on, leaving a name that restores only folders.
+    pub fn referenced_workspace_ids(&self) -> Option<HashSet<WorkspaceId>> {
+        self.blocked.is_none().then(|| {
+            let mut referenced = self.committed.referenced_workspace_ids();
+            referenced.extend(self.workspace_row_reservations.values().flatten().copied());
+            referenced
+        })
+    }
+
+    pub(crate) fn reserve_workspace_rows(
+        workspace_ids: impl IntoIterator<Item = WorkspaceId>,
+        cx: &mut App,
+    ) -> Uuid {
+        let this = cx.global_mut::<Self>();
+        let reservation_id = Uuid::new_v4();
+        this.workspace_row_reservations
+            .insert(reservation_id, workspace_ids.into_iter().collect());
+        reservation_id
+    }
+
+    pub(crate) fn release_workspace_rows(reservation_id: Uuid, cx: &mut App) {
+        cx.global_mut::<Self>()
+            .workspace_row_reservations
+            .remove(&reservation_id);
+    }
+
+    pub fn delete_unreferenced_workspace_rows_global(
+        db: WorkspaceDb,
+        workspace_ids: Vec<WorkspaceId>,
+        cx: &mut App,
+    ) -> Task<Result<Vec<WorkspaceId>>> {
+        let (send_result, receive_result) = futures::channel::oneshot::channel();
+        let previous = cx.global_mut::<Self>().queue_tail.take();
+
+        let queued = cx.spawn(async move |cx| {
+            if let Some(previous) = previous {
+                previous.await;
+            }
+
+            let result = async {
+                let workspace_ids = cx.update(|cx| {
+                    let protected_workspace_ids = Self::global(cx)
+                        .referenced_workspace_ids()
+                        .context("saved workspace configurations are unavailable")?;
+                    Ok::<_, anyhow::Error>(
+                        workspace_ids
+                            .into_iter()
+                            .filter(|id| !protected_workspace_ids.contains(id))
+                            .collect::<Vec<_>>(),
+                    )
+                })?;
+
+                for workspace_id in &workspace_ids {
+                    db.delete_workspace_by_id(*workspace_id).await?;
+                }
+                Ok(workspace_ids)
+            }
+            .await;
+
+            if send_result.send(result).is_err() {
+                log::debug!("workspace row deletion caller was dropped");
+            }
+        });
+
+        cx.global_mut::<Self>().queue_tail = Some(queued);
+        cx.background_spawn(async move {
+            receive_result
+                .await
+                .context("workspace configuration store dropped the row deletion")?
+        })
+    }
+
+    /// Queue one typed change.
+    ///
+    /// The returned task resolves after this mutation has been durably written, and every
+    /// mutation queued before it has finished. A caller that drops the returned task does
+    /// not cancel the write — the work lives on the store's own queue.
+    pub fn mutate_global(
+        mutation: WorkspaceConfigurationMutation,
+        cx: &mut App,
+    ) -> Task<Result<StoreCommit>> {
+        Self::mutate_after_global(Task::ready(Ok(())), None, mutation, cx)
+    }
+
+    pub(crate) fn mutate_conditionally_global(
+        validation: impl FnOnce(&mut App) -> Result<()> + 'static,
+        mutation: WorkspaceConfigurationMutation,
+        cx: &mut App,
+    ) -> Task<Result<StoreCommit>> {
+        Self::mutate_after_global(
+            Task::ready(Ok(())),
+            Some(Box::new(validation)),
+            mutation,
+            cx,
+        )
+    }
+
+    fn mutate_after_global(
+        prerequisite: Task<Result<()>>,
+        validation: Option<Box<dyn FnOnce(&mut App) -> Result<()>>>,
+        mutation: WorkspaceConfigurationMutation,
+        cx: &mut App,
+    ) -> Task<Result<StoreCommit>> {
+        let (send_result, receive_result) = futures::channel::oneshot::channel();
+        let previous = cx.global_mut::<Self>().queue_tail.take();
+
+        let queued = cx.spawn(async move |cx| {
+            if let Some(previous) = previous {
+                previous.await;
+            }
+
+            let result = async {
+                prerequisite.await?;
+                if let Some(validation) = validation {
+                    cx.update(validation)?;
+                }
+                Self::apply(mutation, cx).await
+            }
+            .await;
+            if send_result.send(result).is_err() {
+                log::debug!("workspace configuration mutation caller was dropped");
+            }
+        });
+
+        cx.global_mut::<Self>().queue_tail = Some(queued);
+
+        cx.background_spawn(async move {
+            receive_result
+                .await
+                .context("workspace configuration store dropped the mutation")?
+        })
+    }
+
+    pub(crate) fn checkpoint_after_for_shutdown(
+        prerequisite: Task<Result<()>>,
+        id: model::WorkspaceConfigurationId,
+        members: Vec<model::WorkspaceConfigurationMember>,
+        active_member: Option<WorkspaceId>,
+        cx: &mut App,
+    ) -> futures::future::LocalBoxFuture<'static, Result<StoreCommit>> {
+        let kvp = KeyValueStore::global(cx);
+        let (previous, shutdown_committed, shutdown_queue, blocked, generation) = {
+            let this = cx.global_mut::<Self>();
+            (
+                this.queue_tail.take(),
+                this.shutdown_committed.clone(),
+                this.shutdown_queue.clone(),
+                this.blocked.clone(),
+                this.generation,
+            )
+        };
+        Box::pin(async move {
+            let _queue_guard = shutdown_queue.lock().await;
+            if let Some(previous) = previous {
+                previous.await;
+            }
+            prerequisite.await?;
+            if let Some(blocked) = blocked {
+                anyhow::bail!("{}", blocked.user_facing_message());
+            }
+            let mut collection = shutdown_committed.lock().clone();
+            let id = Self::apply_to_collection(
+                &mut collection,
+                WorkspaceConfigurationMutation::Checkpoint {
+                    id,
+                    members,
+                    active_member,
+                },
+            )?;
+            let json = serde_json::to_string(&collection)
+                .context("serializing the workspace configuration collection")?;
+            kvp.scoped(WORKSPACE_CONFIGURATIONS_NAMESPACE)
+                .write(WORKSPACE_CONFIGURATIONS_KEY.to_string(), json)
+                .await
+                .context("writing the workspace configuration collection")?;
+            *shutdown_committed.lock() = collection;
+            Ok(StoreCommit {
+                id,
+                generation: generation + 1,
+            })
+        })
+    }
+
+    async fn apply(
+        mutation: WorkspaceConfigurationMutation,
+        cx: &mut AsyncApp,
+    ) -> Result<StoreCommit> {
+        let (mut collection, kvp) = cx.update(|cx| {
+            let this = Self::global(cx);
+            if let Some(blocked) = this.blocked.clone() {
+                anyhow::bail!("{}", blocked.user_facing_message());
+            }
+            #[cfg(test)]
+            anyhow::ensure!(
+                !this.fail_writes_for_tests,
+                "forced workspace configuration write failure"
+            );
+            Ok((this.committed.clone(), KeyValueStore::global(cx)))
+        })?;
+
+        let id = Self::apply_to_collection(&mut collection, mutation)?;
+
+        let json = serde_json::to_string(&collection)
+            .context("serializing the workspace configuration collection")?;
+
+        // The in-memory value advances only after the write lands, so a failed write
+        // leaves both the stored value and this process's view of it untouched.
+        kvp.scoped(WORKSPACE_CONFIGURATIONS_NAMESPACE)
+            .write(WORKSPACE_CONFIGURATIONS_KEY.to_string(), json)
+            .await
+            .context("writing the workspace configuration collection")?;
+        Ok(cx.update(|cx| {
+            cx.update_global::<Self, _>(|this, cx| {
+                this.committed = collection.clone();
+                *this.shutdown_committed.lock() = collection;
+                this.generation += 1;
+                cx.refresh_windows();
+                StoreCommit {
+                    id,
+                    generation: this.generation,
+                }
+            })
+        }))
+    }
+
+    fn apply_to_collection(
+        collection: &mut model::WorkspaceConfigurationCollection,
+        mutation: WorkspaceConfigurationMutation,
+    ) -> Result<model::WorkspaceConfigurationId> {
+        let id = match mutation {
+            WorkspaceConfigurationMutation::Create {
+                name,
+                members,
+                active_member,
+            } => {
+                let name = name.trim().to_string();
+                anyhow::ensure!(!name.is_empty(), "Enter a configuration name.");
+                anyhow::ensure!(
+                    collection.find_by_name(&name).is_none(),
+                    "A workspace configuration named \u{201c}{name}\u{201d} already exists."
+                );
+
+                let id = model::WorkspaceConfigurationId::new();
+                collection
+                    .configurations
+                    .push(model::WorkspaceConfiguration {
+                        id,
+                        name,
+                        members,
+                        active_member,
+                    });
+                id
+            }
+            WorkspaceConfigurationMutation::Checkpoint {
+                id,
+                members,
+                active_member,
+            } => {
+                let configuration = collection
+                    .configurations
+                    .iter_mut()
+                    .find(|configuration| configuration.id == id)
+                    .context("that workspace configuration no longer exists")?;
+                configuration.members = members;
+                configuration.active_member = active_member;
+                id
+            }
+        };
+
+        Ok(id)
+    }
+}
+
+pub fn workspace_configuration_referenced_workspace_ids(cx: &App) -> Option<HashSet<WorkspaceId>> {
+    WorkspaceConfigurationStore::try_global(cx)
+        .and_then(WorkspaceConfigurationStore::referenced_workspace_ids)
 }
 
 pub fn read_serialized_multi_workspaces(
@@ -1199,10 +1737,13 @@ impl WorkspaceDb {
             display,
             docks,
             session_id: None,
-            bookmarks: self.bookmarks(workspace_id),
-            breakpoints: self.breakpoints(workspace_id),
+            bookmarks: self.bookmarks(workspace_id).log_err().unwrap_or_default(),
+            breakpoints: self.breakpoints(workspace_id).log_err().unwrap_or_default(),
             window_id,
-            user_toolchains: self.user_toolchains(workspace_id, remote_connection_id),
+            user_toolchains: self
+                .user_toolchains(workspace_id, remote_connection_id)
+                .log_err()
+                .unwrap_or_default(),
         })
     }
 
@@ -1211,18 +1752,16 @@ impl WorkspaceDb {
         &self,
         workspace_id: WorkspaceId,
     ) -> Option<SerializedWorkspace> {
-        let (
-            paths,
-            paths_order,
-            identity_paths,
-            identity_paths_order,
-            window_bounds,
-            display,
-            centered_layout,
-            docks,
-            window_id,
-            remote_connection_id,
-        ): (
+        self.workspace_for_id_checked(workspace_id)
+            .log_err()
+            .flatten()
+    }
+
+    pub(crate) fn workspace_for_id_checked(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<Option<SerializedWorkspace>> {
+        let row: Option<(
             String,
             String,
             Option<String>,
@@ -1233,7 +1772,7 @@ impl WorkspaceDb {
             DockStructure,
             Option<u64>,
             Option<i32>,
-        ) = self
+        )> = self
             .select_row_bound(sql! {
                 SELECT
                     paths,
@@ -1261,10 +1800,22 @@ impl WorkspaceDb {
                 FROM workspaces
                 WHERE workspace_id = ?
             })
-            .and_then(|mut prepared_statement| (prepared_statement)(workspace_id))
-            .context("No workspace found for id")
-            .warn_on_err()
-            .flatten()?;
+            .and_then(|mut prepared_statement| (prepared_statement)(workspace_id))?;
+        let Some((
+            paths,
+            paths_order,
+            identity_paths,
+            identity_paths_order,
+            window_bounds,
+            display,
+            centered_layout,
+            docks,
+            window_id,
+            remote_connection_id,
+        )) = row
+        else {
+            return Ok(None);
+        };
 
         let paths = PathList::deserialize(&SerializedPathList {
             paths,
@@ -1279,14 +1830,15 @@ impl WorkspaceDb {
 
         let remote_connection_id = remote_connection_id.map(|id| RemoteConnectionId(id as u64));
         let remote_connection_options = if let Some(remote_connection_id) = remote_connection_id {
-            self.remote_connection(remote_connection_id)
-                .context("Get remote connection")
-                .log_err()
+            Some(
+                self.remote_connection(remote_connection_id)
+                    .context("getting remote connection for exact workspace restore")?,
+            )
         } else {
             None
         };
 
-        Some(SerializedWorkspace {
+        Ok(Some(SerializedWorkspace {
             id: workspace_id,
             location: match remote_connection_options {
                 Some(options) => SerializedWorkspaceLocation::Remote(options),
@@ -1296,21 +1848,51 @@ impl WorkspaceDb {
             identity_paths,
             center_group: self
                 .get_center_pane_group(workspace_id)
-                .context("Getting center group")
-                .log_err()?,
+                .context("getting center group for exact workspace restore")?,
             window_bounds,
             centered_layout: centered_layout.unwrap_or(false),
             display,
             docks,
             session_id: None,
-            bookmarks: self.bookmarks(workspace_id),
-            breakpoints: self.breakpoints(workspace_id),
+            bookmarks: self.bookmarks(workspace_id)?,
+            breakpoints: self.breakpoints(workspace_id)?,
             window_id,
-            user_toolchains: self.user_toolchains(workspace_id, remote_connection_id),
-        })
+            user_toolchains: self.user_toolchains(workspace_id, remote_connection_id)?,
+        }))
     }
 
-    fn bookmarks(&self, workspace_id: WorkspaceId) -> BTreeMap<Arc<Path>, Vec<SerializedBookmark>> {
+    pub(crate) fn workspace_for_local_identity_paths(
+        &self,
+        identity_paths: &[PathBuf],
+    ) -> Option<SerializedWorkspace> {
+        self.workspace_for_local_identity_paths_checked(identity_paths)
+            .log_err()
+            .flatten()
+    }
+
+    pub(crate) fn workspace_for_local_identity_paths_checked(
+        &self,
+        identity_paths: &[PathBuf],
+    ) -> Result<Option<SerializedWorkspace>> {
+        if identity_paths.is_empty() {
+            return Ok(None);
+        }
+        for (workspace_id, paths, stored_identity_paths, remote_connection_id, _, _) in
+            self.recent_workspaces()?
+        {
+            if remote_connection_id.is_none()
+                && stored_identity_paths.unwrap_or(paths).paths() == identity_paths
+            {
+                return self.workspace_for_id_checked(workspace_id);
+            }
+        }
+        Ok(None)
+    }
+
+    fn bookmarks(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<BTreeMap<Arc<Path>, Vec<SerializedBookmark>>> {
         let bookmarks: Result<Vec<(PathBuf, Bookmark)>> = self
             .select_bound(sql! {
                 SELECT path, row, label
@@ -1320,34 +1902,30 @@ impl WorkspaceDb {
             })
             .and_then(|mut prepared_statement| (prepared_statement)(workspace_id));
 
-        match bookmarks {
-            Ok(bookmarks) => {
-                if bookmarks.is_empty() {
-                    log::debug!("Bookmarks are empty after querying database for them");
-                }
-
-                let mut map: BTreeMap<_, Vec<_>> = BTreeMap::default();
-
-                for (path, bookmark) in bookmarks {
-                    let path: Arc<Path> = path.into();
-                    map.entry(path.clone())
-                        .or_default()
-                        .push(SerializedBookmark {
-                            row: bookmark.row,
-                            label: bookmark.label,
-                        })
-                }
-
-                map
-            }
-            Err(e) => {
-                log::error!("Failed to load bookmarks: {}", e);
-                BTreeMap::default()
-            }
+        let bookmarks = bookmarks?;
+        if bookmarks.is_empty() {
+            log::debug!("Bookmarks are empty after querying database for them");
         }
+
+        let mut map: BTreeMap<_, Vec<_>> = BTreeMap::default();
+
+        for (path, bookmark) in bookmarks {
+            let path: Arc<Path> = path.into();
+            map.entry(path.clone())
+                .or_default()
+                .push(SerializedBookmark {
+                    row: bookmark.row,
+                    label: bookmark.label,
+                })
+        }
+
+        Ok(map)
     }
 
-    fn breakpoints(&self, workspace_id: WorkspaceId) -> BTreeMap<Arc<Path>, Vec<SourceBreakpoint>> {
+    fn breakpoints(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<BTreeMap<Arc<Path>, Vec<SourceBreakpoint>>> {
         let breakpoints: Result<Vec<(PathBuf, Breakpoint)>> = self
             .select_bound(sql! {
                 SELECT path, breakpoint_location, log_message, condition, hit_condition, state
@@ -1356,48 +1934,41 @@ impl WorkspaceDb {
             })
             .and_then(|mut prepared_statement| (prepared_statement)(workspace_id));
 
-        match breakpoints {
-            Ok(bp) => {
-                if bp.is_empty() {
-                    log::debug!("Breakpoints are empty after querying database for them");
-                }
-
-                let mut map: BTreeMap<Arc<Path>, Vec<SourceBreakpoint>> = Default::default();
-
-                for (path, breakpoint) in bp {
-                    let path: Arc<Path> = path.into();
-                    map.entry(path.clone()).or_default().push(SourceBreakpoint {
-                        row: breakpoint.position,
-                        path,
-                        message: breakpoint.message,
-                        condition: breakpoint.condition,
-                        hit_condition: breakpoint.hit_condition,
-                        state: breakpoint.state,
-                    });
-                }
-
-                for (path, bps) in map.iter() {
-                    log::info!(
-                        "Got {} breakpoints from database at path: {}",
-                        bps.len(),
-                        path.to_string_lossy()
-                    );
-                }
-
-                map
-            }
-            Err(msg) => {
-                log::error!("Breakpoints query failed with msg: {msg}");
-                Default::default()
-            }
+        let breakpoints = breakpoints?;
+        if breakpoints.is_empty() {
+            log::debug!("Breakpoints are empty after querying database for them");
         }
+
+        let mut map: BTreeMap<Arc<Path>, Vec<SourceBreakpoint>> = Default::default();
+
+        for (path, breakpoint) in breakpoints {
+            let path: Arc<Path> = path.into();
+            map.entry(path.clone()).or_default().push(SourceBreakpoint {
+                row: breakpoint.position,
+                path,
+                message: breakpoint.message,
+                condition: breakpoint.condition,
+                hit_condition: breakpoint.hit_condition,
+                state: breakpoint.state,
+            });
+        }
+
+        for (path, breakpoints) in map.iter() {
+            log::info!(
+                "Got {} breakpoints from database at path: {}",
+                breakpoints.len(),
+                path.to_string_lossy()
+            );
+        }
+
+        Ok(map)
     }
 
     fn user_toolchains(
         &self,
         workspace_id: WorkspaceId,
         remote_connection_id: Option<RemoteConnectionId>,
-    ) -> BTreeMap<ToolchainScope, IndexSet<Toolchain>> {
+    ) -> Result<BTreeMap<ToolchainScope, IndexSet<Toolchain>>> {
         type RowKind = (WorkspaceId, String, String, String, String, String, String);
 
         let toolchains: Vec<RowKind> = self
@@ -1410,8 +1981,7 @@ impl WorkspaceDb {
             })
             .and_then(|mut statement| {
                 (statement)((remote_connection_id.map(|id| id.0), workspace_id))
-            })
-            .unwrap_or_default();
+            })?;
         let mut ret = BTreeMap::<_, IndexSet<_>>::default();
 
         for (
@@ -1463,15 +2033,59 @@ impl WorkspaceDb {
             ret.entry(scope).or_default().insert(toolchain);
         }
 
-        ret
+        Ok(ret)
     }
 
-    pub(crate) async fn save_workspace(&self, workspace: SerializedWorkspace) {
+    pub(crate) async fn save_workspace_checked(
+        &self,
+        workspace: SerializedWorkspace,
+    ) -> Result<()> {
+        self.write(move |connection| Self::save_workspace_on_connection(connection, workspace))
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_workspace_write_for_tests(workspace_id: WorkspaceId) {
+        FAIL_NEXT_WORKSPACE_WRITE.lock().insert(workspace_id);
+    }
+
+    pub(crate) async fn begin_exact_checkpoint_transaction(
+        &self,
+    ) -> Result<sqlez::thread_safe_connection::WriteTransaction> {
+        self.0.begin_write_transaction().await
+    }
+
+    pub(crate) fn queue_exact_checkpoint_transaction(
+        &self,
+    ) -> (
+        sqlez::thread_safe_connection::WriteTransaction,
+        impl std::future::Future<Output = Result<()>> + use<>,
+    ) {
+        self.0.queue_write_transaction()
+    }
+
+    pub(crate) async fn save_workspace_in_transaction(
+        transaction: &sqlez::thread_safe_connection::WriteTransaction,
+        workspace: SerializedWorkspace,
+    ) -> Result<()> {
+        transaction
+            .write(move |connection| Self::save_workspace_on_connection(connection, workspace))
+            .await?
+    }
+
+    fn save_workspace_on_connection(
+        conn: &Connection,
+        workspace: SerializedWorkspace,
+    ) -> Result<()> {
+        #[cfg(test)]
+        if FAIL_NEXT_WORKSPACE_WRITE.lock().remove(&workspace.id) {
+            bail!("forced workspace row write failure");
+        }
+
         let paths = workspace.paths.serialize();
         let identity_paths = workspace.identity_paths.map(|paths| paths.serialize());
         log::debug!("Saving workspace at location: {:?}", workspace.location);
-        self.write(move |conn| {
-            conn.with_savepoint("update_worktrees", || {
+        conn.with_savepoint("update_worktrees", || {
                 let remote_connection_id = match workspace.location.clone() {
                     SerializedWorkspaceLocation::Local => None,
                     SerializedWorkspaceLocation::Remote(connection_options) => {
@@ -1512,11 +2126,9 @@ impl WorkspaceDb {
                 for (path, breakpoints) in workspace.breakpoints {
                     for bp in breakpoints {
                         let state = BreakpointStateWrapper::from(bp.state);
-                        match conn.exec_bound(sql!(
+                        conn.exec_bound(sql!(
                             INSERT INTO breakpoints (workspace_id, path, breakpoint_location,  log_message, condition, hit_condition, state)
-                            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7);))?
-
-                        ((
+                            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7);))?((
                             workspace.id,
                             path.as_ref(),
                             bp.row,
@@ -1524,15 +2136,14 @@ impl WorkspaceDb {
                             bp.condition,
                             bp.hit_condition,
                             state,
-                        )) {
-                            Ok(_) => {
-                                log::debug!("Stored breakpoint at row: {} in path: {}", bp.row, path.to_string_lossy())
-                            }
-                            Err(err) => {
-                                log::error!("{err}");
-                                continue;
-                            }
-                        }
+                        ))
+                        .with_context(|| {
+                            format!(
+                                "storing breakpoint at row {} in {}",
+                                bp.row,
+                                path.to_string_lossy()
+                            )
+                        })?;
                     }
                 }
 
@@ -1552,10 +2163,8 @@ impl WorkspaceDb {
                         };
                         let args = (remote_connection_id, workspace_id.unwrap_or(WorkspaceId(0)), worktree_root_path.unwrap_or_default(), relative_worktree_path.unwrap_or_default(),
                         toolchain.language_name.as_ref().to_owned(), toolchain.name.to_string(), toolchain.path.to_string(), toolchain.as_json.to_string());
-                        if let Err(err) = conn.exec_bound(query)?(args) {
-                            log::error!("{err}");
-                            continue;
-                        }
+                        conn.exec_bound(query)?(args)
+                            .context("storing workspace user toolchain")?;
                     }
                 }
 
@@ -1598,9 +2207,16 @@ impl WorkspaceDb {
                         bottom_dock_zoom,
                         session_id,
                         window_id,
+                        window_state,
+                        window_x,
+                        window_y,
+                        window_width,
+                        window_height,
+                        display,
+                        centered_layout,
                         timestamp
                     )
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, CURRENT_TIMESTAMP)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, CURRENT_TIMESTAMP)
                     ON CONFLICT DO
                     UPDATE SET
                         paths = ?2,
@@ -1619,6 +2235,13 @@ impl WorkspaceDb {
                         bottom_dock_zoom = ?15,
                         session_id = ?16,
                         window_id = ?17,
+                        window_state = ?18,
+                        window_x = ?19,
+                        window_y = ?20,
+                        window_width = ?21,
+                        window_height = ?22,
+                        display = ?23,
+                        centered_layout = ?24,
                         timestamp = CURRENT_TIMESTAMP
                 );
                 let mut prepared_query = conn.exec_bound(query)?;
@@ -1632,6 +2255,11 @@ impl WorkspaceDb {
                     workspace.docks,
                     workspace.session_id,
                     workspace.window_id,
+                    (
+                        workspace.window_bounds,
+                        workspace.display,
+                        workspace.centered_layout,
+                    ),
                 );
 
                 prepared_query(args).context("Updating workspace")?;
@@ -1640,11 +2268,23 @@ impl WorkspaceDb {
                 Self::save_pane_group(conn, workspace.id, &workspace.center_group, None)
                     .context("save pane group in save workspace")?;
 
-                Ok(())
-            })
-            .log_err();
+            Ok(())
         })
-        .await;
+    }
+
+    pub(crate) async fn save_workspace(&self, workspace: SerializedWorkspace) {
+        self.save_workspace_checked(workspace).await.log_err();
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn set_query_only_for_tests(&self, query_only: bool) -> Result<()> {
+        let query = if query_only {
+            "PRAGMA query_only = ON"
+        } else {
+            "PRAGMA query_only = OFF"
+        };
+        self.write(move |connection| connection.exec(query).and_then(|mut statement| statement()))
+            .await
     }
 
     pub(crate) async fn get_or_create_remote_connection(
@@ -1994,7 +2634,7 @@ impl WorkspaceDb {
     }
 
     query! {
-        pub async fn delete_workspace_by_id(id: WorkspaceId) -> Result<()> {
+        async fn delete_workspace_by_id(id: WorkspaceId) -> Result<()> {
             DELETE FROM workspaces
             WHERE workspace_id IS ?
         }
@@ -2070,7 +2710,7 @@ impl WorkspaceDb {
         ))
     }
 
-    pub async fn delete_recent_workspace_group(
+    pub async fn recent_workspace_group_ids(
         &self,
         target: &RecentWorkspace,
     ) -> Result<Vec<WorkspaceId>> {
@@ -2102,15 +2742,24 @@ impl WorkspaceDb {
                 workspace_ids.push(workspace_id);
             }
         }
+        Ok(workspace_ids)
+    }
 
-        futures::future::join_all(
-            workspace_ids
-                .iter()
-                .copied()
-                .map(|workspace_id| self.delete_workspace_by_id(workspace_id)),
-        )
-        .await;
-
+    #[cfg(test)]
+    async fn delete_recent_workspace_group(
+        &self,
+        target: &RecentWorkspace,
+        protected_workspace_ids: &HashSet<WorkspaceId>,
+    ) -> Result<Vec<WorkspaceId>> {
+        let workspace_ids = self
+            .recent_workspace_group_ids(target)
+            .await?
+            .into_iter()
+            .filter(|id| !protected_workspace_ids.contains(id))
+            .collect::<Vec<_>>();
+        for workspace_id in &workspace_ids {
+            self.delete_workspace_by_id(*workspace_id).await?;
+        }
         Ok(workspace_ids)
     }
 
@@ -2119,18 +2768,22 @@ impl WorkspaceDb {
     // up immediately. Local workspaces with no valid paths on disk are kept for seven days
     // after going stale. Workspaces belonging to the current session or the last session are
     // always preserved so that an in-progress restore can rehydrate them.
-    pub async fn garbage_collect_workspaces(
+    pub async fn garbage_collect_workspace_candidates(
         &self,
         fs: &dyn Fs,
         current_session_id: &str,
         last_session_id: Option<&str>,
-    ) -> Result<()> {
+        protected_workspace_ids: &HashSet<WorkspaceId>,
+    ) -> Result<Vec<WorkspaceId>> {
         let remote_connections = self.remote_connections()?;
         let now = Utc::now();
         let mut workspaces_to_delete = Vec::new();
         for (id, paths, _identity_paths_hint, remote_connection_id, session_id, timestamp) in
             self.recent_workspaces()?
         {
+            if protected_workspace_ids.contains(&id) {
+                continue;
+            }
             if let Some(session_id) = session_id.as_deref() {
                 if session_id == current_session_id || Some(session_id) == last_session_id {
                     continue;
@@ -2161,12 +2814,28 @@ impl WorkspaceDb {
             }
         }
 
-        futures::future::join_all(
-            workspaces_to_delete
-                .into_iter()
-                .map(|id| self.delete_workspace_by_id(id)),
-        )
-        .await;
+        Ok(workspaces_to_delete)
+    }
+
+    #[cfg(test)]
+    async fn garbage_collect_workspaces(
+        &self,
+        fs: &dyn Fs,
+        current_session_id: &str,
+        last_session_id: Option<&str>,
+        protected_workspace_ids: &HashSet<WorkspaceId>,
+    ) -> Result<()> {
+        let workspace_ids = self
+            .garbage_collect_workspace_candidates(
+                fs,
+                current_session_id,
+                last_session_id,
+                protected_workspace_ids,
+            )
+            .await?;
+        for workspace_id in workspace_ids {
+            self.delete_workspace_by_id(workspace_id).await?;
+        }
         Ok(())
     }
 
@@ -2780,7 +3449,6 @@ mod tests {
     };
     use gpui::TaskExt;
 
-    use gpui::AppContext as _;
     use pretty_assertions::assert_eq;
     use project::Project;
     use remote::SshConnectionOptions;
@@ -3794,6 +4462,35 @@ mod tests {
         }
     }
 
+    #[gpui::test]
+    async fn workspace_for_id_checked_propagates_constituent_query_failure() {
+        let db = WorkspaceDb::open_test_db("workspace_for_id_checked_query_failure").await;
+        let workspace_id = WorkspaceId(8801);
+        db.save_workspace_checked(workspace_with(
+            workspace_id.0 as u64,
+            &[Path::new("/strict-query-failure")],
+            empty_pane_group(),
+            None,
+        ))
+        .await
+        .unwrap();
+        db.write(|connection| {
+            connection
+                .exec("DROP TABLE bookmarks")
+                .and_then(|mut statement| statement())
+        })
+        .await
+        .unwrap();
+
+        let error = db
+            .workspace_for_id_checked(workspace_id)
+            .expect_err("strict restore must propagate a constituent query failure");
+        assert!(
+            format!("{error:#}").contains("bookmarks"),
+            "the strict error should identify the failed constituent query"
+        );
+    }
+
     fn remote_workspace_with(id: u64, host: &str, paths: &[&Path]) -> SerializedWorkspace {
         SerializedWorkspace {
             id: WorkspaceId(id as i64),
@@ -3871,7 +4568,7 @@ mod tests {
         db.save_workspace(workspace_with(1, &[], empty_pane_group(), None))
             .await;
 
-        db.garbage_collect_workspaces(fs.as_ref(), "current", None)
+        db.garbage_collect_workspaces(fs.as_ref(), "current", None, &Default::default())
             .await
             .unwrap();
         assert!(
@@ -3889,14 +4586,39 @@ mod tests {
             .await;
         db.set_timestamp_for_tests(WorkspaceId(1), "2000-01-01 00:00:00".to_owned())
             .await
-            .unwrap();
+            .expect("failed to age the configuration-referenced workspace");
 
-        db.garbage_collect_workspaces(fs.as_ref(), "current", None)
+        db.garbage_collect_workspaces(fs.as_ref(), "current", None, &Default::default())
             .await
             .unwrap();
         assert!(
             db.workspace_for_id(WorkspaceId(1)).is_none(),
             "stale empty workspace older than the retention window must be deleted"
+        );
+    }
+
+    #[gpui::test]
+    async fn workspace_configuration_row_retention_preserves_referenced_workspace_during_gc(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fs = fs::FakeFs::new(cx.executor());
+        let db = WorkspaceDb::open_test_db("test_gc_preserves_configuration_reference").await;
+
+        db.save_workspace(workspace_with(1, &[], empty_pane_group(), None))
+            .await;
+        db.set_timestamp_for_tests(WorkspaceId(1), "2000-01-01 00:00:00".to_owned())
+            .await
+            .expect("failed to age the configuration-referenced workspace");
+
+        let mut protected_workspace_ids = HashSet::default();
+        protected_workspace_ids.insert(WorkspaceId(1));
+        db.garbage_collect_workspaces(fs.as_ref(), "current", None, &protected_workspace_ids)
+            .await
+            .expect("failed to garbage collect while preserving referenced workspaces");
+
+        assert!(
+            db.workspace_for_id(WorkspaceId(1)).is_some(),
+            "configuration-referenced exact rows must survive startup GC"
         );
     }
 
@@ -3918,7 +4640,7 @@ mod tests {
         ))
         .await;
 
-        db.garbage_collect_workspaces(fs.as_ref(), "current", None)
+        db.garbage_collect_workspaces(fs.as_ref(), "current", None, &Default::default())
             .await
             .unwrap();
         assert!(
@@ -3929,7 +4651,7 @@ mod tests {
         db.set_timestamp_for_tests(WorkspaceId(1), "2000-01-01 00:00:00".to_owned())
             .await
             .unwrap();
-        db.garbage_collect_workspaces(fs.as_ref(), "current", None)
+        db.garbage_collect_workspaces(fs.as_ref(), "current", None, &Default::default())
             .await
             .unwrap();
         assert!(
@@ -3956,7 +4678,7 @@ mod tests {
                 .unwrap();
         }
 
-        db.garbage_collect_workspaces(fs.as_ref(), "current", Some("last"))
+        db.garbage_collect_workspaces(fs.as_ref(), "current", Some("last"), &Default::default())
             .await
             .unwrap();
 
@@ -3985,7 +4707,7 @@ mod tests {
             .await
             .unwrap();
 
-        db.garbage_collect_workspaces(fs.as_ref(), "current", None)
+        db.garbage_collect_workspaces(fs.as_ref(), "current", None, &Default::default())
             .await
             .unwrap();
         assert!(
@@ -4591,6 +5313,7 @@ mod tests {
                 project_groups: vec![],
                 sidebar_open: true,
                 sidebar_state: None,
+                active_configuration_id: None,
             },
         )
         .await;
@@ -4603,6 +5326,7 @@ mod tests {
                 project_groups: vec![],
                 sidebar_open: false,
                 sidebar_state: None,
+                active_configuration_id: None,
             },
         )
         .await;
@@ -5647,11 +6371,79 @@ mod tests {
         let recents = db.recent_project_workspaces(fs.as_ref()).await.unwrap();
         assert_eq!(recents.len(), 1);
 
-        let deleted = db.delete_recent_workspace_group(&recents[0]).await.unwrap();
+        let deleted = db
+            .delete_recent_workspace_group(&recents[0], &Default::default())
+            .await
+            .expect("failed to delete the unprotected recent workspace group");
         assert_eq!(deleted, vec![WorkspaceId(2), WorkspaceId(1)]);
 
-        let recents = db.recent_project_workspaces(fs.as_ref()).await.unwrap();
+        let recents = db
+            .recent_project_workspaces(fs.as_ref())
+            .await
+            .expect("failed to load the protected recent workspace group");
         assert!(recents.is_empty());
+    }
+
+    #[gpui::test]
+    async fn workspace_configuration_row_retention_preserves_reference_during_recent_deletion(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fs = fs::FakeFs::new(cx.executor());
+        let db = WorkspaceDb::open_test_db("test_delete_recent_preserves_reference").await;
+        fs.insert_tree("/the-group", json!({ ".git": {}, "file": "" }))
+            .await;
+        fs.insert_tree("/the-group-linked", json!({ ".git": {}, "file": "" }))
+            .await;
+
+        for (id, path) in [(1_u64, "/the-group"), (2, "/the-group-linked")] {
+            db.save_workspace(SerializedWorkspace {
+                identity_paths: Some(PathList::new(&["/the-group"])),
+                ..workspace_with(id, &[Path::new(path)], empty_pane_group(), None)
+            })
+            .await;
+        }
+
+        let recents = db
+            .recent_project_workspaces(fs.as_ref())
+            .await
+            .expect("failed to load the protected recent workspace group");
+        let mut protected_workspace_ids = HashSet::default();
+        protected_workspace_ids.insert(WorkspaceId(1));
+        let deleted = db
+            .delete_recent_workspace_group(&recents[0], &protected_workspace_ids)
+            .await
+            .expect("failed to delete the recent group around its protected workspace");
+
+        assert_eq!(deleted, vec![WorkspaceId(2)]);
+        assert!(db.workspace_for_id(WorkspaceId(1)).is_some());
+        assert!(db.workspace_for_id(WorkspaceId(2)).is_none());
+    }
+
+    #[gpui::test]
+    async fn workspace_configuration_row_retention_identity_fallback_requires_exact_local_row(
+        _cx: &mut gpui::TestAppContext,
+    ) {
+        let db = WorkspaceDb::open_test_db("test_workspace_identity_fallback").await;
+        db.save_workspace(SerializedWorkspace {
+            identity_paths: Some(PathList::new(&["/repo"])),
+            ..workspace_with(
+                2,
+                &[Path::new("/repo-linked")],
+                pane_with_items(&[200]),
+                None,
+            )
+        })
+        .await;
+
+        let fallback = db
+            .workspace_for_local_identity_paths(&[PathBuf::from("/repo")])
+            .expect("an existing exact row with the same identity should be usable");
+        assert_eq!(fallback.id, WorkspaceId(2));
+        assert!(db.workspace_for_local_identity_paths(&[]).is_none());
+        assert!(
+            db.workspace_for_local_identity_paths(&[PathBuf::from("/other")])
+                .is_none()
+        );
     }
 
     #[gpui::test]
@@ -6000,5 +6792,823 @@ mod tests {
                 "fallback should have found workspace_b, not the excluded workspace_a"
             );
         });
+    }
+
+    fn member(workspace_id: i64) -> model::WorkspaceConfigurationMember {
+        model::WorkspaceConfigurationMember {
+            workspace_id: WorkspaceId(workspace_id),
+            identity_paths: vec![PathBuf::from(format!("/repo-{workspace_id}"))],
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct WorkspaceConfigurationStoreTestHandle;
+
+    struct WorkspaceConfigurationStoreMutationHandle;
+
+    impl WorkspaceConfigurationStoreMutationHandle {
+        fn mutate(
+            &mut self,
+            mutation: WorkspaceConfigurationMutation,
+            cx: &mut App,
+        ) -> Task<Result<StoreCommit>> {
+            WorkspaceConfigurationStore::mutate_global(mutation, cx)
+        }
+    }
+
+    impl WorkspaceConfigurationStoreTestHandle {
+        fn update<R>(
+            &self,
+            cx: &mut gpui::TestAppContext,
+            update: impl FnOnce(&mut WorkspaceConfigurationStoreMutationHandle, &mut App) -> R,
+        ) -> R {
+            cx.update(|cx| update(&mut WorkspaceConfigurationStoreMutationHandle, cx))
+        }
+
+        fn read_with<R>(
+            &self,
+            cx: &mut gpui::TestAppContext,
+            read: impl FnOnce(&WorkspaceConfigurationStore, &App) -> R,
+        ) -> R {
+            cx.update(|cx| read(WorkspaceConfigurationStore::global(cx), cx))
+        }
+    }
+
+    /// Writes a raw value straight into the configuration key, bypassing the store, so a
+    /// test can set up what a different build would have left behind.
+    async fn write_raw_configurations(cx: &mut gpui::TestAppContext, json: &str) {
+        let kvp = cx.update(|cx| KeyValueStore::global(cx));
+        kvp.scoped(WORKSPACE_CONFIGURATIONS_NAMESPACE)
+            .write(WORKSPACE_CONFIGURATIONS_KEY.to_string(), json.to_string())
+            .await
+            .unwrap();
+    }
+
+    async fn read_raw_configurations(cx: &mut gpui::TestAppContext) -> Option<String> {
+        let kvp = cx.update(|cx| KeyValueStore::global(cx));
+        kvp.scoped(WORKSPACE_CONFIGURATIONS_NAMESPACE)
+            .read(WORKSPACE_CONFIGURATIONS_KEY)
+            .unwrap()
+    }
+
+    async fn clear_raw_configurations(cx: &mut gpui::TestAppContext) {
+        let kvp = cx.update(|cx| KeyValueStore::global(cx));
+        if let Err(error) = kvp
+            .scoped(WORKSPACE_CONFIGURATIONS_NAMESPACE)
+            .delete(WORKSPACE_CONFIGURATIONS_KEY.to_string())
+            .await
+        {
+            panic!("failed to clear workspace configurations before test: {error:#}");
+        }
+    }
+
+    async fn set_configuration_store_query_only(cx: &mut gpui::TestAppContext, query_only: bool) {
+        let kvp = cx.update(|cx| KeyValueStore::global(cx));
+        let query = if query_only {
+            "PRAGMA query_only = ON"
+        } else {
+            "PRAGMA query_only = OFF"
+        };
+        let result = kvp
+            .write(move |connection| connection.exec(query).and_then(|mut statement| statement()))
+            .await;
+        if let Err(error) = result {
+            panic!("failed to change query_only while testing configuration writes: {error:#}");
+        }
+    }
+
+    #[gpui::test]
+    async fn workspace_configuration_store_round_trip(cx: &mut gpui::TestAppContext) {
+        clear_raw_configurations(cx).await;
+        cx.update(|cx| WorkspaceConfigurationStore::init(cx));
+        let store = WorkspaceConfigurationStoreTestHandle;
+
+        let commit = store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Create {
+                        name: "  Daily  ".to_string(),
+                        members: vec![member(1), member(2)],
+                        active_member: Some(WorkspaceId(2)),
+                    },
+                    cx,
+                )
+            })
+            .await;
+        let commit = match commit {
+            Ok(commit) => commit,
+            Err(error) => panic!("failed to create the configuration test fixture: {error:#}"),
+        };
+
+        store.read_with(cx, |store, _| {
+            let configuration = store.configuration(commit.id).unwrap();
+            assert_eq!(configuration.name, "Daily", "the name is stored trimmed");
+            assert_eq!(configuration.members, vec![member(1), member(2)]);
+            assert_eq!(configuration.active_member, Some(WorkspaceId(2)));
+            assert_eq!(store.generation(), 1);
+        });
+
+        // A checkpoint replaces membership, order, and active workspace together.
+        store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Checkpoint {
+                        id: commit.id,
+                        members: vec![member(2), member(1), member(3)],
+                        active_member: Some(WorkspaceId(3)),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        store.read_with(cx, |store, _| {
+            let configuration = store.configuration(commit.id).unwrap();
+            assert_eq!(configuration.members, vec![member(2), member(1), member(3)]);
+            assert_eq!(configuration.active_member, Some(WorkspaceId(3)));
+            assert_eq!(store.generation(), 2, "each commit advances the generation");
+        });
+
+        // A store loaded fresh from the same value sees the checkpointed state, which is
+        // what makes a configuration survive quit and relaunch.
+        let reloaded = cx.update(|cx| cx.new(|cx| WorkspaceConfigurationStore::load(cx)));
+        reloaded.read_with(cx, |store, _| {
+            assert!(store.blocked().is_none());
+            let configuration = store.configuration(commit.id).unwrap();
+            assert_eq!(configuration.name, "Daily");
+            assert_eq!(configuration.members, vec![member(2), member(1), member(3)]);
+            assert_eq!(configuration.active_member, Some(WorkspaceId(3)));
+        });
+    }
+
+    #[gpui::test]
+    async fn workspace_configuration_store_rejects_invalid_names(cx: &mut gpui::TestAppContext) {
+        clear_raw_configurations(cx).await;
+        cx.update(|cx| WorkspaceConfigurationStore::init(cx));
+        let store = WorkspaceConfigurationStoreTestHandle;
+
+        store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Create {
+                        name: "Daily".to_string(),
+                        members: vec![member(1)],
+                        active_member: Some(WorkspaceId(1)),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        let before = read_raw_configurations(cx).await;
+
+        let empty = store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Create {
+                        name: "   ".to_string(),
+                        members: vec![member(2)],
+                        active_member: None,
+                    },
+                    cx,
+                )
+            })
+            .await;
+        assert!(empty.is_err(), "a blank name is refused");
+
+        // Case and surrounding whitespace do not make a name distinct.
+        let duplicate = store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Create {
+                        name: " daily ".to_string(),
+                        members: vec![member(2)],
+                        active_member: None,
+                    },
+                    cx,
+                )
+            })
+            .await;
+        assert!(duplicate.is_err(), "a duplicate name is refused");
+
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.configurations().len(),
+                1,
+                "a refused create adds nothing"
+            );
+            assert_eq!(store.generation(), 1, "a refused create does not commit");
+        });
+        assert_eq!(
+            read_raw_configurations(cx).await,
+            before,
+            "a refused create leaves the stored value byte-identical"
+        );
+    }
+
+    #[gpui::test]
+    async fn workspace_configuration_store_preserves_prior_value_when_write_fails(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        clear_raw_configurations(cx).await;
+        cx.update(|cx| WorkspaceConfigurationStore::init(cx));
+        let store = WorkspaceConfigurationStoreTestHandle;
+
+        let commit = store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Create {
+                        name: "Daily".to_string(),
+                        members: vec![member(1)],
+                        active_member: Some(WorkspaceId(1)),
+                    },
+                    cx,
+                )
+            })
+            .await;
+        let commit = match commit {
+            Ok(commit) => commit,
+            Err(error) => panic!("failed to create the configuration test fixture: {error:#}"),
+        };
+        let before = read_raw_configurations(cx).await;
+
+        set_configuration_store_query_only(cx, true).await;
+        let checkpoint = store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Checkpoint {
+                        id: commit.id,
+                        members: vec![member(2)],
+                        active_member: Some(WorkspaceId(2)),
+                    },
+                    cx,
+                )
+            })
+            .await;
+        set_configuration_store_query_only(cx, false).await;
+
+        assert!(
+            checkpoint.is_err(),
+            "the forced database failure is reported"
+        );
+        store.read_with(cx, |store, _| {
+            let Some(configuration) = store.configuration(commit.id) else {
+                panic!("the prior configuration disappeared after a failed write");
+            };
+            assert_eq!(configuration.members, vec![member(1)]);
+            assert_eq!(configuration.active_member, Some(WorkspaceId(1)));
+            assert_eq!(store.generation(), 1, "a failed write does not commit");
+        });
+        assert_eq!(
+            read_raw_configurations(cx).await,
+            before,
+            "a failed write leaves the stored value byte-identical"
+        );
+    }
+
+    #[gpui::test]
+    async fn workspace_configuration_store_blocks_mutation_when_read_fails(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        clear_raw_configurations(cx).await;
+        cx.update(|cx| WorkspaceConfigurationStore::init(cx));
+        let store = WorkspaceConfigurationStoreTestHandle;
+
+        store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Create {
+                        name: "Daily".to_string(),
+                        members: vec![member(1)],
+                        active_member: Some(WorkspaceId(1)),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let before = read_raw_configurations(cx).await;
+
+        assert_eq!(
+            stored_configurations_from_read_result(Err(anyhow::anyhow!(
+                "forced workspace configuration read failure"
+            ))),
+            StoredConfigurations::ReadFailed
+        );
+        cx.update(|cx| {
+            cx.set_global(WorkspaceConfigurationStore::new(
+                Default::default(),
+                Some(StoreBlock::ReadFailed),
+            ));
+        });
+
+        let mutation = store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Create {
+                        name: "Replacement".to_string(),
+                        members: vec![member(2)],
+                        active_member: Some(WorkspaceId(2)),
+                    },
+                    cx,
+                )
+            })
+            .await;
+
+        assert!(mutation.is_err(), "a read failure blocks every mutation");
+        assert_eq!(
+            read_raw_configurations(cx).await,
+            before,
+            "a later successful write cannot erase the unread value"
+        );
+    }
+
+    #[gpui::test]
+    async fn workspace_configuration_store_refuses_newer_schema(cx: &mut gpui::TestAppContext) {
+        clear_raw_configurations(cx).await;
+        // What a build one schema ahead of this one would have written.
+        let newer = format!(
+            r#"{{"schema_version":{},"configurations":[{{"id":"5f1d4e5c-0000-4000-8000-000000000001","name":"From The Future","members":[],"active_member":null}}]}}"#,
+            model::WORKSPACE_CONFIGURATION_SCHEMA_VERSION + 1
+        );
+        write_raw_configurations(cx, &newer).await;
+
+        cx.update(|cx| WorkspaceConfigurationStore::init(cx));
+        let store = WorkspaceConfigurationStoreTestHandle;
+
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.blocked(),
+                Some(&StoreBlock::WrittenByNewerBuild {
+                    schema_version: model::WORKSPACE_CONFIGURATION_SCHEMA_VERSION + 1
+                })
+            );
+            assert!(
+                store.configurations().is_empty(),
+                "a value this build cannot read is not presented as configurations"
+            );
+            assert!(
+                store.referenced_workspace_ids().is_none(),
+                "cleanup must stop when referenced workspace ids cannot be decoded"
+            );
+        });
+
+        let refused = store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Create {
+                        name: "Daily".to_string(),
+                        members: vec![member(1)],
+                        active_member: None,
+                    },
+                    cx,
+                )
+            })
+            .await;
+        assert!(refused.is_err(), "every mutation is refused while blocked");
+
+        assert_eq!(
+            read_raw_configurations(cx).await.as_deref(),
+            Some(newer.as_str()),
+            "rolling back to this build must not destroy the newer build's configurations"
+        );
+    }
+
+    /// A newer build is the case most likely to have reshaped the value around the
+    /// version field. It must still read as "newer", not as damaged, or the user is told
+    /// to go read a log when what they actually need is to update.
+    #[gpui::test]
+    async fn workspace_configuration_store_reads_newer_schema_of_unknown_shape(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        clear_raw_configurations(cx).await;
+        let newer = format!(
+            r#"{{"schema_version":{},"groups":[{{"whatever":true}}],"renamed_everything":null}}"#,
+            model::WORKSPACE_CONFIGURATION_SCHEMA_VERSION + 1
+        );
+        write_raw_configurations(cx, &newer).await;
+
+        cx.update(|cx| WorkspaceConfigurationStore::init(cx));
+        let store = WorkspaceConfigurationStoreTestHandle;
+
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.blocked(),
+                Some(&StoreBlock::WrittenByNewerBuild {
+                    schema_version: model::WORKSPACE_CONFIGURATION_SCHEMA_VERSION + 1
+                }),
+                "a newer value whose body this build cannot parse is newer, not corrupt"
+            );
+        });
+
+        assert_eq!(
+            read_raw_configurations(cx).await.as_deref(),
+            Some(newer.as_str()),
+            "and it is still left untouched"
+        );
+    }
+
+    #[gpui::test]
+    async fn workspace_configuration_store_refuses_corrupt_value(cx: &mut gpui::TestAppContext) {
+        clear_raw_configurations(cx).await;
+        let corrupt = "{ this is not a configuration collection";
+        write_raw_configurations(cx, corrupt).await;
+
+        cx.update(|cx| WorkspaceConfigurationStore::init(cx));
+        let store = WorkspaceConfigurationStoreTestHandle;
+
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.blocked(), Some(&StoreBlock::Corrupt));
+        });
+
+        let refused = store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Create {
+                        name: "Daily".to_string(),
+                        members: vec![member(1)],
+                        active_member: None,
+                    },
+                    cx,
+                )
+            })
+            .await;
+        assert!(refused.is_err(), "a corrupt value is not overwritten");
+
+        assert_eq!(
+            read_raw_configurations(cx).await.as_deref(),
+            Some(corrupt),
+            "a corrupt value is left intact for recovery rather than replaced"
+        );
+    }
+
+    /// Two windows checkpointing different configurations at the same time must both
+    /// survive. This is the lost-update case: whole-value replacement from a cached copy
+    /// would let whichever wrote second erase the other.
+    #[gpui::test]
+    async fn workspace_configuration_store_orders_mutations_workspace_configuration_concurrency(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        clear_raw_configurations(cx).await;
+        cx.update(|cx| WorkspaceConfigurationStore::init(cx));
+        let store = WorkspaceConfigurationStoreTestHandle;
+
+        let daily = store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Create {
+                        name: "Daily".to_string(),
+                        members: vec![member(1)],
+                        active_member: Some(WorkspaceId(1)),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        let release = store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Create {
+                        name: "Release".to_string(),
+                        members: vec![member(2)],
+                        active_member: Some(WorkspaceId(2)),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        // Queue both checkpoints before awaiting either, so they are in flight together.
+        let (first, second) = store.update(cx, |store, cx| {
+            let first = store.mutate(
+                WorkspaceConfigurationMutation::Checkpoint {
+                    id: daily.id,
+                    members: vec![member(1), member(3)],
+                    active_member: Some(WorkspaceId(3)),
+                },
+                cx,
+            );
+            let second = store.mutate(
+                WorkspaceConfigurationMutation::Checkpoint {
+                    id: release.id,
+                    members: vec![member(2), member(4)],
+                    active_member: Some(WorkspaceId(4)),
+                },
+                cx,
+            );
+            (first, second)
+        });
+
+        first.await.unwrap();
+        second.await.unwrap();
+
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.configuration(daily.id).unwrap().members,
+                vec![member(1), member(3)],
+                "the first checkpoint survives the second"
+            );
+            assert_eq!(
+                store.configuration(release.id).unwrap().members,
+                vec![member(2), member(4)],
+                "the second checkpoint applied to the collection the first committed"
+            );
+            assert_eq!(store.generation(), 4);
+        });
+
+        // The durable value agrees with memory, so a relaunch sees both checkpoints.
+        let reloaded = cx.update(|cx| cx.new(|cx| WorkspaceConfigurationStore::load(cx)));
+        reloaded.read_with(cx, |store, _| {
+            assert_eq!(
+                store.configuration(daily.id).unwrap().members,
+                vec![member(1), member(3)]
+            );
+            assert_eq!(
+                store.configuration(release.id).unwrap().members,
+                vec![member(2), member(4)]
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn workspace_configuration_shutdown_checkpoint_preserves_queued_mutation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        clear_raw_configurations(cx).await;
+        cx.update(|cx| WorkspaceConfigurationStore::init(cx));
+        let store = WorkspaceConfigurationStoreTestHandle;
+
+        let daily = store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Create {
+                        name: "Daily".to_string(),
+                        members: vec![member(1)],
+                        active_member: Some(WorkspaceId(1)),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let release = store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Create {
+                        name: "Release".to_string(),
+                        members: vec![member(2)],
+                        active_member: Some(WorkspaceId(2)),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        let (resume_sender, resume_receiver) = futures::channel::oneshot::channel();
+        cx.update(|cx| {
+            let blocker = cx.spawn(async move |_cx| {
+                resume_receiver.await.ok();
+            });
+            cx.global_mut::<WorkspaceConfigurationStore>().queue_tail = Some(blocker);
+        });
+
+        let (queued_mutation, shutdown_checkpoint) = cx.update(|cx| {
+            let queued_mutation = WorkspaceConfigurationStore::mutate_global(
+                WorkspaceConfigurationMutation::Checkpoint {
+                    id: daily.id,
+                    members: vec![member(1), member(3)],
+                    active_member: Some(WorkspaceId(3)),
+                },
+                cx,
+            );
+            let shutdown_checkpoint = WorkspaceConfigurationStore::checkpoint_after_for_shutdown(
+                Task::ready(Ok(())),
+                release.id,
+                vec![member(2), member(4)],
+                Some(WorkspaceId(4)),
+                cx,
+            );
+            (queued_mutation, shutdown_checkpoint)
+        });
+        resume_sender.send(()).unwrap();
+
+        queued_mutation
+            .await
+            .expect("shutdown must not cancel an already queued mutation");
+        shutdown_checkpoint.await.unwrap();
+
+        let reloaded = cx.update(|cx| cx.new(|cx| WorkspaceConfigurationStore::load(cx)));
+        reloaded.read_with(cx, |store, _| {
+            assert_eq!(
+                store.configuration(daily.id).unwrap().members,
+                vec![member(1), member(3)]
+            );
+            assert_eq!(
+                store.configuration(release.id).unwrap().members,
+                vec![member(2), member(4)]
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn failed_shutdown_checkpoint_does_not_leak_into_later_write(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        clear_raw_configurations(cx).await;
+        cx.update(|cx| WorkspaceConfigurationStore::init(cx));
+        let store = WorkspaceConfigurationStoreTestHandle;
+
+        let daily = store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Create {
+                        name: "Daily".to_string(),
+                        members: vec![member(1)],
+                        active_member: Some(WorkspaceId(1)),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let release = store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Create {
+                        name: "Release".to_string(),
+                        members: vec![member(2)],
+                        active_member: Some(WorkspaceId(2)),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        let (failed_checkpoint, succeeding_checkpoint) = cx.update(|cx| {
+            let failed_checkpoint = WorkspaceConfigurationStore::checkpoint_after_for_shutdown(
+                Task::ready(Err(anyhow::anyhow!("forced exact checkpoint failure"))),
+                daily.id,
+                vec![member(1), member(3)],
+                Some(WorkspaceId(3)),
+                cx,
+            );
+            let succeeding_checkpoint = WorkspaceConfigurationStore::checkpoint_after_for_shutdown(
+                Task::ready(Ok(())),
+                release.id,
+                vec![member(2), member(4)],
+                Some(WorkspaceId(4)),
+                cx,
+            );
+            (failed_checkpoint, succeeding_checkpoint)
+        });
+
+        assert!(failed_checkpoint.await.is_err());
+        succeeding_checkpoint.await.unwrap();
+
+        let reloaded = cx.update(|cx| cx.new(|cx| WorkspaceConfigurationStore::load(cx)));
+        reloaded.read_with(cx, |store, _| {
+            assert_eq!(
+                store.configuration(daily.id).unwrap().members,
+                vec![member(1)],
+                "a failed shutdown snapshot never becomes committed state"
+            );
+            assert_eq!(
+                store.configuration(release.id).unwrap().members,
+                vec![member(2), member(4)]
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn workspace_configuration_store_reports_referenced_rows(cx: &mut gpui::TestAppContext) {
+        clear_raw_configurations(cx).await;
+        cx.update(|cx| WorkspaceConfigurationStore::init(cx));
+        let store = WorkspaceConfigurationStoreTestHandle;
+
+        store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Create {
+                        name: "Daily".to_string(),
+                        members: vec![member(1), member(2)],
+                        active_member: Some(WorkspaceId(1)),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Create {
+                        name: "Release".to_string(),
+                        members: vec![member(2), member(3)],
+                        active_member: Some(WorkspaceId(3)),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        store.read_with(cx, |store, _| {
+            let referenced = store
+                .referenced_workspace_ids()
+                .expect("a readable store can report referenced rows");
+            // Workspace 2 belongs to both, and is reported once.
+            assert_eq!(referenced.len(), 3);
+            for id in [WorkspaceId(1), WorkspaceId(2), WorkspaceId(3)] {
+                assert!(
+                    referenced.contains(&id),
+                    "{id:?} is referenced and must survive Recent cleanup"
+                );
+            }
+        });
+    }
+
+    #[gpui::test]
+    async fn workspace_configuration_store_reserves_rows_until_publication_finishes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        clear_raw_configurations(cx).await;
+        cx.update(WorkspaceConfigurationStore::init);
+
+        let reservation_id = cx.update(|cx| {
+            WorkspaceConfigurationStore::reserve_workspace_rows(
+                [WorkspaceId(41), WorkspaceId(42)],
+                cx,
+            )
+        });
+        cx.update(|cx| {
+            let referenced = WorkspaceConfigurationStore::global(cx)
+                .referenced_workspace_ids()
+                .expect("a readable store can report reserved rows");
+            assert_eq!(
+                referenced,
+                [WorkspaceId(41), WorkspaceId(42)]
+                    .into_iter()
+                    .collect::<HashSet<_>>()
+            );
+        });
+
+        cx.update(|cx| WorkspaceConfigurationStore::release_workspace_rows(reservation_id, cx));
+        cx.update(|cx| {
+            assert_eq!(
+                WorkspaceConfigurationStore::global(cx).referenced_workspace_ids(),
+                Some(HashSet::default())
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn workspace_row_deletion_rechecks_reservations_on_the_store_queue(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        clear_raw_configurations(cx).await;
+        cx.update(WorkspaceConfigurationStore::init);
+        let db = WorkspaceDb::open_test_db(
+            "workspace_row_deletion_rechecks_reservations_on_the_store_queue",
+        )
+        .await;
+        let workspace_id = WorkspaceId(41);
+        db.save_workspace(workspace_with(
+            41,
+            &[Path::new("/reserved")],
+            empty_pane_group(),
+            None,
+        ))
+        .await;
+
+        let reservation_id =
+            cx.update(|cx| WorkspaceConfigurationStore::reserve_workspace_rows([workspace_id], cx));
+        let delete_task = cx.update(|cx| {
+            WorkspaceConfigurationStore::delete_unreferenced_workspace_rows_global(
+                db.clone(),
+                vec![workspace_id],
+                cx,
+            )
+        });
+        assert!(delete_task.await.unwrap().is_empty());
+        assert!(db.workspace_for_id(workspace_id).is_some());
+
+        cx.update(|cx| WorkspaceConfigurationStore::release_workspace_rows(reservation_id, cx));
+        let delete_task = cx.update(|cx| {
+            WorkspaceConfigurationStore::delete_unreferenced_workspace_rows_global(
+                db.clone(),
+                vec![workspace_id],
+                cx,
+            )
+        });
+        assert_eq!(delete_task.await.unwrap(), vec![workspace_id]);
+        assert!(db.workspace_for_id(workspace_id).is_none());
     }
 }

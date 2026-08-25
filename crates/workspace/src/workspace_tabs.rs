@@ -5,16 +5,21 @@ use std::{
 };
 
 use gpui::{
-    Anchor, App, Context, Entity, Pixels, ScrollHandle, SharedString, TaskExt, Window,
-    WindowControlArea, px,
+    Action, Anchor, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
+    Pixels, PromptLevel, ScrollHandle, SharedString, TaskExt, WeakEntity, Window,
+    WindowControlArea, px, rems,
 };
 use project::ProjectGroupKey;
 use ui::{
-    ContextMenu, ContextMenuEntry, IconButtonShape, Indicator, PopoverMenu, Tooltip, WithScrollbar,
-    prelude::*, utils::platform_title_bar_height,
+    Button, ButtonLike, ButtonStyle, ContextMenu, ContextMenuEntry, IconButtonShape, Indicator,
+    PopoverMenu, Tooltip, WithScrollbar, prelude::*, utils::platform_title_bar_height,
 };
+use ui_input::InputField;
 
-use crate::{MultiWorkspace, Workspace};
+use crate::{
+    ModalView, MultiWorkspace, SaveWorkspaceConfigurationAs, Workspace,
+    persistence::{StoreBlock, WorkspaceConfigurationStore, model::WorkspaceConfigurationId},
+};
 
 #[derive(Clone)]
 struct DraggedWorkspaceTab {
@@ -64,7 +69,11 @@ impl MultiWorkspace {
         }
 
         let workspaces = self.ordered_workspaces(cx);
-        if workspaces.len() < 2 {
+        let store_requires_recovery = WorkspaceConfigurationStore::try_global(cx)
+            .is_some_and(|store| store.blocked().is_some());
+        let has_saved_configurations = WorkspaceConfigurationStore::try_global(cx)
+            .is_some_and(|store| !store.configurations().is_empty());
+        if workspaces.len() < 2 && !has_saved_configurations && !store_requires_recovery {
             return None;
         }
 
@@ -146,7 +155,7 @@ impl MultiWorkspace {
                         .overflow_y_scroll()
                         .track_scroll(&self.workspace_tabs_scroll_handle)
                         .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
-                        .child(workspace_tab_heading())
+                        .child(self.workspace_tab_heading(cx))
                         .children(
                             workspaces
                                 .into_iter()
@@ -346,22 +355,477 @@ impl MultiWorkspace {
             })
             .collect()
     }
+
+    pub(crate) fn test_workspace_configuration_menu_is_deployed(&self) -> bool {
+        self.workspace_configuration_menu_handle.is_deployed()
+    }
 }
 
-fn workspace_tab_heading() -> AnyElement {
-    h_flex()
-        .debug_selector(|| "WORKSPACE-TABS-HEADING".to_string())
-        .h(px(24.))
-        .flex_shrink_0()
-        .w_full()
-        .px_2()
-        .items_center()
-        .child(
-            Label::new("Workspaces")
-                .size(LabelSize::Small)
-                .color(Color::Muted),
-        )
-        .into_any_element()
+impl MultiWorkspace {
+    fn workspace_tab_heading(&self, cx: &Context<Self>) -> AnyElement {
+        let active_name = self
+            .active_configuration_id()
+            .and_then(|configuration_id| {
+                WorkspaceConfigurationStore::try_global(cx)
+                    .and_then(|store| store.configuration(configuration_id))
+            })
+            .map(|configuration| configuration.name.clone());
+        let label: SharedString = active_name
+            .as_ref()
+            .map(|name| format!("Workspaces: {name}").into())
+            .unwrap_or_else(|| "Workspaces".into());
+        let is_stale = self.configuration_checkpoint_error().is_some();
+        let mut tooltip = active_name
+            .map(|name| format!("Workspace Configurations: {name}"))
+            .unwrap_or_else(|| "Workspace Configurations".to_string());
+        if is_stale {
+            tooltip.push_str(" — changes not saved; open this menu to Retry");
+        }
+        let aria_label = if is_stale {
+            "Workspace Configurations, changes not saved"
+        } else {
+            "Workspace Configurations"
+        };
+        let multi_workspace = cx.weak_entity();
+
+        h_flex()
+            .debug_selector(|| "WORKSPACE-TABS-HEADING".to_string())
+            .h(px(24.))
+            .flex_shrink_0()
+            .w_full()
+            .px_1()
+            .items_center()
+            .child(
+                PopoverMenu::new("workspace-configuration-menu")
+                    .full_width(true)
+                    .with_handle(self.workspace_configuration_menu_handle.clone())
+                    .trigger_with_tooltip(
+                        ButtonLike::new("workspace-configuration-menu-trigger")
+                            .full_width()
+                            .style(ButtonStyle::Subtle)
+                            .size(ButtonSize::None)
+                            .aria_label(aria_label)
+                            .child(
+                                h_flex().w_full().min_w_0().justify_start().child(
+                                    h_flex()
+                                        .debug_selector(|| {
+                                            "WORKSPACE-CONFIGURATION-TRIGGER-CONTENT".to_string()
+                                        })
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .gap_1()
+                                        .child(
+                                            Label::new(label)
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted)
+                                                .truncate(),
+                                        )
+                                        .when(is_stale, |this| {
+                                            this.child(
+                                                h_flex()
+                                                    .debug_selector(|| {
+                                                        "WORKSPACE-CONFIGURATION-STALE-WARNING"
+                                                            .to_string()
+                                                    })
+                                                    .flex_none()
+                                                    .size_4()
+                                                    .child(
+                                                        Icon::new(IconName::Warning)
+                                                            .size(IconSize::XSmall)
+                                                            .color(Color::Warning),
+                                                    ),
+                                            )
+                                        })
+                                        .child(
+                                            Icon::new(IconName::ChevronDown)
+                                                .size(IconSize::XSmall)
+                                                .color(Color::Muted),
+                                        ),
+                                ),
+                            ),
+                        Tooltip::text(tooltip),
+                    )
+                    .anchor(Anchor::TopLeft)
+                    .menu(move |window, cx| {
+                        multi_workspace
+                            .update(cx, |multi_workspace, cx| {
+                                multi_workspace.build_workspace_configuration_menu(window, cx)
+                            })
+                            .ok()
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn build_workspace_configuration_menu(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<ContextMenu> {
+        let configurations = WorkspaceConfigurationStore::try_global(cx)
+            .map(|store| store.configurations().to_vec())
+            .unwrap_or_default();
+        let store_block_message = WorkspaceConfigurationStore::try_global(cx)
+            .and_then(WorkspaceConfigurationStore::blocked)
+            .map(StoreBlock::user_facing_message);
+        let store_is_blocked = store_block_message.is_some();
+        let active_configuration_id = self.active_configuration_id();
+        let is_stale = self.configuration_checkpoint_error().is_some();
+        let switch_in_progress = self.configuration_switch_in_progress();
+        let multi_workspace = cx.weak_entity();
+
+        ContextMenu::build(window, cx, move |mut menu, _, _| {
+            if let Some(message) = store_block_message {
+                menu = menu.item(ContextMenuEntry::new(message).disabled(true));
+            } else if configurations.is_empty() {
+                menu = menu.item(ContextMenuEntry::new("No Saved Configurations").disabled(true));
+            } else {
+                for configuration in &configurations {
+                    let configuration_id = configuration.id;
+                    let configuration_name = configuration.name.clone();
+                    let multi_workspace = multi_workspace.clone();
+                    menu = menu.toggleable_entry_disabled_when(
+                        configuration.name.clone(),
+                        active_configuration_id == Some(configuration_id),
+                        switch_in_progress,
+                        IconPosition::Start,
+                        None,
+                        move |window, cx| {
+                            multi_workspace
+                                .update(cx, |multi_workspace, cx| {
+                                    multi_workspace.switch_workspace_configuration_from_ui(
+                                        configuration_id,
+                                        configuration_name.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                })
+                                .ok();
+                        },
+                    );
+                }
+            }
+
+            menu = menu.separator();
+            if is_stale {
+                let multi_workspace = multi_workspace.clone();
+                menu = menu.item(
+                    ContextMenuEntry::new("Retry")
+                        .disabled(switch_in_progress)
+                        .handler(move |window, cx| {
+                            multi_workspace
+                                .update(cx, |multi_workspace, cx| {
+                                    multi_workspace
+                                        .retry_workspace_configuration_from_ui(window, cx);
+                                })
+                                .ok();
+                        }),
+                );
+            }
+
+            let multi_workspace = multi_workspace.clone();
+            menu.item(
+                ContextMenuEntry::new("Save Workspace Configuration As…")
+                    .action(SaveWorkspaceConfigurationAs.boxed_clone())
+                    .disabled(switch_in_progress || store_is_blocked)
+                    .handler(move |window, cx| {
+                        multi_workspace
+                            .update(cx, |multi_workspace, cx| {
+                                multi_workspace.show_save_workspace_configuration_as(window, cx);
+                            })
+                            .ok();
+                    }),
+            )
+            .key_context("WorkspaceConfigurations")
+        })
+    }
+
+    pub(crate) fn show_save_workspace_configuration_as(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.configuration_switch_in_progress() {
+            return;
+        }
+        WorkspaceConfigurationStore::init(cx);
+        let multi_workspace = cx.weak_entity();
+        self.toggle_modal(window, cx, move |window, cx| {
+            SaveWorkspaceConfigurationModal::new(multi_workspace, None, window, cx)
+        });
+    }
+
+    pub(crate) fn switch_workspace_configuration_from_ui(
+        &mut self,
+        configuration_id: WorkspaceConfigurationId,
+        configuration_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_configuration_id().is_none()
+            && !self.unnamed_configuration_is_pristine_scratch(window, cx)
+        {
+            let prompt = window.prompt(
+                PromptLevel::Warning,
+                "Save Current Workspace Configuration?",
+                Some(&format!(
+                    "Save the current workspace set before switching to “{configuration_name}”?"
+                )),
+                &[
+                    "Save Workspace Configuration As…",
+                    "Switch Without Saving",
+                    "Cancel",
+                ],
+                cx,
+            );
+            cx.spawn_in(window, async move |this, cx| {
+                match prompt.await {
+                    Ok(0) => {
+                        this.update_in(cx, |this, window, cx| {
+                            let multi_workspace = cx.weak_entity();
+                            this.toggle_modal(window, cx, move |window, cx| {
+                                SaveWorkspaceConfigurationModal::new(
+                                    multi_workspace,
+                                    Some((configuration_id, configuration_name)),
+                                    window,
+                                    cx,
+                                )
+                            });
+                        })?;
+                    }
+                    Ok(1) => {
+                        this.update_in(cx, |this, window, cx| {
+                            this.start_workspace_configuration_switch(
+                                configuration_id,
+                                configuration_name,
+                                window,
+                                cx,
+                            );
+                        })?;
+                    }
+                    Ok(_) | Err(_) => {}
+                }
+                anyhow::Ok(())
+            })
+            .detach_and_log_err(cx);
+            return;
+        }
+
+        self.start_workspace_configuration_switch(configuration_id, configuration_name, window, cx);
+    }
+
+    fn start_workspace_configuration_switch(
+        &mut self,
+        configuration_id: WorkspaceConfigurationId,
+        configuration_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let switch = self.switch_workspace_configuration(configuration_id, window, cx);
+        cx.spawn_in(window, async move |_, cx| {
+            if let Err(error) = switch.await {
+                if Self::workspace_configuration_switch_was_canceled(&error) {
+                    return anyhow::Ok(());
+                }
+                log::error!(
+                    "failed to switch workspace configuration {:?}: {error:#}",
+                    configuration_id
+                );
+                cx.update(|window, cx| {
+                    let detail = format!(
+                        "“{configuration_name}” wasn’t applied. Your current workspaces are unchanged.\n\n{error}"
+                    );
+                    drop(window.prompt(
+                        PromptLevel::Critical,
+                        "Couldn’t Switch Workspace Configuration",
+                        Some(&detail),
+                        &["OK"],
+                        cx,
+                    ));
+                })?;
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn retry_workspace_configuration_from_ui(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let retry = self.retry_configuration_checkpoint(cx);
+        cx.spawn_in(window, async move |_, cx| {
+            if let Err(error) = retry.await {
+                log::error!("failed to retry workspace configuration checkpoint: {error:#}");
+                cx.update(|window, cx| {
+                    let detail = format!(
+                        "Your current workspaces are intact, but the saved configuration is still out of date.\n\n{error}"
+                    );
+                    drop(window.prompt(
+                        PromptLevel::Critical,
+                        "Couldn’t Save Workspace Configuration",
+                        Some(&detail),
+                        &["OK"],
+                        cx,
+                    ));
+                })?;
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+}
+
+struct SaveWorkspaceConfigurationModal {
+    name: Entity<InputField>,
+    multi_workspace: WeakEntity<MultiWorkspace>,
+    switch_after_save: Option<(WorkspaceConfigurationId, String)>,
+    saving: bool,
+}
+
+impl SaveWorkspaceConfigurationModal {
+    fn new(
+        multi_workspace: WeakEntity<MultiWorkspace>,
+        switch_after_save: Option<(WorkspaceConfigurationId, String)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let name = cx.new(|cx| InputField::new(window, cx, "Name").label("Name"));
+        Self {
+            name,
+            multi_workspace,
+            switch_after_save,
+            saving: false,
+        }
+    }
+
+    fn cancel(&mut self, _: &menu::Cancel, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.saving {
+            cx.emit(DismissEvent);
+        }
+    }
+
+    fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        if self.saving {
+            return;
+        }
+        let name = self.name.read(cx).text(cx).trim().to_string();
+        let validation_error = if name.is_empty() {
+            Some("Enter a configuration name.".to_string())
+        } else if WorkspaceConfigurationStore::try_global(cx).is_some_and(|store| {
+            store
+                .configurations()
+                .iter()
+                .any(|configuration| configuration.name.eq_ignore_ascii_case(&name))
+        }) {
+            Some(format!(
+                "A workspace configuration named “{name}” already exists."
+            ))
+        } else {
+            None
+        };
+        if let Some(error) = validation_error {
+            self.name
+                .update(cx, |name, cx| name.set_error(Some(error), cx));
+            return;
+        }
+
+        self.name
+            .update(cx, |name, cx| name.set_error(None::<String>, cx));
+        self.saving = true;
+        cx.notify();
+        let multi_workspace = self.multi_workspace.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let save = multi_workspace.update(cx, |multi_workspace, cx| {
+                multi_workspace.save_configuration_as(name, cx)
+            })?;
+            let result = save.await;
+            this.update_in(cx, |this, window, cx| {
+                this.saving = false;
+                match result {
+                    Ok(_) => {
+                        cx.emit(DismissEvent);
+                        if let Some((configuration_id, configuration_name)) =
+                            this.switch_after_save.take()
+                        {
+                            this.multi_workspace
+                                .update(cx, |multi_workspace, cx| {
+                                    multi_workspace.start_workspace_configuration_switch(
+                                        configuration_id,
+                                        configuration_name,
+                                        window,
+                                        cx,
+                                    );
+                                })
+                                .ok();
+                        }
+                    }
+                    Err(error) => this
+                        .name
+                        .update(cx, |name, cx| name.set_error(Some(error.to_string()), cx)),
+                }
+                cx.notify();
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+}
+
+impl Focusable for SaveWorkspaceConfigurationModal {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.name.focus_handle(cx)
+    }
+}
+
+impl EventEmitter<DismissEvent> for SaveWorkspaceConfigurationModal {}
+impl ModalView for SaveWorkspaceConfigurationModal {}
+
+impl Render for SaveWorkspaceConfigurationModal {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .debug_selector(|| "SAVE-WORKSPACE-CONFIGURATION-MODAL".to_string())
+            .key_context("SaveWorkspaceConfiguration")
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::confirm))
+            .w(rems(30.))
+            .elevation_3(cx)
+            .bg(cx.theme().colors().elevated_surface_background)
+            .rounded_md()
+            .overflow_hidden()
+            .child(
+                v_flex()
+                    .p_3()
+                    .gap_3()
+                    .child(Label::new("Save Workspace Configuration"))
+                    .child(self.name.clone()),
+            )
+            .child(
+                h_flex()
+                    .justify_end()
+                    .gap_2()
+                    .p_3()
+                    .border_t_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .child(
+                        Button::new("cancel-workspace-configuration", "Cancel")
+                            .disabled(self.saving)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.cancel(&menu::Cancel, window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("save-workspace-configuration", "Save")
+                            .style(ButtonStyle::Filled)
+                            .loading(self.saving)
+                            .disabled(self.saving)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.confirm(&menu::Confirm, window, cx)
+                            })),
+                    ),
+            )
+    }
 }
 
 fn workspace_tab_actions_menu(

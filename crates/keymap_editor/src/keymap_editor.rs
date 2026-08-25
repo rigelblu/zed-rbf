@@ -3971,12 +3971,34 @@ impl SerializableItem for KeymapEditor {
         ))
     }
 
+    fn checkpoint_in_transaction(
+        &mut self,
+        workspace: &mut Workspace,
+        item_id: workspace::ItemId,
+        transaction: db::sqlez::thread_safe_connection::WriteTransaction,
+        _window: &mut Window,
+        cx: &mut ui::Context<Self>,
+    ) -> gpui::Task<gpui::Result<()>> {
+        let Some(workspace_id) = workspace.database_id() else {
+            return gpui::Task::ready(Ok(()));
+        };
+        cx.background_spawn(async move {
+            persistence::KeybindingEditorDb::save_keybinding_editor_in_transaction(
+                &transaction,
+                item_id,
+                workspace_id,
+            )
+            .await
+        })
+    }
+
     fn should_serialize(&self, _event: &Self::Event) -> bool {
         false
     }
 }
 
 mod persistence {
+    use anyhow::Result;
     use db::{query, sqlez::domain::Domain, sqlez_macros::sql};
     use workspace::WorkspaceDb;
 
@@ -4000,6 +4022,21 @@ mod persistence {
     db::static_connection!(KeybindingEditorDb, [WorkspaceDb]);
 
     impl KeybindingEditorDb {
+        pub async fn save_keybinding_editor_in_transaction(
+            transaction: &db::sqlez::thread_safe_connection::WriteTransaction,
+            item_id: workspace::ItemId,
+            workspace_id: workspace::WorkspaceId,
+        ) -> Result<()> {
+            transaction
+                .write(move |connection| {
+                    connection.exec_bound(sql!(
+                        INSERT OR REPLACE INTO keybinding_editors(item_id, workspace_id)
+                        VALUES (?1, ?2)
+                    ))?((item_id, workspace_id))
+                })
+                .await?
+        }
+
         query! {
             pub async fn save_keybinding_editor(
                 item_id: workspace::ItemId,

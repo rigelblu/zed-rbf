@@ -5,7 +5,10 @@ use parking_lot::{Mutex, RwLock};
 use std::{
     marker::PhantomData,
     ops::Deref,
-    sync::{Arc, LazyLock},
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::Duration,
 };
@@ -17,9 +20,149 @@ const MIGRATION_RETRIES: usize = 10;
 const CONNECTION_INITIALIZE_RETRIES: usize = 50;
 const CONNECTION_INITIALIZE_RETRY_DELAY: Duration = Duration::from_millis(1);
 
-type QueuedWrite = Box<dyn 'static + Send + FnOnce()>;
+pub enum QueuedWrite {
+    Normal(Box<dyn 'static + Send + FnOnce()>),
+    Transaction {
+        activation: std::sync::mpsc::Receiver<()>,
+        write: Box<dyn 'static + Send + FnOnce()>,
+    },
+}
+
+impl QueuedWrite {
+    fn run(self) {
+        match self {
+            Self::Normal(write) => write(),
+            Self::Transaction { activation, write } => {
+                if activation.recv().is_ok() {
+                    write();
+                }
+            }
+        }
+    }
+}
 type WriteQueue = Box<dyn 'static + Send + Sync + Fn(QueuedWrite)>;
 type WriteQueueConstructor = Box<dyn 'static + Send + FnMut() -> WriteQueue>;
+
+enum TransactionCommand {
+    Write(QueuedWriteTransaction),
+    Commit(oneshot::Sender<anyhow::Result<()>>),
+    CommitBlocking(std::sync::mpsc::SyncSender<anyhow::Result<()>>),
+    Rollback(oneshot::Sender<anyhow::Result<()>>),
+    RollbackBlocking(std::sync::mpsc::SyncSender<anyhow::Result<()>>),
+}
+
+enum TransactionReadySender {
+    Async(oneshot::Sender<anyhow::Result<()>>),
+    Blocking(std::sync::mpsc::SyncSender<anyhow::Result<()>>),
+    Unobserved,
+}
+
+impl TransactionReadySender {
+    fn send(self, result: anyhow::Result<()>) -> bool {
+        match self {
+            Self::Async(sender) => sender.send(result).is_ok(),
+            Self::Blocking(sender) => sender.send(result).is_ok(),
+            Self::Unobserved => true,
+        }
+    }
+}
+
+enum TransactionReadyReceiver {
+    Async(oneshot::Receiver<anyhow::Result<()>>),
+    Blocking(std::sync::mpsc::Receiver<anyhow::Result<()>>),
+    Ready,
+}
+
+type QueuedWriteTransaction = Box<dyn 'static + Send + FnOnce(&Connection)>;
+
+#[derive(Clone)]
+pub struct WriteTransaction {
+    commands: std::sync::mpsc::Sender<TransactionCommand>,
+    activation: std::sync::mpsc::Sender<()>,
+    activated: Arc<AtomicBool>,
+    block_until_complete: bool,
+}
+
+impl WriteTransaction {
+    pub fn activate(&self) -> anyhow::Result<()> {
+        if !self.activated.swap(true, Ordering::SeqCst) {
+            self.activation.send(()).map_err(|_| {
+                anyhow::anyhow!("database write transaction could not be activated")
+            })?;
+        }
+        Ok(())
+    }
+
+    pub async fn write<T: 'static + Send + Sync>(
+        &self,
+        callback: impl 'static + Send + FnOnce(&Connection) -> T,
+    ) -> anyhow::Result<T> {
+        self.activate()?;
+        if self.block_until_complete {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            self.commands
+                .send(TransactionCommand::Write(Box::new(move |connection| {
+                    sender.send(callback(connection)).ok();
+                })))
+                .map_err(|_| anyhow::anyhow!("database write transaction is no longer active"))?;
+            return receiver
+                .recv()
+                .map_err(|_| anyhow::anyhow!("database write transaction dropped a queued write"));
+        }
+
+        let (sender, receiver) = oneshot::channel();
+        self.commands
+            .send(TransactionCommand::Write(Box::new(move |connection| {
+                sender.send(callback(connection)).ok();
+            })))
+            .map_err(|_| anyhow::anyhow!("database write transaction is no longer active"))?;
+        receiver
+            .await
+            .map_err(|_| anyhow::anyhow!("database write transaction dropped a queued write"))
+    }
+
+    pub async fn commit(self) -> anyhow::Result<()> {
+        self.activate()?;
+        if self.block_until_complete {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            self.commands
+                .send(TransactionCommand::CommitBlocking(sender))
+                .map_err(|_| anyhow::anyhow!("database write transaction is no longer active"))?;
+            return receiver
+                .recv()
+                .map_err(|_| anyhow::anyhow!("database write transaction dropped its commit"))?;
+        }
+
+        let (sender, receiver) = oneshot::channel();
+        self.commands
+            .send(TransactionCommand::Commit(sender))
+            .map_err(|_| anyhow::anyhow!("database write transaction is no longer active"))?;
+        receiver
+            .await
+            .map_err(|_| anyhow::anyhow!("database write transaction dropped its commit"))?
+    }
+
+    pub async fn rollback(self) -> anyhow::Result<()> {
+        self.activate()?;
+        if self.block_until_complete {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            self.commands
+                .send(TransactionCommand::RollbackBlocking(sender))
+                .map_err(|_| anyhow::anyhow!("database write transaction is no longer active"))?;
+            return receiver
+                .recv()
+                .map_err(|_| anyhow::anyhow!("database write transaction dropped its rollback"))?;
+        }
+
+        let (sender, receiver) = oneshot::channel();
+        self.commands
+            .send(TransactionCommand::Rollback(sender))
+            .map_err(|_| anyhow::anyhow!("database write transaction is no longer active"))?;
+        receiver
+            .await
+            .map_err(|_| anyhow::anyhow!("database write transaction dropped its rollback"))?
+    }
+}
 
 /// List of queues of tasks by database uri. This lets us serialize writes to the database
 /// and have a single worker thread per db file. This means many thread safe connections
@@ -36,6 +179,7 @@ pub struct ThreadSafeConnection {
     persistent: bool,
     connection_initialize_query: Option<&'static str>,
     connections: Arc<ThreadLocal<Connection>>,
+    block_on_transaction_commands: bool,
 }
 
 unsafe impl Send for ThreadSafeConnection {}
@@ -73,6 +217,12 @@ impl<M: Migrator> ThreadSafeConnectionBuilder<M> {
         write_queue_constructor: WriteQueueConstructor,
     ) -> Self {
         self.write_queue_constructor = Some(write_queue_constructor);
+        self
+    }
+
+    pub fn with_locking_write_queue(mut self) -> Self {
+        self.write_queue_constructor = Some(locking_queue());
+        self.connection.block_on_transaction_commands = true;
         self
     }
 
@@ -149,6 +299,7 @@ impl ThreadSafeConnection {
                 persistent,
                 connection_initialize_query: None,
                 connections: Default::default(),
+                block_on_transaction_commands: false,
             },
             _migrator: PhantomData,
         }
@@ -181,12 +332,146 @@ impl ThreadSafeConnection {
         let (sender, receiver) = oneshot::channel();
 
         let thread_safe_connection = (*self).clone();
-        write_channel(Box::new(move || {
+        write_channel(QueuedWrite::Normal(Box::new(move || {
             let connection = thread_safe_connection.deref();
             let result = connection.with_write(|connection| callback(connection));
             sender.send(result).ok();
-        }));
+        })));
         receiver.map(|response| response.expect("Write queue unexpectedly closed"))
+    }
+
+    pub fn queue_write_transaction(
+        &self,
+    ) -> (
+        WriteTransaction,
+        futures::future::BoxFuture<'static, anyhow::Result<()>>,
+    ) {
+        self.queue_write_transaction_inner(false)
+    }
+
+    fn queue_write_transaction_inner(
+        &self,
+        block_until_started: bool,
+    ) -> (
+        WriteTransaction,
+        futures::future::BoxFuture<'static, anyhow::Result<()>>,
+    ) {
+        const SAVEPOINT: &str = "thread_safe_connection_write_transaction";
+
+        let (commands, command_receiver) = std::sync::mpsc::channel();
+        let (activation, activation_receiver) = std::sync::mpsc::channel();
+        let block_until_complete = self.block_on_transaction_commands;
+        let (ready_sender, ready_receiver) = if block_until_started {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            (
+                TransactionReadySender::Blocking(sender),
+                TransactionReadyReceiver::Blocking(receiver),
+            )
+        } else if block_until_complete {
+            (
+                TransactionReadySender::Unobserved,
+                TransactionReadyReceiver::Ready,
+            )
+        } else {
+            let (sender, receiver) = oneshot::channel();
+            (
+                TransactionReadySender::Async(sender),
+                TransactionReadyReceiver::Async(receiver),
+            )
+        };
+        let transaction = WriteTransaction {
+            commands,
+            activation,
+            activated: Arc::new(AtomicBool::new(false)),
+            block_until_complete,
+        };
+        let queues = QUEUES.read();
+        let write_channel = queues
+            .get(&self.uri)
+            .expect("Queues are inserted when build is called. This should always succeed");
+        let thread_safe_connection = self.clone();
+        write_channel(QueuedWrite::Transaction {
+            activation: activation_receiver,
+            write: Box::new(move || {
+                let connection = thread_safe_connection.deref();
+                connection.with_write(|connection| {
+                    let begin_result = connection
+                        .exec(&format!("SAVEPOINT {SAVEPOINT}"))
+                        .and_then(|mut statement| statement());
+                    if let Err(error) = begin_result {
+                        ready_sender.send(Err(error));
+                        return;
+                    }
+                    if !ready_sender.send(Ok(())) {
+                        rollback_transaction(connection, SAVEPOINT).ok();
+                        return;
+                    }
+
+                    while let Ok(command) = command_receiver.recv() {
+                        match command {
+                            TransactionCommand::Write(write) => write(connection),
+                            TransactionCommand::Commit(completion) => {
+                                let result = connection
+                                    .exec(&format!("RELEASE SAVEPOINT {SAVEPOINT}"))
+                                    .and_then(|mut statement| statement());
+                                completion.send(result).ok();
+                                return;
+                            }
+                            TransactionCommand::CommitBlocking(completion) => {
+                                let result = connection
+                                    .exec(&format!("RELEASE SAVEPOINT {SAVEPOINT}"))
+                                    .and_then(|mut statement| statement());
+                                completion.send(result).ok();
+                                return;
+                            }
+                            TransactionCommand::Rollback(completion) => {
+                                completion
+                                    .send(rollback_transaction(connection, SAVEPOINT))
+                                    .ok();
+                                return;
+                            }
+                            TransactionCommand::RollbackBlocking(completion) => {
+                                completion
+                                    .send(rollback_transaction(connection, SAVEPOINT))
+                                    .ok();
+                                return;
+                            }
+                        }
+                    }
+
+                    rollback_transaction(connection, SAVEPOINT).ok();
+                });
+            }),
+        });
+        if block_until_started && let Err(error) = transaction.activate() {
+            return (transaction, futures::future::ready(Err(error)).boxed());
+        }
+        let ready = match ready_receiver {
+            TransactionReadyReceiver::Async(receiver) => async move {
+                receiver
+                    .await
+                    .map_err(|_| anyhow::anyhow!("database write transaction failed to start"))?
+            }
+            .boxed(),
+            TransactionReadyReceiver::Blocking(receiver) => {
+                let result = receiver.recv().unwrap_or_else(|_| {
+                    Err(anyhow::anyhow!(
+                        "database write transaction failed to start"
+                    ))
+                });
+                futures::future::ready(result).boxed()
+            }
+            TransactionReadyReceiver::Ready => futures::future::ready(Ok(())).boxed(),
+        };
+        (transaction, ready)
+    }
+
+    pub async fn begin_write_transaction(&self) -> anyhow::Result<WriteTransaction> {
+        let (transaction, ready) =
+            self.queue_write_transaction_inner(self.block_on_transaction_commands);
+        transaction.activate()?;
+        ready.await?;
+        Ok(transaction)
     }
 
     pub(crate) fn create_connection(
@@ -243,6 +528,12 @@ impl ThreadSafeConnection {
     }
 }
 
+fn rollback_transaction(connection: &Connection, savepoint: &str) -> anyhow::Result<()> {
+    connection.exec(&format!("ROLLBACK TO SAVEPOINT {savepoint}"))?()?;
+    connection.exec(&format!("RELEASE SAVEPOINT {savepoint}"))?()?;
+    Ok(())
+}
+
 fn is_schema_lock_error(err: &anyhow::Error) -> bool {
     let message = format!("{err:#}");
     message.contains("database schema is locked") || message.contains("database is locked")
@@ -262,6 +553,7 @@ impl ThreadSafeConnection {
             persistent,
             connection_initialize_query,
             connections: Default::default(),
+            block_on_transaction_commands: false,
         };
 
         connection.initialize_queues(write_queue_constructor);
@@ -289,7 +581,7 @@ pub fn background_thread_queue() -> WriteQueueConstructor {
             .name("sqlezWorker".to_string())
             .spawn(move || {
                 while let Ok(write) = receiver.recv() {
-                    write()
+                    write.run()
                 }
             })
             .unwrap();
@@ -305,10 +597,23 @@ pub fn background_thread_queue() -> WriteQueueConstructor {
 
 pub fn locking_queue() -> WriteQueueConstructor {
     Box::new(|| {
-        let write_mutex = Mutex::new(());
+        let write_mutex = Arc::new(Mutex::new(()));
         Box::new(move |queued_write| {
-            let _lock = write_mutex.lock();
-            queued_write();
+            let write_mutex = write_mutex.clone();
+            match queued_write {
+                QueuedWrite::Normal(write) => {
+                    let _lock = write_mutex.lock();
+                    write();
+                }
+                QueuedWrite::Transaction { activation, write } => {
+                    thread::spawn(move || {
+                        if activation.recv().is_ok() {
+                            let _lock = write_mutex.lock();
+                            write();
+                        }
+                    });
+                }
+            }
         })
     })
 }
@@ -370,5 +675,55 @@ mod test {
 
         ThreadSafeConnection::create_connection(false, name, Some("PRAGMA FOREIGN_KEYS=true"));
         releaser.join().unwrap();
+    }
+
+    #[test]
+    fn write_transaction_commits_or_rolls_back_as_one_unit() {
+        let connection = pollster::block_on(
+            ThreadSafeConnection::builder::<()>(
+                "write_transaction_commits_or_rolls_back_as_one_unit",
+                false,
+            )
+            .with_locking_write_queue()
+            .build(),
+        )
+        .unwrap();
+        pollster::block_on(connection.write(|connection| {
+            connection.exec("CREATE TABLE values_table(value INTEGER)")?()?;
+            anyhow::Ok(())
+        }))
+        .unwrap();
+
+        let transaction = pollster::block_on(connection.begin_write_transaction()).unwrap();
+        pollster::block_on(transaction.write(|connection| {
+            connection.exec("INSERT INTO values_table VALUES (1)")?()?;
+            anyhow::Ok(())
+        }))
+        .unwrap()
+        .unwrap();
+        pollster::block_on(transaction.rollback()).unwrap();
+        assert_eq!(
+            connection
+                .select_row::<i64>("SELECT COUNT(*) FROM values_table")
+                .unwrap()()
+            .unwrap(),
+            Some(0)
+        );
+
+        let transaction = pollster::block_on(connection.begin_write_transaction()).unwrap();
+        pollster::block_on(transaction.write(|connection| {
+            connection.exec("INSERT INTO values_table VALUES (2)")?()?;
+            anyhow::Ok(())
+        }))
+        .unwrap()
+        .unwrap();
+        pollster::block_on(transaction.commit()).unwrap();
+        assert_eq!(
+            connection
+                .select_row::<i64>("SELECT value FROM values_table")
+                .unwrap()()
+            .unwrap(),
+            Some(2)
+        );
     }
 }

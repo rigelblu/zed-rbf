@@ -207,6 +207,20 @@ impl<'a, T: 'static> Context<'a, T> {
     /// The future returned from this callback will be polled for up to [crate::SHUTDOWN_TIMEOUT] until the app fully quits.
     pub fn on_app_quit<Fut>(
         &self,
+        on_quit: impl FnMut(&mut T, &mut Context<T>) -> Fut + 'static,
+    ) -> Subscription
+    where
+        Fut: 'static + Future<Output = ()>,
+        T: 'static,
+    {
+        self.on_app_quit_with_timeout(crate::SHUTDOWN_TIMEOUT, on_quit)
+    }
+
+    /// Arrange for the given function to be invoked whenever the application is quit,
+    /// allowing this callback to extend the default graceful-shutdown deadline.
+    pub fn on_app_quit_with_timeout<Fut>(
+        &self,
+        timeout: std::time::Duration,
         mut on_quit: impl FnMut(&mut T, &mut Context<T>) -> Fut + 'static,
     ) -> Subscription
     where
@@ -214,7 +228,7 @@ impl<'a, T: 'static> Context<'a, T> {
         T: 'static,
     {
         let handle = self.weak_entity();
-        self.app.on_app_quit(move |cx| {
+        self.app.on_app_quit_with_timeout(timeout, move |cx| {
             let future = handle.update(cx, |entity, cx| on_quit(entity, cx)).ok();
             async move {
                 if let Some(future) = future {

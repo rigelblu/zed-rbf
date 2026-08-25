@@ -324,7 +324,10 @@ type Handler = Box<dyn FnMut(&mut App) -> bool + 'static>;
 type Listener = Box<dyn FnMut(&dyn Any, &mut App) -> bool + 'static>;
 pub(crate) type KeystrokeObserver =
     Box<dyn FnMut(&KeystrokeEvent, &mut Window, &mut App) -> bool + 'static>;
-type QuitHandler = Box<dyn FnOnce(&mut App) -> LocalBoxFuture<'static, ()> + 'static>;
+pub(crate) struct QuitHandler {
+    callback: Box<dyn FnOnce(&mut App) -> LocalBoxFuture<'static, ()> + 'static>,
+    timeout: Duration,
+}
 type WindowClosedHandler = Box<dyn FnMut(&mut App, WindowId)>;
 type ReleaseListener = Box<dyn FnOnce(&mut dyn Any, &mut App) + 'static>;
 type NewEntityListener = Box<dyn FnMut(AnyEntity, &mut Option<&mut Window>, &mut App) + 'static>;
@@ -947,8 +950,10 @@ impl App {
     pub fn shutdown(&mut self) {
         let mut futures = Vec::new();
 
+        let mut shutdown_timeout = SHUTDOWN_TIMEOUT;
         for observer in self.quit_observers.remove(&()) {
-            futures.push(observer(self));
+            shutdown_timeout = shutdown_timeout.max(observer.timeout);
+            futures.push((observer.callback)(self));
         }
 
         self.windows.clear();
@@ -959,7 +964,7 @@ impl App {
         let futures = futures::future::join_all(futures);
         if self
             .foreground_executor
-            .block_with_timeout(SHUTDOWN_TIMEOUT, futures)
+            .block_with_timeout(shutdown_timeout, futures)
             .is_err()
         {
             log::error!("timed out waiting on app_will_quit");
@@ -2267,8 +2272,18 @@ impl App {
 
     /// Register a callback to be invoked when the application is about to quit.
     /// It is not possible to cancel the quit event at this point.
-    pub fn on_app_quit<Fut>(
+    pub fn on_app_quit<Fut>(&self, on_quit: impl FnMut(&mut App) -> Fut + 'static) -> Subscription
+    where
+        Fut: 'static + Future<Output = ()>,
+    {
+        self.on_app_quit_with_timeout(SHUTDOWN_TIMEOUT, on_quit)
+    }
+
+    /// Register a callback to be invoked when the application is about to quit, allowing
+    /// this callback to extend the default graceful-shutdown deadline.
+    pub fn on_app_quit_with_timeout<Fut>(
         &self,
+        timeout: Duration,
         mut on_quit: impl FnMut(&mut App) -> Fut + 'static,
     ) -> Subscription
     where
@@ -2276,10 +2291,13 @@ impl App {
     {
         let (subscription, activate) = self.quit_observers.insert(
             (),
-            Box::new(move |cx| {
-                let future = on_quit(cx);
-                future.boxed_local()
-            }),
+            QuitHandler {
+                callback: Box::new(move |cx| {
+                    let future = on_quit(cx);
+                    future.boxed_local()
+                }),
+                timeout,
+            },
         );
         activate();
         subscription

@@ -965,14 +965,29 @@ fn main() {
             let db = workspace::WorkspaceDb::global(cx);
             let fs = app_state.fs.clone();
             let restore_finished = restore_finished.clone();
-            async move |_cx| {
+            async move |cx| {
                 restore_finished.await;
-                db.garbage_collect_workspaces(
-                    fs.as_ref(),
-                    &current_session_id,
-                    last_session_id.as_deref(),
-                )
-                .await
+                let Some(protected_workspace_ids) =
+                    cx.update(|cx| workspace::workspace_configuration_referenced_workspace_ids(cx))
+                else {
+                    return Ok(());
+                };
+                let candidates = db
+                    .garbage_collect_workspace_candidates(
+                        fs.as_ref(),
+                        &current_session_id,
+                        last_session_id.as_deref(),
+                        &protected_workspace_ids,
+                    )
+                    .await?;
+                let delete_task = cx.update(|cx| {
+                    workspace::WorkspaceConfigurationStore::delete_unreferenced_workspace_rows_global(
+                        db,
+                        candidates,
+                        cx,
+                    )
+                });
+                delete_task.await.map(|_| ())
             }
         })
         .detach_and_log_err(cx);

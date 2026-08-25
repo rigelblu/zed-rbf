@@ -46,8 +46,8 @@ use ui::{
 use util::{ResultExt, paths::PathExt};
 use workspace::{
     HistoryManager, ModalView, MultiWorkspace, OpenMode, OpenOptions, OpenVisible, PathList,
-    RecentWorkspace, SerializedWorkspaceLocation, Toast, Workspace, WorkspaceDb, WorkspaceId,
-    WorkspaceSettings,
+    RecentWorkspace, SerializedWorkspaceLocation, Toast, Workspace, WorkspaceConfigurationStore,
+    WorkspaceDb, WorkspaceId, WorkspaceSettings,
     notifications::{DetachAndPromptErr, NotificationId},
     with_active_or_new_workspace,
 };
@@ -362,10 +362,6 @@ pub async fn get_recent_projects(
         Some(n) => entries.into_iter().take(n).collect(),
         None => entries,
     }
-}
-
-pub async fn delete_recent_project(workspace_id: WorkspaceId, db: &WorkspaceDb) {
-    let _ = db.delete_workspace_by_id(workspace_id).await;
 }
 
 fn get_open_folders(workspace: &Workspace, cx: &App) -> Vec<OpenFolderEntry> {
@@ -3047,11 +3043,21 @@ impl RecentProjectsDelegate {
             let db = WorkspaceDb::global(cx);
             cx.spawn_in(window, async move |this, cx| {
                 let Some(fs) = fs else { return };
-                let deleted_workspace_ids = db
-                    .delete_recent_workspace_group(&recent_workspace)
+                let candidate_workspace_ids = db
+                    .recent_workspace_group_ids(&recent_workspace)
                     .await
                     .log_err()
                     .unwrap_or_default();
+                let Ok(delete_task) = cx.update(|_window, cx| {
+                    WorkspaceConfigurationStore::delete_unreferenced_workspace_rows_global(
+                        db.clone(),
+                        candidate_workspace_ids,
+                        cx,
+                    )
+                }) else {
+                    return;
+                };
+                let deleted_workspace_ids = delete_task.await.log_err().unwrap_or_default();
                 let workspaces = db
                     .recent_project_workspaces(fs.as_ref())
                     .await
