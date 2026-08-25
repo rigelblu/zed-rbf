@@ -67,6 +67,12 @@ actions!(
     [
         /// Saves the current window's workspace configuration under a new name.
         SaveWorkspaceConfigurationAs,
+        /// Opens the saved workspace configuration manager.
+        ManageWorkspaceConfigurations,
+        /// Selects the next saved workspace configuration in the manager.
+        SelectNextWorkspaceConfiguration,
+        /// Selects the previous saved workspace configuration in the manager.
+        SelectPreviousWorkspaceConfiguration,
         /// Opens the saved workspace configuration switcher.
         SwitchWorkspaceConfiguration,
     ]
@@ -3454,6 +3460,13 @@ impl Render for MultiWorkspace {
                     |this: &mut Self, _: &SaveWorkspaceConfigurationAs, window, cx| {
                         if !this.configuration_switch_in_progress {
                             this.show_save_workspace_configuration_as(window, cx);
+                        }
+                    },
+                ))
+                .on_action(cx.listener(
+                    |this: &mut Self, _: &ManageWorkspaceConfigurations, window, cx| {
+                        if !this.configuration_switch_in_progress {
+                            this.show_manage_workspace_configurations(window, cx);
                         }
                     },
                 ))

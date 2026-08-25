@@ -1,27 +1,133 @@
-use std::path::PathBuf;
+use std::{any::Any, path::PathBuf, sync::Arc};
 
 use super::*;
 use crate::item::test::TestItem;
-use crate::multi_workspace::WorkspaceConfigurationSwitchTestStage;
+use crate::multi_workspace::{
+    ManageWorkspaceConfigurations, SelectNextWorkspaceConfiguration,
+    SelectPreviousWorkspaceConfiguration, WorkspaceConfigurationSwitchTestStage,
+};
 use crate::persistence::WorkspaceConfigurationStore;
 use agent_settings::AgentSettings;
 use client::proto;
 use db::kvp::KeyValueStore;
 use fs::{FakeFs, Fs};
-use gpui::{IntoElement, MouseButton, TestAppContext, VisualTestContext, WindowId, div};
+use gpui::{
+    IntoElement, KeyBinding, MouseButton, TestAppContext, VisualTestContext, WindowId, div,
+};
 use project::DisableAiSettings;
 use serde_json::json;
 use settings::{Settings, SettingsStore};
 use ui::utils::platform_title_bar_height;
 use util::path;
 
+struct TestInputEditor {
+    text: String,
+    focus_handle: gpui::FocusHandle,
+}
+
+#[derive(Clone)]
+struct TestErasedEditor(Entity<TestInputEditor>);
+
+impl ui_input::ErasedEditor for TestErasedEditor {
+    fn text(&self, cx: &App) -> String {
+        self.0.read(cx).text.clone()
+    }
+
+    fn set_text(&self, text: &str, _window: &mut Window, cx: &mut App) {
+        self.0.update(cx, |editor, cx| {
+            editor.text = text.to_string();
+            cx.notify();
+        });
+    }
+
+    fn clear(&self, window: &mut Window, cx: &mut App) {
+        self.set_text("", window, cx);
+    }
+
+    fn set_placeholder_text(&self, _text: &str, _window: &mut Window, _cx: &mut App) {}
+
+    fn move_selection_to_end(&self, _window: &mut Window, _cx: &mut App) {}
+
+    fn select_all(&self, _window: &mut Window, _cx: &mut App) {}
+
+    fn set_masked(&self, _masked: bool, _window: &mut Window, _cx: &mut App) {}
+
+    fn set_read_only(&self, _read_only: bool, _cx: &mut App) {}
+
+    fn set_multiline(&self, _max_lines: Option<usize>, _window: &mut Window, _cx: &mut App) {}
+
+    fn focus_handle(&self, cx: &App) -> gpui::FocusHandle {
+        self.0.read(cx).focus_handle.clone()
+    }
+
+    fn subscribe(
+        &self,
+        _callback: Box<dyn FnMut(ui_input::ErasedEditorEvent, &mut Window, &mut App) + 'static>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> gpui::Subscription {
+        gpui::Subscription::new(|| {})
+    }
+
+    fn render(&self, _window: &mut Window, cx: &App) -> ui::AnyElement {
+        div().child(self.text(cx)).into_any_element()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        &self.0
+    }
+}
+
+fn test_erased_editor_factory(
+    _window: &mut Window,
+    cx: &mut App,
+) -> Arc<dyn ui_input::ErasedEditor> {
+    Arc::new(TestErasedEditor(cx.new(|cx| TestInputEditor {
+        text: String::new(),
+        focus_handle: cx.focus_handle(),
+    })))
+}
+
 fn init_test(cx: &mut TestAppContext) {
     cx.update(|cx| {
+        ui_input::ERASED_EDITOR_FACTORY.get_or_init(|| test_erased_editor_factory);
         let settings_store = SettingsStore::test(cx);
         cx.set_global(settings_store);
         theme_settings::init(theme::LoadThemes::JustBase, cx);
         DisableAiSettings::register(cx);
         WorkspaceConfigurationStore::init(cx);
+        cx.bind_keys([
+            KeyBinding::new(
+                "tab",
+                menu::SelectNext,
+                Some("ManageWorkspaceConfigurations"),
+            ),
+            KeyBinding::new(
+                "shift-tab",
+                menu::SelectPrevious,
+                Some("ManageWorkspaceConfigurations"),
+            ),
+            KeyBinding::new(
+                "enter",
+                menu::Confirm,
+                Some("ManageWorkspaceConfigurations"),
+            ),
+            KeyBinding::new(
+                "escape",
+                menu::Cancel,
+                Some("ManageWorkspaceConfigurations"),
+            ),
+            KeyBinding::new(
+                "down",
+                SelectNextWorkspaceConfiguration,
+                Some("ManageWorkspaceConfigurations"),
+            ),
+            KeyBinding::new(
+                "up",
+                SelectPreviousWorkspaceConfiguration,
+                Some("ManageWorkspaceConfigurations"),
+            ),
+        ]);
     });
 }
 
@@ -1636,8 +1742,15 @@ async fn workspace_configuration_ui_keeps_single_workspace_strip_and_switch_acti
     let save = multi_workspace.update(cx, |multi_workspace, cx| {
         multi_workspace.save_configuration_as("Daily".to_string(), cx)
     });
-    save.await
+    let daily_id = save
+        .await
         .expect("failed to save the single-workspace UI fixture");
+    let save = multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.save_configuration_as("Review".to_string(), cx)
+    });
+    let review_id = save
+        .await
+        .expect("failed to save the second management UI fixture");
     cx.run_until_parked();
 
     cx.draw(
@@ -1664,6 +1777,119 @@ async fn workspace_configuration_ui_keeps_single_workspace_strip_and_switch_acti
     });
     multi_workspace.update(cx, |multi_workspace, cx| {
         multi_workspace.workspace_configuration_menu_handle.hide(cx);
+    });
+
+    cx.dispatch_action(ManageWorkspaceConfigurations);
+    cx.run_until_parked();
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert!(
+            multi_workspace.test_workspace_configuration_management_modal_is_open(cx),
+            "saved configurations should be manageable without switching"
+        );
+    });
+    cx.draw(
+        gpui::point(gpui::px(0.), gpui::px(0.)),
+        gpui::size(gpui::px(800.), gpui::px(600.)),
+        |_, _| multi_workspace.clone().into_any_element(),
+    );
+    assert!(
+        cx.debug_bounds("WORKSPACE-CONFIGURATION-MANAGEMENT-MODAL")
+            .is_some(),
+        "management should render as a dedicated modal"
+    );
+    cx.dispatch_action(SelectNextWorkspaceConfiguration);
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert!(
+            multi_workspace.test_workspace_configuration_management_modal_is_renaming(cx),
+            "Return on the selected configuration should start an inline rename"
+        );
+        assert_eq!(
+            multi_workspace.test_workspace_configuration_management_rename_text(cx),
+            Some("Review".to_string()),
+            "Down should visibly select the next configuration before Return renames it"
+        );
+    });
+
+    cx.draw(
+        gpui::point(gpui::px(0.), gpui::px(0.)),
+        gpui::size(gpui::px(800.), gpui::px(600.)),
+        |_, _| multi_workspace.clone().into_any_element(),
+    );
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|window, cx| {
+            multi_workspace
+                .read(cx)
+                .test_workspace_configuration_management_focused_control(window, cx)
+        }),
+        Some("rename-cancel")
+    );
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        workspace_configuration(review_id, cx).map(|configuration| configuration.name),
+        Some("Review".to_string()),
+        "Enter on the rename Cancel button must not save"
+    );
+    assert!(workspace_configuration(daily_id, cx).is_some());
+    assert!(workspace_configuration(review_id, cx).is_some());
+
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    let rename_input = multi_workspace
+        .read_with(cx, |multi_workspace, cx| {
+            multi_workspace.test_workspace_configuration_management_rename_input(cx)
+        })
+        .expect("Return should reopen the selected configuration's rename field");
+    rename_input.update_in(cx, |input, window, cx| {
+        input.set_text("   ", window, cx);
+    });
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert!(
+            multi_workspace.test_workspace_configuration_management_modal_is_renaming(cx),
+            "an empty name should keep the inline rename open"
+        );
+    });
+    assert_eq!(
+        workspace_configuration(review_id, cx).map(|configuration| configuration.name),
+        Some("Review".to_string())
+    );
+
+    rename_input.update_in(cx, |input, window, cx| {
+        input.set_text("Renamed Review", window, cx);
+    });
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        workspace_configuration(review_id, cx).map(|configuration| configuration.name),
+        Some("Renamed Review".to_string()),
+        "Save should commit the inline rename"
+    );
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert!(
+            !multi_workspace.test_workspace_configuration_management_modal_is_renaming(cx),
+            "a successful rename should return to the management list"
+        );
+    });
+
+    cx.draw(
+        gpui::point(gpui::px(0.), gpui::px(0.)),
+        gpui::size(gpui::px(800.), gpui::px(600.)),
+        |_, _| multi_workspace.clone().into_any_element(),
+    );
+    cx.simulate_keystrokes("tab enter");
+    cx.run_until_parked();
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert!(
+            !multi_workspace.test_workspace_configuration_management_modal_is_open(cx),
+            "Enter on Done should dismiss the manager"
+        );
     });
 }
 

@@ -1640,4 +1640,11 @@
       "shift-tab": "skill_creator::FocusPreviousField",
     },
   },
+  {
+    "context": "ManageWorkspaceConfigurations",
+    "bindings": {
+      "down": "workspace::SelectNextWorkspaceConfiguration",
+      "up": "workspace::SelectPreviousWorkspaceConfiguration",
+    },
+  },
 ]

@@ -15,10 +15,18 @@ use ui::{
     PopoverMenu, Tooltip, WithScrollbar, prelude::*, utils::platform_title_bar_height,
 };
 use ui_input::InputField;
+use util::ResultExt as _;
 
 use crate::{
     ModalView, MultiWorkspace, SaveWorkspaceConfigurationAs, Workspace,
-    persistence::{StoreBlock, WorkspaceConfigurationStore, model::WorkspaceConfigurationId},
+    multi_workspace::{
+        ManageWorkspaceConfigurations, SelectNextWorkspaceConfiguration,
+        SelectPreviousWorkspaceConfiguration,
+    },
+    persistence::{
+        StoreBlock, WorkspaceConfigurationMutation, WorkspaceConfigurationStore,
+        model::WorkspaceConfigurationId,
+    },
 };
 
 #[derive(Clone)]
@@ -359,6 +367,73 @@ impl MultiWorkspace {
     pub(crate) fn test_workspace_configuration_menu_is_deployed(&self) -> bool {
         self.workspace_configuration_menu_handle.is_deployed()
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_workspace_configuration_management_modal_is_open(&self, cx: &App) -> bool {
+        self.active_modal::<WorkspaceConfigurationManagementModal>(cx)
+            .is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_workspace_configuration_management_modal_is_renaming(
+        &self,
+        cx: &App,
+    ) -> bool {
+        self.active_modal::<WorkspaceConfigurationManagementModal>(cx)
+            .is_some_and(|modal| {
+                matches!(
+                    modal.read(cx).mode,
+                    WorkspaceConfigurationManagementMode::Rename { .. }
+                )
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_workspace_configuration_management_rename_text(
+        &self,
+        cx: &App,
+    ) -> Option<String> {
+        let modal = self.active_modal::<WorkspaceConfigurationManagementModal>(cx)?;
+        match &modal.read(cx).mode {
+            WorkspaceConfigurationManagementMode::Rename { name, .. } => {
+                Some(name.read(cx).text(cx))
+            }
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_workspace_configuration_management_rename_input(
+        &self,
+        cx: &App,
+    ) -> Option<Entity<InputField>> {
+        let modal = self.active_modal::<WorkspaceConfigurationManagementModal>(cx)?;
+        match &modal.read(cx).mode {
+            WorkspaceConfigurationManagementMode::Rename { name, .. } => Some(name.clone()),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_workspace_configuration_management_focused_control(
+        &self,
+        window: &Window,
+        cx: &App,
+    ) -> Option<&'static str> {
+        let modal = self.active_modal::<WorkspaceConfigurationManagementModal>(cx)?;
+        let modal = modal.read(cx);
+        if modal.done_focus_handle.is_focused(window) {
+            Some("list-done")
+        } else if modal.rename_cancel_focus_handle.is_focused(window) {
+            Some("rename-cancel")
+        } else if modal.rename_save_focus_handle.is_focused(window) {
+            Some("rename-save")
+        } else if modal.focus_handle.is_focused(window) {
+            Some("list")
+        } else {
+            None
+        }
+    }
 }
 
 impl MultiWorkspace {
@@ -469,6 +544,7 @@ impl MultiWorkspace {
             .and_then(WorkspaceConfigurationStore::blocked)
             .map(StoreBlock::user_facing_message);
         let store_is_blocked = store_block_message.is_some();
+        let has_configurations = !configurations.is_empty();
         let active_configuration_id = self.active_configuration_id();
         let is_stale = self.configuration_checkpoint_error().is_some();
         let switch_in_progress = self.configuration_switch_in_progress();
@@ -523,17 +599,31 @@ impl MultiWorkspace {
                 );
             }
 
-            let multi_workspace = multi_workspace.clone();
-            menu.item(
+            let save_workspace = multi_workspace.clone();
+            menu = menu.item(
                 ContextMenuEntry::new("Save Workspace Configuration As…")
                     .action(SaveWorkspaceConfigurationAs.boxed_clone())
                     .disabled(switch_in_progress || store_is_blocked)
                     .handler(move |window, cx| {
-                        multi_workspace
+                        save_workspace
                             .update(cx, |multi_workspace, cx| {
                                 multi_workspace.show_save_workspace_configuration_as(window, cx);
                             })
-                            .ok();
+                            .log_err();
+                    }),
+            );
+
+            let management_workspace = multi_workspace.clone();
+            menu.item(
+                ContextMenuEntry::new("Manage Workspace Configurations…")
+                    .action(ManageWorkspaceConfigurations.boxed_clone())
+                    .disabled(switch_in_progress || store_is_blocked || !has_configurations)
+                    .handler(move |window, cx| {
+                        management_workspace
+                            .update(cx, |multi_workspace, cx| {
+                                multi_workspace.show_manage_workspace_configurations(window, cx);
+                            })
+                            .log_err();
                     }),
             )
             .key_context("WorkspaceConfigurations")
@@ -552,6 +642,28 @@ impl MultiWorkspace {
         let multi_workspace = cx.weak_entity();
         self.toggle_modal(window, cx, move |window, cx| {
             SaveWorkspaceConfigurationModal::new(multi_workspace, None, window, cx)
+        });
+    }
+
+    pub(crate) fn show_manage_workspace_configurations(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.configuration_switch_in_progress() {
+            return;
+        }
+        WorkspaceConfigurationStore::init(cx);
+        if WorkspaceConfigurationStore::global(cx).blocked().is_some()
+            || WorkspaceConfigurationStore::global(cx)
+                .configurations()
+                .is_empty()
+        {
+            return;
+        }
+        let multi_workspace = cx.weak_entity();
+        self.toggle_modal(window, cx, move |window, cx| {
+            WorkspaceConfigurationManagementModal::new(multi_workspace, window, cx)
         });
     }
 
@@ -825,6 +937,544 @@ impl Render for SaveWorkspaceConfigurationModal {
                             })),
                     ),
             )
+    }
+}
+
+#[derive(Clone)]
+enum WorkspaceConfigurationManagementMode {
+    List,
+    Rename {
+        id: WorkspaceConfigurationId,
+        name: Entity<InputField>,
+    },
+}
+
+struct WorkspaceConfigurationManagementModal {
+    focus_handle: FocusHandle,
+    done_focus_handle: FocusHandle,
+    rename_cancel_focus_handle: FocusHandle,
+    rename_save_focus_handle: FocusHandle,
+    scroll_handle: ScrollHandle,
+    multi_workspace: WeakEntity<MultiWorkspace>,
+    selected_configuration_id: Option<WorkspaceConfigurationId>,
+    mode: WorkspaceConfigurationManagementMode,
+    busy: bool,
+    error: Option<String>,
+}
+
+impl WorkspaceConfigurationManagementModal {
+    fn new(
+        multi_workspace: WeakEntity<MultiWorkspace>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let selected_configuration_id = WorkspaceConfigurationStore::try_global(cx)
+            .and_then(|store| store.configurations().first())
+            .map(|configuration| configuration.id);
+        Self {
+            focus_handle: cx.focus_handle(),
+            done_focus_handle: cx.focus_handle(),
+            rename_cancel_focus_handle: cx.focus_handle(),
+            rename_save_focus_handle: cx.focus_handle(),
+            scroll_handle: ScrollHandle::new(),
+            multi_workspace,
+            selected_configuration_id,
+            mode: WorkspaceConfigurationManagementMode::List,
+            busy: false,
+            error: None,
+        }
+    }
+
+    fn cancel(&mut self, _: &menu::Cancel, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        match self.mode {
+            WorkspaceConfigurationManagementMode::List => cx.emit(DismissEvent),
+            _ => {
+                self.mode = WorkspaceConfigurationManagementMode::List;
+                self.error = None;
+                self.focus_handle.focus(window, cx);
+                cx.notify();
+            }
+        }
+    }
+
+    fn start_rename(
+        &mut self,
+        id: WorkspaceConfigurationId,
+        current_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.selected_configuration_id = Some(id);
+        let name = cx.new(|cx| {
+            InputField::new(window, cx, "Name")
+                .label("Name")
+                .tab_index(0)
+        });
+        name.update(cx, |name, cx| {
+            name.set_text(&current_name, window, cx);
+            name.editor().select_all(window, cx);
+        });
+        name.focus_handle(cx).focus(window, cx);
+        self.mode = WorkspaceConfigurationManagementMode::Rename { id, name };
+        self.error = None;
+        cx.notify();
+    }
+
+    fn select_next(
+        &mut self,
+        _: &SelectNextWorkspaceConfiguration,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_selection(true, cx);
+    }
+
+    fn select_previous(
+        &mut self,
+        _: &SelectPreviousWorkspaceConfiguration,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_selection(false, cx);
+    }
+
+    fn move_selection(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if !matches!(self.mode, WorkspaceConfigurationManagementMode::List) {
+            return;
+        }
+        let configurations = WorkspaceConfigurationStore::try_global(cx)
+            .map(|store| store.configurations())
+            .unwrap_or_default();
+        if configurations.is_empty() {
+            self.selected_configuration_id = None;
+            return;
+        }
+        let selected_index = self
+            .selected_configuration_id
+            .and_then(|selected_id| {
+                configurations
+                    .iter()
+                    .position(|configuration| configuration.id == selected_id)
+            })
+            .unwrap_or(0);
+        let next_index = if forward {
+            (selected_index + 1) % configurations.len()
+        } else if selected_index == 0 {
+            configurations.len() - 1
+        } else {
+            selected_index - 1
+        };
+        self.selected_configuration_id = Some(configurations[next_index].id);
+        self.scroll_handle.scroll_to_item(next_index);
+        cx.notify();
+    }
+
+    fn focus_next(&mut self, _: &menu::SelectNext, window: &mut Window, cx: &mut Context<Self>) {
+        match &self.mode {
+            WorkspaceConfigurationManagementMode::List => {
+                if self.done_focus_handle.is_focused(window) {
+                    self.focus_handle.focus(window, cx);
+                } else {
+                    self.done_focus_handle.focus(window, cx);
+                }
+            }
+            WorkspaceConfigurationManagementMode::Rename { name, .. } => {
+                if self.rename_cancel_focus_handle.is_focused(window) {
+                    self.rename_save_focus_handle.focus(window, cx);
+                } else if self.rename_save_focus_handle.is_focused(window) {
+                    name.focus_handle(cx).focus(window, cx);
+                } else {
+                    self.rename_cancel_focus_handle.focus(window, cx);
+                }
+            }
+        }
+    }
+
+    fn focus_previous(
+        &mut self,
+        _: &menu::SelectPrevious,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match &self.mode {
+            WorkspaceConfigurationManagementMode::List => {
+                if self.done_focus_handle.is_focused(window) {
+                    self.focus_handle.focus(window, cx);
+                } else {
+                    self.done_focus_handle.focus(window, cx);
+                }
+            }
+            WorkspaceConfigurationManagementMode::Rename { name, .. } => {
+                if self.rename_save_focus_handle.is_focused(window) {
+                    self.rename_cancel_focus_handle.focus(window, cx);
+                } else if self.rename_cancel_focus_handle.is_focused(window) {
+                    name.focus_handle(cx).focus(window, cx);
+                } else {
+                    self.rename_save_focus_handle.focus(window, cx);
+                }
+            }
+        }
+    }
+
+    fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        let cancel_is_focused = match &self.mode {
+            WorkspaceConfigurationManagementMode::List => self.done_focus_handle.is_focused(window),
+            WorkspaceConfigurationManagementMode::Rename { .. } => {
+                self.rename_cancel_focus_handle.is_focused(window)
+            }
+        };
+        if cancel_is_focused {
+            self.cancel(&menu::Cancel, window, cx);
+            return;
+        }
+        self.confirm_primary(window, cx);
+    }
+
+    fn confirm_primary(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        match &self.mode {
+            WorkspaceConfigurationManagementMode::List => {
+                let Some(configuration_id) = self.selected_configuration_id else {
+                    return;
+                };
+                let Some(configuration_name) = WorkspaceConfigurationStore::try_global(cx)
+                    .and_then(|store| store.configuration(configuration_id))
+                    .map(|configuration| configuration.name.clone())
+                else {
+                    return;
+                };
+                self.start_rename(configuration_id, configuration_name, window, cx);
+            }
+            WorkspaceConfigurationManagementMode::Rename { id, name } => {
+                let id = *id;
+                let name_field = name.clone();
+                let name = name.read(cx).text(cx).trim().to_string();
+                let validation_error = if name.is_empty() {
+                    Some("Enter a configuration name.".to_string())
+                } else if WorkspaceConfigurationStore::try_global(cx).is_some_and(|store| {
+                    store.configurations().iter().any(|configuration| {
+                        configuration.id != id && configuration.name.eq_ignore_ascii_case(&name)
+                    })
+                }) {
+                    Some(format!(
+                        "A workspace configuration named “{name}” already exists."
+                    ))
+                } else {
+                    None
+                };
+                if let Some(error) = validation_error {
+                    name_field.update(cx, |name, cx| name.set_error(Some(error), cx));
+                    return;
+                }
+
+                name_field.update(cx, |name, cx| name.set_error(None::<String>, cx));
+                self.busy = true;
+                self.error = None;
+                cx.notify();
+                let rename = WorkspaceConfigurationStore::mutate_global(
+                    WorkspaceConfigurationMutation::Rename { id, name },
+                    cx,
+                );
+                cx.spawn_in(window, async move |this, cx| {
+                    let result = rename.await;
+                    this.update_in(cx, |this, window, cx| {
+                        this.busy = false;
+                        match result {
+                            Ok(_) => {
+                                this.mode = WorkspaceConfigurationManagementMode::List;
+                                this.error = None;
+                                this.focus_handle.focus(window, cx);
+                            }
+                            Err(error) => {
+                                log::error!(
+                                    "failed to rename workspace configuration {:?}: {error:#}",
+                                    id
+                                );
+                                if WorkspaceConfigurationStore::global(cx)
+                                    .configuration(id)
+                                    .is_none()
+                                {
+                                    this.mode = WorkspaceConfigurationManagementMode::List;
+                                    this.selected_configuration_id =
+                                        WorkspaceConfigurationStore::global(cx)
+                                            .configurations()
+                                            .first()
+                                            .map(|configuration| configuration.id);
+                                    this.focus_handle.focus(window, cx);
+                                }
+                                this.error = Some(
+                                    "Couldn't Rename Workspace Configuration\n\nThe saved name was not changed. See the Zed log for details."
+                                        .to_string(),
+                                );
+                            }
+                        }
+                        cx.notify();
+                    })?;
+                    anyhow::Ok(())
+                })
+                .detach_and_log_err(cx);
+            }
+        }
+    }
+
+    fn render_list(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let configurations = WorkspaceConfigurationStore::try_global(cx)
+            .map(|store| store.configurations().to_vec())
+            .unwrap_or_default();
+        let active_configuration_id = self
+            .multi_workspace
+            .read_with(cx, |multi_workspace, _| {
+                multi_workspace.active_configuration_id()
+            })
+            .ok()
+            .flatten();
+        let mode = self.mode.clone();
+        let mut rows = Vec::with_capacity(configurations.len());
+        for (index, configuration) in configurations.into_iter().enumerate() {
+            let configuration_id = configuration.id;
+            let is_selected = self.selected_configuration_id == Some(configuration_id);
+            let is_active = active_configuration_id == Some(configuration_id);
+
+            if let WorkspaceConfigurationManagementMode::Rename { id, name } = &mode
+                && *id == configuration_id
+            {
+                rows.push(
+                    v_flex()
+                        .when(index > 0, |this| {
+                            this.border_t_1()
+                                .border_color(cx.theme().colors().border_variant)
+                        })
+                        .w_full()
+                        .gap_2()
+                        .p_3()
+                        .border_l_2()
+                        .border_color(cx.theme().colors().border_focused)
+                        .bg(cx.theme().colors().ghost_element_selected)
+                        .child(
+                            h_flex()
+                                .min_w_0()
+                                .gap_2()
+                                .child(configuration_marker(is_active))
+                                .child(Label::new("Rename Workspace Configuration")),
+                        )
+                        .child(name.clone())
+                        .when_some(self.error.clone(), |this, error| {
+                            this.child(Label::new(error).size(LabelSize::Small).color(Color::Error))
+                        })
+                        .child(
+                            h_flex()
+                                .justify_end()
+                                .gap_2()
+                                .child(
+                                    Button::new("cancel-workspace-configuration-rename", "Cancel")
+                                        .track_focus(&self.rename_cancel_focus_handle)
+                                        .tab_index(1_isize)
+                                        .disabled(self.busy)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.cancel(&menu::Cancel, window, cx)
+                                        })),
+                                )
+                                .child(
+                                    Button::new("save-workspace-configuration-rename", "Save")
+                                        .track_focus(&self.rename_save_focus_handle)
+                                        .tab_index(2_isize)
+                                        .style(ButtonStyle::Filled)
+                                        .loading(self.busy)
+                                        .disabled(self.busy)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.confirm_primary(window, cx)
+                                        })),
+                                ),
+                        )
+                        .into_any_element(),
+                );
+                continue;
+            }
+
+            let rename_name = configuration.name.clone();
+            rows.push(
+                h_flex()
+                    .id(("workspace-configuration-management-row", index))
+                    .when(index > 0, |this| {
+                        this.border_t_1()
+                            .border_color(cx.theme().colors().border_variant)
+                    })
+                    .w_full()
+                    .min_w_0()
+                    .justify_between()
+                    .gap_3()
+                    .px_3()
+                    .py_2()
+                    .border_l_2()
+                    .border_color(if is_selected {
+                        cx.theme().colors().border_focused
+                    } else {
+                        cx.theme().colors().border.opacity(0.)
+                    })
+                    .cursor_pointer()
+                    .hover(|this| this.bg(cx.theme().colors().ghost_element_hover))
+                    .when(is_selected, |this| {
+                        this.bg(cx.theme().colors().ghost_element_selected)
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.selected_configuration_id = Some(configuration_id);
+                        this.focus_handle.focus(window, cx);
+                        cx.notify();
+                    }))
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .gap_2()
+                            .child(configuration_marker(is_active))
+                            .child(Label::new(configuration.name).truncate()),
+                    )
+                    .child(
+                        h_flex().flex_none().gap_1().child(
+                            Button::new(("rename-workspace-configuration", index), "Rename")
+                                .style(ButtonStyle::Subtle)
+                                .disabled(self.busy)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.selected_configuration_id = Some(configuration_id);
+                                    this.start_rename(
+                                        configuration_id,
+                                        rename_name.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                })),
+                        ),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        v_flex()
+            .p_3()
+            .gap_3()
+            .child(Label::new("Manage Workspace Configurations"))
+            .child(
+                v_flex()
+                    .border_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .rounded_md()
+                    .overflow_hidden()
+                    .child(
+                        v_flex()
+                            .id("workspace-configuration-management-list")
+                            .max_h(rems(24.))
+                            .overflow_y_scroll()
+                            .track_scroll(&self.scroll_handle)
+                            .when(rows.is_empty(), |this| {
+                                this.child(
+                                    Label::new("No saved workspace configurations.")
+                                        .color(Color::Muted),
+                                )
+                                .p_3()
+                            })
+                            .children(rows),
+                    ),
+            )
+            .when(
+                matches!(mode, WorkspaceConfigurationManagementMode::List),
+                |this| {
+                    this.when_some(self.error.clone(), |this, error| {
+                        this.child(Label::new(error).size(LabelSize::Small).color(Color::Error))
+                    })
+                },
+            )
+            .when(
+                matches!(mode, WorkspaceConfigurationManagementMode::List),
+                |this| {
+                    this.child(
+                        h_flex().justify_end().child(
+                            Button::new("done-workspace-configuration-management", "Done")
+                                .track_focus(&self.done_focus_handle)
+                                .tab_index(1_isize)
+                                .disabled(self.busy)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.cancel(&menu::Cancel, window, cx)
+                                })),
+                        ),
+                    )
+                },
+            )
+            .into_any_element()
+    }
+}
+
+fn configuration_marker(is_active: bool) -> AnyElement {
+    div()
+        .w(rems(1.))
+        .flex_none()
+        .when(is_active, |this| {
+            this.child(
+                Icon::new(IconName::Check)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            )
+        })
+        .into_any_element()
+}
+
+impl Focusable for WorkspaceConfigurationManagementModal {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        match &self.mode {
+            WorkspaceConfigurationManagementMode::Rename { name, .. } => name.focus_handle(cx),
+            WorkspaceConfigurationManagementMode::List => self.focus_handle.clone(),
+        }
+    }
+}
+
+impl EventEmitter<DismissEvent> for WorkspaceConfigurationManagementModal {}
+impl ModalView for WorkspaceConfigurationManagementModal {}
+
+impl Render for WorkspaceConfigurationManagementModal {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let edited_configuration_is_missing = match &self.mode {
+            WorkspaceConfigurationManagementMode::Rename { id, .. } => {
+                WorkspaceConfigurationStore::try_global(cx)
+                    .is_none_or(|store| store.configuration(*id).is_none())
+            }
+            _ => false,
+        };
+        if edited_configuration_is_missing {
+            self.mode = WorkspaceConfigurationManagementMode::List;
+            self.selected_configuration_id = WorkspaceConfigurationStore::try_global(cx)
+                .and_then(|store| store.configurations().first())
+                .map(|configuration| configuration.id);
+            self.error = Some(
+                "Couldn't Rename Workspace Configuration\n\nThe saved name was not changed. See the Zed log for details."
+                    .to_string(),
+            );
+            self.focus_handle.focus(window, cx);
+        }
+        let content = self.render_list(cx);
+
+        v_flex()
+            .debug_selector(|| "WORKSPACE-CONFIGURATION-MANAGEMENT-MODAL".to_string())
+            .key_context("ManageWorkspaceConfigurations")
+            .track_focus(&self.focus_handle)
+            .tab_group()
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::confirm))
+            .on_action(cx.listener(Self::focus_next))
+            .on_action(cx.listener(Self::focus_previous))
+            .on_action(cx.listener(Self::select_next))
+            .on_action(cx.listener(Self::select_previous))
+            .w(rems(38.))
+            .elevation_3(cx)
+            .bg(cx.theme().colors().elevated_surface_background)
+            .rounded_md()
+            .overflow_hidden()
+            .child(content)
     }
 }
 

@@ -457,6 +457,10 @@ pub enum WorkspaceConfigurationMutation {
         members: Vec<model::WorkspaceConfigurationMember>,
         active_member: Option<WorkspaceId>,
     },
+    Rename {
+        id: model::WorkspaceConfigurationId,
+        name: String,
+    },
 }
 
 /// What a successful mutation produced.
@@ -849,6 +853,30 @@ impl WorkspaceConfigurationStore {
                     .context("that workspace configuration no longer exists")?;
                 configuration.members = members;
                 configuration.active_member = active_member;
+                id
+            }
+            WorkspaceConfigurationMutation::Rename { id, name } => {
+                let name = name.trim().to_string();
+                anyhow::ensure!(!name.is_empty(), "Enter a configuration name.");
+                anyhow::ensure!(
+                    collection
+                        .configurations
+                        .iter()
+                        .any(|configuration| configuration.id == id),
+                    "that workspace configuration no longer exists"
+                );
+                anyhow::ensure!(
+                    collection
+                        .find_by_name(&name)
+                        .is_none_or(|configuration| configuration.id == id),
+                    "A workspace configuration named \u{201c}{name}\u{201d} already exists."
+                );
+                let configuration = collection
+                    .configurations
+                    .iter_mut()
+                    .find(|configuration| configuration.id == id)
+                    .context("that workspace configuration no longer exists")?;
+                configuration.name = name;
                 id
             }
         };
@@ -7006,6 +7034,177 @@ mod tests {
             before,
             "a refused create leaves the stored value byte-identical"
         );
+    }
+
+    #[gpui::test]
+    async fn workspace_configuration_management_preserves_identity_and_membership(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        clear_raw_configurations(cx).await;
+        cx.update(|cx| WorkspaceConfigurationStore::init(cx));
+        let store = WorkspaceConfigurationStoreTestHandle;
+
+        let first = store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Create {
+                        name: "Daily".to_string(),
+                        members: vec![member(1), member(2)],
+                        active_member: Some(WorkspaceId(2)),
+                    },
+                    cx,
+                )
+            })
+            .await;
+        let first = match first {
+            Ok(commit) => commit,
+            Err(error) => panic!("failed to create the first configuration: {error:#}"),
+        };
+        let second = store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Create {
+                        name: "Review".to_string(),
+                        members: vec![member(3)],
+                        active_member: Some(WorkspaceId(3)),
+                    },
+                    cx,
+                )
+            })
+            .await;
+        let second = match second {
+            Ok(commit) => commit,
+            Err(error) => panic!("failed to create the second configuration: {error:#}"),
+        };
+
+        let before_failed_rename = read_raw_configurations(cx).await;
+        cx.update(|cx| WorkspaceConfigurationStore::set_write_failure_for_tests(true, cx));
+        let failed_rename = store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Rename {
+                        id: first.id,
+                        name: "Changed".to_string(),
+                    },
+                    cx,
+                )
+            })
+            .await;
+        cx.update(|cx| WorkspaceConfigurationStore::set_write_failure_for_tests(false, cx));
+        assert!(failed_rename.is_err(), "a failed rename is reported");
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store
+                    .configuration(first.id)
+                    .map(|configuration| configuration.name.as_str()),
+                Some("Daily"),
+                "a failed rename leaves the in-memory name unchanged"
+            );
+        });
+        assert_eq!(
+            read_raw_configurations(cx).await,
+            before_failed_rename,
+            "a failed rename leaves the stored value byte-identical"
+        );
+
+        let rename = store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Rename {
+                        id: first.id,
+                        name: "  DAILY  ".to_string(),
+                    },
+                    cx,
+                )
+            })
+            .await;
+        assert!(rename.is_ok(), "a case-only rename is allowed");
+        store.read_with(cx, |store, _| {
+            let Some(configuration) = store.configuration(first.id) else {
+                panic!("renaming removed the configuration");
+            };
+            assert_eq!(configuration.name, "DAILY");
+            assert_eq!(configuration.members, vec![member(1), member(2)]);
+            assert_eq!(configuration.active_member, Some(WorkspaceId(2)));
+        });
+
+        let before_refused_rename = read_raw_configurations(cx).await;
+        let blank = store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Rename {
+                        id: first.id,
+                        name: "   ".to_string(),
+                    },
+                    cx,
+                )
+            })
+            .await;
+        assert!(blank.is_err(), "an empty rename is refused");
+
+        let duplicate = store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Rename {
+                        id: first.id,
+                        name: " review ".to_string(),
+                    },
+                    cx,
+                )
+            })
+            .await;
+        assert!(duplicate.is_err(), "a duplicate rename is refused");
+        let missing = store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Rename {
+                        id: model::WorkspaceConfigurationId::new(),
+                        name: "Review".to_string(),
+                    },
+                    cx,
+                )
+            })
+            .await;
+        let missing_error = missing.expect_err("renaming a missing identity is refused");
+        assert!(
+            format!("{missing_error:#}").contains("no longer exists"),
+            "missing identity should take precedence over duplicate-name validation"
+        );
+        assert_eq!(
+            read_raw_configurations(cx).await,
+            before_refused_rename,
+            "a refused rename leaves the stored value byte-identical"
+        );
+
+        store.read_with(cx, |store, _| {
+            let Some(configuration) = store.configuration(first.id) else {
+                panic!("renaming removed the first configuration");
+            };
+            assert_eq!(configuration.name, "DAILY");
+            assert_eq!(configuration.members, vec![member(1), member(2)]);
+            assert_eq!(configuration.active_member, Some(WorkspaceId(2)));
+            let Some(configuration) = store.configuration(second.id) else {
+                panic!("renaming one configuration removed another");
+            };
+            assert_eq!(configuration.name, "Review");
+            assert_eq!(configuration.members, vec![member(3)]);
+            assert_eq!(
+                store.generation(),
+                3,
+                "only the two creates and rename committed"
+            );
+        });
+
+        let reloaded = cx.update(|cx| cx.new(|cx| WorkspaceConfigurationStore::load(cx)));
+        reloaded.read_with(cx, |store, _| {
+            assert_eq!(
+                store
+                    .configuration(first.id)
+                    .map(|configuration| configuration.name.as_str()),
+                Some("DAILY")
+            );
+            assert!(store.configuration(second.id).is_some());
+        });
     }
 
     #[gpui::test]
