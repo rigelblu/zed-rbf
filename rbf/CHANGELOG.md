@@ -6,6 +6,11 @@ title: "Zed RBF Changelog"
 
 ---
 
+# 🔵⋯ v0.62.0 (2026-08-25) — #zed-64
+- 2026-08-25 - feat (ux) | save named workspace configurations and switch between their latest vertical-tab, editor, and pane state instead of reconstructing the set after installing a build [@zed-rbf]
+
+---
+
 # 🔵⋯ v0.61.0 (2026-08-24) — #zed-60, #zed-61, #zed-63
 - 2026-08-20 - fix (ux) | open files and folders from File → Open and ⌘O again after installing a new build over a running app, instead of the macOS panel beachballing and never appearing [@zed-rbf]
 - 2026-08-20 - fix (ux) | keep the loaded commit history when switching to the Git panel's Compare tab, instead of Compare silently running the Changes reset and discarding it [@zed-rbf]

@@ -117,6 +117,7 @@ The configured order is the display order. `~` and `$VAR` expand. Missing paths 
 - Cycle workspaces with keyboard shortcuts (`cmd-alt-]` and `cmd-alt-[`)
 - Restores open workspace tabs, layout, and edit states stably across app restarts
 - Grouped tab management and close controls directly on the tab strip
+- Save the current vertical-tab workspace set as a named configuration, then switch the same window between saved sets while restoring each workspace's latest editor and pane state
 
 ## 🟠⋯ File Tags
 - Mark important files with lightweight Zed-local color tags from the Project Panel file-row workflow, visible as markers on file rows
