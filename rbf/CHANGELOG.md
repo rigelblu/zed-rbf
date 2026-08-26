@@ -3,6 +3,8 @@ title: "Zed RBF Changelog"
 ---
 
 # 🔵⋯ [Unreleased]
+- 2026-08-26 - feat (ux) | rename any saved workspace configuration without switching to it, so a growing saved list stays recognizable (#zed-64) [@zed-rbf]
+- 2026-08-26 - feat (ux) | delete an obsolete or broken saved workspace configuration without closing its open workspaces or losing their editor state, even when deleting the active configuration (#zed-64) [@zed-rbf]
 
 ---
 
