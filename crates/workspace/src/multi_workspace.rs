@@ -767,6 +767,54 @@ impl MultiWorkspace {
         self.active_configuration_id
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_active_configuration_for_test(
+        &mut self,
+        configuration_id: WorkspaceConfigurationId,
+        checkpoint_error: Option<String>,
+    ) {
+        self.active_configuration_id = Some(configuration_id);
+        self.configuration_checkpoint_error = checkpoint_error;
+    }
+
+    pub(crate) fn delete_workspace_configuration(
+        &mut self,
+        configuration_id: WorkspaceConfigurationId,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        cx.spawn(async move |_, cx| {
+            cx.update(|cx| {
+                WorkspaceConfigurationStore::mutate_global(
+                    WorkspaceConfigurationMutation::Delete {
+                        id: configuration_id,
+                    },
+                    cx,
+                )
+            })
+            .await?;
+
+            cx.update(|cx| {
+                for window in cx.windows() {
+                    let Some(multi_workspace) = window.downcast::<MultiWorkspace>() else {
+                        continue;
+                    };
+                    multi_workspace
+                        .update(cx, |multi_workspace, _window, cx| {
+                            if multi_workspace.active_configuration_id == Some(configuration_id) {
+                                multi_workspace.active_configuration_id = None;
+                                multi_workspace.configuration_checkpoint_error = None;
+                                multi_workspace.workspace_configuration_generation += 1;
+                                multi_workspace.serialize(cx);
+                                cx.notify();
+                            }
+                        })
+                        .log_err();
+                }
+            });
+            Ok(())
+        })
+    }
+
     pub fn configuration_checkpoint_error(&self) -> Option<&str> {
         self.configuration_checkpoint_error.as_deref()
     }

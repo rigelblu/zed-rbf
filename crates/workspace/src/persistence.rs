@@ -461,6 +461,9 @@ pub enum WorkspaceConfigurationMutation {
         id: model::WorkspaceConfigurationId,
         name: String,
     },
+    Delete {
+        id: model::WorkspaceConfigurationId,
+    },
 }
 
 /// What a successful mutation produced.
@@ -877,6 +880,15 @@ impl WorkspaceConfigurationStore {
                     .find(|configuration| configuration.id == id)
                     .context("that workspace configuration no longer exists")?;
                 configuration.name = name;
+                id
+            }
+            WorkspaceConfigurationMutation::Delete { id } => {
+                let configuration_index = collection
+                    .configurations
+                    .iter()
+                    .position(|configuration| configuration.id == id)
+                    .context("that workspace configuration no longer exists")?;
+                collection.configurations.remove(configuration_index);
                 id
             }
         };
@@ -7176,33 +7188,63 @@ mod tests {
             "a refused rename leaves the stored value byte-identical"
         );
 
+        let before_failed_delete = read_raw_configurations(cx).await;
+        cx.update(|cx| WorkspaceConfigurationStore::set_write_failure_for_tests(true, cx));
+        let failed_delete = store
+            .update(cx, |store, cx| {
+                store.mutate(WorkspaceConfigurationMutation::Delete { id: first.id }, cx)
+            })
+            .await;
+        cx.update(|cx| WorkspaceConfigurationStore::set_write_failure_for_tests(false, cx));
+        assert!(failed_delete.is_err(), "a failed delete is reported");
         store.read_with(cx, |store, _| {
-            let Some(configuration) = store.configuration(first.id) else {
-                panic!("renaming removed the first configuration");
-            };
-            assert_eq!(configuration.name, "DAILY");
-            assert_eq!(configuration.members, vec![member(1), member(2)]);
-            assert_eq!(configuration.active_member, Some(WorkspaceId(2)));
+            assert!(
+                store.configuration(first.id).is_some(),
+                "a failed delete leaves the in-memory configuration present"
+            );
+        });
+        assert_eq!(
+            read_raw_configurations(cx).await,
+            before_failed_delete,
+            "a failed delete leaves the stored value byte-identical"
+        );
+
+        let delete = store.update(cx, |store, cx| {
+            store.mutate(WorkspaceConfigurationMutation::Delete { id: first.id }, cx)
+        });
+        let checkpoint = store.update(cx, |store, cx| {
+            store.mutate(
+                WorkspaceConfigurationMutation::Checkpoint {
+                    id: first.id,
+                    members: vec![member(4)],
+                    active_member: Some(WorkspaceId(4)),
+                },
+                cx,
+            )
+        });
+        let (delete, checkpoint) = futures::join!(delete, checkpoint);
+        assert!(delete.is_ok(), "the configuration can be deleted");
+        assert!(
+            checkpoint.is_err(),
+            "a checkpoint queued after deletion cannot recreate the configuration"
+        );
+        store.read_with(cx, |store, _| {
+            assert!(store.configuration(first.id).is_none());
             let Some(configuration) = store.configuration(second.id) else {
-                panic!("renaming one configuration removed another");
+                panic!("deleting one configuration removed another");
             };
             assert_eq!(configuration.name, "Review");
             assert_eq!(configuration.members, vec![member(3)]);
             assert_eq!(
                 store.generation(),
-                3,
-                "only the two creates and rename committed"
+                4,
+                "only the two creates, rename, and delete committed"
             );
         });
 
         let reloaded = cx.update(|cx| cx.new(|cx| WorkspaceConfigurationStore::load(cx)));
         reloaded.read_with(cx, |store, _| {
-            assert_eq!(
-                store
-                    .configuration(first.id)
-                    .map(|configuration| configuration.name.as_str()),
-                Some("DAILY")
-            );
+            assert!(store.configuration(first.id).is_none());
             assert!(store.configuration(second.id).is_some());
         });
     }

@@ -415,6 +415,20 @@ impl MultiWorkspace {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_workspace_configuration_management_modal_is_confirming_delete(
+        &self,
+        cx: &App,
+    ) -> bool {
+        self.active_modal::<WorkspaceConfigurationManagementModal>(cx)
+            .is_some_and(|modal| {
+                matches!(
+                    modal.read(cx).mode,
+                    WorkspaceConfigurationManagementMode::ConfirmDelete { .. }
+                )
+            })
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_workspace_configuration_management_focused_control(
         &self,
         window: &Window,
@@ -422,12 +436,18 @@ impl MultiWorkspace {
     ) -> Option<&'static str> {
         let modal = self.active_modal::<WorkspaceConfigurationManagementModal>(cx)?;
         let modal = modal.read(cx);
-        if modal.done_focus_handle.is_focused(window) {
+        if modal.delete_focus_handle.is_focused(window) {
+            Some("list-delete")
+        } else if modal.done_focus_handle.is_focused(window) {
             Some("list-done")
         } else if modal.rename_cancel_focus_handle.is_focused(window) {
             Some("rename-cancel")
         } else if modal.rename_save_focus_handle.is_focused(window) {
             Some("rename-save")
+        } else if modal.delete_cancel_focus_handle.is_focused(window) {
+            Some("delete-cancel")
+        } else if modal.delete_confirm_focus_handle.is_focused(window) {
+            Some("delete-confirm")
         } else if modal.focus_handle.is_focused(window) {
             Some("list")
         } else {
@@ -947,13 +967,20 @@ enum WorkspaceConfigurationManagementMode {
         id: WorkspaceConfigurationId,
         name: Entity<InputField>,
     },
+    ConfirmDelete {
+        id: WorkspaceConfigurationId,
+        name: String,
+    },
 }
 
 struct WorkspaceConfigurationManagementModal {
     focus_handle: FocusHandle,
+    delete_focus_handle: FocusHandle,
     done_focus_handle: FocusHandle,
     rename_cancel_focus_handle: FocusHandle,
     rename_save_focus_handle: FocusHandle,
+    delete_cancel_focus_handle: FocusHandle,
+    delete_confirm_focus_handle: FocusHandle,
     scroll_handle: ScrollHandle,
     multi_workspace: WeakEntity<MultiWorkspace>,
     selected_configuration_id: Option<WorkspaceConfigurationId>,
@@ -973,9 +1000,12 @@ impl WorkspaceConfigurationManagementModal {
             .map(|configuration| configuration.id);
         Self {
             focus_handle: cx.focus_handle(),
+            delete_focus_handle: cx.focus_handle(),
             done_focus_handle: cx.focus_handle(),
             rename_cancel_focus_handle: cx.focus_handle(),
             rename_save_focus_handle: cx.focus_handle(),
+            delete_cancel_focus_handle: cx.focus_handle(),
+            delete_confirm_focus_handle: cx.focus_handle(),
             scroll_handle: ScrollHandle::new(),
             multi_workspace,
             selected_configuration_id,
@@ -1020,6 +1050,20 @@ impl WorkspaceConfigurationManagementModal {
         name.focus_handle(cx).focus(window, cx);
         self.mode = WorkspaceConfigurationManagementMode::Rename { id, name };
         self.error = None;
+        cx.notify();
+    }
+
+    fn start_delete(
+        &mut self,
+        id: WorkspaceConfigurationId,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.selected_configuration_id = Some(id);
+        self.mode = WorkspaceConfigurationManagementMode::ConfirmDelete { id, name };
+        self.error = None;
+        self.delete_cancel_focus_handle.focus(window, cx);
         cx.notify();
     }
 
@@ -1075,10 +1119,12 @@ impl WorkspaceConfigurationManagementModal {
     fn focus_next(&mut self, _: &menu::SelectNext, window: &mut Window, cx: &mut Context<Self>) {
         match &self.mode {
             WorkspaceConfigurationManagementMode::List => {
-                if self.done_focus_handle.is_focused(window) {
+                if self.delete_focus_handle.is_focused(window) {
+                    self.done_focus_handle.focus(window, cx);
+                } else if self.done_focus_handle.is_focused(window) {
                     self.focus_handle.focus(window, cx);
                 } else {
-                    self.done_focus_handle.focus(window, cx);
+                    self.delete_focus_handle.focus(window, cx);
                 }
             }
             WorkspaceConfigurationManagementMode::Rename { name, .. } => {
@@ -1088,6 +1134,13 @@ impl WorkspaceConfigurationManagementModal {
                     name.focus_handle(cx).focus(window, cx);
                 } else {
                     self.rename_cancel_focus_handle.focus(window, cx);
+                }
+            }
+            WorkspaceConfigurationManagementMode::ConfirmDelete { .. } => {
+                if self.delete_cancel_focus_handle.is_focused(window) {
+                    self.delete_confirm_focus_handle.focus(window, cx);
+                } else {
+                    self.delete_cancel_focus_handle.focus(window, cx);
                 }
             }
         }
@@ -1102,6 +1155,8 @@ impl WorkspaceConfigurationManagementModal {
         match &self.mode {
             WorkspaceConfigurationManagementMode::List => {
                 if self.done_focus_handle.is_focused(window) {
+                    self.delete_focus_handle.focus(window, cx);
+                } else if self.delete_focus_handle.is_focused(window) {
                     self.focus_handle.focus(window, cx);
                 } else {
                     self.done_focus_handle.focus(window, cx);
@@ -1116,6 +1171,13 @@ impl WorkspaceConfigurationManagementModal {
                     self.rename_save_focus_handle.focus(window, cx);
                 }
             }
+            WorkspaceConfigurationManagementMode::ConfirmDelete { .. } => {
+                if self.delete_confirm_focus_handle.is_focused(window) {
+                    self.delete_cancel_focus_handle.focus(window, cx);
+                } else {
+                    self.delete_confirm_focus_handle.focus(window, cx);
+                }
+            }
         }
     }
 
@@ -1128,9 +1190,27 @@ impl WorkspaceConfigurationManagementModal {
             WorkspaceConfigurationManagementMode::Rename { .. } => {
                 self.rename_cancel_focus_handle.is_focused(window)
             }
+            WorkspaceConfigurationManagementMode::ConfirmDelete { .. } => {
+                self.delete_cancel_focus_handle.is_focused(window)
+            }
         };
         if cancel_is_focused {
             self.cancel(&menu::Cancel, window, cx);
+            return;
+        }
+        if matches!(self.mode, WorkspaceConfigurationManagementMode::List)
+            && self.delete_focus_handle.is_focused(window)
+        {
+            let Some(configuration_id) = self.selected_configuration_id else {
+                return;
+            };
+            let Some(configuration_name) = WorkspaceConfigurationStore::try_global(cx)
+                .and_then(|store| store.configuration(configuration_id))
+                .map(|configuration| configuration.name.clone())
+            else {
+                return;
+            };
+            self.start_delete(configuration_id, configuration_name, window, cx);
             return;
         }
         self.confirm_primary(window, cx);
@@ -1222,6 +1302,66 @@ impl WorkspaceConfigurationManagementModal {
                 })
                 .detach_and_log_err(cx);
             }
+            WorkspaceConfigurationManagementMode::ConfirmDelete { id, name } => {
+                let id = *id;
+                let configuration_name = name.clone();
+                let delete = match self.multi_workspace.update(cx, |multi_workspace, cx| {
+                    multi_workspace.delete_workspace_configuration(id, cx)
+                }) {
+                    Ok(delete) => delete,
+                    Err(error) => {
+                        log::error!(
+                            "failed to start deleting workspace configuration {:?}: {error:#}",
+                            id
+                        );
+                        self.error = Some(format!(
+                            "Couldn't Delete Workspace Configuration\n\n“{configuration_name}” was not deleted. Your workspaces are unchanged. See the Zed log for details."
+                        ));
+                        cx.notify();
+                        return;
+                    }
+                };
+                self.busy = true;
+                self.error = None;
+                cx.notify();
+                cx.spawn_in(window, async move |this, cx| {
+                    let result = delete.await;
+                    this.update_in(cx, |this, window, cx| {
+                        this.busy = false;
+                        match result {
+                            Ok(()) => {
+                                if WorkspaceConfigurationStore::global(cx)
+                                    .configurations()
+                                    .is_empty()
+                                {
+                                    cx.emit(DismissEvent);
+                                } else {
+                                    this.mode = WorkspaceConfigurationManagementMode::List;
+                                    this.error = None;
+                                    this.selected_configuration_id =
+                                        WorkspaceConfigurationStore::global(cx)
+                                            .configurations()
+                                            .first()
+                                            .map(|configuration| configuration.id);
+                                    this.focus_handle.focus(window, cx);
+                                }
+                            }
+                            Err(error) => {
+                                log::error!(
+                                    "failed to delete workspace configuration {:?}: {error:#}",
+                                    id
+                                );
+                                this.error = Some(format!(
+                                    "Couldn't Delete Workspace Configuration\n\n“{configuration_name}” was not deleted. Your workspaces are unchanged. See the Zed log for details."
+                                ));
+                            }
+                        }
+                        cx.notify();
+                    })?;
+                    anyhow::Ok(())
+                })
+                .detach_and_log_err(cx);
+            }
         }
     }
 
@@ -1300,6 +1440,7 @@ impl WorkspaceConfigurationManagementModal {
             }
 
             let rename_name = configuration.name.clone();
+            let delete_name = configuration.name.clone();
             rows.push(
                 h_flex()
                     .id(("workspace-configuration-management-row", index))
@@ -1337,20 +1478,40 @@ impl WorkspaceConfigurationManagementModal {
                             .child(Label::new(configuration.name).truncate()),
                     )
                     .child(
-                        h_flex().flex_none().gap_1().child(
-                            Button::new(("rename-workspace-configuration", index), "Rename")
-                                .style(ButtonStyle::Subtle)
-                                .disabled(self.busy)
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.selected_configuration_id = Some(configuration_id);
-                                    this.start_rename(
-                                        configuration_id,
-                                        rename_name.clone(),
-                                        window,
-                                        cx,
-                                    );
-                                })),
-                        ),
+                        h_flex()
+                            .flex_none()
+                            .gap_1()
+                            .child(
+                                Button::new(("rename-workspace-configuration", index), "Rename")
+                                    .style(ButtonStyle::Subtle)
+                                    .disabled(self.busy)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.selected_configuration_id = Some(configuration_id);
+                                        this.start_rename(
+                                            configuration_id,
+                                            rename_name.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    })),
+                            )
+                            .child(
+                                Button::new(("delete-workspace-configuration", index), "Delete")
+                                    .style(ButtonStyle::Subtle)
+                                    .when(is_selected, |this| {
+                                        this.track_focus(&self.delete_focus_handle)
+                                            .tab_index(0_isize)
+                                    })
+                                    .disabled(self.busy)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.start_delete(
+                                            configuration_id,
+                                            delete_name.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    })),
+                            ),
                     )
                     .into_any_element(),
             );
@@ -1408,6 +1569,30 @@ impl WorkspaceConfigurationManagementModal {
             )
             .into_any_element()
     }
+
+    fn render_delete(&self, name: String, _cx: &mut Context<Self>) -> AnyElement {
+        v_flex()
+            .p_3()
+            .gap_3()
+            .child(
+                h_flex()
+                    .items_start()
+                    .gap_3()
+                    .child(Icon::new(IconName::Trash).color(Color::Error))
+                    .child(
+                        v_flex()
+                            .gap_2()
+                            .child(Label::new(format!("Delete “{name}”?")))
+                            .child(Label::new(
+                                "Its saved set will be removed. Its workspaces and editor state will not be deleted. Any open window using it will keep its current workspaces as an unnamed set.",
+                            )),
+                    ),
+            )
+            .when_some(self.error.clone(), |this, error| {
+                this.child(Label::new(error).size(LabelSize::Small).color(Color::Error))
+            })
+            .into_any_element()
+    }
 }
 
 fn configuration_marker(is_active: bool) -> AnyElement {
@@ -1428,6 +1613,9 @@ impl Focusable for WorkspaceConfigurationManagementModal {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         match &self.mode {
             WorkspaceConfigurationManagementMode::Rename { name, .. } => name.focus_handle(cx),
+            WorkspaceConfigurationManagementMode::ConfirmDelete { .. } => {
+                self.delete_cancel_focus_handle.clone()
+            }
             WorkspaceConfigurationManagementMode::List => self.focus_handle.clone(),
         }
     }
@@ -1456,7 +1644,14 @@ impl Render for WorkspaceConfigurationManagementModal {
             );
             self.focus_handle.focus(window, cx);
         }
-        let content = self.render_list(cx);
+        let mode = self.mode.clone();
+        let content = match &mode {
+            WorkspaceConfigurationManagementMode::List
+            | WorkspaceConfigurationManagementMode::Rename { .. } => self.render_list(cx),
+            WorkspaceConfigurationManagementMode::ConfirmDelete { name, .. } => {
+                self.render_delete(name.clone(), cx)
+            }
+        };
 
         v_flex()
             .debug_selector(|| "WORKSPACE-CONFIGURATION-MANAGEMENT-MODAL".to_string())
@@ -1475,6 +1670,42 @@ impl Render for WorkspaceConfigurationManagementModal {
             .rounded_md()
             .overflow_hidden()
             .child(content)
+            .when(
+                matches!(
+                    mode,
+                    WorkspaceConfigurationManagementMode::ConfirmDelete { .. }
+                ),
+                |this| {
+                    this.child(
+                        h_flex()
+                            .justify_end()
+                            .gap_2()
+                            .p_3()
+                            .border_t_1()
+                            .border_color(cx.theme().colors().border_variant)
+                            .child(
+                                Button::new("cancel-workspace-configuration-management", "Cancel")
+                                    .track_focus(&self.delete_cancel_focus_handle)
+                                    .tab_index(0_isize)
+                                    .disabled(self.busy)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.cancel(&menu::Cancel, window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("confirm-workspace-configuration-management", "Delete")
+                                    .track_focus(&self.delete_confirm_focus_handle)
+                                    .tab_index(1_isize)
+                                    .style(ButtonStyle::Tinted(ui::TintColor::Error))
+                                    .loading(self.busy)
+                                    .disabled(self.busy)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.confirm_primary(window, cx);
+                                    })),
+                            ),
+                    )
+                },
+            )
     }
 }
 

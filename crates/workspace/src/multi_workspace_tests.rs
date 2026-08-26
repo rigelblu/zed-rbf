@@ -337,6 +337,160 @@ async fn workspace_configuration_strict_restore_stays_detached(cx: &mut TestAppC
 }
 
 #[gpui::test]
+async fn workspace_configuration_management_delete_preserves_every_open_window(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    reset_workspace_configuration_store(cx).await;
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/first", json!({ "first.txt": "" })).await;
+    fs.insert_tree("/second", json!({ "second.txt": "" })).await;
+    let first_project = Project::test(fs.clone(), ["/first".as_ref()], cx).await;
+    let second_project = Project::test(fs, ["/second".as_ref()], cx).await;
+
+    let first = {
+        let (multi_workspace, _) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(first_project, window, cx));
+        multi_workspace
+    };
+    let (second, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(second_project, window, cx));
+    for multi_workspace in [&first, &second] {
+        multi_workspace.update(cx, |multi_workspace, cx| {
+            multi_workspace
+                .workspace()
+                .update(cx, |workspace, _| workspace.set_random_database_id());
+        });
+    }
+
+    let save = first.update(cx, |multi_workspace, cx| {
+        multi_workspace.save_configuration_as("Shared Identity".to_string(), cx)
+    });
+    let configuration_id = match save.await {
+        Ok(configuration_id) => configuration_id,
+        Err(error) => panic!("failed to save the delete fixture: {error:#}"),
+    };
+    second.update(cx, |multi_workspace, _| {
+        multi_workspace
+            .set_active_configuration_for_test(configuration_id, Some("stale fixture".to_string()));
+    });
+    let dirty_item = cx.new(|cx| TestItem::new(cx).with_dirty(true));
+    let second_workspace =
+        second.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+    second_workspace.update_in(cx, |workspace, window, cx| {
+        workspace.add_item_to_active_pane(Box::new(dirty_item.clone()), None, true, window, cx);
+    });
+    cx.run_until_parked();
+
+    let first_window_id =
+        first.read_with(cx, |multi_workspace, _| multi_workspace.test_window_id());
+    let second_window_id =
+        second.read_with(cx, |multi_workspace, _| multi_workspace.test_window_id());
+
+    let first_before = first.read_with(cx, |multi_workspace, cx| {
+        (
+            multi_workspace
+                .ordered_workspaces(cx)
+                .into_iter()
+                .map(|workspace| workspace.entity_id())
+                .collect::<Vec<_>>(),
+            multi_workspace.workspace().entity_id(),
+        )
+    });
+    let second_before = second.read_with(cx, |multi_workspace, cx| {
+        (
+            multi_workspace
+                .ordered_workspaces(cx)
+                .into_iter()
+                .map(|workspace| workspace.entity_id())
+                .collect::<Vec<_>>(),
+            multi_workspace.workspace().entity_id(),
+            multi_workspace
+                .workspace()
+                .read(cx)
+                .active_pane()
+                .entity_id(),
+            multi_workspace
+                .workspace()
+                .read(cx)
+                .active_item_as::<TestItem>(cx)
+                .map(|item| (item.entity_id(), item.read(cx).is_dirty)),
+        )
+    });
+
+    let delete = first.update(cx, |multi_workspace, cx| {
+        multi_workspace.delete_workspace_configuration(configuration_id, cx)
+    });
+    if let Err(error) = delete.await {
+        panic!("failed to delete the configuration: {error:#}");
+    }
+    cx.run_until_parked();
+
+    assert!(
+        workspace_configuration(configuration_id, cx).is_none(),
+        "the durable configuration identity should be gone"
+    );
+    first.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(multi_workspace.active_configuration_id(), None);
+        assert_eq!(multi_workspace.configuration_checkpoint_error(), None);
+        assert_eq!(
+            (
+                multi_workspace
+                    .ordered_workspaces(cx)
+                    .into_iter()
+                    .map(|workspace| workspace.entity_id())
+                    .collect::<Vec<_>>(),
+                multi_workspace.workspace().entity_id(),
+            ),
+            first_before,
+            "deleting a configuration must not alter its window"
+        );
+    });
+    second.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(multi_workspace.active_configuration_id(), None);
+        assert_eq!(multi_workspace.configuration_checkpoint_error(), None);
+        assert_eq!(
+            (
+                multi_workspace
+                    .ordered_workspaces(cx)
+                    .into_iter()
+                    .map(|workspace| workspace.entity_id())
+                    .collect::<Vec<_>>(),
+                multi_workspace.workspace().entity_id(),
+                multi_workspace
+                    .workspace()
+                    .read(cx)
+                    .active_pane()
+                    .entity_id(),
+                multi_workspace
+                    .workspace()
+                    .read(cx)
+                    .active_item_as::<TestItem>(cx)
+                    .map(|item| (item.entity_id(), item.read(cx).is_dirty)),
+            ),
+            second_before,
+            "every matching open window must become unnamed in place"
+        );
+    });
+    assert!(dirty_item.read_with(cx, |item, _| item.is_dirty));
+
+    let kvp = cx.update(|_window, cx| KeyValueStore::global(cx));
+    for window_id in [first_window_id, second_window_id] {
+        let state = kvp
+            .scoped("multi_workspace_state")
+            .read(&window_id.as_u64().to_string())
+            .unwrap_or_else(|error| panic!("failed to read detached window state: {error:#}"))
+            .and_then(|json| {
+                serde_json::from_str::<crate::persistence::model::MultiWorkspaceState>(&json).ok()
+            });
+        let Some(state) = state else {
+            panic!("detached window state was not persisted");
+        };
+        assert_eq!(state.active_configuration_id, None);
+    }
+}
+
+#[gpui::test]
 async fn workspace_configuration_strict_restore_failure_changes_nothing(cx: &mut TestAppContext) {
     init_test(cx);
     let app_state = cx.update(AppState::test);
@@ -1751,6 +1905,12 @@ async fn workspace_configuration_ui_keeps_single_workspace_strip_and_switch_acti
     let review_id = save
         .await
         .expect("failed to save the second management UI fixture");
+    let save = multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.save_configuration_as("Concurrent".to_string(), cx)
+    });
+    let concurrent_id = save
+        .await
+        .expect("failed to save the concurrent-deletion UI fixture");
     cx.run_until_parked();
 
     cx.draw(
@@ -1835,6 +1995,45 @@ async fn workspace_configuration_ui_keeps_single_workspace_strip_and_switch_acti
         Some("Review".to_string()),
         "Enter on the rename Cancel button must not save"
     );
+    cx.draw(
+        gpui::point(gpui::px(0.), gpui::px(0.)),
+        gpui::size(gpui::px(800.), gpui::px(600.)),
+        |_, _| multi_workspace.clone().into_any_element(),
+    );
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|window, cx| {
+            multi_workspace
+                .read(cx)
+                .test_workspace_configuration_management_focused_control(window, cx)
+        }),
+        Some("list-delete")
+    );
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert!(
+            multi_workspace.test_workspace_configuration_management_modal_is_confirming_delete(cx),
+            "Delete should be separately keyboard reachable from the selected configuration"
+        );
+    });
+    cx.draw(
+        gpui::point(gpui::px(0.), gpui::px(0.)),
+        gpui::size(gpui::px(800.), gpui::px(600.)),
+        |_, _| multi_workspace.clone().into_any_element(),
+    );
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert!(
+            multi_workspace.test_workspace_configuration_management_modal_is_open(cx),
+            "Enter on the initially focused delete Cancel button should return to the list"
+        );
+        assert!(
+            !multi_workspace.test_workspace_configuration_management_modal_is_confirming_delete(cx)
+        );
+    });
     assert!(workspace_configuration(daily_id, cx).is_some());
     assert!(workspace_configuration(review_id, cx).is_some());
 
@@ -1884,6 +2083,79 @@ async fn workspace_configuration_ui_keeps_single_workspace_strip_and_switch_acti
         |_, _| multi_workspace.clone().into_any_element(),
     );
     cx.simulate_keystrokes("tab enter");
+    cx.run_until_parked();
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert!(
+            multi_workspace.test_workspace_configuration_management_modal_is_confirming_delete(cx),
+            "the renamed configuration should remain selected for deletion"
+        );
+    });
+    cx.draw(
+        gpui::point(gpui::px(0.), gpui::px(0.)),
+        gpui::size(gpui::px(800.), gpui::px(600.)),
+        |_, _| multi_workspace.clone().into_any_element(),
+    );
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|window, cx| {
+            multi_workspace
+                .read(cx)
+                .test_workspace_configuration_management_focused_control(window, cx)
+        }),
+        Some("delete-confirm")
+    );
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(
+        workspace_configuration(review_id, cx).is_none(),
+        "confirmed Delete should remove the selected identity"
+    );
+    assert!(workspace_configuration(daily_id, cx).is_some());
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert!(
+            multi_workspace.test_workspace_configuration_management_modal_is_open(cx),
+            "deleting one configuration should return to the list"
+        );
+    });
+
+    cx.dispatch_action(SelectNextWorkspaceConfiguration);
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        multi_workspace.read_with(cx, |multi_workspace, cx| {
+            multi_workspace.test_workspace_configuration_management_rename_text(cx)
+        }),
+        Some("Concurrent".to_string())
+    );
+    let delete = multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.delete_workspace_configuration(concurrent_id, cx)
+    });
+    delete
+        .await
+        .expect("failed to delete the configuration being renamed");
+    cx.run_until_parked();
+    cx.draw(
+        gpui::point(gpui::px(0.), gpui::px(0.)),
+        gpui::size(gpui::px(800.), gpui::px(600.)),
+        |_, _| multi_workspace.clone().into_any_element(),
+    );
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert!(multi_workspace.test_workspace_configuration_management_modal_is_open(cx));
+        assert!(
+            !multi_workspace.test_workspace_configuration_management_modal_is_renaming(cx),
+            "deleting a configuration in another window must not orphan its inline rename"
+        );
+    });
+    assert!(workspace_configuration(concurrent_id, cx).is_none());
+
+    cx.draw(
+        gpui::point(gpui::px(0.), gpui::px(0.)),
+        gpui::size(gpui::px(800.), gpui::px(600.)),
+        |_, _| multi_workspace.clone().into_any_element(),
+    );
+    cx.simulate_keystrokes("tab tab enter");
     cx.run_until_parked();
     multi_workspace.read_with(cx, |multi_workspace, cx| {
         assert!(
