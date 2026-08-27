@@ -6,6 +6,7 @@ title: "Zed RBF Changelog"
 - 2026-08-26 - feat (ux) | rename any saved workspace configuration without switching to it, so a growing saved list stays recognizable (#zed-64) [@zed-rbf]
 - 2026-08-26 - feat (ux) | delete an obsolete or broken saved workspace configuration without closing its open workspaces or losing their editor state, even when deleting the active configuration (#zed-64) [@zed-rbf]
 - 2026-08-27 - fix (ux) | drag the window by the title bar above the workspace strip, and get back the 78px the title bar was still reserving for traffic lights that sit over the strip, instead of a dead band left of the project name that neither moves the window nor holds anything (#zed-65) [@zed-rbf]
+- 2026-08-27 - fix (ux) | close workspace tabs as many times as you like without the Workspaces strip filling up with `Empty Workspace` rows that nothing can clear (#zed-66) [@zed-rbf]
 
 ---
 

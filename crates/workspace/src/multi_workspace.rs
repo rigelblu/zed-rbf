@@ -36,6 +36,7 @@ use crate::{
         WorkspaceConfigurationMutation, WorkspaceConfigurationStore,
         model::{MultiWorkspaceState, WorkspaceConfigurationId, WorkspaceConfigurationMember},
     },
+    workspace_tabs::workspace_tab_paths,
 };
 
 actions!(
@@ -2651,6 +2652,23 @@ impl MultiWorkspace {
     /// Detaches a workspace: clears session state, DB binding, cached
     /// group key, and emits `WorkspaceRemoved`. The DB row is preserved
     /// so the workspace still appears in the recent-projects list.
+    /// Whether `workspace` is still nothing but a placeholder, and so safe to drop.
+    ///
+    /// Both callers mint an empty workspace to hold the window across an await, then
+    /// detach it once the real workspace opens. Asking only whether it is still pinned is
+    /// not enough: the await covers filesystem and database work, and a user looking at
+    /// the empty window can drop a folder onto it. That adds a visible worktree to *this*
+    /// workspace's project rather than opening a new workspace, so a pinned-only guard
+    /// would discard their project without a prompt or a log line.
+    ///
+    /// Requiring it to still be undisplayed also keeps `detach_workspace`'s re-point
+    /// assertion unreachable from these call sites.
+    fn placeholder_is_disposable(&self, workspace: &Entity<Workspace>, cx: &App) -> bool {
+        self.held_index(workspace).is_some()
+            && self.workspace() != workspace
+            && workspace_tab_paths(workspace.read(cx), cx).is_empty()
+    }
+
     fn detach_workspace(&mut self, workspace: &Entity<Workspace>, cx: &mut Context<Self>) {
         if let Some(index) = self.held_index(workspace) {
             assert_ne!(
@@ -2973,6 +2991,15 @@ impl MultiWorkspace {
         tasks
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_placeholder_is_disposable(
+        &self,
+        workspace: &Entity<Workspace>,
+        cx: &App,
+    ) -> bool {
+        self.placeholder_is_disposable(workspace, cx)
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn test_expand_all_groups(&mut self) {
         self.set_all_groups_expanded(true);
@@ -3227,6 +3254,7 @@ impl MultiWorkspace {
 
             // Edit phase: one synchronous update. Delete the rows, then pick
             // the replacement from the rows that actually remain.
+            let mut placeholder = None;
             let (removed_any, reopen_key) = this.update_in(cx, |this, window, cx| {
                 let mut removed_any = false;
                 let displayed_workspace = this.workspace().clone();
@@ -3282,7 +3310,17 @@ impl MultiWorkspace {
                                 project::LocalProjectFlags::default(),
                                 cx,
                             );
-                            cx.new(|cx| Workspace::new(None, project, app_state, window, cx))
+                            let empty =
+                                cx.new(|cx| Workspace::new(None, project, app_state, window, cx));
+                            // `#zed-66`: this empty is only a placeholder when something
+                            // else is about to be opened; with no `reopen_key` it *is* the
+                            // replacement and must stay. It has to exist across the await
+                            // either way, because `detach_workspace` asserts the displayed
+                            // workspace is re-pointed before it is detached.
+                            if reopen_key.is_some() {
+                                placeholder = Some(empty.clone());
+                            }
+                            empty
                         });
 
                     this.activate(replacement, None, window, cx);
@@ -3305,18 +3343,41 @@ impl MultiWorkspace {
             })?;
 
             if let Some(key) = reopen_key {
-                this.update_in(cx, |this, window, cx| {
-                    this.find_or_create_local_workspace(
-                        key.path_list().clone(),
-                        Some(key),
-                        None,
-                        OpenMode::Activate,
-                        None,
-                        window,
-                        cx,
-                    )
-                })?
-                .await?;
+                let reopened = this
+                    .update_in(cx, |this, window, cx| {
+                        this.find_or_create_local_workspace(
+                            key.path_list().clone(),
+                            Some(key),
+                            None,
+                            OpenMode::Activate,
+                            None,
+                            window,
+                            cx,
+                        )
+                    })?
+                    .await?;
+
+                // `#zed-66`: the reopen landed, so the placeholder has served its purpose.
+                // Left held it becomes an `Empty Workspace` row that no close ever clears,
+                // and every subsequent close strands another.
+                //
+                // A failed reopen never reaches here. That is deliberate — the window keeps
+                // its placeholder rather than going blank — but it is a real trade, not a
+                // free one: while the reopen keeps failing, closing *other* workspaces
+                // strands one placeholder each, which is the original symptom. Closing the
+                // stranded empty itself does not compound, because its group key has an
+                // empty path list, so no adjacent group is found and the next empty is the
+                // legitimate replacement.
+                if let Some(placeholder) = placeholder
+                    && placeholder != reopened
+                {
+                    this.update(cx, |this, cx| {
+                        if this.placeholder_is_disposable(&placeholder, cx) {
+                            this.detach_workspace(&placeholder, cx);
+                            cx.notify();
+                        }
+                    })?;
+                }
             }
 
             Ok(removed_any)
@@ -3374,8 +3435,11 @@ impl MultiWorkspace {
                     && empty_workspace != new_workspace
                 {
                     this.update(cx, |this, cx| {
-                        if this.is_workspace_retained(&empty_workspace) {
+                        // `#zed-66`: same exposure as `remove`'s placeholder cleanup —
+                        // `empty_workspace` is captured before an await.
+                        if this.placeholder_is_disposable(&empty_workspace, cx) {
                             this.detach_workspace(&empty_workspace, cx);
+                            cx.notify();
                         }
                     })?;
                 }

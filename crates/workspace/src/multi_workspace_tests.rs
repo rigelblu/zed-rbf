@@ -7,6 +7,7 @@ use crate::multi_workspace::{
     SelectPreviousWorkspaceConfiguration, WorkspaceConfigurationSwitchTestStage,
 };
 use crate::persistence::WorkspaceConfigurationStore;
+use crate::workspace_tabs::workspace_tab_paths;
 use agent_settings::AgentSettings;
 use client::proto;
 use db::kvp::KeyValueStore;
@@ -5634,4 +5635,210 @@ async fn workspace_configuration_checkpoint_quit_after_save(cx: &mut TestAppCont
     }
     let app = cx.cx.clone();
     app.quit();
+}
+
+#[gpui::test]
+async fn test_closing_workspace_tabs_does_not_accumulate_empty_workspaces(cx: &mut TestAppContext) {
+    init_test(cx);
+    reset_workspace_configuration_store(cx).await;
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "a.txt": "" })).await;
+    fs.insert_tree("/root_b", json!({ "b.txt": "" })).await;
+    fs.insert_tree("/root_c", json!({ "c.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs.clone(), ["/root_b".as_ref()], cx).await;
+    let project_c = Project::test(fs.clone(), ["/root_c".as_ref()], cx).await;
+    cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b, window, cx);
+        multi_workspace.test_add_workspace(project_c, window, cx);
+    });
+    cx.run_until_parked();
+
+    // Closing the displayed workspace reopens an adjacent project group, and the empty
+    // workspace minted to hold the window during that reopen used to stay held. Four
+    // closes therefore left four `Empty Workspace` rows nothing could clear.
+    for round in 0..4 {
+        let doomed = multi_workspace.read_with(cx, |multi_workspace, _cx| {
+            multi_workspace.workspace().clone()
+        });
+        multi_workspace
+            .update_in(cx, |multi_workspace, window, cx| {
+                multi_workspace.close_workspace(&doomed, window, cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        let empty_rows = multi_workspace.read_with(cx, |multi_workspace, cx| {
+            multi_workspace
+                .workspaces()
+                .filter(|workspace| workspace_tab_paths(workspace.read(cx), cx).is_empty())
+                .count()
+        });
+        assert_eq!(
+            empty_rows, 0,
+            "round {round}: closing a workspace stranded {empty_rows} empty workspace(s)"
+        );
+    }
+}
+
+#[gpui::test]
+async fn test_closing_the_last_workspace_leaves_exactly_one_empty(cx: &mut TestAppContext) {
+    init_test(cx);
+    reset_workspace_configuration_store(cx).await;
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "a.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    cx.run_until_parked();
+
+    // With no adjacent group to reopen, the empty is the real replacement, not a
+    // placeholder — the window must never be left with nothing.
+    let doomed = multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        multi_workspace.workspace().clone()
+    });
+    multi_workspace
+        .update_in(cx, |multi_workspace, window, cx| {
+            multi_workspace.close_workspace(&doomed, window, cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+
+    let held: Vec<bool> = multi_workspace.read_with(cx, |multi_workspace, cx| {
+        multi_workspace
+            .workspaces()
+            .map(|workspace| workspace_tab_paths(workspace.read(cx), cx).is_empty())
+            .collect()
+    });
+    assert_eq!(
+        held,
+        vec![true],
+        "closing the only workspace should leave exactly one empty workspace"
+    );
+}
+
+#[gpui::test]
+async fn test_keep_project_removal_does_not_strand_an_empty_workspace(cx: &mut TestAppContext) {
+    init_test(cx);
+    reset_workspace_configuration_store(cx).await;
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "a.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    cx.run_until_parked();
+
+    // `KeepProject` is the second source of `reopen_key` and reaches the placeholder
+    // branch on a one-project window: no same-group member, no neighbour to fall back to.
+    // The `CloseProject` tests never exercise it.
+    let doomed = multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        multi_workspace.workspace().clone()
+    });
+    multi_workspace
+        .update_in(cx, |multi_workspace, window, cx| {
+            multi_workspace.remove([doomed], RemovalIntent::KeepProject, window, cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+
+    let (total, empty) = multi_workspace.read_with(cx, |multi_workspace, cx| {
+        let all: Vec<_> = multi_workspace.workspaces().cloned().collect();
+        let empty = all
+            .iter()
+            .filter(|workspace| workspace_tab_paths(workspace.read(cx), cx).is_empty())
+            .count();
+        (all.len(), empty)
+    });
+    assert_eq!(
+        (total, empty),
+        (1, 0),
+        "KeepProject reopens the project it kept, so no empty placeholder should survive"
+    );
+}
+
+#[gpui::test]
+async fn test_placeholder_is_disposable_only_while_it_is_still_empty(cx: &mut TestAppContext) {
+    init_test(cx);
+    reset_workspace_configuration_store(cx).await;
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "a.txt": "" })).await;
+    fs.insert_tree("/root_b", json!({ "b.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs.clone(), ["/root_b".as_ref()], cx).await;
+    cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    let workspace_b = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b, window, cx)
+    });
+    cx.run_until_parked();
+
+    // Stand in for the placeholder `remove` mints: an empty workspace, held and not
+    // displayed. The end-to-end race — a folder dropped while the reopen still awaits —
+    // has no test hook to interleave on, so witness the predicate the guard turns on.
+    let placeholder = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        let app_state = multi_workspace.workspace().read(cx).app_state().clone();
+        let project = Project::local(
+            app_state.client.clone(),
+            app_state.node_runtime.clone(),
+            app_state.user_store.clone(),
+            app_state.languages.clone(),
+            app_state.fs.clone(),
+            None,
+            project::LocalProjectFlags::default(),
+            cx,
+        );
+        let placeholder = cx.new(|cx| Workspace::new(None, project, app_state, window, cx));
+        multi_workspace.activate(placeholder.clone(), None, window, cx);
+        multi_workspace.activate(workspace_b.clone(), None, window, cx);
+        placeholder
+    });
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert!(
+            multi_workspace.test_placeholder_is_disposable(&placeholder, cx),
+            "a held, undisplayed, empty placeholder is exactly what the cleanup may drop"
+        );
+    });
+
+    // Now it holds the user's project — the case a pinned-only guard got wrong.
+    placeholder
+        .update_in(cx, |workspace, window, cx| {
+            workspace.open_paths(
+                vec![PathBuf::from("/root_a")],
+                crate::OpenOptions {
+                    visible: Some(crate::OpenVisible::All),
+                    ..Default::default()
+                },
+                None,
+                window,
+                cx,
+            )
+        })
+        .await;
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert!(
+            !multi_workspace.test_placeholder_is_disposable(&placeholder, cx),
+            "once it holds a worktree it is the user's project, not a disposable placeholder"
+        );
+        assert!(
+            multi_workspace.is_workspace_retained(&placeholder),
+            "and it is still pinned — which is why the pinned-only guard discarded it"
+        );
+    });
 }

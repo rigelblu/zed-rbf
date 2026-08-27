@@ -1825,7 +1825,7 @@ impl Render for DraggedWorkspaceTab {
     }
 }
 
-fn workspace_tab_paths(workspace: &Workspace, cx: &App) -> Vec<PathBuf> {
+pub(crate) fn workspace_tab_paths(workspace: &Workspace, cx: &App) -> Vec<PathBuf> {
     workspace
         .root_paths(cx)
         .into_iter()
