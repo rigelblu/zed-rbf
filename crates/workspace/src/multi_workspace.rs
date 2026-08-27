@@ -3188,7 +3188,7 @@ impl MultiWorkspace {
     /// remains: another workspace in the same project, then a workspace in the
     /// nearest neighboring project, then an empty workspace. When the intent is
     /// `KeepProject` and the project has no other workspace, its root worktrees
-    /// are reopened afterwards; the same applies to the adjacent local project
+    /// are reopened afterwards; under `RemovalIntent::KeepProject` the same applies to the adjacent local project
     /// when nothing at all remains.
     ///
     /// Returns `true` if any workspaces were actually removed.
@@ -3294,7 +3294,15 @@ impl MultiWorkspace {
                                 .find_map(|key| this.live_member_for_group(key, doomed, cx))
                         })
                         .unwrap_or_else(|| {
-                            if reopen_key.is_none() {
+                            // `#zed-68`: `adjacent_key` comes from `project_groups`, which
+                            // holds groups with no live workspace, so reopening from it
+                            // loads a project the user never had open. That is right for
+                            // `KeepProject` — the caller asked to keep the project — and
+                            // wrong for an explicit close, where it reads as "I closed my
+                            // only workspace and something unrelated appeared". With no
+                            // reopen the empty below is the legitimate replacement, not a
+                            // placeholder, so the ✕ path also stops flashing a phantom row.
+                            if reopen_key.is_none() && intent == RemovalIntent::KeepProject {
                                 reopen_key = adjacent_key.clone().filter(|key| {
                                     key.host().is_none() && !key.path_list().is_empty()
                                 });

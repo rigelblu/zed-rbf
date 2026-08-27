@@ -4369,7 +4369,7 @@ async fn test_close_workspace_prefers_workspace_in_same_project_group(cx: &mut T
 }
 
 #[gpui::test]
-async fn test_close_workspace_opens_unloaded_local_neighbor(cx: &mut TestAppContext) {
+async fn test_close_workspace_does_not_open_unloaded_local_neighbor(cx: &mut TestAppContext) {
     init_test(cx);
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree("/project-a", json!({})).await;
@@ -4406,16 +4406,26 @@ async fn test_close_workspace_opens_unloaded_local_neighbor(cx: &mut TestAppCont
 
     assert!(closed, "close_workspace should remove the active workspace");
     multi_workspace.read_with(cx, |multi_workspace, cx| {
-        assert_eq!(
-            multi_workspace.workspace().read(cx).project_group_key(cx),
-            key_b,
-            "the unloaded local neighboring group should be opened"
+        // `#zed-68`: DELIBERATE DIVERGENCE from upstream PR #60602, which asserted
+        // `key_b` here — that closing reaches into `project_groups` and opens a neighbour
+        // that was never open. Tom hit that dogfooding `#zed-66`: he closed his only
+        // workspace and an unrelated project from history appeared. An explicit close now
+        // closes. Switching to an *already-open* neighbour is unchanged and still covered
+        // by `test_close_workspace_prefers_already_loaded_neighboring_workspace`.
+        assert!(
+            multi_workspace
+                .workspace()
+                .read(cx)
+                .project_group_key(cx)
+                .path_list()
+                .is_empty(),
+            "an explicit close should leave an empty workspace, not open {key_b:?}"
         );
     });
 }
 
 #[gpui::test]
-async fn test_remove_project_group_opens_unloaded_local_neighbor(cx: &mut TestAppContext) {
+async fn test_remove_project_group_does_not_open_unloaded_local_neighbor(cx: &mut TestAppContext) {
     init_test(cx);
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree("/project-a", json!({})).await;
@@ -4449,10 +4459,20 @@ async fn test_remove_project_group_opens_unloaded_local_neighbor(cx: &mut TestAp
     );
 
     multi_workspace.read_with(cx, |multi_workspace, cx| {
-        assert_eq!(
-            multi_workspace.workspace().read(cx).project_group_key(cx),
-            key_b,
-            "the unloaded local neighboring group should be opened"
+        // `#zed-68`: DELIBERATE DIVERGENCE from upstream PR #60602, which asserted
+        // `key_b` here — that closing reaches into `project_groups` and opens a neighbour
+        // that was never open. Tom hit that dogfooding `#zed-66`: he closed his only
+        // workspace and an unrelated project from history appeared. An explicit close now
+        // closes. Switching to an *already-open* neighbour is unchanged and still covered
+        // by `test_close_workspace_prefers_already_loaded_neighboring_workspace`.
+        assert!(
+            multi_workspace
+                .workspace()
+                .read(cx)
+                .project_group_key(cx)
+                .path_list()
+                .is_empty(),
+            "an explicit close should leave an empty workspace, not open {key_b:?}"
         );
     });
 }
@@ -5658,9 +5678,17 @@ async fn test_closing_workspace_tabs_does_not_accumulate_empty_workspaces(cx: &m
     });
     cx.run_until_parked();
 
-    // Closing the displayed workspace reopens an adjacent project group, and the empty
-    // workspace minted to hold the window during that reopen used to stay held. Four
-    // closes therefore left four `Empty Workspace` rows nothing could clear.
+    // The empty workspace minted to hold the window during a reopen used to stay held, so
+    // four closes left four `Empty Workspace` rows nothing could clear. Since `#zed-68`
+    // an explicit close no longer reopens an adjacent group, so the reachable shape is one
+    // empty at the end — never a growing pile.
+    //
+    // NOTE: this test no longer witnesses `#zed-66`'s placeholder cleanup. `close_workspace`
+    // uses `CloseProject`, which since `#zed-68` can never set `reopen_key`, so the cleanup
+    // is unreachable from here. Deleting that cleanup leaves this test green. The one test
+    // that does witness it is `test_keep_project_removal_does_not_strand_an_empty_workspace`
+    // — verified by mutation on 2026-08-27. This test still guards the user-visible
+    // invariant the defect was reported as, which is why it stays.
     for round in 0..4 {
         let doomed = multi_workspace.read_with(cx, |multi_workspace, _cx| {
             multi_workspace.workspace().clone()
@@ -5679,9 +5707,12 @@ async fn test_closing_workspace_tabs_does_not_accumulate_empty_workspaces(cx: &m
                 .filter(|workspace| workspace_tab_paths(workspace.read(cx), cx).is_empty())
                 .count()
         });
-        assert_eq!(
-            empty_rows, 0,
-            "round {round}: closing a workspace stranded {empty_rows} empty workspace(s)"
+        // At most one, ever. `#zed-68` makes a single empty the correct end state once the
+        // real workspaces are gone, so "none" is the wrong invariant — "never a pile" is
+        // the one this defect was about.
+        assert!(
+            empty_rows <= 1,
+            "round {round}: closing a workspace left {empty_rows} empty workspaces"
         );
     }
 }
@@ -5839,6 +5870,135 @@ async fn test_placeholder_is_disposable_only_while_it_is_still_empty(cx: &mut Te
         assert!(
             multi_workspace.is_workspace_retained(&placeholder),
             "and it is still pinned — which is why the pinned-only guard discarded it"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_closing_a_workspace_never_opens_a_project_that_was_not_open(cx: &mut TestAppContext) {
+    init_test(cx);
+    reset_workspace_configuration_store(cx).await;
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "a.txt": "" })).await;
+    fs.insert_tree("/root_b", json!({ "b.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs.clone(), ["/root_b".as_ref()], cx).await;
+    let project_b_key = project_b.read_with(cx, |project, cx| project.project_group_key(cx));
+    cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+
+    // Opening the sidebar is what establishes the workspaces' project groups. Without it
+    // `project_groups` never holds the closing workspace's own group, `group_index` is
+    // `None`, `adjacent_key` is `None`, and the branch under test cannot fire at all —
+    // which made an earlier version of this test pass with the fix reverted.
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.open_sidebar(cx);
+    });
+    cx.run_until_parked();
+
+    // `/root_b` is a known project group with no live workspace — exactly the shape that
+    // used to get reopened when the user closed their last live workspace.
+    multi_workspace.update_in(cx, |multi_workspace, _window, _cx| {
+        multi_workspace.test_add_project_group(ProjectGroup {
+            key: project_b_key.clone(),
+            workspaces: Vec::new(),
+            expanded: true,
+        });
+    });
+    cx.run_until_parked();
+
+    let doomed = multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        multi_workspace.workspace().clone()
+    });
+    multi_workspace
+        .update_in(cx, |multi_workspace, window, cx| {
+            multi_workspace.close_workspace(&doomed, window, cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+
+    let paths: Vec<Vec<String>> = multi_workspace.read_with(cx, |multi_workspace, cx| {
+        multi_workspace
+            .workspaces()
+            .map(|workspace| {
+                workspace_tab_paths(workspace.read(cx), cx)
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect()
+            })
+            .collect()
+    });
+    assert_eq!(
+        paths,
+        vec![Vec::<String>::new()],
+        "closing the only workspace should leave one empty workspace, not open /root_b"
+    );
+}
+
+#[gpui::test]
+async fn test_keep_project_removal_of_remote_workspace_reopens_local_neighbor(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    reset_workspace_configuration_store(cx).await;
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_local", json!({ "a.txt": "" })).await;
+    let project_remote = Project::test(fs.clone(), [], cx).await;
+    cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_remote, window, cx));
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.open_sidebar(cx);
+    });
+    cx.run_until_parked();
+
+    // `#zed-68` gated the `adjacent_key` reopen on `KeepProject`, and inverting the two
+    // upstream tests left that branch with no witness at all — it could be deleted whole
+    // and every test stayed green. It is still live on exactly this shape: `KeepProject`,
+    // a group key with no paths (so the first `reopen_key` source is skipped), no live
+    // neighbour, and a local adjacent group to fall back to.
+    // Both groups must be registered and in this order: `group_index` is the doomed
+    // workspace's own position in `project_groups`, and `adjacent_key` is index + 1.
+    // Without the doomed group present, `group_index` is `None` and the branch is
+    // unreachable — which is what made the first version of this test fail.
+    let doomed_key = multi_workspace.read_with(cx, |multi_workspace, cx| {
+        multi_workspace.workspace().read(cx).project_group_key(cx)
+    });
+    let local_key = ProjectGroupKey::new(None, PathList::new(&[PathBuf::from("/root_local")]));
+    multi_workspace.update(cx, |multi_workspace, _cx| {
+        multi_workspace.test_add_project_group(ProjectGroup {
+            key: doomed_key.clone(),
+            workspaces: Vec::new(),
+            expanded: true,
+        });
+        multi_workspace.test_add_project_group(ProjectGroup {
+            key: local_key.clone(),
+            workspaces: Vec::new(),
+            expanded: true,
+        });
+    });
+    cx.run_until_parked();
+
+    let doomed = multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        multi_workspace.workspace().clone()
+    });
+    multi_workspace
+        .update_in(cx, |multi_workspace, window, cx| {
+            multi_workspace.remove([doomed], RemovalIntent::KeepProject, window, cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(
+            multi_workspace.workspace().read(cx).project_group_key(cx),
+            local_key,
+            "KeepProject with nothing live left should still reopen the local adjacent group"
         );
     });
 }
