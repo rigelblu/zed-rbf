@@ -348,7 +348,19 @@ impl WelcomePage {
                     // Only the same-window case. `open_project`'s retention branch opens with
                     // `OpenMode::Activate` regardless of what it is handed, so routing a
                     // `NewWindow` request through it would quietly ignore the setting.
-                    if open_mode == OpenMode::Activate
+                    // Route on the *effective* mode, not the configured one.
+                    // `open_workspace_for_paths` coerces `NewWindow` to `Activate` when
+                    // the calling workspace holds nothing — which is exactly this bug's
+                    // precondition — so `default_open_behavior: "new_window"` still
+                    // reuses this window, and asking only about `open_mode` would leave
+                    // that configuration stranding the row this fix exists to remove.
+                    let opens_into_this_window = open_mode == OpenMode::Activate
+                        || self
+                            .workspace
+                            .upgrade()
+                            .is_some_and(|workspace| workspace.read(cx).holds_nothing(cx));
+
+                    if opens_into_this_window
                         && let Some(multi_workspace) =
                             window.window_handle().downcast::<crate::MultiWorkspace>()
                     {
@@ -356,7 +368,8 @@ impl WelcomePage {
                         // the window's own update, and re-entering it through the handle
                         // fails with "window not found" — silently, because the error is
                         // only logged and a click would simply do nothing. Both sibling
-                        // recent-project surfaces spawn for the same reason.
+                        // recent-project surfaces escape the update for the same reason,
+                        // though the sidebar uses `cx.defer` rather than a spawn.
                         window
                             .spawn(cx, async move |cx| {
                                 if let Some(task) = multi_workspace

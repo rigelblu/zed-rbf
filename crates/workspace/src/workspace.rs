@@ -3732,6 +3732,19 @@ impl Workspace {
         })
     }
 
+    /// Whether this workspace holds nothing a user would lose by reusing its window.
+    ///
+    /// `#zed-66.3`: opening a project into an empty workspace reuses its window **even
+    /// when the setting asks for a new one** — `open_workspace_for_paths` coerces
+    /// `OpenMode::NewWindow` to `Activate` here. Anything deciding "does this open into
+    /// the current window" has to ask this, not the configured mode, or it will reason
+    /// about a new window that never gets created.
+    pub fn holds_nothing(&self, cx: &App) -> bool {
+        !self.project.read(cx).is_via_collab()
+            && self.project.read(cx).worktrees(cx).next().is_none()
+            && !self.items(cx).any(|item| item.is_dirty(cx))
+    }
+
     pub fn open_workspace_for_paths(
         &mut self,
         // replace_current_window: bool,
@@ -3741,12 +3754,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Workspace>>> {
         let requesting_window = window.window_handle().downcast::<MultiWorkspace>();
-        let is_remote = self.project.read(cx).is_via_collab();
-        let has_worktree = self.project.read(cx).worktrees(cx).next().is_some();
-        let has_dirty_items = self.items(cx).any(|item| item.is_dirty(cx));
 
-        let workspace_is_empty = !is_remote && !has_worktree && !has_dirty_items;
-        if workspace_is_empty {
+        if self.holds_nothing(cx) {
             open_mode = OpenMode::Activate;
         }
 

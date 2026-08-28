@@ -6046,9 +6046,88 @@ async fn test_welcome_recent_list_does_not_strand_an_empty_workspace(cx: &mut Te
             "the empty workspace it was opened from is detached, not merely hidden — \
              hiding it would be `#zed-66.2`'s filter papering over a stranded workspace"
         );
+        assert_eq!(
+            workspace_tab_paths(multi_workspace.workspace().read(cx), cx),
+            vec![std::path::PathBuf::from(path!("/root_b"))],
+            "and the workspace on screen is the one that was clicked — asserting merely \
+             non-empty would pass with root_a still displayed"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_welcome_recent_list_does_not_strand_under_new_window_setting(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    // The configuration the first draft of `#zed-66.3` left stranding, found by the cold
+    // review. `open_workspace_for_paths` coerces `NewWindow` to `Activate` when the
+    // calling workspace holds nothing, so this setting still reuses the window — routing
+    // on the configured mode rather than the effective one missed exactly this case.
+    cx.update_global::<SettingsStore, ()>(|store, cx| {
+        store.update_user_settings(cx, |s| {
+            s.workspace.default_open_behavior = Some(settings::DefaultOpenBehavior::NewWindow);
+        });
+    });
+    reset_workspace_configuration_store(cx).await;
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/root_a"), json!({ "a.txt": "" }))
+        .await;
+    fs.insert_tree(path!("/root_b"), json!({ "b.txt": "" }))
+        .await;
+    let project_a = Project::test(fs.clone(), [path!("/root_a").as_ref()], cx).await;
+    cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    cx.run_until_parked();
+
+    let empty = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        let app_state = multi_workspace.workspace().read(cx).app_state().clone();
+        let project = Project::local(
+            app_state.client.clone(),
+            app_state.node_runtime.clone(),
+            app_state.user_store.clone(),
+            app_state.languages.clone(),
+            app_state.fs.clone(),
+            None,
+            project::LocalProjectFlags::default(),
+            cx,
+        );
+        let empty = cx.new(|cx| Workspace::new(None, project, app_state, window, cx));
+        multi_workspace.activate(empty.clone(), None, window, cx);
+        empty
+    });
+    cx.run_until_parked();
+
+    let recent = vec![crate::persistence::RecentWorkspace {
+        workspace_id: Default::default(),
+        location: crate::SerializedWorkspaceLocation::Local,
+        paths: crate::PathList::new(&[path!("/root_b")]),
+        identity_paths: crate::PathList::new(&[path!("/root_b")]),
+        timestamp: chrono::Utc::now(),
+    }];
+
+    let welcome = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        let workspace = multi_workspace.workspace().downgrade();
+        cx.new(|cx| {
+            crate::welcome::WelcomePage::test_new_with_recent_workspaces(
+                workspace, recent, window, cx,
+            )
+        })
+    });
+    cx.run_until_parked();
+
+    welcome.update_in(cx, |welcome, window, cx| {
+        welcome.test_open_recent_project(0, window, cx)
+    });
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |multi_workspace, _cx| {
         assert!(
-            !workspace_tab_paths(multi_workspace.workspace().read(cx), cx).is_empty(),
-            "and the displayed workspace is the real project"
+            !multi_workspace.workspaces().any(|held| held == &empty),
+            "the empty workspace is detached even though the setting says new window, \
+             because an empty workspace reuses its window regardless of that setting"
         );
     });
 }
