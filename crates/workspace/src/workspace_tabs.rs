@@ -88,7 +88,7 @@ impl MultiWorkspace {
         // new workspace activating and the placeholder detaching — making the whole
         // strip appear and vanish for a user who has no saved configurations, rather
         // than just gaining and losing a row.
-        self.workspace_tab_count(cx) >= 2 || has_saved_configurations || store_requires_recovery
+        self.workspace_tab_count() >= 2 || has_saved_configurations || store_requires_recovery
     }
 
     pub(crate) fn render_workspace_tabs(

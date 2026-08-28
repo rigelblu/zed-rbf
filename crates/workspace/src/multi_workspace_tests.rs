@@ -5964,6 +5964,65 @@ async fn test_workspace_tab_rows_omit_a_disposable_placeholder(cx: &mut TestAppC
 }
 
 #[gpui::test]
+async fn test_cycling_never_lands_on_a_hidden_placeholder(cx: &mut TestAppContext) {
+    init_test(cx);
+    reset_workspace_configuration_store(cx).await;
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "a.txt": "" })).await;
+    fs.insert_tree("/root_b", json!({ "b.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs.clone(), ["/root_b".as_ref()], cx).await;
+    cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    let workspace_a = multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        multi_workspace.workspace().clone()
+    });
+    let workspace_b = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        let workspace_b = multi_workspace.test_add_workspace(project_b, window, cx);
+        multi_workspace.activate(workspace_a.clone(), None, window, cx);
+        workspace_b
+    });
+    cx.run_until_parked();
+
+    let placeholder = mint_held_placeholder(&multi_workspace, &workspace_a, cx);
+
+    // `cycle_workspace_tab` reads the strip's list for exactly this reason: `activate`
+    // would *display* whatever it lands on, so cycling onto a hidden placeholder puts
+    // the `Empty Workspace` row back on screen — the defect this slice removes, through
+    // a different door. Three steps, because two drawable rows means an unfiltered list
+    // of three only reaches the placeholder on the second or third.
+    for step in 0..3 {
+        multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+            multi_workspace.cycle_workspace_tab(true, window, cx)
+        });
+        cx.run_until_parked();
+
+        multi_workspace.read_with(cx, |multi_workspace, _cx| {
+            assert_ne!(
+                multi_workspace.workspace(),
+                &placeholder,
+                "cycling step {step} displayed the placeholder the strip refuses to draw"
+            );
+        });
+    }
+
+    // Which rows are drawn, not their order — cycling activates, and `ordered_workspaces`
+    // orders by `project_groups`, so the two real rows legitimately swap places.
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        let rows = multi_workspace.ordered_workspace_tabs(cx);
+        assert_eq!(rows.len(), 2, "cycling drew a row it should not have");
+        assert!(rows.contains(&workspace_a), "workspace A kept its row");
+        assert!(rows.contains(&workspace_b), "workspace B kept its row");
+        assert!(
+            !rows.contains(&placeholder),
+            "and the placeholder never gained one"
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_workspace_tab_rows_keep_the_displayed_empty_workspace(cx: &mut TestAppContext) {
     init_test(cx);
     reset_workspace_configuration_store(cx).await;
@@ -6089,7 +6148,7 @@ async fn test_strip_stays_hidden_while_a_placeholder_is_held(cx: &mut TestAppCon
              cross the threshold"
         );
         assert_eq!(
-            multi_workspace.workspace_tab_count(cx),
+            multi_workspace.workspace_tab_count(),
             1,
             "but only one of them is drawable"
         );
@@ -6166,7 +6225,7 @@ async fn test_saved_configuration_still_shows_the_strip_with_a_placeholder_held(
     // count. This slice must not reach into that branch.
     multi_workspace.read_with(cx, |multi_workspace, cx| {
         assert_eq!(
-            multi_workspace.workspace_tab_count(cx),
+            multi_workspace.workspace_tab_count(),
             1,
             "fixture precondition: one drawable row, so the count branch cannot be what \
              makes the strip visible"

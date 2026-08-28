@@ -406,6 +406,18 @@ pub struct MultiWorkspace {
     /// mouse-move. See `workspace_tabs.rs` for why the move can't start on the down.
     pub(crate) workspace_tabs_title_bar_drag_armed: bool,
     pub(crate) workspace_configuration_menu_handle: PopoverMenuHandle<ContextMenu>,
+    /// The workspace being held across an await purely to keep the window alive, if any.
+    ///
+    /// `#zed-66.2`: `remove` mints one, and `open_project` reuses the displayed empty
+    /// workspace it has already been given consent to replace. Either way it is on its
+    /// way out, and the strip must not draw it beside the workspace replacing it.
+    ///
+    /// This is deliberately *not* derived from the workspace's own state. An earlier
+    /// draft asked "held, undisplayed and empty?", which is true of a workspace the user
+    /// emptied themselves — remove its last worktree from the project panel, switch to
+    /// another tab, and it would silently lose its row while staying alive. Only the code
+    /// that mints or claims a placeholder knows one when it sees it, so it says so here.
+    placeholder_in_flight: Option<WeakEntity<Workspace>>,
     pending_removal_tasks: Vec<Task<()>>,
     /// The saved configuration this window is currently following, if any.
     ///
@@ -1413,6 +1425,7 @@ impl MultiWorkspace {
             workspace_tabs_last_scrolled_index: Cell::new(None),
             workspace_tabs_title_bar_drag_armed: false,
             workspace_configuration_menu_handle: PopoverMenuHandle::default(),
+            placeholder_in_flight: None,
             pending_removal_tasks: Vec::new(),
             active_configuration_id: None,
             configuration_checkpoint_error: None,
@@ -2537,28 +2550,53 @@ impl MultiWorkspace {
         ordered
     }
 
+    /// Marks `workspace` as held only to keep the window alive while a replacement opens.
+    ///
+    /// Set before the await, cleared on every path out of it — see `clear_placeholder_in_flight`.
+    fn mark_placeholder_in_flight(&mut self, workspace: &Entity<Workspace>) {
+        self.placeholder_in_flight = Some(workspace.downgrade());
+    }
+
+    /// Clears the in-flight mark. Safe to call when nothing is marked.
+    ///
+    /// Every exit from `remove`'s and `open_project`'s awaits must reach this, including
+    /// the failure paths — a mark left standing would keep an empty, undisplayed
+    /// workspace off the strip. That is a bounded fault: it can only hide a workspace
+    /// already in the state the strip hides, and `is_placeholder_in_flight` still refuses
+    /// to hide the displayed one, so the window can never go rowless.
+    fn clear_placeholder_in_flight(&mut self) {
+        self.placeholder_in_flight = None;
+    }
+
+    /// Whether the strip should skip `workspace` because it is a placeholder mid-flight.
+    ///
+    /// Never hides the displayed workspace: a reopen that never lands leaves its
+    /// placeholder on screen, which is what keeps the window from going blank.
+    fn is_placeholder_in_flight(&self, workspace: &Entity<Workspace>) -> bool {
+        self.placeholder_in_flight
+            .as_ref()
+            .is_some_and(|in_flight| in_flight == &workspace.downgrade())
+            && self.workspace() != workspace
+    }
+
     /// The workspaces the tab strip draws, in strip order.
     ///
-    /// `ordered_workspaces` minus any workspace that is currently only a placeholder.
-    /// `remove` and `open_project` both hold an empty workspace across an await so the
-    /// window has something to show, then detach it once the real one lands. Between
-    /// the activation and that detach the strip would otherwise draw both rows, and
-    /// with no saved configurations it would appear and vanish outright, because
-    /// `workspace_tabs_visible` counts rows to decide whether to render at all.
+    /// `ordered_workspaces` minus the placeholder currently in flight, if any. `remove`
+    /// and `open_project` both hold an empty workspace across an await so the window has
+    /// something to show, then detach it once the real one lands. Between the activation
+    /// and that detach the strip would otherwise draw both rows, and with no saved
+    /// configurations it would appear and vanish outright, because `workspace_tabs_visible`
+    /// counts rows to decide whether to render at all.
     ///
-    /// This reads live state rather than a flag, which is what makes it self-healing:
-    /// a placeholder whose replacement never arrives stays *displayed*, so it keeps
-    /// its row instead of disappearing behind a flag nothing cleared.
-    ///
-    /// Every strip-side index must come from this list, never from
-    /// `ordered_workspaces` — a caller reading positions off the unfiltered list while
-    /// the user reads them off the screen is how a drag lands on the wrong row.
+    /// Every strip-side index must come from this list, never from `ordered_workspaces` —
+    /// a caller reading positions off the unfiltered list while the user reads them off
+    /// the screen is how a drag lands on the wrong row.
     /// `workspace_configuration_snapshot` is the deliberate exception: what a saved
     /// configuration captures is not this slice's to change.
     pub(crate) fn ordered_workspace_tabs(&self, cx: &App) -> Vec<Entity<Workspace>> {
         self.ordered_workspaces(cx)
             .into_iter()
-            .filter(|workspace| !self.placeholder_is_disposable(workspace, cx))
+            .filter(|workspace| !self.is_placeholder_in_flight(workspace))
             .collect()
     }
 
@@ -2566,9 +2604,9 @@ impl MultiWorkspace {
     ///
     /// `workspaces()` rather than `ordered_workspace_tabs()`: filtering does not depend
     /// on order, so the title bar does not pay for a sort on every render.
-    pub(crate) fn workspace_tab_count(&self, cx: &App) -> usize {
+    pub(crate) fn workspace_tab_count(&self) -> usize {
         self.workspaces()
-            .filter(|workspace| !self.placeholder_is_disposable(workspace, cx))
+            .filter(|workspace| !self.is_placeholder_in_flight(workspace))
             .count()
     }
 
@@ -3030,6 +3068,23 @@ impl MultiWorkspace {
         tasks
     }
 
+    /// Puts the multiworkspace into the mid-flight state `remove` and `open_project`
+    /// pass through, so a test can ask what the strip draws during it.
+    #[cfg(test)]
+    pub(crate) fn test_mark_placeholder_in_flight(&mut self, workspace: &Entity<Workspace>) {
+        self.mark_placeholder_in_flight(workspace);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_is_placeholder_in_flight(&self, workspace: &Entity<Workspace>) -> bool {
+        self.is_placeholder_in_flight(workspace)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_clear_placeholder_in_flight(&mut self) {
+        self.clear_placeholder_in_flight();
+    }
+
     #[cfg(test)]
     pub(crate) fn test_placeholder_is_disposable(
         &self,
@@ -3366,6 +3421,9 @@ impl MultiWorkspace {
                             // workspace is re-pointed before it is detached.
                             if reopen_key.is_some() {
                                 placeholder = Some(empty.clone());
+                                // `#zed-66.2`: it is only a placeholder on this branch, so
+                                // this is the only branch that may hide it from the strip.
+                                this.mark_placeholder_in_flight(&empty);
                             }
                             empty
                         });
@@ -3402,7 +3460,14 @@ impl MultiWorkspace {
                             cx,
                         )
                     })?
-                    .await?;
+                    .await;
+
+                // `#zed-66.2`: the mark comes off whatever happened. A reopen that failed
+                // leaves its placeholder displayed, and a displayed workspace must keep its
+                // row — clearing before the `?` below is what makes the failure path safe
+                // rather than merely unlikely.
+                this.update(cx, |this, _cx| this.clear_placeholder_in_flight())?;
+                let reopened = reopened?;
 
                 // `#zed-66`: the reopen landed, so the placeholder has served its purpose.
                 // Left held it becomes an `Empty Workspace` row that no close ever clears,
@@ -3463,6 +3528,12 @@ impl MultiWorkspace {
                     if !should_continue {
                         return Ok(empty_workspace.clone());
                     }
+                    // `#zed-66.2`: marked only after `prepare_to_close` returned true. The
+                    // strip hides this row, so the user has to have agreed it is going —
+                    // consent first, then it may disappear.
+                    this.update(cx, |this, _cx| {
+                        this.mark_placeholder_in_flight(empty_workspace)
+                    })?;
                 }
 
                 let create_task = this.update_in(cx, |this, window, cx| {
@@ -3476,7 +3547,9 @@ impl MultiWorkspace {
                         cx,
                     )
                 })?;
-                let new_workspace = create_task.await?;
+                let new_workspace = create_task.await;
+                this.update(cx, |this, _cx| this.clear_placeholder_in_flight())?;
+                let new_workspace = new_workspace?;
 
                 if let Some(empty_workspace) = empty_workspace
                     && empty_workspace != new_workspace
