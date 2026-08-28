@@ -2573,9 +2573,12 @@ impl MultiWorkspace {
     /// Never hides the displayed workspace: a reopen that never lands leaves its
     /// placeholder on screen, which is what keeps the window from going blank.
     fn is_placeholder_in_flight(&self, workspace: &Entity<Workspace>) -> bool {
+        // Ids rather than handles: `downgrade()` clones a `Weak`, so comparing handles
+        // costs an atomic refcount bump per held workspace per render — and the title bar
+        // asks `workspace_tabs_visible` on every render too, so it would run twice a frame.
         self.placeholder_in_flight
             .as_ref()
-            .is_some_and(|in_flight| in_flight == &workspace.downgrade())
+            .is_some_and(|in_flight| in_flight.entity_id() == workspace.entity_id())
             && self.workspace() != workspace
     }
 
