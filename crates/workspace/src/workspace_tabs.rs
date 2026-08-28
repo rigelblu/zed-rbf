@@ -44,7 +44,8 @@ impl MultiWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let workspaces = self.ordered_workspaces(cx);
+        // `#zed-66.2`: cycling must not land on a row the strip is not drawing.
+        let workspaces = self.ordered_workspace_tabs(cx);
         if workspaces.len() < 2 {
             return;
         }
@@ -82,10 +83,12 @@ impl MultiWorkspace {
         let has_saved_configurations = WorkspaceConfigurationStore::try_global(cx)
             .is_some_and(|store| !store.configurations().is_empty());
 
-        // `workspaces()` rather than `ordered_workspaces()`: the latter is a permutation
-        // of it, so the count is the same, and ordering costs a pass per project group
-        // that the title bar would pay on every render.
-        self.workspaces().count() >= 2 || has_saved_configurations || store_requires_recovery
+        // `#zed-66.2`: count drawable rows, not held workspaces. A placeholder held
+        // across an open would otherwise push the count to 2 for the frames between the
+        // new workspace activating and the placeholder detaching — making the whole
+        // strip appear and vanish for a user who has no saved configurations, rather
+        // than just gaining and losing a row.
+        self.workspace_tab_count(cx) >= 2 || has_saved_configurations || store_requires_recovery
     }
 
     pub(crate) fn render_workspace_tabs(
@@ -97,7 +100,7 @@ impl MultiWorkspace {
             return None;
         }
 
-        let workspaces = self.ordered_workspaces(cx);
+        let workspaces = self.ordered_workspace_tabs(cx);
         let active_workspace = self.workspace().clone();
         let active_workspace_index = workspaces
             .iter()
@@ -371,7 +374,7 @@ impl MultiWorkspace {
 impl MultiWorkspace {
     pub(crate) fn test_workspace_tab_labels(&self, cx: &App) -> Vec<String> {
         let workspace_paths = self
-            .ordered_workspaces(cx)
+            .ordered_workspace_tabs(cx)
             .iter()
             .map(|workspace| workspace_tab_paths(workspace.read(cx), cx))
             .collect::<Vec<_>>();
@@ -385,13 +388,13 @@ impl MultiWorkspace {
 
     pub(crate) fn test_workspace_tab_unsaved_states(&self, cx: &App) -> Vec<(String, bool)> {
         let workspace_paths = self
-            .ordered_workspaces(cx)
+            .ordered_workspace_tabs(cx)
             .iter()
             .map(|workspace| workspace_tab_paths(workspace.read(cx), cx))
             .collect::<Vec<_>>();
         let path_detail_map = workspace_tab_path_detail_map(&workspace_paths);
 
-        self.ordered_workspaces(cx)
+        self.ordered_workspace_tabs(cx)
             .iter()
             .zip(workspace_paths.iter())
             .map(|(workspace, paths)| {
@@ -1831,6 +1834,23 @@ pub(crate) fn workspace_tab_paths(workspace: &Workspace, cx: &App) -> Vec<PathBu
         .into_iter()
         .map(|path| path.as_ref().to_path_buf())
         .collect()
+}
+
+/// Whether `workspace` shows no project at all — the same question as
+/// `workspace_tab_paths(..).is_empty()`, since `root_paths` is a `collect` of exactly
+/// this iterator, but answered without allocating a `Vec<PathBuf>` per workspace.
+///
+/// `#zed-66.2`: `workspace_tabs_visible` asks this once per held workspace on every
+/// render, and the platform title bar asks `workspace_tabs_visible` on every render
+/// too, so the allocating form ran twice a frame for a question that never needed the
+/// paths themselves.
+pub(crate) fn workspace_tab_paths_are_empty(workspace: &Workspace, cx: &App) -> bool {
+    workspace
+        .project()
+        .read(cx)
+        .visible_worktrees(cx)
+        .next()
+        .is_none()
 }
 
 fn workspace_tab_path_detail_map(workspace_paths: &[Vec<PathBuf>]) -> HashMap<PathBuf, usize> {

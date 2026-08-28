@@ -36,7 +36,7 @@ use crate::{
         WorkspaceConfigurationMutation, WorkspaceConfigurationStore,
         model::{MultiWorkspaceState, WorkspaceConfigurationId, WorkspaceConfigurationMember},
     },
-    workspace_tabs::workspace_tab_paths,
+    workspace_tabs::workspace_tab_paths_are_empty,
 };
 
 actions!(
@@ -2079,7 +2079,11 @@ impl MultiWorkspace {
         target_index: usize,
         cx: &mut Context<Self>,
     ) -> bool {
-        let mut ordered_workspaces = self.ordered_workspaces(cx);
+        // `#zed-66.2`: strip order, not held order — the index arrives from a drag on
+        // the rendered rows, so it has to mean the same thing here. Both reorder loops
+        // below end in `extend`, so a filtered-out placeholder is appended rather than
+        // dropped from `project_groups` or `held`.
+        let mut ordered_workspaces = self.ordered_workspace_tabs(cx);
         let Some(current_index) = ordered_workspaces
             .iter()
             .position(|candidate| candidate == workspace)
@@ -2533,6 +2537,41 @@ impl MultiWorkspace {
         ordered
     }
 
+    /// The workspaces the tab strip draws, in strip order.
+    ///
+    /// `ordered_workspaces` minus any workspace that is currently only a placeholder.
+    /// `remove` and `open_project` both hold an empty workspace across an await so the
+    /// window has something to show, then detach it once the real one lands. Between
+    /// the activation and that detach the strip would otherwise draw both rows, and
+    /// with no saved configurations it would appear and vanish outright, because
+    /// `workspace_tabs_visible` counts rows to decide whether to render at all.
+    ///
+    /// This reads live state rather than a flag, which is what makes it self-healing:
+    /// a placeholder whose replacement never arrives stays *displayed*, so it keeps
+    /// its row instead of disappearing behind a flag nothing cleared.
+    ///
+    /// Every strip-side index must come from this list, never from
+    /// `ordered_workspaces` — a caller reading positions off the unfiltered list while
+    /// the user reads them off the screen is how a drag lands on the wrong row.
+    /// `workspace_configuration_snapshot` is the deliberate exception: what a saved
+    /// configuration captures is not this slice's to change.
+    pub(crate) fn ordered_workspace_tabs(&self, cx: &App) -> Vec<Entity<Workspace>> {
+        self.ordered_workspaces(cx)
+            .into_iter()
+            .filter(|workspace| !self.placeholder_is_disposable(workspace, cx))
+            .collect()
+    }
+
+    /// How many rows the tab strip would draw.
+    ///
+    /// `workspaces()` rather than `ordered_workspace_tabs()`: filtering does not depend
+    /// on order, so the title bar does not pay for a sort on every render.
+    pub(crate) fn workspace_tab_count(&self, cx: &App) -> usize {
+        self.workspaces()
+            .filter(|workspace| !self.placeholder_is_disposable(workspace, cx))
+            .count()
+    }
+
     /// Adds a workspace to this window as persistent without changing which
     /// workspace is active. Unlike `activate()`, this always inserts into the
     /// persistent list regardless of sidebar state — it's used for system-
@@ -2649,9 +2688,6 @@ impl MultiWorkspace {
         cx.notify();
     }
 
-    /// Detaches a workspace: clears session state, DB binding, cached
-    /// group key, and emits `WorkspaceRemoved`. The DB row is preserved
-    /// so the workspace still appears in the recent-projects list.
     /// Whether `workspace` is still nothing but a placeholder, and so safe to drop.
     ///
     /// Both callers mint an empty workspace to hold the window across an await, then
@@ -2666,9 +2702,12 @@ impl MultiWorkspace {
     fn placeholder_is_disposable(&self, workspace: &Entity<Workspace>, cx: &App) -> bool {
         self.held_index(workspace).is_some()
             && self.workspace() != workspace
-            && workspace_tab_paths(workspace.read(cx), cx).is_empty()
+            && workspace_tab_paths_are_empty(workspace.read(cx), cx)
     }
 
+    /// Detaches a workspace: clears session state, DB binding, cached
+    /// group key, and emits `WorkspaceRemoved`. The DB row is preserved
+    /// so the workspace still appears in the recent-projects list.
     fn detach_workspace(&mut self, workspace: &Entity<Workspace>, cx: &mut Context<Self>) {
         if let Some(index) = self.held_index(workspace) {
             assert_ne!(

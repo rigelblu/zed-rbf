@@ -5874,6 +5874,413 @@ async fn test_placeholder_is_disposable_only_while_it_is_still_empty(cx: &mut Te
     });
 }
 
+/// Mints the state `open_project` and `remove` both pass through: a real workspace
+/// displayed, and an empty one still held behind it.
+///
+/// The precondition that matters is *undisplayed* — `placeholder_is_disposable` requires
+/// it, so activating the placeholder and then activating something else is what puts
+/// execution inside the filtered branch. Minting one and leaving it displayed exercises
+/// nothing, which is how three tests came to assert nothing on 2026-08-27.
+fn mint_held_placeholder(
+    multi_workspace: &Entity<MultiWorkspace>,
+    displayed: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+) -> Entity<Workspace> {
+    let placeholder = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        let app_state = multi_workspace.workspace().read(cx).app_state().clone();
+        let project = Project::local(
+            app_state.client.clone(),
+            app_state.node_runtime.clone(),
+            app_state.user_store.clone(),
+            app_state.languages.clone(),
+            app_state.fs.clone(),
+            None,
+            project::LocalProjectFlags::default(),
+            cx,
+        );
+        let placeholder = cx.new(|cx| Workspace::new(None, project, app_state, window, cx));
+        multi_workspace.activate(placeholder.clone(), None, window, cx);
+        multi_workspace.activate(displayed.clone(), None, window, cx);
+        placeholder
+    });
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert!(
+            multi_workspace.test_placeholder_is_disposable(&placeholder, cx),
+            "fixture precondition: the placeholder must be held, undisplayed and empty, \
+             or the tests below never reach the code they guard"
+        );
+    });
+
+    placeholder
+}
+
+#[gpui::test]
+async fn test_workspace_tab_rows_omit_a_disposable_placeholder(cx: &mut TestAppContext) {
+    init_test(cx);
+    reset_workspace_configuration_store(cx).await;
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "a.txt": "" })).await;
+    fs.insert_tree("/root_b", json!({ "b.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs.clone(), ["/root_b".as_ref()], cx).await;
+    cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    let workspace_b = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b, window, cx)
+    });
+    cx.run_until_parked();
+
+    let placeholder = mint_held_placeholder(&multi_workspace, &workspace_b, cx);
+
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        let rows = multi_workspace.ordered_workspace_tabs(cx);
+        assert!(
+            !rows.contains(&placeholder),
+            "the strip must not draw a workspace that exists only to hold the window open"
+        );
+        assert_eq!(
+            rows.len(),
+            2,
+            "both real workspaces keep their rows: {:?}",
+            multi_workspace.test_workspace_tab_labels(cx)
+        );
+        assert_eq!(
+            multi_workspace.workspaces().count(),
+            3,
+            "and the placeholder is still held — this slice hides it, it does not detach it"
+        );
+        assert!(
+            !multi_workspace
+                .test_workspace_tab_labels(cx)
+                .iter()
+                .any(|label| label == "Empty Workspace"),
+            "no Empty Workspace label reaches the strip"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_workspace_tab_rows_keep_the_displayed_empty_workspace(cx: &mut TestAppContext) {
+    init_test(cx);
+    reset_workspace_configuration_store(cx).await;
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "a.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    cx.run_until_parked();
+
+    // `#zed-68` leaves exactly one empty workspace after the last one closes, and it is
+    // the displayed one. If the filter read emptiness alone, that window would go blank.
+    let empty = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        let app_state = multi_workspace.workspace().read(cx).app_state().clone();
+        let project = Project::local(
+            app_state.client.clone(),
+            app_state.node_runtime.clone(),
+            app_state.user_store.clone(),
+            app_state.languages.clone(),
+            app_state.fs.clone(),
+            None,
+            project::LocalProjectFlags::default(),
+            cx,
+        );
+        let empty = cx.new(|cx| Workspace::new(None, project, app_state, window, cx));
+        multi_workspace.activate(empty.clone(), None, window, cx);
+        empty
+    });
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert!(
+            multi_workspace.ordered_workspace_tabs(cx).contains(&empty),
+            "a displayed empty workspace keeps its row — it is what the user is looking at"
+        );
+        assert!(
+            !multi_workspace.test_placeholder_is_disposable(&empty, cx),
+            "and the predicate agrees it is not disposable, which is what makes the \
+             failed-reopen case self-healing rather than flag-dependent"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_workspace_tab_rows_keep_a_held_workspace_that_has_paths(cx: &mut TestAppContext) {
+    init_test(cx);
+    reset_workspace_configuration_store(cx).await;
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "a.txt": "" })).await;
+    fs.insert_tree("/root_b", json!({ "b.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs.clone(), ["/root_b".as_ref()], cx).await;
+    cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    let workspace_a = multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        multi_workspace.workspace().clone()
+    });
+    let workspace_b = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        let workspace_b = multi_workspace.test_add_workspace(project_b, window, cx);
+        // `test_add_workspace` activates what it adds, so display has to move back for
+        // `workspace_b` to be the undisplayed-but-real case this test is about.
+        multi_workspace.activate(workspace_a.clone(), None, window, cx);
+        workspace_b
+    });
+    cx.run_until_parked();
+
+    // `workspace_b` is held and undisplayed — two of the three conditions. Only its
+    // paths keep it on screen, so this is what separates "not displayed" from
+    // "disposable".
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert_ne!(
+            multi_workspace.workspace(),
+            &workspace_b,
+            "fixture precondition: workspace_b must be undisplayed"
+        );
+        assert!(
+            multi_workspace
+                .ordered_workspace_tabs(cx)
+                .contains(&workspace_b),
+            "an undisplayed workspace that holds a project keeps its row"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_strip_stays_hidden_while_a_placeholder_is_held(cx: &mut TestAppContext) {
+    init_test(cx);
+    reset_workspace_configuration_store(cx).await;
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "a.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    cx.run_until_parked();
+    let workspace_a = multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        multi_workspace.workspace().clone()
+    });
+
+    let placeholder = mint_held_placeholder(&multi_workspace, &workspace_a, cx);
+
+    // The louder half of the defect: with no saved configurations the strip is gated on
+    // a row count, so an unfiltered count of 2 makes the whole strip appear and vanish
+    // rather than gaining and losing a row.
+    let draw = |cx: &mut VisualTestContext| {
+        cx.draw(
+            gpui::point(gpui::px(0.), gpui::px(0.)),
+            gpui::size(gpui::px(800.), gpui::px(600.)),
+            |_, _| multi_workspace.clone().into_any_element(),
+        );
+    };
+
+    let claimed = multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(
+            multi_workspace.workspaces().count(),
+            2,
+            "fixture precondition: two held workspaces, which is what made the old count \
+             cross the threshold"
+        );
+        assert_eq!(
+            multi_workspace.workspace_tab_count(cx),
+            1,
+            "but only one of them is drawable"
+        );
+        multi_workspace.workspace_tabs_visible(cx)
+    });
+    assert!(
+        !claimed,
+        "one real workspace plus a placeholder is still one row, so no strip"
+    );
+    draw(cx);
+    assert_eq!(
+        claimed,
+        cx.debug_bounds("WORKSPACE-TAB-0").is_some(),
+        "workspace_tabs_visible must agree with what render_workspace_tabs draws — \
+         `#zed-65`'s title bar reads this to decide the traffic-light padding"
+    );
+    assert!(
+        multi_workspace.read_with(cx, |multi_workspace, cx| {
+            !multi_workspace
+                .ordered_workspace_tabs(cx)
+                .contains(&placeholder)
+        }),
+        "and the placeholder is the row that was dropped"
+    );
+}
+
+#[gpui::test]
+async fn test_saved_configuration_still_shows_the_strip_with_a_placeholder_held(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "a.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    reset_workspace_configuration_store(cx).await;
+    cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+
+    // Exactly one real workspace, on purpose. With two, `workspace_tab_count >= 2`
+    // carries the strip on its own and the assertion below would pass whether or not
+    // the saved-configuration branch works — the shape of test that proves nothing.
+    // `test_strip_stays_hidden_while_a_placeholder_is_held` is this test's control:
+    // same state, no saved configuration, strip hidden.
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    cx.run_until_parked();
+
+    // The sidebar retains the workspace and establishes its project group, which the
+    // save needs — then close it, because an open sidebar short-circuits
+    // `workspace_tabs_visible` before it reaches the branch under test.
+    multi_workspace.update(cx, |multi_workspace, cx| multi_workspace.open_sidebar(cx));
+    cx.run_until_parked();
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        for workspace in multi_workspace.ordered_workspaces(cx) {
+            workspace.update(cx, |workspace, _cx| workspace.set_random_database_id());
+        }
+    });
+    let save = multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.save_configuration_as("Daily".to_string(), cx)
+    });
+    if let Err(error) = save.await {
+        panic!("failed to save workspace configuration: {error:#}");
+    }
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.close_sidebar(window, cx)
+    });
+    cx.run_until_parked();
+
+    let displayed = multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        multi_workspace.workspace().clone()
+    });
+    let placeholder = mint_held_placeholder(&multi_workspace, &displayed, cx);
+
+    // `#zed-64` keeps the strip up whenever a configuration is saved, whatever the row
+    // count. This slice must not reach into that branch.
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(
+            multi_workspace.workspace_tab_count(cx),
+            1,
+            "fixture precondition: one drawable row, so the count branch cannot be what \
+             makes the strip visible"
+        );
+        assert!(
+            multi_workspace.workspace_tabs_visible(cx),
+            "a saved configuration keeps the strip visible — that branch is `#zed-64`'s"
+        );
+        assert!(
+            !multi_workspace
+                .ordered_workspace_tabs(cx)
+                .contains(&placeholder),
+            "and the placeholder is still filtered out of the rows it draws"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_moving_a_workspace_tab_uses_strip_indices(cx: &mut TestAppContext) {
+    init_test(cx);
+    reset_workspace_configuration_store(cx).await;
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "a.txt": "" })).await;
+    fs.insert_tree("/root_b", json!({ "b.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs.clone(), ["/root_b".as_ref()], cx).await;
+    cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    let workspace_b = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b, window, cx)
+    });
+    cx.run_until_parked();
+
+    let placeholder = mint_held_placeholder(&multi_workspace, &workspace_b, cx);
+
+    let rows_before = multi_workspace.read_with(cx, |multi_workspace, cx| {
+        multi_workspace.ordered_workspace_tabs(cx)
+    });
+    let [first, second] = rows_before.as_slice() else {
+        panic!("expected exactly two drawn rows, got {}", rows_before.len());
+    };
+    let (first, second) = (first.clone(), second.clone());
+
+    // The user drags the second row to position 0. That index is read off the screen, so
+    // it has to mean position 0 of the drawn rows — not of the held list, where the
+    // placeholder still sits.
+    let moved = multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.move_workspace_tab_to_index(&second, 0, cx)
+    });
+    assert!(
+        moved,
+        "moving a drawn row to a different index must report a move"
+    );
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(
+            multi_workspace.ordered_workspace_tabs(cx),
+            vec![second.clone(), first.clone()],
+            "the two drawn rows swapped, which is what the user asked for"
+        );
+        assert!(
+            multi_workspace
+                .workspaces()
+                .any(|held| held == &placeholder),
+            "and the placeholder survives the reorder — both loops end in `extend`, so a \
+             filtered row is appended rather than dropped from `held`"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_workspace_configuration_snapshot_still_sees_every_held_workspace(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    reset_workspace_configuration_store(cx).await;
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "a.txt": "" })).await;
+    fs.insert_tree("/root_b", json!({ "b.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs.clone(), ["/root_b".as_ref()], cx).await;
+    cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    let workspace_b = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b, window, cx)
+    });
+    cx.run_until_parked();
+
+    let placeholder = mint_held_placeholder(&multi_workspace, &workspace_b, cx);
+
+    // The ceiling: `workspace_configuration_snapshot` is `#zed-64`'s contract, and this
+    // slice must not change what a saved configuration captures. Pinning it here is what
+    // stops a later reader from "tidying" the filter down into `ordered_workspaces`.
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert!(
+            multi_workspace
+                .ordered_workspaces(cx)
+                .contains(&placeholder),
+            "the unfiltered list still holds the placeholder — only the strip's view drops it"
+        );
+        assert_eq!(
+            multi_workspace.ordered_workspaces(cx).len(),
+            multi_workspace.workspaces().count(),
+            "and it is still a permutation of the held list, which the configuration \
+             snapshot depends on"
+        );
+    });
+}
+
 #[gpui::test]
 async fn test_closing_a_workspace_never_opens_a_project_that_was_not_open(cx: &mut TestAppContext) {
     init_test(cx);
