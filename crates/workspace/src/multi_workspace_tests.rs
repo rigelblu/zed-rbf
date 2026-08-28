@@ -5901,6 +5901,10 @@ fn mint_held_placeholder(
         let placeholder = cx.new(|cx| Workspace::new(None, project, app_state, window, cx));
         multi_workspace.activate(placeholder.clone(), None, window, cx);
         multi_workspace.activate(displayed.clone(), None, window, cx);
+        // What `remove` and `open_project` do before their await. Without it the strip
+        // draws this row, and rightly so — an unmarked empty workspace is one the user
+        // made, not one we minted.
+        multi_workspace.test_mark_placeholder_in_flight(&placeholder);
         placeholder
     });
     cx.run_until_parked();
@@ -5909,7 +5913,12 @@ fn mint_held_placeholder(
         assert!(
             multi_workspace.test_placeholder_is_disposable(&placeholder, cx),
             "fixture precondition: the placeholder must be held, undisplayed and empty, \
-             or the tests below never reach the code they guard"
+             or the detach guard below never reaches the code it protects"
+        );
+        assert!(
+            multi_workspace.test_is_placeholder_in_flight(&placeholder),
+            "fixture precondition: and it must be marked in flight, or the strip keeps \
+             drawing it and the tests below never reach the code they guard"
         );
     });
 
@@ -5959,6 +5968,71 @@ async fn test_workspace_tab_rows_omit_a_disposable_placeholder(cx: &mut TestAppC
                 .iter()
                 .any(|label| label == "Empty Workspace"),
             "no Empty Workspace label reaches the strip"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_workspace_tab_rows_keep_an_empty_workspace_the_user_made(cx: &mut TestAppContext) {
+    init_test(cx);
+    reset_workspace_configuration_store(cx).await;
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "a.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    let workspace_a = multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        multi_workspace.workspace().clone()
+    });
+    cx.run_until_parked();
+
+    // The state an earlier draft of this slice got wrong, found by the independent cold
+    // review. A user removes the last worktree from a workspace's project (project panel
+    // → Remove from Project), then clicks another tab. That workspace is now held,
+    // undisplayed and empty — indistinguishable from a placeholder by state alone — but
+    // it is the user's, nobody consented to it going, and it must keep its row.
+    let user_emptied = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        let app_state = multi_workspace.workspace().read(cx).app_state().clone();
+        let project = Project::local(
+            app_state.client.clone(),
+            app_state.node_runtime.clone(),
+            app_state.user_store.clone(),
+            app_state.languages.clone(),
+            app_state.fs.clone(),
+            None,
+            project::LocalProjectFlags::default(),
+            cx,
+        );
+        let user_emptied = cx.new(|cx| Workspace::new(None, project, app_state, window, cx));
+        multi_workspace.activate(user_emptied.clone(), None, window, cx);
+        multi_workspace.activate(workspace_a.clone(), None, window, cx);
+        user_emptied
+    });
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert!(
+            multi_workspace.test_placeholder_is_disposable(&user_emptied, cx),
+            "precondition: by state alone this is indistinguishable from a placeholder — \
+             which is exactly why state alone was the wrong question"
+        );
+        assert!(
+            !multi_workspace.test_is_placeholder_in_flight(&user_emptied),
+            "but nothing marked it, because nothing minted it"
+        );
+        assert!(
+            multi_workspace
+                .ordered_workspace_tabs(cx)
+                .contains(&user_emptied),
+            "so it keeps its row; hiding a live workspace the user made, with no prompt \
+             and no way back except the sidebar, is the defect this guards"
+        );
+        assert_eq!(
+            multi_workspace.workspace_tab_count(),
+            2,
+            "and it still counts toward whether the strip renders at all"
         );
     });
 }

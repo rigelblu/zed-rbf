@@ -3081,11 +3081,6 @@ impl MultiWorkspace {
     }
 
     #[cfg(test)]
-    pub(crate) fn test_clear_placeholder_in_flight(&mut self) {
-        self.clear_placeholder_in_flight();
-    }
-
-    #[cfg(test)]
     pub(crate) fn test_placeholder_is_disposable(
         &self,
         workspace: &Entity<Workspace>,
