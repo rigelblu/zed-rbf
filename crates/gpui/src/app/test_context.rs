@@ -922,6 +922,14 @@ impl VisualTestContext {
         self.update(|window, _| window.rendered_frame.debug_bounds.get(selector).copied())
     }
 
+    /// How many times this window has been asked to start a platform move.
+    ///
+    /// Lets a test prove that a region actually drags the window, which is otherwise
+    /// invisible: `start_window_move` hands off to the OS and returns nothing.
+    pub fn window_move_count(&self) -> usize {
+        self.cx.test_window(self.window).window_move_count()
+    }
+
     /// Draw an element to the window. Useful for simulating events or actions
     pub fn draw<E>(
         &mut self,

@@ -1561,6 +1561,168 @@ async fn test_workspace_tabs_extend_title_bar_background(cx: &mut TestAppContext
 }
 
 #[gpui::test]
+async fn test_workspace_tabs_title_bar_fill_drags_the_window(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    fs.insert_tree("/root_b", json!({ "file.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs, ["/root_b".as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b, window, cx);
+    });
+    cx.run_until_parked();
+
+    cx.draw(
+        gpui::point(gpui::px(0.), gpui::px(0.)),
+        gpui::size(gpui::px(800.), gpui::px(600.)),
+        |_, _| multi_workspace.clone().into_any_element(),
+    );
+
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+
+    let fill_bounds = cx
+        .debug_bounds("WORKSPACE-TAB-TITLE-BAR-FILL")
+        .expect("workspace tab strip should extend the titlebar background");
+    let grab = fill_bounds.center();
+
+    assert_eq!(
+        cx.window_move_count(),
+        0,
+        "nothing should move the window before the drag starts"
+    );
+
+    cx.simulate_mouse_move(grab, None, gpui::Modifiers::none());
+    assert_eq!(
+        cx.window_move_count(),
+        0,
+        "hovering the titlebar fill should not move the window"
+    );
+
+    cx.simulate_mouse_down(grab, gpui::MouseButton::Left, gpui::Modifiers::none());
+    cx.simulate_mouse_move(
+        grab + gpui::point(gpui::px(24.), gpui::px(6.)),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::none(),
+    );
+
+    assert_eq!(
+        cx.window_move_count(),
+        1,
+        "dragging the titlebar fill should start a window move"
+    );
+}
+
+#[gpui::test]
+async fn test_workspace_tab_rows_do_not_drag_the_window(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    fs.insert_tree("/root_b", json!({ "file.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs, ["/root_b".as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b, window, cx);
+    });
+    cx.run_until_parked();
+
+    cx.draw(
+        gpui::point(gpui::px(0.), gpui::px(0.)),
+        gpui::size(gpui::px(800.), gpui::px(600.)),
+        |_, _| multi_workspace.clone().into_any_element(),
+    );
+
+    let tab_bounds = cx
+        .debug_bounds("WORKSPACE-TAB-0")
+        .expect("first workspace tab should render with debug bounds");
+    let grab = tab_bounds.center();
+
+    cx.simulate_mouse_down(grab, gpui::MouseButton::Left, gpui::Modifiers::none());
+    cx.simulate_mouse_move(
+        grab + gpui::point(gpui::px(0.), gpui::px(24.)),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::none(),
+    );
+
+    assert_eq!(
+        cx.window_move_count(),
+        0,
+        "dragging a workspace tab row reorders tabs and must never move the window"
+    );
+}
+
+#[gpui::test]
+async fn test_workspace_tabs_visible_tracks_the_rendered_strip(cx: &mut TestAppContext) {
+    init_test(cx);
+    // The store is process-wide in tests, and a saved configuration legitimately keeps
+    // the strip up at one workspace (`#zed-64`). Clear it so the lone-workspace case
+    // below asserts the answer the title bar needs: no strip, so the traffic-light
+    // padding comes back.
+    reset_workspace_configuration_store(cx).await;
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    fs.insert_tree("/root_b", json!({ "file.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs, ["/root_b".as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+
+    // The title bar drops its traffic-light padding on this answer, so it has to match
+    // what the strip actually draws. Assert the agreement at both counts, not just the
+    // absolute answers, so the two can never drift apart.
+    let draw = |cx: &mut VisualTestContext| {
+        cx.draw(
+            gpui::point(gpui::px(0.), gpui::px(0.)),
+            gpui::size(gpui::px(800.), gpui::px(600.)),
+            |_, _| multi_workspace.clone().into_any_element(),
+        );
+    };
+
+    let claimed = multi_workspace.read_with(cx, |multi_workspace, cx| {
+        multi_workspace.workspace_tabs_visible(cx)
+    });
+    assert!(
+        !claimed,
+        "one workspace and no saved configuration renders no strip, so the title bar must \
+         keep reserving room for the traffic lights"
+    );
+    draw(cx);
+    assert_eq!(
+        claimed,
+        cx.debug_bounds("WORKSPACE-TAB-0").is_some(),
+        "workspace_tabs_visible must agree with render_workspace_tabs for one workspace"
+    );
+
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b, window, cx);
+    });
+    cx.run_until_parked();
+
+    let claimed = multi_workspace.read_with(cx, |multi_workspace, cx| {
+        multi_workspace.workspace_tabs_visible(cx)
+    });
+    assert!(
+        claimed,
+        "a second workspace always renders the strip, whatever the configuration store holds"
+    );
+    draw(cx);
+    assert_eq!(
+        claimed,
+        cx.debug_bounds("WORKSPACE-TAB-0").is_some(),
+        "workspace_tabs_visible must agree with render_workspace_tabs for two workspaces"
+    );
+}
+
+#[gpui::test]
 async fn test_workspace_tabs_mark_workspaces_with_unsaved_changes(cx: &mut TestAppContext) {
     init_test(cx);
     let fs = FakeFs::new(cx.executor());

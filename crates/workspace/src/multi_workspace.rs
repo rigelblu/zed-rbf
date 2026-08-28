@@ -401,6 +401,9 @@ pub struct MultiWorkspace {
     pub(crate) workspace_tabs_scroll_handle: ScrollHandle,
     pub(crate) workspace_tabs_last_scrolled_workspace_id: Cell<Option<EntityId>>,
     pub(crate) workspace_tabs_last_scrolled_index: Cell<Option<usize>>,
+    /// Armed on mouse-down in the tab strip's title-bar band, spent on the first
+    /// mouse-move. See `workspace_tabs.rs` for why the move can't start on the down.
+    pub(crate) workspace_tabs_title_bar_drag_armed: bool,
     pub(crate) workspace_configuration_menu_handle: PopoverMenuHandle<ContextMenu>,
     pending_removal_tasks: Vec<Task<()>>,
     /// The saved configuration this window is currently following, if any.
@@ -1407,6 +1410,7 @@ impl MultiWorkspace {
             workspace_tabs_scroll_handle: ScrollHandle::new(),
             workspace_tabs_last_scrolled_workspace_id: Cell::new(None),
             workspace_tabs_last_scrolled_index: Cell::new(None),
+            workspace_tabs_title_bar_drag_armed: false,
             workspace_configuration_menu_handle: PopoverMenuHandle::default(),
             pending_removal_tasks: Vec::new(),
             active_configuration_id: None,

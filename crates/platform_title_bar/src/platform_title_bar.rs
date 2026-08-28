@@ -110,6 +110,17 @@ impl PlatformTitleBar {
     pub fn is_workspace_sidebar_enabled(cx: &App) -> bool {
         MultiWorkspace::sidebar_ui_enabled_from_settings(cx)
     }
+
+    /// `#zed-65`: the macOS traffic lights are positioned in window coordinates, so they
+    /// land over whatever occupies the window's left edge. When the workspace tab strip
+    /// does, reserving `TRAFFIC_LIGHT_PADDING` in the title bar as well leaves that much
+    /// dead space before the project name.
+    fn workspace_tabs_cover_left_edge(&self, cx: &App) -> bool {
+        self.multi_workspace
+            .as_ref()
+            .and_then(|mw| mw.upgrade())
+            .is_some_and(|mw| mw.read(cx).workspace_tabs_visible(cx))
+    }
 }
 
 /// Renders the platform-appropriate left-side window controls (e.g. Ubuntu/GNOME close button).
@@ -189,6 +200,7 @@ impl Render for PlatformTitleBar {
 
         let button_layout = self.effective_button_layout(&decorations, cx);
         let sidebar = self.sidebar_render_state(cx);
+        let workspace_tabs_cover_left_edge = self.workspace_tabs_cover_left_edge(cx);
 
         let title_bar = h_flex()
             .window_control_area(WindowControlArea::Drag)
@@ -242,11 +254,17 @@ impl Render for PlatformTitleBar {
             })
             .map(|this| {
                 let show_left_controls = !(sidebar.open && sidebar.side == SidebarSide::Left);
+                let reserve_traffic_light_room =
+                    show_left_controls && !workspace_tabs_cover_left_edge;
 
                 if window.is_fullscreen() {
                     this.pl_2()
-                } else if self.platform_style == PlatformStyle::Mac && show_left_controls {
-                    this.pl(px(TRAFFIC_LIGHT_PADDING))
+                } else if self.platform_style == PlatformStyle::Mac {
+                    if reserve_traffic_light_room {
+                        this.pl(px(TRAFFIC_LIGHT_PADDING))
+                    } else {
+                        this.pl_2()
+                    }
                 } else if let Some(controls) = show_left_controls
                     .then(|| {
                         render_left_window_controls(

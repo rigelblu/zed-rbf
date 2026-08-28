@@ -6,7 +6,7 @@ use std::{
 
 use gpui::{
     Action, Anchor, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
-    Pixels, PromptLevel, ScrollHandle, SharedString, TaskExt, WeakEntity, Window,
+    MouseButton, Pixels, PromptLevel, ScrollHandle, SharedString, TaskExt, WeakEntity, Window,
     WindowControlArea, px, rems,
 };
 use project::ProjectGroupKey;
@@ -64,27 +64,40 @@ impl MultiWorkspace {
         self.activate(workspaces[next_index].clone(), None, window, cx);
     }
 
+    /// Whether the workspace tab strip renders, and so occupies the window's left edge.
+    ///
+    /// `#zed-65`: the platform title bar asks this to decide whether it still has to
+    /// reserve room for the macOS traffic lights, which sit over the strip when there
+    /// is one. Keep it and `render_workspace_tabs` answering the same question.
+    pub fn workspace_tabs_visible(&self, cx: &App) -> bool {
+        if !self.retention_enabled(cx) {
+            return false;
+        }
+        if self.sidebar_ui_enabled(cx) && self.sidebar_open() {
+            return false;
+        }
+
+        let store_requires_recovery = WorkspaceConfigurationStore::try_global(cx)
+            .is_some_and(|store| store.blocked().is_some());
+        let has_saved_configurations = WorkspaceConfigurationStore::try_global(cx)
+            .is_some_and(|store| !store.configurations().is_empty());
+
+        // `workspaces()` rather than `ordered_workspaces()`: the latter is a permutation
+        // of it, so the count is the same, and ordering costs a pass per project group
+        // that the title bar would pay on every render.
+        self.workspaces().count() >= 2 || has_saved_configurations || store_requires_recovery
+    }
+
     pub(crate) fn render_workspace_tabs(
         &self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        if !self.retention_enabled(cx) {
-            return None;
-        }
-        if self.sidebar_ui_enabled(cx) && self.sidebar_open() {
+        if !self.workspace_tabs_visible(cx) {
             return None;
         }
 
         let workspaces = self.ordered_workspaces(cx);
-        let store_requires_recovery = WorkspaceConfigurationStore::try_global(cx)
-            .is_some_and(|store| store.blocked().is_some());
-        let has_saved_configurations = WorkspaceConfigurationStore::try_global(cx)
-            .is_some_and(|store| !store.configurations().is_empty());
-        if workspaces.len() < 2 && !has_saved_configurations && !store_requires_recovery {
-            return None;
-        }
-
         let active_workspace = self.workspace().clone();
         let active_workspace_index = workspaces
             .iter()
@@ -145,7 +158,33 @@ impl MultiWorkspace {
                             .right_0()
                             .h(title_bar_fill_height)
                             .bg(cx.theme().colors().title_bar_background)
+                            // `window_control_area` is a Windows-only hit-test hint —
+                            // `gpui_macos`'s `on_hit_test_window_control` ignores it — so
+                            // macOS needs the same armed gesture `PlatformTitleBar` uses:
+                            // arm on mouse-down, move on the first mouse-move. Starting the
+                            // move on the down would swallow the double-click below.
                             .window_control_area(WindowControlArea::Drag)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _event, _window, _cx| {
+                                    this.workspace_tabs_title_bar_drag_armed = true;
+                                }),
+                            )
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _event, _window, _cx| {
+                                    this.workspace_tabs_title_bar_drag_armed = false;
+                                }),
+                            )
+                            .on_mouse_down_out(cx.listener(|this, _event, _window, _cx| {
+                                this.workspace_tabs_title_bar_drag_armed = false;
+                            }))
+                            .on_mouse_move(cx.listener(|this, _event, window, _cx| {
+                                if this.workspace_tabs_title_bar_drag_armed {
+                                    this.workspace_tabs_title_bar_drag_armed = false;
+                                    window.start_window_move();
+                                }
+                            }))
                             .on_click(|event, window, _| {
                                 if event.click_count() == 2 {
                                     window.titlebar_double_click();
