@@ -285,6 +285,32 @@ impl WelcomePage {
         }
     }
 
+    /// Builds a welcome page with its recent list already filled, skipping the database
+    /// read `new` would otherwise do. `fallback_to_recent_projects: false` keeps that
+    /// read from racing the value the test just set.
+    #[cfg(test)]
+    pub(crate) fn test_new_with_recent_workspaces(
+        workspace: WeakEntity<Workspace>,
+        recent_workspaces: Vec<RecentWorkspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut page = Self::new(workspace, false, window, cx);
+        page.recent_workspaces = Some(recent_workspaces);
+        page
+    }
+
+    /// Clicks the `index`th row of the recent list.
+    #[cfg(test)]
+    pub(crate) fn test_open_recent_project(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_recent_project(&OpenRecentProject { index }, window, cx);
+    }
+
     fn select_next(&mut self, _: &SelectNext, window: &mut Window, cx: &mut Context<Self>) {
         window.focus_next(cx);
         cx.notify();
@@ -311,6 +337,31 @@ impl WelcomePage {
                         DefaultOpenBehavior::ExistingWindow => OpenMode::Activate,
                         DefaultOpenBehavior::NewWindow => OpenMode::NewWindow,
                     };
+
+                    // `#zed-66.3`: open into *this* window through the multiworkspace, the
+                    // way the other two recent-project surfaces already do
+                    // (`recent_projects.rs`, `sidebar_recent_projects.rs`). Going straight to
+                    // `open_workspace_for_paths` skips `MultiWorkspace::open_project`, which
+                    // is what detaches the empty workspace being opened from — so the row it
+                    // was sitting on was stranded for good.
+                    //
+                    // Only the same-window case. `open_project`'s retention branch opens with
+                    // `OpenMode::Activate` regardless of what it is handed, so routing a
+                    // `NewWindow` request through it would quietly ignore the setting.
+                    if open_mode == OpenMode::Activate
+                        && let Some(multi_workspace) =
+                            window.window_handle().downcast::<crate::MultiWorkspace>()
+                    {
+                        multi_workspace
+                            .update(cx, |multi_workspace, window, cx| {
+                                multi_workspace
+                                    .open_project(paths, OpenMode::Activate, window, cx)
+                                    .detach_and_log_err(cx);
+                            })
+                            .log_err();
+                        return;
+                    }
+
                     self.workspace
                         .update(cx, |workspace, cx| {
                             workspace

@@ -9,6 +9,7 @@ title: "Zed RBF Changelog"
 - 2026-08-27 - fix (ux) | close workspace tabs as many times as you like without the Workspaces strip filling up with `Empty Workspace` rows that nothing can clear (#zed-66) [@zed-rbf]
 - 2026-08-27 - fix (ux) | close a workspace tab and have it close, instead of reaching into your project history and opening something you never had open — closing your last workspace now leaves an empty one and keeps the window (#zed-68) [@zed-rbf]
 - 2026-08-28 - fix (ux) | open a project while sitting on an empty workspace without the `Empty Workspace` row flashing beside it first — and without the whole Workspaces strip appearing and vanishing when you have no saved configurations (#zed-66.2) [@zed-rbf]
+- 2026-08-28 - fix (ux) | click a project in the welcome screen's Recent Projects list without the `Empty Workspace` row you opened it from staying behind for good — that list was the one route into a window that never went through the workspace manager, so nothing ever cleared it (#zed-66.3) [@zed-rbf]
 
 ---
 
