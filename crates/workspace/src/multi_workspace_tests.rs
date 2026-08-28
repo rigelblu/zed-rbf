@@ -5973,64 +5973,6 @@ async fn test_workspace_tab_rows_omit_a_disposable_placeholder(cx: &mut TestAppC
 }
 
 #[gpui::test]
-async fn zzz_probe_open_project_directly(cx: &mut TestAppContext) {
-    init_test(cx);
-    reset_workspace_configuration_store(cx).await;
-    let fs = FakeFs::new(cx.executor());
-    fs.insert_tree("/root_a", json!({ "a.txt": "" })).await;
-    fs.insert_tree("/root_b", json!({ "b.txt": "" })).await;
-    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
-    cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
-
-    let (multi_workspace, cx) =
-        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
-    cx.run_until_parked();
-
-    let _empty = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
-        let app_state = multi_workspace.workspace().read(cx).app_state().clone();
-        let project = Project::local(
-            app_state.client.clone(),
-            app_state.node_runtime.clone(),
-            app_state.user_store.clone(),
-            app_state.languages.clone(),
-            app_state.fs.clone(),
-            None,
-            project::LocalProjectFlags::default(),
-            cx,
-        );
-        let empty = cx.new(|cx| Workspace::new(None, project, app_state, window, cx));
-        multi_workspace.activate(empty.clone(), None, window, cx);
-        empty
-    });
-    cx.run_until_parked();
-
-    // Same call, but reached the way `welcome.rs` reaches it: through the window handle.
-    let task = multi_workspace.update_in(cx, |_mw, window, cx| {
-        let handle = window.window_handle().downcast::<MultiWorkspace>().unwrap();
-        handle
-            .update(cx, |multi_workspace, window, cx| {
-                multi_workspace.open_project(
-                    vec![PathBuf::from("/root_b")],
-                    OpenMode::Activate,
-                    window,
-                    cx,
-                )
-            })
-            .unwrap()
-    });
-    let result = task.await;
-    cx.run_until_parked();
-
-    multi_workspace.read_with(cx, |multi_workspace, cx| {
-        panic!(
-            "PROBE open_project ok={:?} rows={:?}",
-            result.is_ok(),
-            multi_workspace.test_workspace_tab_labels(cx)
-        );
-    });
-}
-
-#[gpui::test]
 async fn test_welcome_recent_list_does_not_strand_an_empty_workspace(cx: &mut TestAppContext) {
     init_test(cx);
     reset_workspace_configuration_store(cx).await;
@@ -6087,18 +6029,17 @@ async fn test_welcome_recent_list_does_not_strand_an_empty_workspace(cx: &mut Te
     welcome.update_in(cx, |welcome, window, cx| {
         welcome.test_open_recent_project(0, window, cx)
     });
-    for _ in 0..5 {
-        cx.run_until_parked();
-        cx.background_executor.run_until_parked();
-    }
+    cx.run_until_parked();
 
     multi_workspace.read_with(cx, |multi_workspace, cx| {
-        let rows = multi_workspace.ordered_workspace_tabs(cx);
+        // Which rows exist, not their order — activating the opened project reorders
+        // `project_groups`, so the two real rows legitimately swap places.
+        let mut labels = multi_workspace.test_workspace_tab_labels(cx);
+        labels.sort();
         assert_eq!(
-            rows.len(),
-            1,
-            "one row for the opened project, and nothing left over: {:?}",
-            multi_workspace.test_workspace_tab_labels(cx)
+            labels,
+            vec!["root_a".to_string(), "root_b".to_string()],
+            "the recent project opened, and no Empty Workspace was left over"
         );
         assert!(
             !multi_workspace.workspaces().any(|held| held == &empty),

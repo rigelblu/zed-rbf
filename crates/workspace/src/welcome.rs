@@ -352,13 +352,28 @@ impl WelcomePage {
                         && let Some(multi_workspace) =
                             window.window_handle().downcast::<crate::MultiWorkspace>()
                     {
-                        multi_workspace
-                            .update(cx, |multi_workspace, window, cx| {
-                                multi_workspace
-                                    .open_project(paths, OpenMode::Activate, window, cx)
-                                    .detach_and_log_err(cx);
+                        // From a spawn, not inline: this handler is already running inside
+                        // the window's own update, and re-entering it through the handle
+                        // fails with "window not found" — silently, because the error is
+                        // only logged and a click would simply do nothing. Both sibling
+                        // recent-project surfaces spawn for the same reason.
+                        window
+                            .spawn(cx, async move |cx| {
+                                if let Some(task) = multi_workspace
+                                    .update(cx, |multi_workspace, window, cx| {
+                                        multi_workspace.open_project(
+                                            paths,
+                                            OpenMode::Activate,
+                                            window,
+                                            cx,
+                                        )
+                                    })
+                                    .log_err()
+                                {
+                                    task.await.log_err();
+                                }
                             })
-                            .log_err();
+                            .detach();
                         return;
                     }
 
