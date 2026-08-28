@@ -21,6 +21,15 @@ use settings::{Settings, SettingsStore};
 use ui::utils::platform_title_bar_height;
 use util::path;
 
+/// `#zed-70`: the consent snapshot for a workspace holding no unsaved work.
+///
+/// The empty set is the strictest input the guard accepts — it asserts the subject is
+/// clean — so the preconditions below keep testing exactly what they tested before the
+/// snapshot term existed, rather than passing for a new reason.
+fn nothing_consented() -> HashSet<EntityId> {
+    HashSet::default()
+}
+
 struct TestInputEditor {
     text: String,
     focus_handle: gpui::FocusHandle,
@@ -5840,7 +5849,7 @@ async fn test_placeholder_is_disposable_only_while_it_is_still_empty(cx: &mut Te
 
     multi_workspace.read_with(cx, |multi_workspace, cx| {
         assert!(
-            multi_workspace.test_placeholder_is_disposable(&placeholder, cx),
+            multi_workspace.test_placeholder_is_disposable(&placeholder, &nothing_consented(), cx),
             "a held, undisplayed, empty placeholder is exactly what the cleanup may drop"
         );
     });
@@ -5864,12 +5873,86 @@ async fn test_placeholder_is_disposable_only_while_it_is_still_empty(cx: &mut Te
 
     multi_workspace.read_with(cx, |multi_workspace, cx| {
         assert!(
-            !multi_workspace.test_placeholder_is_disposable(&placeholder, cx),
+            !multi_workspace.test_placeholder_is_disposable(&placeholder, &nothing_consented(), cx),
             "once it holds a worktree it is the user's project, not a disposable placeholder"
         );
         assert!(
             multi_workspace.is_workspace_retained(&placeholder),
             "and it is still pinned — which is why the pinned-only guard discarded it"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_placeholder_is_disposable_only_for_work_that_was_consented(cx: &mut TestAppContext) {
+    init_test(cx);
+    reset_workspace_configuration_store(cx).await;
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "a.txt": "" })).await;
+    fs.insert_tree("/root_b", json!({ "b.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs.clone(), ["/root_b".as_ref()], cx).await;
+    cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    let workspace_b = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b, window, cx)
+    });
+    cx.run_until_parked();
+
+    let placeholder = mint_held_placeholder(&multi_workspace, &workspace_b, cx);
+
+    // The snapshot `open_project` takes the instant `prepare_to_close` returns true.
+    // Nothing is dirty yet, so it is empty — which is the whole point: it records what
+    // the user was actually asked about.
+    let consented_at_prompt = multi_workspace.read_with(cx, |_, cx| {
+        MultiWorkspace::test_dirty_item_ids(&placeholder, cx)
+    });
+
+    // The race: the placeholder is still on screen while the replacement project loads,
+    // so the user can type into it. This item was never covered by any prompt.
+    let typed_after_consent = cx.new(|cx| TestItem::new(cx).with_dirty(true));
+    placeholder.update_in(cx, |workspace, window, cx| {
+        workspace.add_item_to_active_pane(
+            Box::new(typed_after_consent.clone()),
+            None,
+            true,
+            window,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert!(
+            !multi_workspace.test_placeholder_is_disposable(&placeholder, &consented_at_prompt, cx),
+            "work typed after consent was never agreed to, so the detach must not take it"
+        );
+    });
+
+    // The same workspace, same dirty item, against a snapshot taken *after* it was
+    // dirtied — which is the consented flow: prompted, "Don't Save", and a scratch
+    // buffer that stays dirty because it has no file to reload from. This half is the
+    // control. Widening the guard to plain `is_dirty` passes the assertion above and
+    // fails this one, which is exactly how that fix was caught on 2026-08-28.
+    let consented_including_the_buffer = multi_workspace.read_with(cx, |_, cx| {
+        MultiWorkspace::test_dirty_item_ids(&placeholder, cx)
+    });
+    assert!(
+        consented_including_the_buffer.contains(&typed_after_consent.entity_id()),
+        "fixture precondition: the later snapshot has to actually see the dirty item, \
+         or the control below passes for the wrong reason"
+    );
+
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert!(
+            multi_workspace.test_placeholder_is_disposable(
+                &placeholder,
+                &consented_including_the_buffer,
+                cx
+            ),
+            "unsaved work the user was prompted about and agreed to discard still detaches"
         );
     });
 }
@@ -5911,7 +5994,7 @@ fn mint_held_placeholder(
 
     multi_workspace.read_with(cx, |multi_workspace, cx| {
         assert!(
-            multi_workspace.test_placeholder_is_disposable(&placeholder, cx),
+            multi_workspace.test_placeholder_is_disposable(&placeholder, &nothing_consented(), cx),
             "fixture precondition: the placeholder must be held, undisplayed and empty, \
              or the detach guard below never reaches the code it protects"
         );
@@ -6174,7 +6257,7 @@ async fn test_workspace_tab_rows_keep_an_empty_workspace_the_user_made(cx: &mut 
 
     multi_workspace.read_with(cx, |multi_workspace, cx| {
         assert!(
-            multi_workspace.test_placeholder_is_disposable(&user_emptied, cx),
+            multi_workspace.test_placeholder_is_disposable(&user_emptied, &nothing_consented(), cx),
             "precondition: by state alone this is indistinguishable from a placeholder — \
              which is exactly why state alone was the wrong question"
         );
@@ -6295,7 +6378,7 @@ async fn test_workspace_tab_rows_keep_the_displayed_empty_workspace(cx: &mut Tes
             "a displayed empty workspace keeps its row — it is what the user is looking at"
         );
         assert!(
-            !multi_workspace.test_placeholder_is_disposable(&empty, cx),
+            !multi_workspace.test_placeholder_is_disposable(&empty, &nothing_consented(), cx),
             "and the predicate agrees it is not disposable, which is what makes the \
              failed-reopen case self-healing rather than flag-dependent"
         );

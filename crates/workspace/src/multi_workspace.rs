@@ -1,4 +1,5 @@
 use anyhow::{Context as _, Result};
+use collections::HashSet;
 use fs::Fs;
 
 use gpui::{
@@ -363,6 +364,20 @@ impl std::fmt::Display for WorkspaceConfigurationSwitchCanceled {
 }
 
 impl std::error::Error for WorkspaceConfigurationSwitchCanceled {}
+
+/// The ids of `workspace`'s items that currently hold unsaved work.
+///
+/// `#zed-70`: taken once when consent is given and once again at detach, so the two can
+/// be compared. Ids rather than handles because the comparison outlives the borrow, and
+/// because an item that is dropped between the two points should simply be absent.
+fn dirty_item_ids(workspace: &Entity<Workspace>, cx: &App) -> HashSet<EntityId> {
+    let workspace = workspace.read(cx);
+    workspace
+        .items(cx)
+        .filter(|item| item.is_dirty(cx))
+        .map(|item| item.item_id())
+        .collect()
+}
 
 fn project_group_covers_workspace_key(
     group_key: &ProjectGroupKey,
@@ -2740,10 +2755,32 @@ impl MultiWorkspace {
     ///
     /// Requiring it to still be undisplayed also keeps `detach_workspace`'s re-point
     /// assertion unreachable from these call sites.
-    fn placeholder_is_disposable(&self, workspace: &Entity<Workspace>, cx: &App) -> bool {
+    ///
+    /// `consented_dirty` is the snapshot taken by [`dirty_item_ids`] at the moment
+    /// consent was given. Work dirtied *after* that moment was never covered by the
+    /// prompt, so detaching would destroy it silently.
+    ///
+    /// `#zed-70`: asking `is_dirty` alone cannot work here. `Pane::save_item`'s
+    /// "Don't Save" branch reloads from disk only when `can_save && is_singleton`, and a
+    /// scratch buffer has no file to reload from — so it stays dirty after a fully
+    /// consented discard. An empty workspace has no worktrees, so scratch buffers are the
+    /// only dirty content it can hold: dirty-after-consent is the normal outcome there,
+    /// not the exception. Comparing against the snapshot is what separates the two.
+    ///
+    /// **Known limit.** A buffer that was dirty at consent and is edited *further* during
+    /// the await keeps its id, so it stays in the subset and is still detached. Closing
+    /// that needs per-buffer edit versions; it is not built, because the user is typing
+    /// into a buffer they just asked the app to discard.
+    fn placeholder_is_disposable(
+        &self,
+        workspace: &Entity<Workspace>,
+        consented_dirty: &HashSet<EntityId>,
+        cx: &App,
+    ) -> bool {
         self.held_index(workspace).is_some()
             && self.workspace() != workspace
             && workspace_tab_paths_are_empty(workspace.read(cx), cx)
+            && dirty_item_ids(workspace, cx).is_subset(consented_dirty)
     }
 
     /// Detaches a workspace: clears session state, DB binding, cached
@@ -3087,9 +3124,20 @@ impl MultiWorkspace {
     pub(crate) fn test_placeholder_is_disposable(
         &self,
         workspace: &Entity<Workspace>,
+        consented_dirty: &HashSet<EntityId>,
         cx: &App,
     ) -> bool {
-        self.placeholder_is_disposable(workspace, cx)
+        self.placeholder_is_disposable(workspace, consented_dirty, cx)
+    }
+
+    /// The snapshot `open_project` takes when consent is given, exposed so a test can
+    /// take it at one moment and ask the guard about a later one.
+    #[cfg(test)]
+    pub(crate) fn test_dirty_item_ids(
+        workspace: &Entity<Workspace>,
+        cx: &App,
+    ) -> HashSet<EntityId> {
+        dirty_item_ids(workspace, cx)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -3347,6 +3395,11 @@ impl MultiWorkspace {
             // Edit phase: one synchronous update. Delete the rows, then pick
             // the replacement from the rows that actually remain.
             let mut placeholder = None;
+            // `#zed-70`: a freshly minted empty holds nothing, so this is provably empty
+            // here. It is still taken rather than assumed, so the guard reads the same
+            // consent snapshot on both paths and the reopen await gets the same
+            // protection as the open await.
+            let mut consented_dirty = HashSet::default();
             let (removed_any, reopen_key) = this.update_in(cx, |this, window, cx| {
                 let mut removed_any = false;
                 let displayed_workspace = this.workspace().clone();
@@ -3419,6 +3472,7 @@ impl MultiWorkspace {
                             // workspace is re-pointed before it is detached.
                             if reopen_key.is_some() {
                                 placeholder = Some(empty.clone());
+                                consented_dirty = dirty_item_ids(&empty, cx);
                                 // `#zed-66.2`: it is only a placeholder on this branch, so
                                 // this is the only branch that may hide it from the strip.
                                 this.mark_placeholder_in_flight(&empty);
@@ -3482,7 +3536,7 @@ impl MultiWorkspace {
                     && placeholder != reopened
                 {
                     this.update(cx, |this, cx| {
-                        if this.placeholder_is_disposable(&placeholder, cx) {
+                        if this.placeholder_is_disposable(&placeholder, &consented_dirty, cx) {
                             this.detach_workspace(&placeholder, cx);
                             cx.notify();
                         }
@@ -3517,6 +3571,7 @@ impl MultiWorkspace {
             };
 
             cx.spawn_in(window, async move |this, cx| {
+                let mut consented_dirty = HashSet::default();
                 if let Some(empty_workspace) = empty_workspace.as_ref() {
                     let should_continue = empty_workspace
                         .update_in(cx, |workspace, window, cx| {
@@ -3529,6 +3584,10 @@ impl MultiWorkspace {
                     // `#zed-66.2`: marked only after `prepare_to_close` returned true. The
                     // strip hides this row, so the user has to have agreed it is going —
                     // consent first, then it may disappear.
+                    //
+                    // `#zed-70`: the same moment is where consent's *extent* is captured.
+                    // Anything dirtied after this line was never covered by the prompt.
+                    consented_dirty = cx.update(|_, cx| dirty_item_ids(empty_workspace, cx))?;
                     this.update(cx, |this, _cx| {
                         this.mark_placeholder_in_flight(empty_workspace)
                     })?;
@@ -3555,7 +3614,7 @@ impl MultiWorkspace {
                     this.update(cx, |this, cx| {
                         // `#zed-66`: same exposure as `remove`'s placeholder cleanup —
                         // `empty_workspace` is captured before an await.
-                        if this.placeholder_is_disposable(&empty_workspace, cx) {
+                        if this.placeholder_is_disposable(&empty_workspace, &consented_dirty, cx) {
                             this.detach_workspace(&empty_workspace, cx);
                             cx.notify();
                         }
