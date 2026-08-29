@@ -2358,7 +2358,13 @@ impl MultiWorkspace {
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Workspace>>> {
         if let Some(workspace) = self.workspace_for_paths(&paths, host.as_ref(), cx) {
-            self.activate(workspace.clone(), source_workspace, window, cx);
+            // `#zed-66.4`: this runs *before* the delegation below, with the same
+            // predicate when `host` is `None` — so it shadows the guard in
+            // `find_or_create_local_workspace` for every caller that enters here. Every
+            // sidebar, recent-projects and git surface does. The first draft of this
+            // slice guarded only the shadowed one and claimed in its commit message that
+            // it was the branch those surfaces hit; it is not.
+            self.activate_as_open(workspace.clone(), source_workspace, window, cx);
             return Task::ready(Ok(workspace));
         }
 
@@ -2461,13 +2467,12 @@ impl MultiWorkspace {
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Workspace>>> {
         if let Some(workspace) = self.workspace_for_paths(&path_list, None, cx) {
-            // `#zed-66.4`: the synchronous twin of the check inside the spawn below, and
-            // the one every sidebar and recent-projects surface actually hits. It returns
-            // before `open_paths` or `Workspace::new_local` are ever reached, so neither
-            // of the other detaches can see this open.
-            let displaced = self.workspace().clone();
-            self.activate(workspace.clone(), source_workspace, window, cx);
-            self.detach_replaced_empty_workspace(&displaced, &HashSet::default(), cx);
+            // `#zed-66.4`: reached only by `remove` and `open_project`, the two callers
+            // that enter this function directly. Everything else arrives through
+            // `find_or_create_workspace`, whose own early return above matches first and
+            // is guarded separately. Both are kept: this one still returns before
+            // `open_paths` or `Workspace::new_local`, so no other detach can see it.
+            self.activate_as_open(workspace.clone(), source_workspace, window, cx);
             return Task::ready(Ok(workspace));
         }
 
@@ -2503,16 +2508,18 @@ impl MultiWorkspace {
             if let Some(requesting_window) = requesting_window
                 && let Some(workspace) = requesting_window
                     .update(cx, |multi_workspace, window, cx| {
-                        // `#zed-66.4`: **deliberately not detaching here**, unlike the
-                        // synchronous twin above. This branch is only reached when the
-                        // project-group fallback rewrites the path list, and no test in
-                        // the suite reaches it — a detach added here stayed green when
-                        // deleted, which is the same unwitnessed-change trap `#zed-66.2`'s
-                        // cold review rejected. Filed rather than shipped on faith.
+                        // `#zed-66.4`: reached when the project-group fallback rewrites
+                        // the path list, so the two synchronous checks above both missed
+                        // and only this one matches.
+                        //
+                        // The first draft reverted this for being unwitnessed. That was
+                        // the wrong reading of `#zed-66.2`'s rule, which bars shipping
+                        // code that *cannot* be witnessed — not code not yet witnessed.
+                        // The cold review reached the branch in about sixty lines.
                         multi_workspace
                             .workspace_for_paths(&effective_path_list, None, cx)
                             .inspect(|workspace| {
-                                multi_workspace.activate(
+                                multi_workspace.activate_as_open(
                                     workspace.clone(),
                                     source_workspace.clone(),
                                     window,
@@ -2823,6 +2830,41 @@ impl MultiWorkspace {
             self.detach_workspace(replaced, cx);
             cx.notify();
         }
+    }
+
+    /// Activates `workspace` as the target of an **open**, not a tab switch.
+    ///
+    /// `#zed-66.4`: those two gestures look identical at `activate` and are not. Clicking
+    /// a tab row moves between workspaces the user is keeping; opening a project
+    /// *replaces* the one displayed, and leaving that one behind is the `#zed-66` defect.
+    /// Every open route that activates a workspace the window already holds goes through
+    /// here, so the distinction lives in the name rather than in each caller remembering
+    /// to detach afterwards.
+    ///
+    /// Nothing here consents to losing unsaved work — see
+    /// [`Self::detach_replaced_empty_workspace_if_clean`].
+    pub fn activate_as_open(
+        &mut self,
+        workspace: Entity<Workspace>,
+        source_workspace: Option<WeakEntity<Workspace>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let displaced = self.workspace().clone();
+        self.activate(workspace, source_workspace, window, cx);
+        self.detach_replaced_empty_workspace_if_clean(&displaced, cx);
+    }
+
+    /// The no-consent form of [`Self::detach_replaced_empty_workspace`], for the routes
+    /// that never ran `prepare_to_close` — which is all of them except `open_project` and
+    /// `remove`. Passing no snapshot means only a provably clean workspace may be
+    /// dropped, so these callers can never discard unsaved work.
+    pub fn detach_replaced_empty_workspace_if_clean(
+        &mut self,
+        replaced: &Entity<Workspace>,
+        cx: &mut Context<Self>,
+    ) {
+        self.detach_replaced_empty_workspace(replaced, &HashSet::default(), cx);
     }
 
     /// Detaches a workspace: clears session state, DB binding, cached

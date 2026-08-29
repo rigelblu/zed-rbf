@@ -2079,11 +2079,8 @@ impl Workspace {
                                 // consented to losing unsaved work and only a clean
                                 // workspace may be dropped. `open_project` runs its own
                                 // consented pass afterwards.
-                                multi_workspace.detach_replaced_empty_workspace(
-                                    &displaced,
-                                    &HashSet::default(),
-                                    cx,
-                                );
+                                multi_workspace
+                                    .detach_replaced_empty_workspace_if_clean(&displaced, cx);
                             }
                             OpenMode::Add => {
                                 // Untouched by `#zed-66.4`: `Add` means keep what is
@@ -11274,11 +11271,10 @@ pub fn open_paths(
                     // the seam inside it cannot see this open. Reopening a project the
                     // window already holds displaces the current workspace just the same,
                     // and without this every such open from an empty one strands a row.
-                    let displaced = multi_workspace.workspace().clone();
-                    multi_workspace.activate(target_workspace.clone(), None, window, cx);
-                    multi_workspace.detach_replaced_empty_workspace(
-                        &displaced,
-                        &HashSet::default(),
+                    multi_workspace.activate_as_open(
+                        target_workspace.clone(),
+                        None,
+                        window,
                         cx,
                     );
                     target_workspace.update(cx, |workspace, cx| {

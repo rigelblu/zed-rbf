@@ -1514,7 +1514,13 @@ impl PickerDelegate for RecentProjectsDelegate {
                         {
                             handle
                                 .update(cx, |multi_workspace, window, cx| {
-                                    multi_workspace.activate(workspace, None, window, cx);
+                                    // `#zed-66.4`: picking a project group activates a
+                                    // held workspace directly, so it reaches none of the
+                                    // detaches in `workspace`. Without this, opening a
+                                    // project from the switcher while sitting on an empty
+                                    // workspace strands its row — the `#zed-66` defect on
+                                    // a first-class open-a-project surface.
+                                    multi_workspace.activate_as_open(workspace, None, window, cx);
                                 })
                                 .log_err();
                         } else {

@@ -4067,6 +4067,73 @@ async fn test_find_or_create_workspace_uses_project_group_key_when_paths_are_mis
 }
 
 #[gpui::test]
+async fn test_project_group_fallback_clears_the_empty_it_replaces(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/project", json!({ ".git": {}, "src": {} }))
+        .await;
+    cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+    let project = Project::test(fs.clone(), ["/project".as_ref()], cx).await;
+    project
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+    let project_group_key = project.read_with(cx, |project, cx| project.project_group_key(cx));
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    cx.run_until_parked();
+
+    // The fixture line that turns
+    // `test_find_or_create_workspace_uses_project_group_key_when_paths_are_missing` into a
+    // witness for `#zed-66.4`: an empty workspace displayed when the fallback fires.
+    let empty_workspace = multi_workspace.update_in(cx, |mw, window, cx| {
+        let app_state = mw.workspace().read(cx).app_state().clone();
+        let empty_project = Project::local(
+            app_state.client.clone(),
+            app_state.node_runtime.clone(),
+            app_state.user_store.clone(),
+            app_state.languages.clone(),
+            app_state.fs.clone(),
+            None,
+            project::LocalProjectFlags::default(),
+            cx,
+        );
+        let empty = cx.new(|cx| Workspace::new(None, empty_project, app_state, window, cx));
+        mw.activate(empty.clone(), None, window, cx);
+        empty
+    });
+    cx.run_until_parked();
+
+    // `/wt-feature-a` is missing on disk, so both synchronous path checks miss and the
+    // project-group fallback inside the spawn rewrites the list — the only route that
+    // reaches the async early return.
+    multi_workspace
+        .update_in(cx, |mw, window, cx| {
+            mw.find_or_create_workspace(
+                PathList::new(&[PathBuf::from("/wt-feature-a")]),
+                None,
+                Some(project_group_key.clone()),
+                |_options, _window, _cx| Task::ready(Ok(None)),
+                None,
+                OpenMode::Activate,
+                None,
+                window,
+                cx,
+            )
+        })
+        .await
+        .expect("the fallback should reuse the project group key's workspace");
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |mw, _cx| {
+        assert!(
+            !mw.workspaces().any(|w| w == &empty_workspace),
+            "the empty workspace the fallback displaced must be detached like every other route"
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_remove_fallback_via_find_or_create_skips_removed_workspaces(cx: &mut TestAppContext) {
     init_test(cx);
     let fs = FakeFs::new(cx.executor());
@@ -4894,6 +4961,237 @@ async fn test_find_or_create_clears_the_empty_when_it_matches_a_held_workspace(
             assert!(
                 !held.contains(&empty_workspace),
                 "the displaced empty must be detached on the early-return branch too"
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+async fn test_open_detaches_the_displaced_empty_and_spares_a_hand_emptied_one(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let app_state = cx.update(AppState::test);
+    let fs = app_state.fs.as_fake();
+    fs.insert_tree(path!("/project_a"), json!({ "file_a.txt": "" }))
+        .await;
+
+    let project_a = Project::test(app_state.fs.clone(), [path!("/project_a").as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    cx.run_until_parked();
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+    let make_empty =
+        |mw: &mut MultiWorkspace, window: &mut Window, cx: &mut Context<MultiWorkspace>| {
+            let app_state = mw.workspace().read(cx).app_state().clone();
+            let project = Project::local(
+                app_state.client.clone(),
+                app_state.node_runtime.clone(),
+                app_state.user_store.clone(),
+                app_state.languages.clone(),
+                app_state.fs.clone(),
+                None,
+                project::LocalProjectFlags::default(),
+                cx,
+            );
+            cx.new(|cx| Workspace::new(None, project, app_state, window, cx))
+        };
+
+    // Two empty workspaces that are indistinguishable by state. `hand_emptied` stands in
+    // for one the user emptied themselves (project panel → Remove from Project) and then
+    // clicked away from; `displaced` is the one they are sitting on when they open.
+    let (hand_emptied, displaced) = window
+        .update(cx, |mw, window, cx| {
+            let hand_emptied = make_empty(mw, window, cx);
+            mw.activate(hand_emptied.clone(), None, window, cx);
+            let displaced = make_empty(mw, window, cx);
+            mw.activate(displaced.clone(), None, window, cx);
+            (hand_emptied, displaced)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    // `#zed-66.4`: the assertion this whole design rests on, and the one the first draft
+    // shipped without. `placeholder_is_disposable` cannot tell these two apart — the cold
+    // review proved it by swapping the body for a scan over every held workspace and
+    // watching the suite stay green. What separates them is that callers pass the
+    // workspace *this open displaced*, captured before the activate, never one found by
+    // scanning for a disposable-looking row.
+    displaced
+        .update_in(cx, |workspace, window, cx| {
+            workspace.open_workspace_for_paths(
+                OpenMode::Activate,
+                vec![PathBuf::from(path!("/project_a"))],
+                window,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+
+    window
+        .read_with(cx, |mw, _cx| {
+            let held: Vec<_> = mw.workspaces().cloned().collect();
+            assert!(
+                held.contains(&hand_emptied),
+                "the workspace the user emptied by hand and clicked away from is theirs — \
+                 nobody consented to it going, and no open displaced it"
+            );
+            assert!(
+                !held.contains(&displaced),
+                "but the one the open replaced is detached, or the fix does nothing"
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+async fn test_find_or_create_workspace_clears_the_empty_on_the_outer_early_return(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let app_state = cx.update(AppState::test);
+    let fs = app_state.fs.as_fake();
+    fs.insert_tree(path!("/project_a"), json!({ "file_a.txt": "" }))
+        .await;
+
+    let project_a = Project::test(app_state.fs.clone(), [path!("/project_a").as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    cx.run_until_parked();
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+    let empty_workspace = window
+        .update(cx, |mw, window, cx| {
+            let app_state = mw.workspace().read(cx).app_state().clone();
+            let project = Project::local(
+                app_state.client.clone(),
+                app_state.node_runtime.clone(),
+                app_state.user_store.clone(),
+                app_state.languages.clone(),
+                app_state.fs.clone(),
+                None,
+                project::LocalProjectFlags::default(),
+                cx,
+            );
+            let empty = cx.new(|cx| Workspace::new(None, project, app_state, window, cx));
+            mw.activate(empty.clone(), None, window, cx);
+            empty
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    // `#zed-66.4`: through `find_or_create_workspace`, the **outer** function. Every
+    // sidebar, recent-projects and git surface calls this one, and its own early return
+    // matches before it ever delegates to `find_or_create_local_workspace` — so guarding
+    // only the inner twin left every one of those surfaces stranding a row.
+    window
+        .update(cx, |mw, window, cx| {
+            mw.find_or_create_workspace(
+                PathList::new(&[PathBuf::from(path!("/project_a"))]),
+                None,
+                None,
+                |_, _, _| Task::ready(Ok(None)),
+                None,
+                OpenMode::Activate,
+                None,
+                window,
+                cx,
+            )
+        })
+        .unwrap()
+        .await
+        .unwrap();
+    cx.run_until_parked();
+
+    window
+        .read_with(cx, |mw, _cx| {
+            assert!(
+                !mw.workspaces().any(|w| w == &empty_workspace),
+                "the displaced empty must be detached on the outer early return too"
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+async fn test_activate_as_open_clears_the_displaced_empty_but_plain_activate_does_not(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let app_state = cx.update(AppState::test);
+    let fs = app_state.fs.as_fake();
+    fs.insert_tree(path!("/project_a"), json!({ "file_a.txt": "" }))
+        .await;
+
+    let project_a = Project::test(app_state.fs.clone(), [path!("/project_a").as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    cx.run_until_parked();
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+    let workspace_a = window
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+
+    let new_empty =
+        |mw: &mut MultiWorkspace, window: &mut Window, cx: &mut Context<MultiWorkspace>| {
+            let app_state = mw.workspace().read(cx).app_state().clone();
+            let project = Project::local(
+                app_state.client.clone(),
+                app_state.node_runtime.clone(),
+                app_state.user_store.clone(),
+                app_state.languages.clone(),
+                app_state.fs.clone(),
+                None,
+                project::LocalProjectFlags::default(),
+                cx,
+            );
+            cx.new(|cx| Workspace::new(None, project, app_state, window, cx))
+        };
+
+    // `#zed-66.4`: the two gestures that look identical at `activate`. Switching tabs must
+    // leave the workspace behind; opening a project must replace it. The project-group
+    // picker in `recent_projects` was doing the first when it meant the second, which is
+    // why picking a group from the switcher stranded a row.
+    let switched_away_from = window
+        .update(cx, |mw, window, cx| {
+            let empty = new_empty(mw, window, cx);
+            mw.activate(empty.clone(), None, window, cx);
+            mw.activate(workspace_a.clone(), None, window, cx);
+            empty
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    window
+        .read_with(cx, |mw, _cx| {
+            assert!(
+                mw.workspaces().any(|w| w == &switched_away_from),
+                "a plain `activate` is a tab switch and must keep the workspace it left"
+            );
+        })
+        .unwrap();
+
+    let opened_away_from = window
+        .update(cx, |mw, window, cx| {
+            let empty = new_empty(mw, window, cx);
+            mw.activate(empty.clone(), None, window, cx);
+            mw.activate_as_open(workspace_a.clone(), None, window, cx);
+            empty
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    window
+        .read_with(cx, |mw, _cx| {
+            assert!(
+                !mw.workspaces().any(|w| w == &opened_away_from),
+                "but `activate_as_open` replaces it, which is what every open route needs"
+            );
+            assert!(
+                mw.workspaces().any(|w| w == &switched_away_from),
+                "and it touches only what it displaced — the earlier one is still the \
+                 user's, and no open displaced it"
             );
         })
         .unwrap();
