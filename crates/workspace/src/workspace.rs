@@ -2040,6 +2040,12 @@ impl Workspace {
                         .unwrap_or(false);
 
                     let workspace = window.update(cx, |multi_workspace, window, cx| {
+                        // `#zed-66.4`: captured *before* the activate below, because this
+                        // is the only moment that identifies the workspace the open
+                        // displaced. Scanning afterwards for an empty, undisplayed row
+                        // would also find a workspace the user emptied by hand and clicked
+                        // away from, which has identical state and must keep its row.
+                        let displaced = multi_workspace.workspace().clone();
                         let workspace = cx.new(|cx| {
                             let mut workspace = Workspace::new(
                                 Some(workspace_id),
@@ -2061,8 +2067,27 @@ impl Workspace {
                         match open_mode {
                             OpenMode::Activate => {
                                 multi_workspace.activate(workspace.clone(), None, window, cx);
+                                // `#zed-66.4`: this arm is the seam every same-window open
+                                // converges on, `MultiWorkspace::open_project` included.
+                                // Clearing the displaced empty here rather than in each
+                                // caller is what stops the next route from regenerating
+                                // the defect — the project panel's empty-state drop and
+                                // `zed <dir>` were instances six and seven.
+                                //
+                                // The empty snapshot is deliberate: callers arriving here
+                                // directly never ran `prepare_to_close`, so nothing has
+                                // consented to losing unsaved work and only a clean
+                                // workspace may be dropped. `open_project` runs its own
+                                // consented pass afterwards.
+                                multi_workspace.detach_replaced_empty_workspace(
+                                    &displaced,
+                                    &HashSet::default(),
+                                    cx,
+                                );
                             }
                             OpenMode::Add => {
+                                // Untouched by `#zed-66.4`: `Add` means keep what is
+                                // already there.
                                 multi_workspace.add(workspace.clone(), window, cx);
                             }
                             OpenMode::NewWindow => {
@@ -11245,7 +11270,17 @@ pub fn open_paths(
             let open_task = existing
                 .update(cx, |multi_workspace, window, cx| {
                     window.activate_window();
+                    // `#zed-66.4`: this branch never reaches `Workspace::new_local`, so
+                    // the seam inside it cannot see this open. Reopening a project the
+                    // window already holds displaces the current workspace just the same,
+                    // and without this every such open from an empty one strands a row.
+                    let displaced = multi_workspace.workspace().clone();
                     multi_workspace.activate(target_workspace.clone(), None, window, cx);
+                    multi_workspace.detach_replaced_empty_workspace(
+                        &displaced,
+                        &HashSet::default(),
+                        cx,
+                    );
                     target_workspace.update(cx, |workspace, cx| {
                         if open_in_dev_container {
                             workspace.set_open_in_dev_container(true);

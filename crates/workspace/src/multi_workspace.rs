@@ -2461,7 +2461,13 @@ impl MultiWorkspace {
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Workspace>>> {
         if let Some(workspace) = self.workspace_for_paths(&path_list, None, cx) {
+            // `#zed-66.4`: the synchronous twin of the check inside the spawn below, and
+            // the one every sidebar and recent-projects surface actually hits. It returns
+            // before `open_paths` or `Workspace::new_local` are ever reached, so neither
+            // of the other detaches can see this open.
+            let displaced = self.workspace().clone();
             self.activate(workspace.clone(), source_workspace, window, cx);
+            self.detach_replaced_empty_workspace(&displaced, &HashSet::default(), cx);
             return Task::ready(Ok(workspace));
         }
 
@@ -2497,6 +2503,12 @@ impl MultiWorkspace {
             if let Some(requesting_window) = requesting_window
                 && let Some(workspace) = requesting_window
                     .update(cx, |multi_workspace, window, cx| {
+                        // `#zed-66.4`: **deliberately not detaching here**, unlike the
+                        // synchronous twin above. This branch is only reached when the
+                        // project-group fallback rewrites the path list, and no test in
+                        // the suite reaches it — a detach added here stayed green when
+                        // deleted, which is the same unwitnessed-change trap `#zed-66.2`'s
+                        // cold review rejected. Filed rather than shipped on faith.
                         multi_workspace
                             .workspace_for_paths(&effective_path_list, None, cx)
                             .inspect(|workspace| {
@@ -2781,6 +2793,36 @@ impl MultiWorkspace {
             && self.workspace() != workspace
             && workspace_tab_paths_are_empty(workspace.read(cx), cx)
             && dirty_item_ids(workspace, cx).is_subset(consented_dirty)
+    }
+
+    /// Detaches `replaced` if opening a project has just displaced it and it held
+    /// nothing the user would miss.
+    ///
+    /// `#zed-66.4`: the one implementation behind three callers — `remove`'s reopen,
+    /// `open_project`, and `Workspace::new_local`'s replace arm, which is the seam every
+    /// same-window open converges on. They differ only in `consented_dirty`: the seam
+    /// passes an empty set, because routes reaching it directly (the project panel's
+    /// empty-state drop, `zed <dir>`) never ran `prepare_to_close`, so it may only ever
+    /// drop a clean workspace. `open_project` passes the real snapshot, and is the only
+    /// caller that can drop work the user agreed to discard.
+    ///
+    /// **The caller chooses `replaced`, and that choice is load-bearing.**
+    /// `placeholder_is_disposable` answers a question about *state*, and a workspace the
+    /// user emptied by hand and then clicked away from has exactly the same state as a
+    /// placeholder — `test_workspace_tab_rows_keep_an_empty_workspace_the_user_made`
+    /// asserts precisely that. Nothing here can tell them apart. What keeps the user's
+    /// workspace safe is that every caller passes the workspace the open displaced, never
+    /// one merely found by scanning for a disposable-looking row.
+    pub(crate) fn detach_replaced_empty_workspace(
+        &mut self,
+        replaced: &Entity<Workspace>,
+        consented_dirty: &HashSet<EntityId>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.placeholder_is_disposable(replaced, consented_dirty, cx) {
+            self.detach_workspace(replaced, cx);
+            cx.notify();
+        }
     }
 
     /// Detaches a workspace: clears session state, DB binding, cached
@@ -3536,10 +3578,7 @@ impl MultiWorkspace {
                     && placeholder != reopened
                 {
                     this.update(cx, |this, cx| {
-                        if this.placeholder_is_disposable(&placeholder, &consented_dirty, cx) {
-                            this.detach_workspace(&placeholder, cx);
-                            cx.notify();
-                        }
+                        this.detach_replaced_empty_workspace(&placeholder, &consented_dirty, cx)
                     })?;
                 }
             }
@@ -3614,10 +3653,11 @@ impl MultiWorkspace {
                     this.update(cx, |this, cx| {
                         // `#zed-66`: same exposure as `remove`'s placeholder cleanup —
                         // `empty_workspace` is captured before an await.
-                        if this.placeholder_is_disposable(&empty_workspace, &consented_dirty, cx) {
-                            this.detach_workspace(&empty_workspace, cx);
-                            cx.notify();
-                        }
+                        //
+                        // `#zed-66.4`: the seam inside `new_local` has already tried this
+                        // with an empty snapshot and declined if anything was dirty. This
+                        // is the only call that can act on consent, so it stays.
+                        this.detach_replaced_empty_workspace(&empty_workspace, &consented_dirty, cx)
                     })?;
                 }
 

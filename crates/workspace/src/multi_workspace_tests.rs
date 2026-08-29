@@ -4716,6 +4716,190 @@ async fn test_remote_project_root_dir_changes_update_groups(cx: &mut TestAppCont
 }
 
 #[gpui::test]
+async fn test_open_workspace_for_paths_clears_the_empty_it_replaces(cx: &mut TestAppContext) {
+    init_test(cx);
+    let app_state = cx.update(AppState::test);
+    let fs = app_state.fs.as_fake();
+    fs.insert_tree(path!("/project_a"), json!({ "file_a.txt": "" }))
+        .await;
+
+    let project = Project::test(app_state.fs.clone(), [], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    cx.run_until_parked();
+
+    let empty_workspace = window
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+    // `#zed-66.4`: the bypass shape, not a UI surface. `Workspace::open_workspace_for_paths`
+    // with `OpenMode::Activate` is the exact call the project panel's empty-state drop
+    // target makes, and the one the welcome list made before `#zed-66.3` rerouted it.
+    // It never reaches `MultiWorkspace::open_project`, so before this slice it stranded
+    // the workspace it opened from.
+    empty_workspace
+        .update_in(cx, |workspace, window, cx| {
+            workspace.open_workspace_for_paths(
+                OpenMode::Activate,
+                vec![PathBuf::from(path!("/project_a"))],
+                window,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+
+    window
+        .read_with(cx, |mw, cx| {
+            let held: Vec<_> = mw.workspaces().cloned().collect();
+            assert!(
+                !held.contains(&empty_workspace),
+                "the empty workspace the open replaced must be detached, not merely hidden — \
+                 `#zed-66.2`'s render filter would make a stranded one look cleaned up"
+            );
+            assert_eq!(
+                workspace_tab_paths(mw.workspace().read(cx), cx),
+                vec![PathBuf::from(path!("/project_a"))],
+                "and the window shows the project that was opened"
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+async fn test_open_workspace_for_paths_clears_the_empty_when_the_project_is_already_held(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let app_state = cx.update(AppState::test);
+    let fs = app_state.fs.as_fake();
+    fs.insert_tree(path!("/project_a"), json!({ "file_a.txt": "" }))
+        .await;
+
+    let project_a = Project::test(app_state.fs.clone(), [path!("/project_a").as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    cx.run_until_parked();
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+    // An empty workspace, displayed, with `/project_a` already open behind it.
+    let empty_workspace = window
+        .update(cx, |mw, window, cx| {
+            let app_state = mw.workspace().read(cx).app_state().clone();
+            let project = Project::local(
+                app_state.client.clone(),
+                app_state.node_runtime.clone(),
+                app_state.user_store.clone(),
+                app_state.languages.clone(),
+                app_state.fs.clone(),
+                None,
+                project::LocalProjectFlags::default(),
+                cx,
+            );
+            let empty = cx.new(|cx| Workspace::new(None, project, app_state, window, cx));
+            mw.activate(empty.clone(), None, window, cx);
+            empty
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    // `#zed-66.4`: the same bypass call, but for a project the window already holds.
+    // `open_paths` takes its `existing` branch and activates that workspace directly,
+    // never reaching `Workspace::new_local` — so the seam inside `new_local` cannot see
+    // this open at all. Without a detach at the activate itself, the empty is stranded.
+    empty_workspace
+        .update_in(cx, |workspace, window, cx| {
+            workspace.open_workspace_for_paths(
+                OpenMode::Activate,
+                vec![PathBuf::from(path!("/project_a"))],
+                window,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+
+    window
+        .read_with(cx, |mw, _cx| {
+            let held: Vec<_> = mw.workspaces().cloned().collect();
+            assert!(
+                !held.contains(&empty_workspace),
+                "the displaced empty must be detached on this branch too, or every route \
+                 that reopens an already-held project strands one"
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+async fn test_find_or_create_clears_the_empty_when_it_matches_a_held_workspace(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let app_state = cx.update(AppState::test);
+    let fs = app_state.fs.as_fake();
+    fs.insert_tree(path!("/project_a"), json!({ "file_a.txt": "" }))
+        .await;
+
+    let project_a = Project::test(app_state.fs.clone(), [path!("/project_a").as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    cx.run_until_parked();
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+    let empty_workspace = window
+        .update(cx, |mw, window, cx| {
+            let app_state = mw.workspace().read(cx).app_state().clone();
+            let project = Project::local(
+                app_state.client.clone(),
+                app_state.node_runtime.clone(),
+                app_state.user_store.clone(),
+                app_state.languages.clone(),
+                app_state.fs.clone(),
+                None,
+                project::LocalProjectFlags::default(),
+                cx,
+            );
+            let empty = cx.new(|cx| Workspace::new(None, project, app_state, window, cx));
+            mw.activate(empty.clone(), None, window, cx);
+            empty
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    // `#zed-66.4`: the third activate-an-existing site. Every sidebar and recent-projects
+    // surface calls `find_or_create_workspace`, which returns early here when the paths
+    // match a workspace the window already holds — never reaching `open_paths` or
+    // `Workspace::new_local`, so neither of the other two detaches can see this open.
+    window
+        .update(cx, |mw, window, cx| {
+            mw.find_or_create_local_workspace(
+                PathList::new(&[PathBuf::from(path!("/project_a"))]),
+                None,
+                None,
+                OpenMode::Activate,
+                None,
+                window,
+                cx,
+            )
+        })
+        .unwrap()
+        .await
+        .unwrap();
+    cx.run_until_parked();
+
+    window
+        .read_with(cx, |mw, _cx| {
+            let held: Vec<_> = mw.workspaces().cloned().collect();
+            assert!(
+                !held.contains(&empty_workspace),
+                "the displaced empty must be detached on the early-return branch too"
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
 async fn test_open_project_closes_empty_workspace_but_not_non_empty_ones(cx: &mut TestAppContext) {
     init_test(cx);
     let app_state = cx.update(AppState::test);
