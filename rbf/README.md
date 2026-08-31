@@ -31,7 +31,7 @@ I don't commit these to the repo, but I sync the latest versions to [Google Driv
 ## 🟠⋯ Your Own Markdown (YMD) Markup [Bear App inspired]
 - YMD syntax markers conceal off the cursor row and reveal on it; `editor::ToggleYmdConceal` reveals and re-conceals the syntax
 
-- Emoji-gated Markdown headings hide their `#` prefix
+- Markdown headings hide their `#` prefix and color by level — an explicit color emoji wins; without one the six-level ladder applies (blue/orange/purple/yellow/green/black); YAML frontmatter comments stay raw
 - Outline surfaces show YMD headings cleanly too: the Outline panel and ⌘⇧O picker hide heading markers and apply YMD line color outside the active row
 
 - `==text==` renders as a default background highlight
