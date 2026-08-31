@@ -37546,9 +37546,12 @@ async fn test_ymd_inline_code_stays_literal(cx: &mut gpui::TestAppContext) {
         HighlightKey::YmdBackground(1),
         "`🔴 literal`\n`==🔴literal==`\n# `🔵` heading\n# 🟢 heading",
     );
+    // The captured 🔵 is not a marker, so its heading counts as unmarked and takes
+    // the H1 default blue (#zed-71) — the capture itself stays literal, which is
+    // what this test pins: the blue comes from the level, not the emoji.
     cx.assert_editor_text_highlights(
         HighlightKey::YmdLineForeground(5),
-        "`🔴 literal`\n`==🔴literal==`\n# `🔵` heading\n# 🟢 heading",
+        "`🔴 literal`\n`==🔴literal==`\n«# `🔵` heading»\n# 🟢 heading",
     );
     cx.assert_editor_text_highlights(
         HighlightKey::YmdLineForeground(4),
@@ -37557,7 +37560,7 @@ async fn test_ymd_inline_code_stays_literal(cx: &mut gpui::TestAppContext) {
     cx.update_editor(|editor, _, cx| {
         assert_eq!(
             editor.display_text(cx).replace('\u{2060}', ""),
-            "`🔴 literal`\n`==🔴literal==`\n# `🔵` heading\nheading"
+            "`🔴 literal`\n`==🔴literal==`\n`🔵` heading\nheading"
         );
     });
 }

@@ -2824,7 +2824,11 @@ mod tests {
             ("#### Plain Heading", YmdColor::Yellow),
         ] {
             let styled = style_heading(heading, Appearance::Light).unwrap();
-            assert_eq!(styled.text.as_ref(), "Plain Heading", "text for {heading:?}");
+            assert_eq!(
+                styled.text.as_ref(),
+                "Plain Heading",
+                "text for {heading:?}"
+            );
             assert_eq!(
                 styled.foreground_style,
                 line_foreground_style(expected_color, Appearance::Light),
