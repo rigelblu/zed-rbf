@@ -909,8 +909,13 @@ fn heading_prefix(line: &str) -> Option<(usize, usize)> {
 }
 
 // The default-color fallback for an unmarked heading (#zed-71). Callers run it
-// only after `first_effective_emoji` returned None for the line, so the marker
-// keeps priority and the color and conceal mechanisms cannot disagree.
+// only after `first_effective_emoji` returned None for the line, so an effective
+// marker always outranks the level default. The conceal side computes its own
+// eligibility in `heading_conceal_range` with a narrower exclusion set (inline
+// code only, not background-markup captures), so on H5–H6 a markup-captured
+// emoji like `##### ==🔵 x== rest` still conceals the prefix while this returns
+// no color — a pre-existing corner, not aligned here because widening the
+// conceal's exclusions would change marked-heading behavior.
 fn unmarked_heading_default_color(line: &str) -> Option<YmdColor> {
     let (hash_count, prefix_end) = heading_prefix(line)?;
     if line[prefix_end..].trim().is_empty() {
@@ -1848,6 +1853,12 @@ mod tests {
             vec![YmdConceal { range: 8..12 }]
         );
         assert!(scan_conceals("# \t").is_empty());
+        // The color side has its own empty-content guard in
+        // `unmarked_heading_default_color` — without these two asserts its mutant
+        // survives the suite, emitting a default color with no matching conceal
+        // (cold-review R1, 2026-08-31).
+        assert!(scan("# \t").is_empty());
+        assert!(scan("##   ").is_empty());
     }
 
     #[test]
@@ -1945,6 +1956,20 @@ mod tests {
                 kind: YmdHighlightKind::LineForeground(YmdColor::Blue),
             }],
             "only the post-frontmatter heading colors"
+        );
+
+        // Unclosed opening delimiter: the loose frontmatter walk skips only line 1
+        // (`frontmatter_skip_end` finds no closer), so a `#` line while mid-typing
+        // frontmatter takes the default — matching the grammar, where an unclosed
+        // `---` makes that line a real heading. Pinned so a future tightening of
+        // the walk moves this deliberately (cold-review S1, 2026-08-31).
+        let unclosed = "---\n# comment";
+        assert_eq!(
+            scan(unclosed),
+            vec![YmdHighlight {
+                range: 4..unclosed.len(),
+                kind: YmdHighlightKind::LineForeground(YmdColor::Blue),
+            }]
         );
     }
 

@@ -38091,6 +38091,16 @@ async fn test_ymd_conceals_heading_prefixes_including_level_defaults(
         );
     });
 
+    // And onto the default-concealed plain heading — the new conceal surface must
+    // reveal under the cursor exactly like the marked one (cold-review S2).
+    cx.update_editor(|editor, window, cx| {
+        editor.move_down(&MoveDown, window, cx);
+        assert_eq!(
+            editor.display_text(cx).replace('\u{2060}', ""),
+            "intro\nBlue Heading\n# Plain Heading\n⋯ Green Heading\n"
+        );
+    });
+
     // The global toggle reveals every concealed heading prefix at once.
     cx.update_editor(|editor, window, cx| {
         editor.toggle_ymd_conceal(&ToggleYmdConceal, window, cx);
