@@ -427,6 +427,7 @@ fn is_frontmatter_delimiter_line(line: &str) -> bool {
 pub fn scan(text: &str) -> Vec<YmdHighlight> {
     let mut highlights = Vec::new();
     let fenced_code_ranges = fenced_code_block_ranges(text);
+    let frontmatter_end = frontmatter_skip_end(text);
 
     for_each_line(text, |line_content, line_start| {
         if range_overlaps_any(
@@ -452,6 +453,13 @@ pub fn scan(text: &str) -> Vec<YmdHighlight> {
                 range: line_start..line_start + line_content.len(),
                 kind: YmdHighlightKind::LineForeground(color),
             });
+        } else if line_start >= frontmatter_end
+            && let Some(color) = unmarked_heading_default_color(line_content)
+        {
+            highlights.push(YmdHighlight {
+                range: line_start..line_start + line_content.len(),
+                kind: YmdHighlightKind::LineForeground(color),
+            });
         }
     });
 
@@ -460,16 +468,21 @@ pub fn scan(text: &str) -> Vec<YmdHighlight> {
 
 pub fn style_heading(text: &str, appearance: Appearance) -> Option<YmdStyledHeading> {
     let inline_code_ranges = inline_code_ranges(text);
-    let heading_conceal_range = heading_conceal_range(text, 0, &inline_code_ranges)?;
+    let heading_conceal_range = heading_conceal_range(text, 0, &inline_code_ranges, true)?;
     let inline_highlights = scan_line_background_markups(text, 0, &inline_code_ranges);
     let mut captures = capture_ranges(&inline_highlights, 0);
     captures.extend(inline_code_ranges);
-    let (emoji_range, color) = first_effective_emoji(text, &captures)?;
+    let emoji_match = first_effective_emoji(text, &captures);
+    let color = match &emoji_match {
+        Some((_, color)) => *color,
+        None => unmarked_heading_default_color(text)?,
+    };
 
     let mut conceal_ranges = vec![heading_conceal_range];
-    if !conceal_ranges
-        .iter()
-        .any(|range| range.start <= emoji_range.start && emoji_range.end <= range.end)
+    if let Some((emoji_range, _)) = emoji_match
+        && !conceal_ranges
+            .iter()
+            .any(|range| range.start <= emoji_range.start && emoji_range.end <= range.end)
     {
         conceal_ranges.push(emoji_range);
     }
@@ -737,6 +750,7 @@ fn scan_inline_style_content_ranges(text: &str, marker: &str) -> Vec<Range<usize
 pub fn scan_conceals(text: &str) -> Vec<YmdConceal> {
     let mut conceals = Vec::new();
     let fenced_code_ranges = fenced_code_block_ranges(text);
+    let frontmatter_end = frontmatter_skip_end(text);
 
     for_each_line(text, |line_content, line_start| {
         if range_overlaps_any(
@@ -779,7 +793,12 @@ pub fn scan_conceals(text: &str) -> Vec<YmdConceal> {
             conceals.push(YmdConceal { range });
         }
 
-        let heading_range = heading_conceal_range(line_content, line_start, &inline_code_ranges);
+        let heading_range = heading_conceal_range(
+            line_content,
+            line_start,
+            &inline_code_ranges,
+            line_start >= frontmatter_end,
+        );
         if let Some(heading_range) = heading_range.clone() {
             conceals.push(YmdConceal {
                 range: heading_range,
@@ -851,20 +870,22 @@ fn first_effective_emoji(
     None
 }
 
-// A column-zero ATX heading (`#`×1-6 + whitespace + visible content) conceals its
-// opening marker only when the visible content carries a YMD color emoji — plain
-// Markdown headings keep their `#`. When the color marker immediately follows the
-// prefix, the emoji and its trailing whitespace are absorbed into the fold so the
-// revealed heading does not begin with a stray leading space; a marker further into
-// the text stays put and is concealed by the line-color mechanism instead. The `⋯`
-// in suite headings like `## 🟠⋯ Heading` is plain content, not YMD syntax, so it
-// stays visible — the fold ends right after the emoji (here `⋯` directly follows it,
-// so there is no whitespace to absorb).
-fn heading_conceal_range(
-    line: &str,
-    line_start: usize,
-    excluded_ranges: &[Range<usize>],
-) -> Option<Range<usize>> {
+// The per-level default the marker convention implies: briefs mark H1 🔵, H2 🟠,
+// H3 🟣, H4 🟡, so an unmarked heading borrows its level's color instead of
+// rendering flat (#zed-71). H5–H6 have no conventional marker and stay raw.
+fn default_heading_color(hash_count: usize) -> Option<YmdColor> {
+    match hash_count {
+        1 => Some(YmdColor::Blue),
+        2 => Some(YmdColor::Orange),
+        3 => Some(YmdColor::Purple),
+        4 => Some(YmdColor::Yellow),
+        _ => None,
+    }
+}
+
+// `#`×1-6 at column zero followed by whitespace: (hash_count, prefix_end), with
+// prefix_end past the run of separating whitespace.
+fn heading_prefix(line: &str) -> Option<(usize, usize)> {
     let bytes = line.as_bytes();
     let mut hash_count = 0;
     while bytes.get(hash_count) == Some(&b'#') {
@@ -884,6 +905,41 @@ fn heading_conceal_range(
         prefix_end += 1;
     }
 
+    Some((hash_count, prefix_end))
+}
+
+// The default-color fallback for an unmarked heading (#zed-71). Callers run it
+// only after `first_effective_emoji` returned None for the line, so the marker
+// keeps priority and the color and conceal mechanisms cannot disagree.
+fn unmarked_heading_default_color(line: &str) -> Option<YmdColor> {
+    let (hash_count, prefix_end) = heading_prefix(line)?;
+    if line[prefix_end..].trim().is_empty() {
+        return None;
+    }
+    default_heading_color(hash_count)
+}
+
+// A column-zero ATX heading (`#`×1-6 + whitespace + visible content) conceals its
+// opening marker when the visible content carries a YMD color emoji, or — with
+// `allow_default`, #zed-71 — when the heading level has a default color (H1–H4), so
+// unmarked headings render with the same parity as marked ones. `allow_default` is
+// false inside YAML frontmatter, where a column-zero `# comment` is YAML, not a
+// heading. When the color marker immediately follows the prefix, the emoji and its
+// trailing whitespace are absorbed into the fold so the revealed heading does not
+// begin with a stray leading space; a marker further into the text stays put and is
+// concealed by the line-color mechanism instead. The `⋯` in suite headings like
+// `## 🟠⋯ Heading` is plain content, not YMD syntax, so it stays visible — the fold
+// ends right after the emoji (here `⋯` directly follows it, so there is no
+// whitespace to absorb).
+fn heading_conceal_range(
+    line: &str,
+    line_start: usize,
+    excluded_ranges: &[Range<usize>],
+    allow_default: bool,
+) -> Option<Range<usize>> {
+    let bytes = line.as_bytes();
+    let (hash_count, prefix_end) = heading_prefix(line)?;
+
     let heading_text = &line[prefix_end..];
     let heading_excluded_ranges = excluded_ranges
         .iter()
@@ -895,7 +951,10 @@ fn heading_conceal_range(
         })
         .collect::<Vec<_>>();
     let color_match = first_effective_emoji(heading_text, &heading_excluded_ranges);
-    if heading_text.trim().is_empty() || color_match.is_none() {
+    if heading_text.trim().is_empty() {
+        return None;
+    }
+    if color_match.is_none() && !(allow_default && default_heading_color(hash_count).is_some()) {
         return None;
     }
 
@@ -1775,13 +1834,11 @@ mod tests {
     }
 
     #[test]
-    fn does_not_conceal_plain_or_invalid_heading_prefixes() {
+    fn does_not_conceal_invalid_heading_prefixes() {
         // Heading-gate boundary cases (the emoji-only composite is pinned by
-        // `emoji_only_heading_is_fully_absorbed`): a plain heading keeps its `#`;
-        // `#heading` with no separating space is not a heading (the trailing 🔵 still
-        // line-color conceals); seven `#` is too deep; an empty heading has no
-        // content.
-        assert!(scan_conceals("# Plain Heading").is_empty());
+        // `emoji_only_heading_is_fully_absorbed`): `#heading` with no separating
+        // space is not a heading (the trailing 🔵 still line-color conceals); seven
+        // `#` is too deep; an empty heading has no content, marked or not.
         assert_eq!(
             scan_conceals("#heading 🔵"),
             vec![YmdConceal { range: 9..13 }]
@@ -1791,8 +1848,104 @@ mod tests {
             vec![YmdConceal { range: 8..12 }]
         );
         assert!(scan_conceals("# \t").is_empty());
-        // A heading whose content has no color emoji keeps its `#`.
-        assert!(scan_conceals("# No Color Heading").is_empty());
+    }
+
+    #[test]
+    fn unmarked_headings_conceal_prefix_and_take_level_default_color() {
+        // #zed-71: an unmarked H1–H4 conceals its prefix and colors by the level
+        // ladder (blue/orange/purple/yellow), parity with a marked heading. The
+        // conceal is the `#…` run plus separating whitespace only — there is no
+        // emoji to absorb.
+        for (hashes, expected_color) in [
+            ("#", YmdColor::Blue),
+            ("##", YmdColor::Orange),
+            ("###", YmdColor::Purple),
+            ("####", YmdColor::Yellow),
+        ] {
+            let line = format!("{hashes} Plain Heading");
+            assert_eq!(
+                scan_conceals(&line),
+                vec![YmdConceal {
+                    range: 0..hashes.len() + 1
+                }],
+                "conceal for {line:?}"
+            );
+            assert_eq!(
+                scan(&line),
+                vec![YmdHighlight {
+                    range: 0..line.len(),
+                    kind: YmdHighlightKind::LineForeground(expected_color),
+                }],
+                "highlight for {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unmarked_deep_headings_stay_raw() {
+        // #zed-71: H5–H6 have no default — no conceal, no color. A marked H5 still
+        // conceals as before.
+        assert!(scan_conceals("##### Deep Heading").is_empty());
+        assert!(scan("##### Deep Heading").is_empty());
+        assert!(scan_conceals("###### Deeper Heading").is_empty());
+        assert!(scan("###### Deeper Heading").is_empty());
+        assert_eq!(
+            scan_conceals("##### 🟢 Marked Deep"),
+            vec![YmdConceal { range: 0..11 }]
+        );
+    }
+
+    #[test]
+    fn explicit_marker_overrides_level_default() {
+        // #zed-71: the marker wins over the level default — a green-marked H2 is
+        // green, not the H2 orange.
+        let line = "## 🟢⋯ Green Heading";
+        assert_eq!(
+            scan(line),
+            vec![YmdHighlight {
+                range: 0..line.len(),
+                kind: YmdHighlightKind::LineForeground(YmdColor::Green),
+            }]
+        );
+    }
+
+    #[test]
+    fn captured_emoji_heading_takes_level_default() {
+        // #zed-71: an emoji captured by inline code is not an effective marker, so
+        // the heading counts as unmarked — the level default applies and the
+        // captured emoji stays visible (no emoji conceal, only the prefix fold).
+        let line = "# `🔵` heading";
+        assert_eq!(scan_conceals(line), vec![YmdConceal { range: 0..2 }]);
+        assert_eq!(
+            scan(line),
+            vec![YmdHighlight {
+                range: 0..line.len(),
+                kind: YmdHighlightKind::LineForeground(YmdColor::Blue),
+            }]
+        );
+    }
+
+    #[test]
+    fn frontmatter_comment_lines_do_not_take_heading_default() {
+        // #zed-71: a column-zero `# comment` inside YAML frontmatter is YAML, not a
+        // heading — the default fallback is gated past the frontmatter block. The
+        // same line after the closing delimiter takes the default.
+        let text = "---\n# a yaml comment\n---\n# a real heading";
+        let conceals = scan_conceals(text);
+        assert_eq!(
+            conceals,
+            vec![YmdConceal { range: 25..27 }],
+            "only the post-frontmatter heading folds"
+        );
+        let highlights = scan(text);
+        assert_eq!(
+            highlights,
+            vec![YmdHighlight {
+                range: 25..text.len(),
+                kind: YmdHighlightKind::LineForeground(YmdColor::Blue),
+            }],
+            "only the post-frontmatter heading colors"
+        );
     }
 
     #[test]
@@ -2620,16 +2773,24 @@ mod tests {
         assert!(scan("`==🔴literal==`").is_empty());
         assert_eq!(scan_conceals("`🔴 literal`"), Vec::<YmdConceal>::new());
         assert_eq!(scan_conceals("`==🔴literal==`"), Vec::<YmdConceal>::new());
+        // The captured 🔵 is not a marker, so line 1 is an unmarked H1 and takes the
+        // level default (#zed-71); line 2's real marker still wins over the default.
         assert_eq!(
             scan("# `🔵` heading\n# 🟢 heading"),
-            vec![YmdHighlight {
-                range: 17..31,
-                kind: YmdHighlightKind::LineForeground(YmdColor::Green),
-            }]
+            vec![
+                YmdHighlight {
+                    range: 0..16,
+                    kind: YmdHighlightKind::LineForeground(YmdColor::Blue),
+                },
+                YmdHighlight {
+                    range: 17..31,
+                    kind: YmdHighlightKind::LineForeground(YmdColor::Green),
+                }
+            ]
         );
         assert_eq!(
             scan_conceals("# `🔵` heading\n# 🟢 heading"),
-            vec![YmdConceal { range: 17..24 }]
+            vec![YmdConceal { range: 0..2 }, YmdConceal { range: 17..24 }]
         );
     }
 
@@ -2652,6 +2813,29 @@ mod tests {
     }
 
     #[test]
+    fn style_heading_defaults_unmarked_levels() {
+        // #zed-71: outline surfaces take the same level defaults — an unmarked
+        // H1–H4 conceals its prefix and colors by ladder; H5–H6 return None so the
+        // outline's plain-prefix fallback keeps handling them.
+        for (heading, expected_color) in [
+            ("# Plain Heading", YmdColor::Blue),
+            ("## Plain Heading", YmdColor::Orange),
+            ("### Plain Heading", YmdColor::Purple),
+            ("#### Plain Heading", YmdColor::Yellow),
+        ] {
+            let styled = style_heading(heading, Appearance::Light).unwrap();
+            assert_eq!(styled.text.as_ref(), "Plain Heading", "text for {heading:?}");
+            assert_eq!(
+                styled.foreground_style,
+                line_foreground_style(expected_color, Appearance::Light),
+                "color for {heading:?}"
+            );
+        }
+        assert!(style_heading("##### Deep Heading", Appearance::Light).is_none());
+        assert!(style_heading("# \t", Appearance::Light).is_none());
+    }
+
+    #[test]
     fn style_heading_conceals_mid_text_color_marker_like_the_editor() {
         let heading = "# Blue 🔵 Heading";
         let styled = style_heading(heading, Appearance::Light).unwrap();
@@ -2671,9 +2855,17 @@ mod tests {
     }
 
     #[test]
-    fn style_heading_ignores_plain_headings_and_inline_code_markers() {
-        assert_eq!(style_heading("## Plain Heading", Appearance::Light), None);
-        assert_eq!(style_heading("## `🟢` Heading", Appearance::Light), None);
+    fn style_heading_treats_inline_code_markers_as_unmarked() {
+        // #zed-71 changed the plain-heading half of this pin (defaults now apply —
+        // see `style_heading_defaults_unmarked_levels`); the capture half stands: an
+        // emoji inside inline code is not a marker, so the heading styles by its
+        // level default (H2 orange), never by the captured emoji's green.
+        let styled = style_heading("## `🟢` Heading", Appearance::Light).unwrap();
+        assert_eq!(styled.text.as_ref(), "`🟢` Heading");
+        assert_eq!(
+            styled.foreground_style,
+            line_foreground_style(YmdColor::Orange, Appearance::Light)
+        );
     }
 
     #[test]

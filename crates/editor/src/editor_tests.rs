@@ -38051,7 +38051,9 @@ async fn test_ymd_same_row_motion_is_a_fold_no_op(cx: &mut gpui::TestAppContext)
 }
 
 #[gpui::test]
-async fn test_ymd_conceals_emoji_heading_prefixes_only(cx: &mut gpui::TestAppContext) {
+async fn test_ymd_conceals_heading_prefixes_including_level_defaults(
+    cx: &mut gpui::TestAppContext,
+) {
     init_test(cx, |_| {});
 
     let markdown_language = Arc::new(Language::new(
@@ -38064,15 +38066,16 @@ async fn test_ymd_conceals_emoji_heading_prefixes_only(cx: &mut gpui::TestAppCon
 
     let mut cx = EditorTestContext::new(cx).await;
     cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
-    // H1 clean, plain (keeps `#`), H2 with a visible `⋯` after the marker, and an
-    // emoji-only heading that vanishes entirely. Cursor starts off every heading.
+    // H1 clean, plain (unmarked — conceals via the H1 level default, #zed-71), H2
+    // with a visible `⋯` after the marker, and an emoji-only heading that vanishes
+    // entirely. Cursor starts off every heading.
     cx.set_state("ˇintro\n# 🔵 Blue Heading\n# Plain Heading\n## 🟢⋯ Green Heading\n# 🟠");
     cx.run_until_parked();
 
     cx.update_editor(|editor, _, cx| {
         assert_eq!(
             editor.display_text(cx).replace('\u{2060}', ""),
-            "intro\nBlue Heading\n# Plain Heading\n⋯ Green Heading\n"
+            "intro\nBlue Heading\nPlain Heading\n⋯ Green Heading\n"
         );
     });
 
@@ -38081,7 +38084,7 @@ async fn test_ymd_conceals_emoji_heading_prefixes_only(cx: &mut gpui::TestAppCon
         editor.move_down(&MoveDown, window, cx);
         assert_eq!(
             editor.display_text(cx).replace('\u{2060}', ""),
-            "intro\n# 🔵 Blue Heading\n# Plain Heading\n⋯ Green Heading\n"
+            "intro\n# 🔵 Blue Heading\nPlain Heading\n⋯ Green Heading\n"
         );
     });
 
@@ -38105,7 +38108,7 @@ async fn test_ymd_conceals_emoji_heading_prefixes_only(cx: &mut gpui::TestAppCon
     cx.update_editor(|editor, _, cx| {
         assert_eq!(
             editor.display_text(cx).replace('\u{2060}', ""),
-            "intro\nBlue Heading\n# Plain Heading\n⋯ Green Heading\n# 🟠"
+            "intro\nBlue Heading\nPlain Heading\n⋯ Green Heading\n# 🟠"
         );
     });
 }
