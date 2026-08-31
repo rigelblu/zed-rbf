@@ -10,6 +10,7 @@ title: "Zed RBF Changelog"
 - 2026-08-27 - fix (ux) | close a workspace tab and have it close, instead of reaching into your project history and opening something you never had open — closing your last workspace now leaves an empty one and keeps the window (#zed-68) [@zed-rbf]
 - 2026-08-28 - fix (ux) | open a project while sitting on an empty workspace without the `Empty Workspace` row flashing beside it first — and without the whole Workspaces strip appearing and vanishing when you have no saved configurations (#zed-66.2) [@zed-rbf]
 - 2026-08-28 - fix (ux) | click a project in the welcome screen's Recent Projects list without the `Empty Workspace` row you opened it from staying behind for good — including when `default_open_behavior` is set to `new_window`, since an empty workspace reuses its window either way (#zed-66.3) [@zed-rbf]
+- 2026-08-31 - feat (ux) | read every markdown heading by its level color without typing a marker — an unmarked heading conceals its `#` and colors by the six-level ladder (blue/orange/purple/yellow/green/black) like its marked twin, in the editor and the outline; YAML frontmatter comments stay raw, and an explicit color marker still wins (#zed-71) [@zed-rbf]
 
 ---
 
