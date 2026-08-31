@@ -872,13 +872,17 @@ fn first_effective_emoji(
 
 // The per-level default the marker convention implies: briefs mark H1 🔵, H2 🟠,
 // H3 🟣, H4 🟡, so an unmarked heading borrows its level's color instead of
-// rendering flat (#zed-71). H5–H6 have no conventional marker and stay raw.
+// rendering flat (#zed-71). H5 green and H6 black extend the ladder past the
+// marked convention — dogfooding the 1–4 ladder showed raw gold `#####` rows
+// reading as noise beside it (decision reversed 2026-08-31).
 fn default_heading_color(hash_count: usize) -> Option<YmdColor> {
     match hash_count {
         1 => Some(YmdColor::Blue),
         2 => Some(YmdColor::Orange),
         3 => Some(YmdColor::Purple),
         4 => Some(YmdColor::Yellow),
+        5 => Some(YmdColor::Green),
+        6 => Some(YmdColor::Black),
         _ => None,
     }
 }
@@ -912,10 +916,9 @@ fn heading_prefix(line: &str) -> Option<(usize, usize)> {
 // only after `first_effective_emoji` returned None for the line, so an effective
 // marker always outranks the level default. The conceal side computes its own
 // eligibility in `heading_conceal_range` with a narrower exclusion set (inline
-// code only, not background-markup captures), so on H5–H6 a markup-captured
-// emoji like `##### ==🔵 x== rest` still conceals the prefix while this returns
-// no color — a pre-existing corner, not aligned here because widening the
-// conceal's exclusions would change marked-heading behavior.
+// code only, not background-markup captures) — a markup-captured emoji like
+// `## ==🔵 x== rest` conceals via the marked path while the color comes from
+// here; with every level carrying a default the two always fire together.
 fn unmarked_heading_default_color(line: &str) -> Option<YmdColor> {
     let (hash_count, prefix_end) = heading_prefix(line)?;
     if line[prefix_end..].trim().is_empty() {
@@ -926,8 +929,9 @@ fn unmarked_heading_default_color(line: &str) -> Option<YmdColor> {
 
 // A column-zero ATX heading (`#`×1-6 + whitespace + visible content) conceals its
 // opening marker when the visible content carries a YMD color emoji, or — with
-// `allow_default`, #zed-71 — when the heading level has a default color (H1–H4), so
-// unmarked headings render with the same parity as marked ones. `allow_default` is
+// `allow_default`, #zed-71 — when the heading level has a default color (all six
+// levels since the 2026-08-31 reversal), so unmarked headings render with the same
+// parity as marked ones. `allow_default` is
 // false inside YAML frontmatter, where a column-zero `# comment` is YAML, not a
 // heading. When the color marker immediately follows the prefix, the emoji and its
 // trailing whitespace are absorbed into the fold so the revealed heading does not
@@ -1863,15 +1867,18 @@ mod tests {
 
     #[test]
     fn unmarked_headings_conceal_prefix_and_take_level_default_color() {
-        // #zed-71: an unmarked H1–H4 conceals its prefix and colors by the level
-        // ladder (blue/orange/purple/yellow), parity with a marked heading. The
-        // conceal is the `#…` run plus separating whitespace only — there is no
-        // emoji to absorb.
+        // #zed-71: an unmarked heading conceals its prefix and colors by the level
+        // ladder, parity with a marked heading — all six levels since the
+        // 2026-08-31 reversal (dogfood found raw gold `#####` rows noisy beside
+        // the ladder). The conceal is the `#…` run plus separating whitespace
+        // only — there is no emoji to absorb.
         for (hashes, expected_color) in [
             ("#", YmdColor::Blue),
             ("##", YmdColor::Orange),
             ("###", YmdColor::Purple),
             ("####", YmdColor::Yellow),
+            ("#####", YmdColor::Green),
+            ("######", YmdColor::Black),
         ] {
             let line = format!("{hashes} Plain Heading");
             assert_eq!(
@@ -1893,13 +1900,9 @@ mod tests {
     }
 
     #[test]
-    fn unmarked_deep_headings_stay_raw() {
-        // #zed-71: H5–H6 have no default — no conceal, no color. A marked H5 still
-        // conceals as before.
-        assert!(scan_conceals("##### Deep Heading").is_empty());
-        assert!(scan("##### Deep Heading").is_empty());
-        assert!(scan_conceals("###### Deeper Heading").is_empty());
-        assert!(scan("###### Deeper Heading").is_empty());
+    fn marked_deep_heading_still_absorbs_its_marker() {
+        // A marked H5 keeps the marked-path fold (prefix + absorbed emoji), which
+        // the level default must not shrink to a prefix-only fold.
         assert_eq!(
             scan_conceals("##### 🟢 Marked Deep"),
             vec![YmdConceal { range: 0..11 }]
@@ -2840,13 +2843,15 @@ mod tests {
     #[test]
     fn style_heading_defaults_unmarked_levels() {
         // #zed-71: outline surfaces take the same level defaults — an unmarked
-        // H1–H4 conceals its prefix and colors by ladder; H5–H6 return None so the
-        // outline's plain-prefix fallback keeps handling them.
+        // heading conceals its prefix and colors by the six-level ladder, so the
+        // outline's plain-prefix fallback now only handles non-heading text.
         for (heading, expected_color) in [
             ("# Plain Heading", YmdColor::Blue),
             ("## Plain Heading", YmdColor::Orange),
             ("### Plain Heading", YmdColor::Purple),
             ("#### Plain Heading", YmdColor::Yellow),
+            ("##### Plain Heading", YmdColor::Green),
+            ("###### Plain Heading", YmdColor::Black),
         ] {
             let styled = style_heading(heading, Appearance::Light).unwrap();
             assert_eq!(
@@ -2860,7 +2865,7 @@ mod tests {
                 "color for {heading:?}"
             );
         }
-        assert!(style_heading("##### Deep Heading", Appearance::Light).is_none());
+        assert!(style_heading("####### Too Deep", Appearance::Light).is_none());
         assert!(style_heading("# \t", Appearance::Light).is_none());
     }
 
