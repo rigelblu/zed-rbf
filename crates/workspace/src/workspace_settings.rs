@@ -1,7 +1,7 @@
 use std::{num::NonZeroUsize, time::Duration};
 
 use crate::DockPosition;
-use collections::HashMap;
+use collections::{HashMap, HashSet};
 use gpui::{App, Subscription};
 use serde::Deserialize;
 pub use settings::{
@@ -162,6 +162,45 @@ impl AccessibleMode for App {
     }
 }
 
+/// The components currently marked hidden everywhere.
+fn hidden_component_keys(cx: &App) -> HashSet<String> {
+    WorkspaceLayoutSettings::get_global(cx)
+        .component_positions
+        .iter()
+        .filter(|(_, component)| component.hidden)
+        .map(|(key, _)| key.clone())
+        .collect()
+}
+
+/// Observes `workspace_layout.component_positions` and invokes `callback` with
+/// the components whose `hidden` flag went `true` to `false`.
+///
+/// This exists because settings.json is a real unhide path, not only a back
+/// door: a hand edit reaches no code, so an unhide performed there would
+/// otherwise leave every dormant workspace's open rows in place. Dropping an
+/// entry entirely counts as unhiding it, since `hidden` defaults to false.
+///
+/// Mirrors [`observe_accessible_mode`] — it holds the previous set in its
+/// closure and fires only on a real change. The returned [`Subscription`] must
+/// be retained for the callback to keep firing.
+pub fn observe_components_unhidden(
+    cx: &mut App,
+    mut callback: impl FnMut(Vec<String>, &mut App) + 'static,
+) -> Subscription {
+    let mut last = hidden_component_keys(cx);
+    cx.observe_global::<SettingsStore>(move |cx| {
+        let current = hidden_component_keys(cx);
+        if current == last {
+            return;
+        }
+        let unhidden: Vec<String> = last.difference(&current).cloned().collect();
+        last = current;
+        if !unhidden.is_empty() {
+            callback(unhidden, cx);
+        }
+    })
+}
+
 /// Observes changes to the accessible-mode setting, invoking `callback` with the
 /// new value whenever it changes. Mirrors the common
 /// `cx.observe_global::<SettingsStore>` pattern, but only fires when the value
@@ -213,6 +252,49 @@ impl Settings for StatusBarSettings {
             cursor_position_button: status_bar.cursor_position_button.unwrap(),
             line_endings_button: status_bar.line_endings_button.unwrap(),
             active_encoding_button: status_bar.active_encoding_button.unwrap(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, RegisterSetting)]
+pub struct WorkspaceLayoutSettings {
+    pub component_positions: collections::HashMap<String, WorkspaceComponentPosition>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct WorkspaceComponentPosition {
+    pub position: Option<settings::DockPosition>,
+    pub hidden: bool,
+    pub pinned: bool,
+}
+
+impl WorkspaceLayoutSettings {
+    pub fn component(&self, panel_key: &str) -> WorkspaceComponentPosition {
+        self.component_positions
+            .get(panel_key)
+            .copied()
+            .unwrap_or_default()
+    }
+}
+
+impl Settings for WorkspaceLayoutSettings {
+    fn from_settings(content: &settings::SettingsContent) -> Self {
+        let layout = content.workspace_layout.clone().unwrap_or_default();
+        WorkspaceLayoutSettings {
+            component_positions: layout
+                .component_positions
+                .into_iter()
+                .map(|(key, entry)| {
+                    (
+                        key,
+                        WorkspaceComponentPosition {
+                            position: entry.position,
+                            hidden: entry.hidden.unwrap_or(false),
+                            pinned: entry.pinned.unwrap_or(false),
+                        },
+                    )
+                })
+                .collect(),
         }
     }
 }

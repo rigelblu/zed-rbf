@@ -1845,6 +1845,11 @@
     "hour_format": "hour12",
   },
   // Status bar-related settings.
+  "workspace_layout": {
+    // Where each workspace component lives, whether it is hidden everywhere,
+    // and whether it keeps its own column, keyed by the component's stable id.
+    "component_positions": {}
+  },
   "status_bar": {
     // Whether to show the status bar.
     "experimental.show": true,

@@ -1630,6 +1630,16 @@ impl Domain for WorkspaceDb {
         sql!(
             ALTER TABLE bookmarks ADD COLUMN label TEXT NOT NULL DEFAULT "";
         ),
+        sql!(
+            CREATE TABLE workspace_open_components(
+                workspace_id INTEGER NOT NULL,
+                panel_key TEXT NOT NULL,
+                PRIMARY KEY(workspace_id, panel_key),
+                FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id)
+                ON DELETE CASCADE
+                ON UPDATE CASCADE
+            );
+        ),
     ];
 
     // Allow recovering from bad migration that was initially shipped to nightly
@@ -2580,6 +2590,56 @@ impl WorkspaceDb {
             DELETE FROM breakpoints
             WHERE file_path = ?2
         }
+    }
+
+    query! {
+        pub(crate) fn open_components(workspace_id: WorkspaceId) -> Result<Vec<String>> {
+            SELECT panel_key
+            FROM workspace_open_components
+            WHERE workspace_id = ?1
+        }
+    }
+
+    /// Forgets one component's openness in every serialized workspace.
+    ///
+    /// This runs at unhide rather than at hide: a workspace that was dormant
+    /// for both writes keeps a stale open row that current settings cannot
+    /// disprove, so the component would resurrect the next time it is shown.
+    /// Deleting by key alone reaches those dormant rows, and re-running it
+    /// changes nothing.
+    pub(crate) async fn scrub_open_component(&self, panel_key: String) -> Result<()> {
+        self.write(move |connection| {
+            connection.exec_bound(sql!(
+                DELETE FROM workspace_open_components WHERE panel_key = ?1
+            ))?(panel_key.as_str())
+            .context("scrubbing a hidden component's open rows")
+        })
+        .await
+    }
+
+    pub(crate) async fn save_open_components(
+        &self,
+        workspace_id: WorkspaceId,
+        panel_keys: Vec<String>,
+    ) -> Result<()> {
+        self.write(move |connection| {
+            connection.with_savepoint("save_open_components", || {
+                connection.exec_bound(sql!(
+                    DELETE FROM workspace_open_components WHERE workspace_id = ?1
+                ))?(workspace_id)
+                .context("clearing a workspace's open components")?;
+
+                for panel_key in &panel_keys {
+                    connection.exec_bound(sql!(
+                        INSERT INTO workspace_open_components(workspace_id, panel_key)
+                        VALUES (?1, ?2)
+                    ))?((workspace_id, panel_key.as_str()))
+                    .context("recording an open component")?;
+                }
+                Ok(())
+            })
+        })
+        .await
     }
 
     fn remote_connections(&self) -> Result<HashMap<RemoteConnectionId, RemoteConnectionOptions>> {
@@ -7851,5 +7911,80 @@ mod tests {
         });
         assert_eq!(delete_task.await.unwrap(), vec![workspace_id]);
         assert!(db.workspace_for_id(workspace_id).is_none());
+    }
+
+    fn sorted_open_components(db: &WorkspaceDb, id: WorkspaceId) -> Vec<String> {
+        let mut keys = db.open_components(id).unwrap();
+        keys.sort();
+        keys
+    }
+
+    #[gpui::test]
+    async fn test_open_components_replace_rather_than_accumulate() {
+        zlog::init_test();
+        let db = WorkspaceDb::open_test_db("test_open_components_replace").await;
+        let id = db.next_id().await.unwrap();
+
+        db.save_open_components(id, vec!["project".into(), "git".into()])
+            .await
+            .unwrap();
+        assert_eq!(sorted_open_components(&db, id), vec!["git", "project"]);
+
+        // A later save is the whole open set, not an addition to it: closing a
+        // component has to be able to remove its row.
+        db.save_open_components(id, vec!["git".into(), "terminal".into()])
+            .await
+            .unwrap();
+        assert_eq!(sorted_open_components(&db, id), vec!["git", "terminal"]);
+    }
+
+    #[gpui::test]
+    async fn test_scrub_open_component_reaches_a_dormant_workspace() {
+        zlog::init_test();
+        let db = WorkspaceDb::open_test_db("test_scrub_open_component_dormant").await;
+        let displayed = db.next_id().await.unwrap();
+        let dormant = db.next_id().await.unwrap();
+
+        for id in [displayed, dormant] {
+            db.save_open_components(id, vec!["project".into(), "git".into()])
+                .await
+                .unwrap();
+        }
+
+        // Neither workspace is loaded. A scrub that only reconciled live
+        // workspaces would leave the dormant row behind, and `git` would come
+        // back the next time it was unhidden.
+        db.scrub_open_component("git".into()).await.unwrap();
+
+        assert_eq!(
+            sorted_open_components(&db, dormant),
+            vec!["project"],
+            "the dormant workspace forgets the hidden component too"
+        );
+        assert_eq!(
+            sorted_open_components(&db, displayed),
+            vec!["project"],
+            "and every other workspace keeps its remaining components"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_scrub_open_component_is_idempotent() {
+        zlog::init_test();
+        let db = WorkspaceDb::open_test_db("test_scrub_open_component_idempotent").await;
+        let id = db.next_id().await.unwrap();
+
+        db.save_open_components(id, vec!["project".into(), "git".into()])
+            .await
+            .unwrap();
+
+        db.scrub_open_component("git".into()).await.unwrap();
+        let after_first = sorted_open_components(&db, id);
+        assert_eq!(after_first, vec!["project"]);
+
+        // Hide is not a single event with a single matching write, so the
+        // scrub has to survive being run again on an already-scrubbed store.
+        db.scrub_open_component("git".into()).await.unwrap();
+        assert_eq!(sorted_open_components(&db, id), after_first);
     }
 }

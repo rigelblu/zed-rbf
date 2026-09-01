@@ -159,12 +159,12 @@ use util::{
 use uuid::Uuid;
 pub use workspace_settings::{
     AccessibleMode, AutosaveSetting, BottomDockLayout, EncodingDisplayOptions, FocusFollowsMouse,
-    RestoreOnStartupBehavior, StatusBarSettings, TabBarSettings, WorkspaceSettings,
-    observe_accessible_mode,
+    RestoreOnStartupBehavior, StatusBarSettings, TabBarSettings, WorkspaceLayoutSettings,
+    WorkspaceSettings, observe_accessible_mode,
 };
 use zed_actions::{Spawn, feedback::FileBugReport, theme::ToggleMode};
 
-use crate::{dock::PanelSizeState, item::ItemBufferKind, notifications::NotificationId};
+use crate::{item::ItemBufferKind, notifications::NotificationId};
 use crate::{
     persistence::{
         SerializedAxis,
@@ -797,6 +797,21 @@ pub fn init(app_state: Arc<AppState>, cx: &mut App) {
     toast_layer::init(cx);
     history_manager::init(app_state.fs.clone(), cx);
     WorkspaceConfigurationStore::init(cx);
+
+    // The scrub's other trigger. `set_component_hidden` scrubs before it writes,
+    // which a settings-file edit cannot do because the write has already
+    // happened by the time we see it. Both may fire for one unhide; the scrub is
+    // idempotent so that costs nothing.
+    workspace_settings::observe_components_unhidden(cx, |panel_keys, cx| {
+        let db = WorkspaceDb::global(cx);
+        cx.background_spawn(async move {
+            for panel_key in panel_keys {
+                db.scrub_open_component(panel_key).await.log_err();
+            }
+        })
+        .detach();
+    })
+    .detach();
 
     cx.on_action(|_: &CloseWindow, cx| Workspace::close_global(cx))
         .on_action(|_: &Reload, cx| reload(cx))
@@ -2187,7 +2202,7 @@ impl Workspace {
                                     (&workspace.bottom_dock, &default_docks.bottom),
                                 ] {
                                     dock.update(cx, |dock, cx| {
-                                        dock.serialized_dock = Some(serialized_dock.clone());
+                                        dock.set_serialized_state(serialized_dock.clone(), None);
                                         dock.restore_state(window, cx);
                                     });
                                 }
@@ -2384,6 +2399,21 @@ impl Workspace {
         }
     }
 
+    /// Every open component's stable key, across all three sides. This is the
+    /// per-workspace open set that the legacy single `active_panel` column
+    /// cannot express.
+    pub fn capture_open_components(&self, cx: &App) -> Vec<String> {
+        [&self.left_dock, &self.right_dock, &self.bottom_dock]
+            .into_iter()
+            .flat_map(|dock| {
+                dock.read(cx)
+                    .open_panels()
+                    .into_iter()
+                    .map(|panel| panel.panel_key().to_string())
+            })
+            .collect()
+    }
+
     pub fn set_dock_structure(
         &self,
         docks: DockStructure,
@@ -2396,7 +2426,7 @@ impl Workspace {
             (&self.right_dock, docks.right),
         ] {
             dock.update(cx, |dock, cx| {
-                dock.serialized_dock = Some(data);
+                dock.set_serialized_state(data, None);
                 dock.restore_state(window, cx);
             });
         }
@@ -2567,44 +2597,32 @@ impl Workspace {
     }
 
     fn dock_size(&self, dock: &Dock, window: &Window, cx: &App) -> Option<Pixels> {
-        let panel = dock.active_panel()?;
-        let size_state = dock
-            .stored_panel_size_state(panel.as_ref())
-            .unwrap_or_default();
-        let position = dock.position();
-
-        let use_flex = panel.has_flexible_size(window, cx);
-
-        if position.axis() == Axis::Horizontal
-            && use_flex
-            && let Some(flex) = size_state.flex.or_else(|| self.default_dock_flex(position))
-        {
-            let workspace_width = self.bounds.size.width;
-            if workspace_width <= Pixels::ZERO {
-                return None;
-            }
-            let flex = flex.max(0.001);
-            let center_column_count = self.center_full_height_column_count();
-            let opposite = self.opposite_dock_panel_and_size_state(position, window, cx);
-            if let Some(opposite_flex) = opposite.as_ref().and_then(|(_, s)| s.flex) {
-                let total_flex = flex + center_column_count + opposite_flex;
-                return Some((flex / total_flex * workspace_width).max(RESIZE_HANDLE_SIZE));
-            } else {
-                let opposite_fixed = opposite
-                    .map(|(panel, s)| s.size.unwrap_or_else(|| panel.default_size(window, cx)))
-                    .unwrap_or_default();
-                let available = (workspace_width - opposite_fixed).max(RESIZE_HANDLE_SIZE);
-                return Some(
-                    (flex / (flex + center_column_count) * available).max(RESIZE_HANDLE_SIZE),
-                );
-            }
+        if !dock.is_open() {
+            return None;
         }
-
-        Some(
-            size_state
-                .size
-                .unwrap_or_else(|| panel.default_size(window, cx)),
-        )
+        let position = dock.position();
+        if position.axis() != Axis::Horizontal {
+            return dock.open_row_size(window, cx);
+        }
+        let fixed = dock.open_fixed_size(window, cx);
+        let Some(flex) = dock.open_flex(self.default_dock_flex(position), window, cx) else {
+            return Some(fixed);
+        };
+        let workspace_width = self.bounds.size.width;
+        if workspace_width <= Pixels::ZERO {
+            return None;
+        }
+        let flex = flex.max(0.001);
+        let center_column_count = self.center_full_height_column_count();
+        let (opposite_fixed, opposite_flex) = self.opposite_dock_size_summary(position, window, cx);
+        let flex_share = if let Some(opposite_flex) = opposite_flex {
+            let total_flex = flex + center_column_count + opposite_flex;
+            (flex / total_flex * workspace_width).max(RESIZE_HANDLE_SIZE)
+        } else {
+            let available = (workspace_width - opposite_fixed - fixed).max(RESIZE_HANDLE_SIZE);
+            (flex / (flex + center_column_count) * available).max(RESIZE_HANDLE_SIZE)
+        };
+        Some(fixed + flex_share)
     }
 
     pub fn dock_flex_for_size(
@@ -2624,41 +2642,37 @@ impl Workspace {
         }
 
         let center_column_count = self.center_full_height_column_count();
-        let opposite = self.opposite_dock_panel_and_size_state(position, window, cx);
-        if let Some(opposite_flex) = opposite.as_ref().and_then(|(_, s)| s.flex) {
+        let (opposite_fixed, opposite_flex) = self.opposite_dock_size_summary(position, window, cx);
+        if let Some(opposite_flex) = opposite_flex {
             let size = size.clamp(px(0.), workspace_width - px(1.));
             Some((size * (center_column_count + opposite_flex) / (workspace_width - size)).max(0.0))
         } else {
-            let opposite_width = opposite
-                .map(|(panel, s)| s.size.unwrap_or_else(|| panel.default_size(window, cx)))
-                .unwrap_or_default();
-            let available = (workspace_width - opposite_width).max(RESIZE_HANDLE_SIZE);
+            let available = (workspace_width - opposite_fixed).max(RESIZE_HANDLE_SIZE);
             let remaining = (available - size).max(px(1.));
             Some((size * center_column_count / remaining).max(0.0))
         }
     }
 
-    fn opposite_dock_panel_and_size_state(
+    /// The opposite side's open panels as one width: fixed px plus total flex.
+    fn opposite_dock_size_summary(
         &self,
         position: DockPosition,
         window: &Window,
         cx: &App,
-    ) -> Option<(Arc<dyn PanelHandle>, PanelSizeState)> {
+    ) -> (Pixels, Option<f32>) {
         let opposite_position = match position {
             DockPosition::Left => DockPosition::Right,
             DockPosition::Right => DockPosition::Left,
-            DockPosition::Bottom => return None,
+            DockPosition::Bottom => return (Pixels::ZERO, None),
         };
-
         let opposite_dock = self.dock_at_position(opposite_position).read(cx);
-        let panel = opposite_dock.visible_panel()?;
-        let mut size_state = opposite_dock
-            .stored_panel_size_state(panel.as_ref())
-            .unwrap_or_default();
-        if size_state.flex.is_none() && panel.has_flexible_size(window, cx) {
-            size_state.flex = self.default_dock_flex(opposite_position);
+        if !opposite_dock.is_open() {
+            return (Pixels::ZERO, None);
         }
-        Some((panel.clone(), size_state))
+        (
+            opposite_dock.open_fixed_size(window, cx),
+            opposite_dock.open_flex(self.default_dock_flex(opposite_position), window, cx),
+        )
     }
 
     fn center_full_height_column_count(&self) -> f32 {
@@ -4467,6 +4481,44 @@ impl Workspace {
     }
 
     /// Transfer focus to the panel of the given type.
+    /// Bottom-bar icon behavior: closed → open and focus; open but unfocused →
+    /// focus; open and focused → close it in this workspace, leaving siblings.
+    pub(crate) fn handle_panel_icon_click(
+        &mut self,
+        dock: &Entity<Dock>,
+        panel_ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel) = dock.read(cx).panel_at(panel_ix).cloned() else {
+            return;
+        };
+        let position = dock.read(cx).position();
+        // A plain toggle: open closes, closed opens and takes focus. Focus is a
+        // consequence of opening rather than a state of its own, so closing a
+        // visible component never costs a second click. A component that is
+        // already on screen can be focused by clicking the component itself.
+        let is_open = dock.read(cx).is_panel_open(panel.panel_id());
+        telemetry::event!(
+            "Panel Button Clicked",
+            name = panel.persistent_name(),
+            toggle_state = !is_open
+        );
+        if is_open {
+            dock.update(cx, |dock, cx| {
+                dock.close_panel_at(panel_ix, window, cx);
+            });
+            self.active_pane
+                .update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx));
+        } else {
+            dock.update(cx, |dock, cx| dock.activate_panel(panel_ix, window, cx));
+            window.focus(&panel.activation_focus_handle(cx), cx);
+            self.dismiss_zoomed_items_to_reveal(Some(position), window, cx);
+        }
+        self.serialize_workspace(window, cx);
+        cx.notify();
+    }
+
     pub fn focus_panel<T: Panel>(
         &mut self,
         window: &mut Window,
@@ -4610,8 +4662,8 @@ impl Workspace {
     pub fn close_panel<T: Panel>(&self, window: &mut Window, cx: &mut Context<Self>) {
         for dock in self.all_docks().iter() {
             dock.update(cx, |dock, cx| {
-                if dock.panel::<T>().is_some() {
-                    dock.set_open(false, window, cx)
+                if let Some(panel_ix) = dock.panel_index_for_type::<T>() {
+                    dock.close_panel_at(panel_ix, window, cx);
                 }
             })
         }
@@ -7577,9 +7629,13 @@ impl Workspace {
                 let serialized_workspace =
                     self.build_serialized_workspace(database_id, location, paths, window, cx);
 
+                let open_components = self.capture_open_components(cx);
                 let db = WorkspaceDb::global(cx);
                 window.spawn(cx, async move |_| {
                     db.save_workspace(serialized_workspace).await;
+                    db.save_open_components(database_id, open_components)
+                        .await
+                        .log_err();
                 })
             }
             WorkspaceLocation::DetachFromSession => {
@@ -7955,6 +8011,12 @@ impl Workspace {
                 }
 
                 let docks = serialized_workspace.docks;
+                // Every dock receives the whole set; a dock only opens the keys
+                // it actually registers, so it filters itself.
+                let open_components = WorkspaceDb::global(cx)
+                    .open_components(serialized_workspace.id)
+                    .log_err()
+                    .unwrap_or_default();
 
                 for (dock, serialized_dock) in [
                     (&mut workspace.right_dock, docks.right),
@@ -7964,7 +8026,10 @@ impl Workspace {
                 .iter_mut()
                 {
                     dock.update(cx, |dock, cx| {
-                        dock.serialized_dock = Some(serialized_dock.clone());
+                        dock.set_serialized_state(
+                            serialized_dock.clone(),
+                            Some(open_components.clone()),
+                        );
                         dock.restore_state(window, cx);
                     });
                 }
@@ -8058,7 +8123,7 @@ impl Workspace {
                     (&workspace.bottom_dock, docks.bottom),
                 ] {
                     dock.update(cx, |dock, cx| {
-                        dock.serialized_dock = Some(serialized_dock);
+                        dock.set_serialized_state(serialized_dock, None);
                         dock.restore_state(window, cx);
                     });
                 }
@@ -8765,43 +8830,33 @@ impl Workspace {
         // included in the element tree so its focus handle remains mounted — without
         // this, toggle_panel_focus cannot focus the panel when the dock is closed.
         let dock = dock.read(cx);
-        if let Some(panel) = dock.visible_panel() {
-            let size_state = dock.stored_panel_size_state(panel.as_ref());
-            let min_size = panel.min_size(window, cx);
+        if dock.is_open() {
             if position.axis() == Axis::Horizontal {
-                let use_flexible = panel.has_flexible_size(window, cx);
-                let flex_grow = if use_flexible {
-                    size_state
-                        .and_then(|state| state.flex)
-                        .or_else(|| self.default_dock_flex(position))
-                } else {
-                    None
-                };
-                if let Some(grow) = flex_grow {
-                    let grow = (grow / self.center_full_height_column_count()).max(0.001);
+                let fixed = dock.open_fixed_size(window, cx);
+                let flex_total = dock.open_flex(self.default_dock_flex(position), window, cx);
+                if let Some(total) = flex_total {
+                    let grow = (total / self.center_full_height_column_count()).max(0.001);
                     let style = container.style();
                     style.flex_grow = Some(grow);
                     style.flex_shrink = Some(1.0);
-                    style.flex_basis = Some(relative(0.).into());
+                    style.flex_basis = Some(if fixed > Pixels::ZERO {
+                        fixed.into()
+                    } else {
+                        relative(0.).into()
+                    });
                 } else {
-                    let size = size_state
-                        .and_then(|state| state.size)
-                        .unwrap_or_else(|| panel.default_size(window, cx));
-                    container = container.w(size);
+                    container = container.w(fixed);
                     // Allow the fixed-width dock to shrink when there isn't
                     // enough space (e.g. when the sidebar is open). The
-                    // stored size is preserved so the dock expands back
+                    // stored sizes are preserved so the dock expands back
                     // when space becomes available.
                     let style = container.style();
                     style.flex_shrink = Some(1.0);
                 }
-                if let Some(min) = min_size {
+                if let Some(min) = dock.open_min_size(window, cx) {
                     container = container.min_w(min);
                 }
-            } else {
-                let size = size_state
-                    .and_then(|state| state.size)
-                    .unwrap_or_else(|| panel.default_size(window, cx));
+            } else if let Some(size) = dock.open_row_size(window, cx) {
                 container = container.h(size);
             }
         }
@@ -9069,15 +9124,10 @@ impl Workspace {
         });
 
         let flex_grow = self.dock_flex_for_size(DockPosition::Left, size, window, cx);
+        // `resize_all_panels_in_dock` is accepted and ignored: every open panel is
+        // visible now, so the editor-facing divider always resizes the whole side.
         self.left_dock.update(cx, |left_dock, cx| {
-            if WorkspaceSettings::get_global(cx)
-                .resize_all_panels_in_dock
-                .contains(&DockPosition::Left)
-            {
-                left_dock.resize_all_panels(Some(size), flex_grow, window, cx);
-            } else {
-                left_dock.resize_active_panel(Some(size), flex_grow, window, cx);
-            }
+            left_dock.resize_active_panel(Some(size), flex_grow, window, cx);
         });
     }
 
@@ -9094,28 +9144,14 @@ impl Workspace {
         });
         let flex_grow = self.dock_flex_for_size(DockPosition::Right, size, window, cx);
         self.right_dock.update(cx, |right_dock, cx| {
-            if WorkspaceSettings::get_global(cx)
-                .resize_all_panels_in_dock
-                .contains(&DockPosition::Right)
-            {
-                right_dock.resize_all_panels(Some(size), flex_grow, window, cx);
-            } else {
-                right_dock.resize_active_panel(Some(size), flex_grow, window, cx);
-            }
+            right_dock.resize_active_panel(Some(size), flex_grow, window, cx);
         });
     }
 
     fn resize_bottom_dock(&mut self, new_size: Pixels, window: &mut Window, cx: &mut App) {
         let size = new_size.min(self.bounds.bottom() - RESIZE_HANDLE_SIZE - self.bounds.top());
         self.bottom_dock.update(cx, |bottom_dock, cx| {
-            if WorkspaceSettings::get_global(cx)
-                .resize_all_panels_in_dock
-                .contains(&DockPosition::Bottom)
-            {
-                bottom_dock.resize_all_panels(Some(size), None, window, cx);
-            } else {
-                bottom_dock.resize_active_panel(Some(size), None, window, cx);
-            }
+            bottom_dock.resize_active_panel(Some(size), None, window, cx);
         });
     }
 
@@ -12366,7 +12402,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        dock::{PanelEvent, test::TestPanel},
+        dock::{PanelEvent, set_component_hidden, test::TestPanel, test::TestPanelB},
         item::{
             ItemBufferKind, ItemEvent,
             test::{TestItem, TestProjectItem},
@@ -14834,7 +14870,13 @@ mod tests {
         let (workspace, cx) =
             cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
         workspace.update_in(cx, |workspace, window, cx| {
-            // Open two docks
+            // A dock's open state is its set of open panels, so each side needs
+            // a registered panel before it can be open at all.
+            let left_panel = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+            workspace.add_panel(left_panel, window, cx);
+            let right_panel = cx.new(|cx| TestPanel::new(DockPosition::Right, 101, cx));
+            workspace.add_panel(right_panel, window, cx);
+
             let left_dock = workspace.dock_at_position(DockPosition::Left);
             let right_dock = workspace.dock_at_position(DockPosition::Right);
 
@@ -14875,7 +14917,13 @@ mod tests {
         let (workspace, cx) =
             cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
         workspace.update_in(cx, |workspace, window, cx| {
-            // Open two docks
+            // A dock's open state is its set of open panels, so each side needs
+            // a registered panel before it can be open at all.
+            let left_panel = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+            workspace.add_panel(left_panel, window, cx);
+            let right_panel = cx.new(|cx| TestPanel::new(DockPosition::Right, 101, cx));
+            workspace.add_panel(right_panel, window, cx);
+
             let left_dock = workspace.dock_at_position(DockPosition::Left);
             let right_dock = workspace.dock_at_position(DockPosition::Right);
 
@@ -14922,7 +14970,10 @@ mod tests {
             let left_panel = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
             workspace.add_panel(left_panel.clone(), window, cx);
 
-            let right_panel = cx.new(|cx| TestPanel::new(DockPosition::Right, 101, cx));
+            // A distinct component type: position is global per component, so
+            // two instances of one type share a position and cannot model two
+            // components moving independently.
+            let right_panel = cx.new(|cx| TestPanelB::new(DockPosition::Right, 101, cx));
             workspace.add_panel(right_panel.clone(), window, cx);
 
             workspace.toggle_dock(DockPosition::Left, window, cx);
@@ -15054,6 +15105,776 @@ mod tests {
                     .panel_id(),
                 left_panel.panel_id(),
                 "Left panel should be the visible panel in the right dock"
+            );
+        });
+    }
+
+    fn set_panel_pinned(cx: &mut VisualTestContext, panel_key: &str, pinned: bool) {
+        cx.update_global(|store: &mut SettingsStore, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings
+                    .workspace_layout
+                    .get_or_insert_default()
+                    .component_positions
+                    .entry(panel_key.to_string())
+                    .or_default()
+                    .pinned = Some(pinned);
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn test_pinned_panels_stay_open_in_icon_order(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        // Pinning is keyed by panel type, so this pins every `TestPanel`.
+        set_panel_pinned(cx, "TestPanel", true);
+
+        let (left_low, left_high, right_low, right_high) =
+            workspace.update_in(cx, |workspace, window, cx| {
+                let left_low = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+                workspace.add_panel(left_low.clone(), window, cx);
+                let left_high = cx.new(|cx| TestPanel::new(DockPosition::Left, 101, cx));
+                workspace.add_panel(left_high.clone(), window, cx);
+                let right_low = cx.new(|cx| TestPanel::new(DockPosition::Right, 100, cx));
+                workspace.add_panel(right_low.clone(), window, cx);
+                let right_high = cx.new(|cx| TestPanel::new(DockPosition::Right, 101, cx));
+                workspace.add_panel(right_high.clone(), window, cx);
+                (left_low, left_high, right_low, right_high)
+            });
+
+        // Open each side's higher-priority panel first, so screen order can
+        // only match entry order by following the entries rather than the clicks.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.activate_panel(1, window, cx);
+                dock.activate_panel(0, window, cx);
+            });
+            workspace.right_dock().update(cx, |dock, cx| {
+                dock.activate_panel(1, window, cx);
+                dock.activate_panel(0, window, cx);
+            });
+        });
+
+        workspace.update(cx, |workspace, cx| {
+            let open_ids = |dock: &Entity<Dock>, cx: &App| -> Vec<EntityId> {
+                dock.read(cx)
+                    .open_panels()
+                    .iter()
+                    .map(|panel| panel.panel_id())
+                    .collect()
+            };
+
+            assert_eq!(
+                open_ids(&workspace.left_dock(), cx),
+                vec![left_low.panel_id(), left_high.panel_id()],
+                "pinned siblings stay open together, in entry order on the left"
+            );
+            assert_eq!(
+                open_ids(&workspace.right_dock(), cx),
+                vec![right_high.panel_id(), right_low.panel_id()],
+                "the right dock reverses entry order so columns read like its reversed icons"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_icon_click_closes_only_the_clicked_panel(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        set_panel_pinned(cx, "TestPanel", true);
+
+        let (first, second) = workspace.update_in(cx, |workspace, window, cx| {
+            let first = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+            workspace.add_panel(first.clone(), window, cx);
+            let second = cx.new(|cx| TestPanel::new(DockPosition::Left, 101, cx));
+            workspace.add_panel(second.clone(), window, cx);
+            // `first` is activated last so the dock holds it as the focused
+            // panel — which is what the icon draws and what the click reads.
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.activate_panel(1, window, cx);
+                dock.activate_panel(0, window, cx);
+            });
+            (first, second)
+        });
+
+        // The clicked panel only has to be open — the toggle does not consult focus.
+        workspace.update_in(cx, |workspace, window, cx| {
+            window.focus(&first.read(cx).focus_handle(cx), cx);
+            assert!(
+                workspace
+                    .left_dock()
+                    .read(cx)
+                    .is_panel_open(first.panel_id())
+            );
+            assert!(
+                workspace
+                    .left_dock()
+                    .read(cx)
+                    .is_panel_open(first.panel_id()),
+                "the clicked panel must be open, or there is nothing for the toggle to close"
+            );
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let dock = workspace.left_dock().clone();
+            workspace.handle_panel_icon_click(&dock, 0, window, cx);
+        });
+
+        workspace.update(cx, |workspace, cx| {
+            let dock = workspace.left_dock();
+            assert!(
+                !dock.read(cx).is_panel_open(first.panel_id()),
+                "clicking an open panel's icon closes that panel"
+            );
+            assert!(
+                dock.read(cx).is_panel_open(second.panel_id()),
+                "its sibling stays open"
+            );
+            assert!(
+                dock.read(cx).is_open(),
+                "and the side stays open because a panel remains"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_unpinned_panels_share_one_slot(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        let (first, second) = workspace.update_in(cx, |workspace, window, cx| {
+            let first = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+            workspace.add_panel(first.clone(), window, cx);
+            let second = cx.new(|cx| TestPanel::new(DockPosition::Left, 101, cx));
+            workspace.add_panel(second.clone(), window, cx);
+            (first, second)
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace
+                .left_dock()
+                .update(cx, |dock, cx| dock.activate_panel(0, window, cx));
+            assert!(
+                workspace
+                    .left_dock()
+                    .read(cx)
+                    .is_panel_open(first.panel_id()),
+                "the first panel must actually be open, or the displacement has nothing to displace"
+            );
+            workspace
+                .left_dock()
+                .update(cx, |dock, cx| dock.activate_panel(1, window, cx));
+        });
+
+        workspace.update(cx, |workspace, cx| {
+            let dock = workspace.left_dock();
+            assert!(
+                !dock.read(cx).is_panel_open(first.panel_id()),
+                "with nothing pinned, opening a panel displaces the unpinned one showing there"
+            );
+            assert!(dock.read(cx).is_panel_open(second.panel_id()));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_pinned_panel_is_not_displaced_by_an_unpinned_sibling(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        // Same fixture as `test_unpinned_panels_share_one_slot` with one flag
+        // flipped, so the two tests differ only in the thing under test.
+        set_panel_pinned(cx, "TestPanel", true);
+
+        let (pinned, unpinned) = workspace.update_in(cx, |workspace, window, cx| {
+            let pinned = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+            workspace.add_panel(pinned.clone(), window, cx);
+            let unpinned = cx.new(|cx| TestPanelB::new(DockPosition::Left, 101, cx));
+            workspace.add_panel(unpinned.clone(), window, cx);
+            (pinned, unpinned)
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace
+                .left_dock()
+                .update(cx, |dock, cx| dock.activate_panel(0, window, cx));
+            assert!(
+                workspace
+                    .left_dock()
+                    .read(cx)
+                    .is_panel_open(pinned.panel_id()),
+                "the pinned panel must be open, or there is nothing to protect from displacement"
+            );
+            workspace
+                .left_dock()
+                .update(cx, |dock, cx| dock.activate_panel(1, window, cx));
+        });
+
+        workspace.update(cx, |workspace, cx| {
+            let dock = workspace.left_dock();
+            assert!(
+                dock.read(cx).is_panel_open(pinned.panel_id()),
+                "an unpinned panel opening never displaces a pinned sibling"
+            );
+            assert!(
+                dock.read(cx).is_panel_open(unpinned.panel_id()),
+                "and the unpinned panel opens beside it"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_pinned_panel_opening_does_not_displace_an_unpinned_sibling(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        // The mirror of `test_pinned_panel_is_not_displaced_by_an_unpinned_sibling`:
+        // there the pinned panel opens first. Only an unpinned panel takes the
+        // side's shared slot, so a pinned one opening later evicts nobody.
+        set_panel_pinned(cx, "TestPanel", true);
+
+        let (pinned, unpinned) = workspace.update_in(cx, |workspace, window, cx| {
+            let pinned = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+            workspace.add_panel(pinned.clone(), window, cx);
+            let unpinned = cx.new(|cx| TestPanelB::new(DockPosition::Left, 101, cx));
+            workspace.add_panel(unpinned.clone(), window, cx);
+            (pinned, unpinned)
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace
+                .left_dock()
+                .update(cx, |dock, cx| dock.activate_panel(1, window, cx));
+            assert!(
+                workspace
+                    .left_dock()
+                    .read(cx)
+                    .is_panel_open(unpinned.panel_id()),
+                "the unpinned panel must hold the shared slot before the pinned one opens"
+            );
+            workspace
+                .left_dock()
+                .update(cx, |dock, cx| dock.activate_panel(0, window, cx));
+        });
+
+        workspace.update(cx, |workspace, cx| {
+            let dock = workspace.left_dock();
+            assert!(
+                dock.read(cx).is_panel_open(unpinned.panel_id()),
+                "opening a pinned panel does not take the side's unpinned slot"
+            );
+            assert!(
+                dock.read(cx).is_panel_open(pinned.panel_id()),
+                "and the pinned panel opens beside it"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_captured_open_component_set_survives_a_restore(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        set_panel_pinned(cx, "TestPanel", true);
+        set_panel_pinned(cx, "TestPanelB", true);
+
+        let (first, second) = workspace.update_in(cx, |workspace, window, cx| {
+            let first = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+            workspace.add_panel(first.clone(), window, cx);
+            let second = cx.new(|cx| TestPanelB::new(DockPosition::Left, 101, cx));
+            workspace.add_panel(second.clone(), window, cx);
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+                dock.activate_panel(1, window, cx);
+            });
+            (first, second)
+        });
+
+        let captured = workspace.read_with(cx, |workspace, cx| {
+            let captured = workspace.capture_open_components(cx);
+            assert_eq!(
+                captured.len(),
+                2,
+                "both open components must be captured, or the restore below proves nothing"
+            );
+            captured
+        });
+
+        // Close both without remembering them, which is the state a dock is in
+        // before a restore. `set_open(false)` would stash the set and let the
+        // group toggle reopen it, hiding whether the saved rows did the work.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.close_panel_at(1, window, cx);
+                dock.close_panel_at(0, window, cx);
+            });
+            assert!(!workspace.left_dock().read(cx).is_open());
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.set_serialized_state(
+                    DockData {
+                        visible: true,
+                        active_panel: None,
+                        zoom: false,
+                    },
+                    Some(captured),
+                );
+                dock.restore_state(window, cx);
+            });
+        });
+
+        workspace.update(cx, |workspace, cx| {
+            let dock = workspace.left_dock();
+            assert!(
+                dock.read(cx).is_panel_open(first.panel_id()),
+                "a restore reopens every saved component, not just the active one"
+            );
+            assert!(
+                dock.read(cx).is_panel_open(second.panel_id()),
+                "including the sibling the legacy single active_panel column could not name"
+            );
+        });
+    }
+
+    fn set_panel_hidden(cx: &mut VisualTestContext, panel_key: &str, hidden: bool) {
+        cx.update_global(|store: &mut SettingsStore, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings
+                    .workspace_layout
+                    .get_or_insert_default()
+                    .component_positions
+                    .entry(panel_key.to_string())
+                    .or_default()
+                    .hidden = Some(hidden);
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn test_a_hidden_component_is_not_reopened_by_a_restore(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+
+        // The saved rows say this component was open — the stale state a
+        // workspace that was dormant across a hide keeps on disk.
+        let restore = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext| {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.left_dock().update(cx, |dock, cx| {
+                    dock.set_serialized_state(
+                        DockData {
+                            visible: true,
+                            active_panel: None,
+                            zoom: false,
+                        },
+                        Some(vec!["TestPanel".to_string()]),
+                    );
+                    dock.restore_state(window, cx);
+                });
+            });
+        };
+
+        // Positive control, same fixture: while it is visible those exact rows
+        // do reopen it. Without this, the assertion below would also pass if
+        // restore were simply broken.
+        restore(&workspace, cx);
+        workspace.update(cx, |workspace, cx| {
+            assert!(
+                workspace
+                    .left_dock()
+                    .read(cx)
+                    .is_panel_open(panel.panel_id()),
+                "the saved rows must reopen a visible component"
+            );
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace
+                .left_dock()
+                .update(cx, |dock, cx| dock.close_panel_at(0, window, cx));
+        });
+        set_panel_hidden(cx, "TestPanel", true);
+        cx.run_until_parked();
+
+        restore(&workspace, cx);
+        workspace.update(cx, |workspace, cx| {
+            let dock = workspace.left_dock();
+            assert!(
+                !dock.read(cx).is_panel_open(panel.panel_id()),
+                "a hidden component stays out of the open set, not merely unrendered"
+            );
+            assert!(
+                !dock.read(cx).is_open(),
+                "and the side has nothing left to show"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_hiding_a_component_closes_it_in_a_live_workspace(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            workspace
+                .left_dock()
+                .update(cx, |dock, cx| dock.activate_panel(0, window, cx));
+            panel
+        });
+
+        workspace.update(cx, |workspace, cx| {
+            assert!(
+                workspace
+                    .left_dock()
+                    .read(cx)
+                    .is_panel_open(panel.panel_id()),
+                "it must be open first, or hiding it has nothing to close"
+            );
+        });
+
+        set_panel_hidden(cx, "TestPanel", true);
+        cx.run_until_parked();
+
+        workspace.update(cx, |workspace, cx| {
+            assert!(
+                !workspace
+                    .left_dock()
+                    .read(cx)
+                    .is_panel_open(panel.panel_id()),
+                "hiding a component closes it in every live workspace, without waiting for a restart"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_unhiding_scrubs_open_rows_but_hiding_leaves_them(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        // The scrub deletes by key across every workspace, so this test uses a
+        // key no other test can be holding rows under.
+        const KEY: &str = "scrub-witness-component";
+
+        let (db, fs) = workspace.read_with(cx, |workspace, cx| {
+            (WorkspaceDb::global(cx), workspace.app_state().fs.clone())
+        });
+        let workspace_id = db.next_id().await.unwrap();
+        db.save_open_components(workspace_id, vec![KEY.to_string()])
+            .await
+            .unwrap();
+
+        // Hiding must leave the rows alone. They are exactly what a later
+        // unhide has to find and delete; live workspaces close the component
+        // through the settings observer instead.
+        workspace.update_in(cx, |_, _, cx| {
+            set_component_hidden(fs.clone(), KEY.to_string(), true, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            db.open_components(workspace_id).unwrap(),
+            vec![KEY.to_string()],
+            "hiding leaves the saved open rows in place"
+        );
+
+        workspace.update_in(cx, |_, _, cx| {
+            set_component_hidden(fs.clone(), KEY.to_string(), false, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            db.open_components(workspace_id).unwrap().is_empty(),
+            "unhiding forgets the component's openness in every serialized workspace"
+        );
+    }
+
+    fn set_panel_position(
+        cx: &mut VisualTestContext,
+        panel_key: &str,
+        position: settings::DockPosition,
+    ) {
+        cx.update_global(|store: &mut SettingsStore, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings
+                    .workspace_layout
+                    .get_or_insert_default()
+                    .component_positions
+                    .entry(panel_key.to_string())
+                    .or_default()
+                    .position = Some(position);
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn test_component_position_moves_the_actual_component(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            workspace
+                .left_dock()
+                .update(cx, |dock, cx| dock.activate_panel(0, window, cx));
+            panel
+        });
+
+        workspace.update(cx, |workspace, cx| {
+            assert!(
+                workspace
+                    .left_dock()
+                    .read(cx)
+                    .panel_id_for_panel_key("TestPanel")
+                    .is_some(),
+                "the component must start on the left, or the move below proves nothing"
+            );
+            assert!(
+                workspace
+                    .left_dock()
+                    .read(cx)
+                    .is_panel_open(panel.panel_id())
+            );
+        });
+
+        set_panel_position(cx, "TestPanel", settings::DockPosition::Right);
+        cx.run_until_parked();
+
+        workspace.update(cx, |workspace, cx| {
+            // A dock's panel entries are what its icon strip renders from, so
+            // the entry moving is the icon moving. This is the gesture the
+            // icon-only build failed: the icon went right, the tree stayed left.
+            assert!(
+                workspace
+                    .right_dock()
+                    .read(cx)
+                    .panel_id_for_panel_key("TestPanel")
+                    .is_some(),
+                "the real component moves to the side its position names"
+            );
+            assert!(
+                workspace
+                    .left_dock()
+                    .read(cx)
+                    .panel_id_for_panel_key("TestPanel")
+                    .is_none(),
+                "and it leaves the side it came from, icon included"
+            );
+            assert!(
+                workspace
+                    .right_dock()
+                    .read(cx)
+                    .is_panel_open(panel.panel_id()),
+                "a component visible before the move is still visible after it"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_a_settings_file_unhide_scrubs_open_rows(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        // Run the product's own wiring. Dogfood check J failed because the
+        // scrub had callers in tests and none in the app, so registering the
+        // observer here instead would prove the mechanism and miss the defect.
+        workspace.update_in(cx, |_, _, cx| {
+            let app_state = AppState::test(cx);
+            init(app_state, cx);
+        });
+
+        const KEY: &str = "settings-unhide-witness";
+        let db = workspace.read_with(cx, |_, cx| WorkspaceDb::global(cx));
+        let workspace_id = db.next_id().await.unwrap();
+        db.save_open_components(workspace_id, vec![KEY.to_string()])
+            .await
+            .unwrap();
+
+        // Hide and unhide entirely through the settings store, which is the
+        // path a hand edit takes. `set_component_hidden` is never called.
+        set_panel_hidden(cx, KEY, true);
+        cx.run_until_parked();
+        assert_eq!(
+            db.open_components(workspace_id).unwrap(),
+            vec![KEY.to_string()],
+            "hiding leaves the rows in place for the unhide to find"
+        );
+
+        set_panel_hidden(cx, KEY, false);
+        cx.run_until_parked();
+        assert!(
+            db.open_components(workspace_id).unwrap().is_empty(),
+            "an unhide written straight to settings still scrubs every serialized workspace"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_a_closed_component_is_not_reopened_when_another_panel_registers(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        set_panel_pinned(cx, "TestPanel", true);
+        set_panel_pinned(cx, "TestPanelB", true);
+
+        let restored = workspace.update_in(cx, |workspace, window, cx| {
+            let restored = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+            workspace.add_panel(restored.clone(), window, cx);
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.set_serialized_state(
+                    DockData {
+                        visible: true,
+                        active_panel: None,
+                        zoom: false,
+                    },
+                    Some(vec!["TestPanel".to_string()]),
+                );
+                dock.restore_state(window, cx);
+            });
+            restored
+        });
+
+        workspace.update(cx, |workspace, cx| {
+            assert!(
+                workspace
+                    .left_dock()
+                    .read(cx)
+                    .is_panel_open(restored.panel_id()),
+                "the restore must have opened it, or closing it below proves nothing"
+            );
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace
+                .left_dock()
+                .update(cx, |dock, cx| dock.close_panel_at(0, window, cx));
+            assert!(
+                !workspace
+                    .left_dock()
+                    .read(cx)
+                    .is_panel_open(restored.panel_id())
+            );
+        });
+
+        // Registering a panel re-runs `restore_state`, and a dock move does
+        // exactly this. A saved set that stayed armed would reopen what the
+        // user just closed.
+        workspace.update_in(cx, |workspace, window, cx| {
+            let later = cx.new(|cx| TestPanelB::new(DockPosition::Left, 101, cx));
+            workspace.add_panel(later, window, cx);
+        });
+
+        workspace.update(cx, |workspace, cx| {
+            assert!(
+                !workspace
+                    .left_dock()
+                    .read(cx)
+                    .is_panel_open(restored.panel_id()),
+                "a component closed after its restore stays closed when another panel registers"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_icon_click_closes_an_open_panel_that_does_not_have_focus(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        set_panel_pinned(cx, "TestPanel", true);
+        set_panel_pinned(cx, "TestPanelB", true);
+
+        let (unfocused, focused) = workspace.update_in(cx, |workspace, window, cx| {
+            let unfocused = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+            workspace.add_panel(unfocused.clone(), window, cx);
+            let focused = cx.new(|cx| TestPanelB::new(DockPosition::Left, 101, cx));
+            workspace.add_panel(focused.clone(), window, cx);
+            // Activated last, so the dock's emphasis sits on the *other* panel.
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+                dock.activate_panel(1, window, cx);
+            });
+            (unfocused, focused)
+        });
+
+        workspace.update(cx, |workspace, cx| {
+            let dock = workspace.left_dock();
+            assert!(dock.read(cx).is_panel_open(unfocused.panel_id()));
+            assert_eq!(
+                dock.read(cx).focused_panel_id(),
+                Some(focused.panel_id()),
+                "the panel under test must NOT hold emphasis — that is the whole case"
+            );
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let dock = workspace.left_dock().clone();
+            workspace.handle_panel_icon_click(&dock, 0, window, cx);
+        });
+
+        workspace.update(cx, |workspace, cx| {
+            let dock = workspace.left_dock();
+            assert!(
+                !dock.read(cx).is_panel_open(unfocused.panel_id()),
+                "the icon is a plain toggle: one click closes an open panel, focused or not"
+            );
+            assert!(
+                dock.read(cx).is_panel_open(focused.panel_id()),
+                "and leaves its sibling alone"
             );
         });
     }
@@ -16101,7 +16922,8 @@ mod tests {
             let panel_1 = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
             workspace.add_panel(panel_1.clone(), window, cx);
             workspace.toggle_dock(DockPosition::Left, window, cx);
-            let panel_2 = cx.new(|cx| TestPanel::new(DockPosition::Right, 101, cx));
+            // A distinct component type, for the same reason as above.
+            let panel_2 = cx.new(|cx| TestPanelB::new(DockPosition::Right, 101, cx));
             workspace.add_panel(panel_2.clone(), window, cx);
             workspace.toggle_dock(DockPosition::Right, window, cx);
 
@@ -16249,9 +17071,12 @@ mod tests {
             assert_eq!(workspace.zoomed_position, Some(DockPosition::Left));
         });
 
-        // Move panel to another dock while it is zoomed
-        panel_1.update_in(cx, |panel, window, cx| {
-            panel.set_position(DockPosition::Right, window, cx)
+        // Move panel to another dock while it is zoomed. This goes through the
+        // panel handle, the way a placement gesture does: `component_positions`
+        // is authoritative, so writing only the panel's own dock setting would
+        // be shadowed by the shared position set earlier in this test.
+        workspace.update_in(cx, |_, window, cx| {
+            panel_1.set_position(DockPosition::Right, window, cx);
         });
         workspace.read_with(cx, |workspace, _| {
             assert_eq!(workspace.zoomed, Some(panel_1.to_any().downgrade()));
@@ -18185,10 +19010,14 @@ mod tests {
     }
 
     pub fn init_test(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.executor());
         cx.update(|cx| {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
             cx.set_global(db::AppDatabase::test_new());
+            // `main.rs` installs this in production. Component placement writes
+            // through it, so any test that moves a panel needs it as well.
+            <dyn fs::Fs>::set_global(fs, cx);
             theme_settings::init(theme::LoadThemes::JustBase, cx);
         });
     }

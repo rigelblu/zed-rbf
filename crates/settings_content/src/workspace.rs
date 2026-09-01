@@ -1068,3 +1068,31 @@ pub struct FocusFollowsMouse {
     pub enabled: Option<bool>,
     pub debounce_ms: Option<u64>,
 }
+
+#[with_fallible_options]
+#[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct WorkspaceLayoutContent {
+    /// Where each workspace component lives, whether it is hidden everywhere,
+    /// and whether it keeps its own column, keyed by the component's stable id.
+    ///
+    /// Default: {}
+    #[serde(default)]
+    pub component_positions: HashMap<String, WorkspaceComponentPositionContent>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct WorkspaceComponentPositionContent {
+    /// The side the component occupies. When absent, the component's own dock
+    /// setting applies, then its registered default.
+    pub position: Option<crate::DockPosition>,
+    /// Whether the component and its icon are removed in every workspace.
+    ///
+    /// Default: false
+    pub hidden: Option<bool>,
+    /// Whether the component keeps its own column instead of sharing the
+    /// side's single unpinned slot.
+    ///
+    /// Default: false
+    pub pinned: Option<bool>,
+}
