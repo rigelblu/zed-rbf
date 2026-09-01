@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsStore, TerminalDockPosition};
 use std::sync::Arc;
 use ui::{
-    ContextMenu, CountBadge, Divider, DividerColor, IconButton, Indicator, Tooltip, prelude::*,
+    ContextMenu, CountBadge, Divider, DividerColor, IconButton, Tooltip, prelude::*,
     right_click_menu,
 };
 use util::ResultExt as _;
@@ -1870,21 +1870,16 @@ impl Render for PanelButtons {
                         })
                         .anchor(menu_anchor)
                         .attach(menu_attach)
-                        .trigger(move |is_active, _window, _cx| {
-                            // Include active state in element ID to invalidate the cached
-                            // tooltip when panel state changes (e.g., via keyboard shortcut)
-                            let button_state =
-                                (is_open_button as u64) + 2 * (is_focused_button as u64);
+                        .trigger(move |is_active, _window, cx| {
+                            // Every state the button draws belongs in its element ID, or a
+                            // cached element outlives the state that produced it.
+                            let button_state = (is_open_button as u64)
+                                + 2 * (is_focused_button as u64)
+                                + 4 * (is_pinned_button as u64);
                             let button = IconButton::new((name, button_state), icon)
                                 .icon_size(IconSize::Small)
                                 .toggle_state(is_open_button)
                                 .when(is_focused_button, |this| this.icon_color(Color::Accent))
-                                // Accent means one thing in this strip: focused.
-                                // Pinning is durable configuration, read far less
-                                // often than focus, so it takes the quieter mark.
-                                .when(is_pinned_button, |this| {
-                                    this.indicator(Indicator::dot().color(Color::Muted))
-                                })
                                 .tab_index(0isize)
                                 .aria_label(icon_tooltip)
                                 .on_click({
@@ -1905,13 +1900,32 @@ impl Render for PanelButtons {
                                     })
                                 });
 
-                            div().relative().child(button).when_some(
-                                icon_label
-                                    .clone()
-                                    .filter(|_| !is_open_button)
-                                    .and_then(|label| label.parse::<usize>().ok()),
-                                |this, count| this.child(CountBadge::new(count)),
-                            )
+                            div()
+                                .relative()
+                                .child(button)
+                                // `Indicator` is deliberately not used for the pin: it draws a
+                                // 6px disc inside a 10px knockout ring, 40% of a 14px glyph,
+                                // which reads as a notification stuck onto the icon rather than
+                                // a property of it. Accent already means focused, so colour
+                                // alone cannot carry this — the mark has to be small.
+                                .when(is_pinned_button, |this| {
+                                    this.child(
+                                        div()
+                                            .absolute()
+                                            .bottom(px(2.))
+                                            .right(px(2.))
+                                            .size(px(4.))
+                                            .rounded_full()
+                                            .bg(Color::Muted.color(cx)),
+                                    )
+                                })
+                                .when_some(
+                                    icon_label
+                                        .clone()
+                                        .filter(|_| !is_open_button)
+                                        .and_then(|label| label.parse::<usize>().ok()),
+                                    |this, count| this.child(CountBadge::new(count)),
+                                )
                         }),
                 )
             })
