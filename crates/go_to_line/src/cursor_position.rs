@@ -1,5 +1,5 @@
 use editor::{Editor, EditorEvent, MBTextSummary, MultiBufferSnapshot};
-use gpui::{App, Entity, FocusHandle, Focusable, Styled, Subscription, Task, WeakEntity};
+use gpui::{App, Entity, FocusHandle, Focusable, Subscription, Task, WeakEntity};
 use settings::{RegisterSetting, Settings};
 use std::{fmt::Write, num::NonZeroU32, time::Duration};
 use text::{Point, Selection};
@@ -8,9 +8,7 @@ use ui::{
     Render, Tooltip, Window, div,
 };
 use util::paths::FILE_ROW_COLUMN_DELIMITER;
-use workspace::{
-    HideStatusItem, StatusBarSettings, StatusItemView, Workspace, item::ItemHandle, layout_registry,
-};
+use workspace::{HideStatusItem, StatusItemView, Workspace, item::ItemHandle};
 
 #[derive(Copy, Clone, Debug, Default, PartialOrd, PartialEq)]
 pub(crate) struct SelectionStats {
@@ -211,13 +209,10 @@ impl CursorPosition {
 
 impl Render for CursorPosition {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let settings = StatusBarSettings::get_global(cx);
-        if !settings.item_enabled(
-            layout_registry::ids::CURSOR_POSITION,
-            settings.cursor_position_button,
-        ) {
-            return div().hidden();
-        }
+        // Visibility is the status bar's filter now, not this item's business: an
+        // item resolving to `Hidden` is never handed to render at all. The legacy
+        // `cursor_position_button` still governs it, through the adapter bound where
+        // the status bar is assembled.
 
         div().when_some(self.position, |el, position| {
             let mut text = format!(

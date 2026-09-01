@@ -124,7 +124,7 @@ use sqlez::{
     statement::Statement,
 };
 use status_bar::StatusBar;
-pub use status_bar::{HideStatusItem, StatusItemView, add_hide_button_entry};
+pub use status_bar::{HideStatusItem, StatusControlAdapter, StatusItemView, add_hide_button_entry};
 use std::{
     any::TypeId,
     borrow::Cow,
@@ -160,8 +160,8 @@ use util::{
 use uuid::Uuid;
 pub use workspace_settings::{
     AccessibleMode, AutosaveSetting, BottomDockLayout, EncodingDisplayOptions, FocusFollowsMouse,
-    RestoreOnStartupBehavior, StatusBarSettings, TabBarSettings, WorkspaceLayoutSettings,
-    WorkspaceSettings, observe_accessible_mode,
+    RestoreOnStartupBehavior, StatusBarItemLocation, StatusBarSettings, TabBarSettings,
+    WorkspaceLayoutSettings, WorkspaceSettings, observe_accessible_mode,
 };
 use zed_actions::{Spawn, feedback::FileBugReport, theme::ToggleMode};
 

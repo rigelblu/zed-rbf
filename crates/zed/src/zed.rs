@@ -60,7 +60,7 @@ use paths::{
     local_debug_file_relative_path, local_settings_file_relative_path,
     local_tasks_file_relative_path,
 };
-use project::{DirectoryLister, DisableAiSettings, ProjectItem};
+use project::{DirectoryLister, DisableAiSettings, ProjectItem, project_settings};
 use project_panel::ProjectPanel;
 use quick_action_bar::QuickActionBar;
 use recent_projects::open_remote_project;
@@ -95,9 +95,10 @@ use vim_mode_setting::VimModeSetting;
 use workspace::notifications::{NotificationId, dismiss_app_notification, show_app_notification};
 
 use workspace::{
-    AppState, MultiWorkspace, NewFile, NewWindow, OpenLog, Panel, Toast, Workspace,
-    WorkspaceSettings, create_and_open_local_file,
-    notifications::simple_message_notification::MessageNotification, open_new,
+    AppState, MultiWorkspace, NewFile, NewWindow, OpenLog, Panel, StatusBarSettings,
+    StatusControlAdapter, Toast, Workspace, WorkspaceSettings, create_and_open_local_file,
+    layout_registry::ids, notifications::simple_message_notification::MessageNotification,
+    open_new,
 };
 use workspace::{
     CloseIntent, CloseProject, CloseWindow, RestoreBanner, with_active_or_new_workspace,
@@ -630,22 +631,129 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         let git_blame_status = cx.new(|_| git_ui::GitBlameStatus::default());
         let merge_conflict_indicator =
             cx.new(|cx| git_ui::MergeConflictIndicator::new(workspace, cx));
+        // Each control is bound to its registry id and to the setting that governed
+        // it before placement existed. The id supplies label, icon and default zone
+        // from `layout_registry`; the closure is the half that cannot be static,
+        // because these settings live in crates `workspace` does not depend on.
+        // Items with no setting of their own pass `true` — they are already
+        // conditional on their own content, like the activity indicator.
         workspace.status_bar().update(cx, |status_bar, cx| {
-            status_bar.add_left_item(search_button, window, cx);
-            status_bar.add_left_item(lsp_button, window, cx);
-            status_bar.add_left_item(diagnostic_summary, window, cx);
-            status_bar.add_left_item(active_file_name, window, cx);
-            status_bar.add_left_item(git_blame_status, window, cx);
-            status_bar.add_left_item(merge_conflict_indicator, window, cx);
-            status_bar.add_left_item(activity_indicator, window, cx);
-            status_bar.add_right_item(edit_prediction_ui, window, cx);
-            status_bar.add_right_item(active_buffer_encoding, window, cx);
-            status_bar.add_right_item(active_buffer_language, window, cx);
-            status_bar.add_right_item(active_toolchain_language, window, cx);
-            status_bar.add_right_item(line_ending_indicator, window, cx);
-            status_bar.add_right_item(vim_mode_indicator, window, cx);
-            status_bar.add_right_item(cursor_position, window, cx);
-            status_bar.add_right_item(image_info, window, cx);
+            status_bar.add_status_control(
+                search_button,
+                StatusControlAdapter::new(ids::PROJECT_SEARCH, |cx| {
+                    editor::EditorSettings::get_global(cx).search.button
+                }),
+                window,
+                cx,
+            );
+            status_bar.add_status_control(
+                lsp_button,
+                StatusControlAdapter::new(ids::LSP_SERVERS, |cx| {
+                    project_settings::ProjectSettings::get_global(cx)
+                        .global_lsp_settings
+                        .button
+                }),
+                window,
+                cx,
+            );
+            status_bar.add_status_control(
+                diagnostic_summary,
+                StatusControlAdapter::new(ids::DIAGNOSTICS, |cx| {
+                    project_settings::ProjectSettings::get_global(cx)
+                        .diagnostics
+                        .button
+                }),
+                window,
+                cx,
+            );
+            status_bar.add_status_control(
+                active_file_name,
+                StatusControlAdapter::new(ids::ACTIVE_FILE, |cx| {
+                    StatusBarSettings::get_global(cx).show_active_file
+                }),
+                window,
+                cx,
+            );
+            status_bar.add_status_control(
+                git_blame_status,
+                StatusControlAdapter::new(ids::GIT_BLAME, |_| true),
+                window,
+                cx,
+            );
+            status_bar.add_status_control(
+                merge_conflict_indicator,
+                StatusControlAdapter::new(ids::MERGE_CONFLICTS, |cx| {
+                    agent_settings::AgentSettings::get_global(cx).show_merge_conflict_indicator
+                }),
+                window,
+                cx,
+            );
+            status_bar.add_status_control(
+                activity_indicator,
+                StatusControlAdapter::new(ids::ACTIVITY, |_| true),
+                window,
+                cx,
+            );
+            status_bar.add_status_control(
+                edit_prediction_ui,
+                StatusControlAdapter::new(ids::EDIT_PREDICTION, |_| true),
+                window,
+                cx,
+            );
+            // Active Encoding's setting is an enum, not a bool: "disabled" is the
+            // only value that means absent, and the placement/display-rule split is
+            // handled by `StatusBarSettings::encoding_display_option`.
+            status_bar.add_status_control(
+                active_buffer_encoding,
+                StatusControlAdapter::new(ids::ACTIVE_ENCODING, |cx| {
+                    StatusBarSettings::get_global(cx).active_encoding_button
+                        != settings::EncodingDisplayOptions::Disabled
+                }),
+                window,
+                cx,
+            );
+            status_bar.add_status_control(
+                active_buffer_language,
+                StatusControlAdapter::new(ids::ACTIVE_LANGUAGE, |cx| {
+                    StatusBarSettings::get_global(cx).active_language_button
+                }),
+                window,
+                cx,
+            );
+            status_bar.add_status_control(
+                active_toolchain_language,
+                StatusControlAdapter::new(ids::ACTIVE_TOOLCHAIN, |_| true),
+                window,
+                cx,
+            );
+            status_bar.add_status_control(
+                line_ending_indicator,
+                StatusControlAdapter::new(ids::LINE_ENDINGS, |cx| {
+                    StatusBarSettings::get_global(cx).line_endings_button
+                }),
+                window,
+                cx,
+            );
+            status_bar.add_status_control(
+                vim_mode_indicator,
+                StatusControlAdapter::new(ids::VIM_MODE, |_| true),
+                window,
+                cx,
+            );
+            status_bar.add_status_control(
+                cursor_position,
+                StatusControlAdapter::new(ids::CURSOR_POSITION, |cx| {
+                    StatusBarSettings::get_global(cx).cursor_position_button
+                }),
+                window,
+                cx,
+            );
+            status_bar.add_status_control(
+                image_info,
+                StatusControlAdapter::new(ids::IMAGE_INFO, |_| true),
+                window,
+                cx,
+            );
         });
 
         let panels_task = initialize_panels(window, cx);

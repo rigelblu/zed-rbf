@@ -1,11 +1,12 @@
 use crate::{
-    ItemHandle, MultiWorkspace, Pane, SidebarSide, ToggleWorkspaceSidebar,
-    sidebar_side_context_menu,
+    ItemHandle, MultiWorkspace, Pane, SidebarSide, StatusBarItemLocation, StatusBarSettings,
+    ToggleWorkspaceSidebar, sidebar_side_context_menu,
 };
 use gpui::{
     Anchor, AnyView, App, Context, Decorations, Entity, FocusHandle, Focusable, IntoElement,
     ParentElement, Render, Role, SharedString, Styled, Subscription, WeakEntity, Window,
 };
+use settings::Settings as _;
 use settings::{SettingsContent, update_settings_file};
 use std::{any::TypeId, sync::Arc};
 use theme::CLIENT_SIDE_DECORATION_ROUNDING;
@@ -97,9 +98,85 @@ impl SidebarStatus {
     }
 }
 
+/// Binds a live status control to its registry id and to the legacy setting that
+/// governed it before placement existed.
+///
+/// It carries only what a static table cannot: the id, and a closure reading that
+/// item's own setting. Label, icon, aliases, registered position and valid zones
+/// all come from `layout_registry`. The closure exists because those settings live
+/// in crates `workspace` cannot depend on — `editor`'s `search.button`, `git_ui`'s
+/// inline blame — so it is supplied where the status bar is assembled.
+#[derive(Clone)]
+pub struct StatusControlAdapter {
+    id: &'static str,
+    legacy_enabled: Arc<dyn Fn(&App) -> bool + Send + Sync>,
+}
+
+impl StatusControlAdapter {
+    pub fn new(
+        id: &'static str,
+        legacy_enabled: impl Fn(&App) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            id,
+            legacy_enabled: Arc::new(legacy_enabled),
+        }
+    }
+
+    pub fn id(&self) -> &'static str {
+        self.id
+    }
+
+    fn effective_location(&self, cx: &App) -> Option<StatusBarItemLocation> {
+        StatusBarSettings::get_global(cx)
+            .resolved_status_control_location(self.id, (self.legacy_enabled)(cx))
+    }
+}
+
+struct StatusBarItem {
+    item: Box<dyn StatusItemViewHandle>,
+    adapter: Option<StatusControlAdapter>,
+    /// Where the item sits when nothing else decides — for the dock button strips
+    /// and anything else added without an adapter, this is the whole answer.
+    default_location: StatusBarItemLocation,
+}
+
+impl StatusBarItem {
+    fn effective_location(&self, cx: &App) -> StatusBarItemLocation {
+        self.adapter
+            .as_ref()
+            .and_then(|adapter| adapter.effective_location(cx))
+            .unwrap_or(self.default_location)
+    }
+}
+
+/// Which items a zone renders, in the order it renders them.
+///
+/// Right renders reversed, so the item added first ends up furthest from the
+/// editor — the ordering the two separate lists used to encode by having one of
+/// them iterated backwards. `Hidden` names no zone, so an item resolving to it is
+/// returned by no call: hiding *is* this filter.
+///
+/// Split out of rendering because this is the half that can be wrong, and the
+/// rendered half cannot be asserted on — `cx.draw` panics once an element
+/// registers a deferred draw, which a tooltip does.
+fn zone_order(locations: &[StatusBarItemLocation], zone: StatusBarItemLocation) -> Vec<usize> {
+    let mut indices: Vec<usize> = locations
+        .iter()
+        .enumerate()
+        .filter(|(_, location)| **location == zone && zone != StatusBarItemLocation::Hidden)
+        .map(|(index, _)| index)
+        .collect();
+    if zone == StatusBarItemLocation::Right {
+        indices.reverse();
+    }
+    indices
+}
+
 pub struct StatusBar {
-    left_items: Vec<Box<dyn StatusItemViewHandle>>,
-    right_items: Vec<Box<dyn StatusItemViewHandle>>,
+    /// One list rather than a list per zone: an item's zone is now resolved from
+    /// settings on every render, so membership can no longer carry it.
+    items: Vec<StatusBarItem>,
     active_pane: Entity<Pane>,
     multi_workspace: Option<WeakEntity<MultiWorkspace>>,
     focus_handle: FocusHandle,
@@ -182,6 +259,11 @@ impl Render for StatusBar {
                     .border_color(cx.theme().colors().status_bar_background),
             })
             .child(self.render_left_tools(&sidebar, cx))
+            // The middle zone sits between the two groups rather than being pinned
+            // to the window centre. True centring — independent of how wide the
+            // left group happens to be — comes with the overflow work, and until
+            // then a placed item is visible here rather than lost.
+            .child(self.render_middle_tools(cx))
             .child(self.render_right_tools(&sidebar, cx))
     }
 }
@@ -200,9 +282,40 @@ impl StatusBar {
                 sidebar.show_toggle && !sidebar.open && sidebar.side == SidebarSide::Left,
                 |this| this.child(self.render_sidebar_toggle(sidebar, cx)),
             )
-            .children(self.left_items.iter().enumerate().map(|(index, item)| {
-                render_hideable_item("status-bar-left", index, item.as_ref(), cx)
-            }))
+            .children(self.render_zone(StatusBarItemLocation::Left, "status-bar-left", cx))
+    }
+
+    /// Items whose resolved zone is `location`, in canonical order. An item
+    /// resolving to `Hidden` matches no zone and so renders nowhere — hiding is
+    /// this filter, not a per-item concern.
+    fn render_zone(
+        &self,
+        location: StatusBarItemLocation,
+        side: &'static str,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let locations: Vec<_> = self
+            .items
+            .iter()
+            .map(|entry| entry.effective_location(cx))
+            .collect();
+        zone_order(&locations, location)
+            .into_iter()
+            .filter_map(|index| self.items.get(index).map(|entry| (index, entry)))
+            .map(|(index, entry)| {
+                // The index is the item's position in the merged list, not a
+                // per-zone counter, so ids stay unique when an item changes zone.
+                render_hideable_item(side, index, entry.item.as_ref(), cx).into_any_element()
+            })
+            .collect()
+    }
+
+    fn render_middle_tools(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .gap_1()
+            .min_w_0()
+            .overflow_x_hidden()
+            .children(self.render_zone(StatusBarItemLocation::Middle, "status-bar-middle", cx))
     }
 
     fn render_right_tools(
@@ -214,15 +327,7 @@ impl StatusBar {
             .flex_shrink_0()
             .gap_1()
             .overflow_x_hidden()
-            .children(
-                self.right_items
-                    .iter()
-                    .enumerate()
-                    .rev()
-                    .map(|(index, item)| {
-                        render_hideable_item("status-bar-right", index, item.as_ref(), cx)
-                    }),
-            )
+            .children(self.render_zone(StatusBarItemLocation::Right, "status-bar-right", cx))
             .when(
                 sidebar.show_toggle && !sidebar.open && sidebar.side == SidebarSide::Right,
                 |this| this.child(self.render_sidebar_toggle(sidebar, cx)),
@@ -331,8 +436,7 @@ impl StatusBar {
         cx: &mut Context<Self>,
     ) -> Self {
         let mut this = Self {
-            left_items: Default::default(),
-            right_items: Default::default(),
+            items: Default::default(),
             active_pane: active_pane.clone(),
             multi_workspace,
             focus_handle: cx.focus_handle(),
@@ -357,35 +461,81 @@ impl StatusBar {
     where
         T: 'static + StatusItemView,
     {
+        self.push_item(item, None, StatusBarItemLocation::Left, window, cx);
+    }
+
+    pub fn add_right_item<T>(
+        &mut self,
+        item: Entity<T>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) where
+        T: 'static + StatusItemView,
+    {
+        self.push_item(item, None, StatusBarItemLocation::Right, window, cx);
+    }
+
+    /// Adds a status control the user can place. Its default zone comes from the
+    /// registry, so a call site cannot disagree with the canonical table about
+    /// where an item belongs.
+    pub fn add_status_control<T>(
+        &mut self,
+        item: Entity<T>,
+        adapter: StatusControlAdapter,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) where
+        T: 'static + StatusItemView,
+    {
+        if self
+            .items
+            .iter()
+            .filter_map(|existing| existing.adapter.as_ref())
+            .any(|existing| existing.id == adapter.id)
+        {
+            log::error!("duplicate status bar item id: {}", adapter.id);
+        }
+
+        let default_location = StatusBarSettings::get_global(cx)
+            .status_control_location(adapter.id)
+            .unwrap_or(StatusBarItemLocation::Right);
+        self.push_item(item, Some(adapter), default_location, window, cx);
+    }
+
+    fn push_item<T>(
+        &mut self,
+        item: Entity<T>,
+        adapter: Option<StatusControlAdapter>,
+        default_location: StatusBarItemLocation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) where
+        T: 'static + StatusItemView,
+    {
         let active_pane_item = self.active_pane.read(cx).active_item();
         item.set_active_pane_item(active_pane_item.as_deref(), window, cx);
 
-        self.left_items.push(Box::new(item));
+        self.items.push(StatusBarItem {
+            item: Box::new(item),
+            adapter,
+            default_location,
+        });
         cx.notify();
     }
 
     pub fn item_of_type<T: StatusItemView>(&self) -> Option<Entity<T>> {
-        self.left_items
+        self.items
             .iter()
-            .chain(self.right_items.iter())
-            .find_map(|item| item.to_any().downcast().ok())
+            .find_map(|entry| entry.item.to_any().downcast().ok())
     }
 
     pub fn position_of_item<T>(&self) -> Option<usize>
     where
         T: StatusItemView,
     {
-        for (index, item) in self.left_items.iter().enumerate() {
-            if item.item_type() == TypeId::of::<T>() {
-                return Some(index);
-            }
-        }
-        for (index, item) in self.right_items.iter().enumerate() {
-            if item.item_type() == TypeId::of::<T>() {
-                return Some(index + self.left_items.len());
-            }
-        }
-        None
+        self.items
+            .iter()
+            .position(|entry| entry.item.item_type() == TypeId::of::<T>())
     }
 
     pub fn insert_item_after<T>(
@@ -400,37 +550,28 @@ impl StatusBar {
         let active_pane_item = self.active_pane.read(cx).active_item();
         item.set_active_pane_item(active_pane_item.as_deref(), window, cx);
 
-        if position < self.left_items.len() {
-            self.left_items.insert(position + 1, Box::new(item))
-        } else {
-            self.right_items
-                .insert(position + 1 - self.left_items.len(), Box::new(item))
-        }
+        let default_location = self
+            .items
+            .get(position)
+            .map(|entry| entry.default_location)
+            .unwrap_or(StatusBarItemLocation::Right);
+        let index = (position + 1).min(self.items.len());
+        self.items.insert(
+            index,
+            StatusBarItem {
+                item: Box::new(item),
+                adapter: None,
+                default_location,
+            },
+        );
         cx.notify()
     }
 
     pub fn remove_item_at(&mut self, position: usize, cx: &mut Context<Self>) {
-        if position < self.left_items.len() {
-            self.left_items.remove(position);
-        } else {
-            self.right_items.remove(position - self.left_items.len());
+        if position < self.items.len() {
+            self.items.remove(position);
+            cx.notify();
         }
-        cx.notify();
-    }
-
-    pub fn add_right_item<T>(
-        &mut self,
-        item: Entity<T>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) where
-        T: 'static + StatusItemView,
-    {
-        let active_pane_item = self.active_pane.read(cx).active_item();
-        item.set_active_pane_item(active_pane_item.as_deref(), window, cx);
-
-        self.right_items.push(Box::new(item));
-        cx.notify();
     }
 
     pub fn set_active_pane(
@@ -448,8 +589,10 @@ impl StatusBar {
 
     fn update_active_pane_item(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let active_pane_item = self.active_pane.read(cx).active_item();
-        for item in self.left_items.iter().chain(&self.right_items) {
-            item.set_active_pane_item(active_pane_item.as_deref(), window, cx);
+        for entry in &self.items {
+            entry
+                .item
+                .set_active_pane_item(active_pane_item.as_deref(), window, cx);
         }
     }
 
@@ -502,5 +645,91 @@ impl<T: StatusItemView> StatusItemViewHandle for Entity<T> {
 impl From<&dyn StatusItemViewHandle> for AnyView {
     fn from(val: &dyn StatusItemViewHandle) -> Self {
         val.to_any()
+    }
+}
+
+#[cfg(test)]
+mod zone_tests {
+    use super::*;
+    use StatusBarItemLocation::{Hidden, Left, Middle, Right};
+
+    const ZONES: [StatusBarItemLocation; 3] = [Left, Middle, Right];
+
+    #[test]
+    fn a_zone_takes_only_its_own_items_and_keeps_their_order() {
+        let locations = [Left, Right, Left, Middle, Left];
+        assert_eq!(zone_order(&locations, Left), vec![0, 2, 4]);
+        assert_eq!(zone_order(&locations, Middle), vec![3]);
+    }
+
+    #[test]
+    fn the_right_zone_renders_reversed() {
+        // The item added first ends up furthest from the editor. Two separate
+        // lists used to encode this by iterating one of them backwards; with one
+        // list it has to be stated.
+        let locations = [Right, Right, Right];
+        assert_eq!(zone_order(&locations, Right), vec![2, 1, 0]);
+        assert_ne!(
+            zone_order(&locations, Right),
+            vec![0, 1, 2],
+            "source order and render order are indistinguishable here, so this \
+             fixture cannot tell a reversal from its absence"
+        );
+    }
+
+    #[test]
+    fn only_the_right_zone_reverses() {
+        let locations = [Left, Left, Middle, Middle];
+        assert_eq!(zone_order(&locations, Left), vec![0, 1]);
+        assert_eq!(zone_order(&locations, Middle), vec![2, 3]);
+    }
+
+    #[test]
+    fn a_hidden_item_is_returned_by_no_zone() {
+        // Hiding is this filter. An item resolving to Hidden must match nothing,
+        // including a query for Hidden itself — there is no Hidden renderer.
+        let locations = [Hidden, Left, Hidden];
+        for zone in ZONES {
+            assert!(
+                !zone_order(&locations, zone).contains(&0),
+                "a hidden item reached the {zone:?} zone"
+            );
+            assert!(!zone_order(&locations, zone).contains(&2));
+        }
+        assert!(
+            zone_order(&locations, Hidden).is_empty(),
+            "asking for the Hidden zone returned items to render"
+        );
+        assert_eq!(zone_order(&locations, Left), vec![1]);
+    }
+
+    #[test]
+    fn every_item_renders_in_exactly_one_zone_or_none() {
+        // The partition property. A duplicate here is an item drawn twice — the
+        // `both` failure the dogfood watched for — and a gap is an item that
+        // silently disappears while its setting says it should be somewhere.
+        let locations = [Left, Right, Middle, Hidden, Right, Left, Middle];
+
+        for (index, location) in locations.iter().enumerate() {
+            let appearances = ZONES
+                .iter()
+                .filter(|zone| zone_order(&locations, **zone).contains(&index))
+                .count();
+            let expected = if *location == Hidden { 0 } else { 1 };
+            assert_eq!(
+                appearances, expected,
+                "item {index} at {location:?} rendered in {appearances} zones"
+            );
+        }
+
+        let total: usize = ZONES
+            .iter()
+            .map(|zone| zone_order(&locations, *zone).len())
+            .sum();
+        assert_eq!(
+            total,
+            locations.iter().filter(|l| **l != Hidden).count(),
+            "the zones together render a different number of items than are placed"
+        );
     }
 }
