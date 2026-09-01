@@ -1782,6 +1782,13 @@ impl Render for PanelButtons {
             .iter()
             .enumerate()
             .filter_map(|(i, entry)| {
+                // Hidden takes the component and its icon together. Without this
+                // the two come apart in the other direction from the legacy
+                // `button` key: the component closes everywhere while its icon
+                // stays in the bar, offering to open something that is hidden.
+                if Dock::is_hidden(entry.panel.as_ref(), cx) {
+                    return None;
+                }
                 let icon = entry.panel.icon(window, cx)?;
                 let icon_tooltip = entry
                     .panel
@@ -1822,22 +1829,48 @@ impl Render for PanelButtons {
                                 DockPosition::Bottom,
                             ];
 
-                            let panel_hide = panel.hide_button_setting(cx);
                             ContextMenu::build(window, cx, |mut menu, _, cx| {
+                                // Every entry here writes through the shared
+                                // workspace-layout service. The legacy
+                                // `Panel::set_position` and `hide_button_setting`
+                                // paths wrote per-panel `dock` and `button` keys
+                                // that `effective_component_position` outranks, so
+                                // a component with an explicit entry took the
+                                // write and did not move — a menu that looked dead
+                                // for exactly the components the user had already
+                                // placed.
                                 let mut has_position_entries = false;
+                                if POSITIONS
+                                    .iter()
+                                    .any(|position| panel.position_is_valid(*position, cx))
+                                {
+                                    menu = menu.header("Workspace Position");
+                                }
                                 for position in POSITIONS {
                                     if panel.position_is_valid(position, cx) {
                                         let is_current = position == dock_position;
-                                        let panel = panel.clone();
+                                        let workspace_for_position = workspace_for_menu.clone();
                                         menu = menu.toggleable_entry(
-                                            format!("Dock {}", position.label()),
+                                            position.label(),
                                             is_current,
                                             IconPosition::Start,
                                             None,
-                                            move |window, cx| {
-                                                if !is_current {
-                                                    panel.set_position(position, window, cx);
+                                            move |_, cx| {
+                                                if is_current {
+                                                    return;
                                                 }
+                                                let Some(workspace) =
+                                                    workspace_for_position.upgrade()
+                                                else {
+                                                    return;
+                                                };
+                                                let fs = workspace.read(cx).app_state().fs.clone();
+                                                set_component_position(
+                                                    fs,
+                                                    panel_key.to_string(),
+                                                    position.into(),
+                                                    cx,
+                                                );
                                             },
                                         );
                                         has_position_entries = true;
@@ -1918,12 +1951,20 @@ impl Render for PanelButtons {
                                         },
                                     );
                                 }
-                                if let Some(hide) = panel_hide {
-                                    menu = crate::status_bar::add_hide_button_entry(
-                                        menu.separator(),
-                                        hide,
-                                    );
-                                }
+                                // `Hidden`, not the legacy `Hide Button`. That
+                                // wrote the panel's own `button` key, which hid
+                                // the icon while the component stayed open — the
+                                // icon-independent-from-component model human
+                                // Check 3 disproved. Hiding a component takes the
+                                // component and its icon together, everywhere.
+                                let workspace_for_hide = workspace_for_menu.clone();
+                                menu = menu.separator().entry("Hidden", None, move |_, cx| {
+                                    let Some(workspace) = workspace_for_hide.upgrade() else {
+                                        return;
+                                    };
+                                    let fs = workspace.read(cx).app_state().fs.clone();
+                                    set_component_hidden(fs, panel_key.to_string(), true, cx);
+                                });
                                 menu
                             })
                         })
@@ -2332,6 +2373,24 @@ mod component_position_tests {
                 sides_only,
             ),
             DockPosition::Right
+        );
+    }
+
+    #[test]
+    fn a_registered_position_the_component_itself_rejects_is_not_used_either() {
+        // Two sources of validity: `is_valid` is the live panel's answer, while
+        // `registered` comes from the static table. A panel can narrow what it
+        // accepts at runtime, and handing back a position it rejects is worse than
+        // deferring to where it currently is. Every other fixture here has a valid
+        // registered position, so without this case the guard is unwitnessed.
+        assert_eq!(
+            resolve_component_position(
+                Some(DockPosition::Bottom),
+                Some(DockPosition::Right),
+                DockPosition::Left,
+                |position| position == DockPosition::Left,
+            ),
+            DockPosition::Left
         );
     }
 

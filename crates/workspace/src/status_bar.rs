@@ -1,13 +1,13 @@
 use crate::{
     ItemHandle, MultiWorkspace, Pane, SidebarSide, StatusBarItemLocation, StatusBarSettings,
-    ToggleWorkspaceSidebar, sidebar_side_context_menu,
+    ToggleWorkspaceSidebar, notifications::DetachAndPromptErr, sidebar_side_context_menu,
 };
 use gpui::{
     Anchor, AnyView, App, Context, Decorations, Entity, FocusHandle, Focusable, IntoElement,
     ParentElement, Render, Role, SharedString, Styled, Subscription, WeakEntity, Window,
 };
 use settings::Settings as _;
-use settings::{SettingsContent, update_settings_file};
+use settings::{SettingsContent, update_settings_file, update_settings_file_with_completion};
 use std::{any::TypeId, sync::Arc};
 use theme::CLIENT_SIDE_DECORATION_ROUNDING;
 use ui::{ContextMenu, Divider, IconPosition, Indicator, Tooltip, prelude::*, right_click_menu};
@@ -305,7 +305,11 @@ impl StatusBar {
             .map(|(index, entry)| {
                 // The index is the item's position in the merged list, not a
                 // per-zone counter, so ids stay unique when an item changes zone.
-                render_hideable_item(side, index, entry.item.as_ref(), cx).into_any_element()
+                //
+                // `location` is handed down rather than re-resolved: it is the
+                // zone that actually rendered this item, so a placement menu
+                // cannot mark a zone the item is not in.
+                render_status_bar_item(side, index, entry, location, cx)
             })
             .collect()
     }
@@ -394,18 +398,38 @@ impl StatusBar {
     }
 }
 
-fn render_hideable_item(
+/// Wraps an item in the right-click menu that fits it.
+///
+/// A registered status control gets `Bottom Bar Placement` — the gesture that
+/// makes placement a feature rather than a settings-file edit. Anything else
+/// keeps the older `Hide Button`, which is all the status bar knows how to
+/// offer an item it has no registry row for.
+fn render_status_bar_item(
     side: &'static str,
     index: usize,
-    item: &dyn StatusItemViewHandle,
+    entry: &StatusBarItem,
+    resolved_location: StatusBarItemLocation,
     cx: &App,
-) -> impl IntoElement {
-    let view = item.to_any();
-    let Some(hide) = item.hide_setting(cx) else {
+) -> AnyElement {
+    let view = entry.item.to_any();
+    let menu_id: SharedString = format!("{side}-item-menu-{index}").into();
+
+    if let Some(adapter) = &entry.adapter {
+        let item_id = adapter.id();
+        return right_click_menu(menu_id)
+            .trigger(move |_is_active, _window, _cx| view)
+            .menu(move |window, cx| {
+                ContextMenu::build(window, cx, move |menu, _window, _cx| {
+                    add_status_control_placement_entries(menu, item_id, resolved_location)
+                })
+            })
+            .into_any_element();
+    }
+
+    let Some(hide) = entry.item.hide_setting(cx) else {
         return view.into_any_element();
     };
 
-    let menu_id: SharedString = format!("{side}-item-menu-{index}").into();
     right_click_menu(menu_id)
         .trigger(move |_is_active, _window, _cx| view)
         .menu(move |window, cx| {
@@ -415,6 +439,88 @@ fn render_hideable_item(
             })
         })
         .into_any_element()
+}
+
+/// The four zones a status control can sit in, as menu entries.
+///
+/// `Hidden` is one of them rather than a separate "Hide Button": hiding is a
+/// placement in this model, and offering both gestures would write two settings
+/// keys for one visible outcome. Its checkmark is unreachable in practice — an
+/// item resolving to `Hidden` renders in no zone, so there is nothing left to
+/// right-click. Getting it back is the layout surface's job.
+fn add_status_control_placement_entries(
+    mut menu: ContextMenu,
+    item_id: &'static str,
+    resolved_location: StatusBarItemLocation,
+) -> ContextMenu {
+    menu = menu.header("Bottom Bar Placement");
+    for (location, label) in [
+        (StatusBarItemLocation::Left, "Left"),
+        (StatusBarItemLocation::Middle, "Middle"),
+        (StatusBarItemLocation::Right, "Right"),
+        (StatusBarItemLocation::Hidden, "Hidden"),
+    ] {
+        menu = menu.toggleable_entry(
+            label,
+            location == resolved_location,
+            IconPosition::Start,
+            None,
+            move |window, cx| set_status_control_location(item_id, location, window, cx),
+        );
+    }
+    menu
+}
+
+/// The whole settings mutation a placement makes.
+///
+/// Split out of the write so it can be asserted: this is the half that decides
+/// which keys a placement gesture touches, and the half a future port could
+/// quietly widen.
+fn place_status_control(
+    settings: &mut SettingsContent,
+    item_id: &str,
+    location: StatusBarItemLocation,
+) {
+    settings
+        .status_bar
+        .get_or_insert_default()
+        .item_locations
+        .get_or_insert_default()
+        .insert(item_id.to_string(), location);
+}
+
+/// Persists a status control's placement.
+///
+/// Only `status_bar.item_locations` is written. An explicit placement already
+/// outranks the item's own legacy boolean in
+/// `StatusBarSettings::resolved_status_control_location`, so writing that
+/// boolean too would leave two settings describing one visible state — and it
+/// would silently edit keys the user never touched.
+///
+/// The write is completion-aware: the old placement stays on screen until it
+/// lands, and a failure is reported rather than swallowed.
+fn set_status_control_location(
+    item_id: &'static str,
+    location: StatusBarItemLocation,
+    window: &mut Window,
+    cx: &App,
+) {
+    let fs = <dyn fs::Fs>::global(cx);
+    let update = update_settings_file_with_completion(fs, cx, move |settings, _cx| {
+        place_status_control(settings, item_id, location);
+    });
+    window
+        .spawn(cx, async move |_| match update.await {
+            Ok(Ok(())) => anyhow::Ok(()),
+            Ok(Err(error)) => Err(error),
+            Err(_) => anyhow::bail!("settings update task was canceled"),
+        })
+        .detach_and_prompt_err(
+            "Failed to update bottom bar placement",
+            window,
+            cx,
+            |_, _, _| None,
+        );
 }
 
 /// Appends a "Hide Button" entry aligned with surrounding toggleable entries.
@@ -645,6 +751,86 @@ impl<T: StatusItemView> StatusItemViewHandle for Entity<T> {
 impl From<&dyn StatusItemViewHandle> for AnyView {
     fn from(val: &dyn StatusItemViewHandle) -> Self {
         val.to_any()
+    }
+}
+
+#[cfg(test)]
+mod placement_menu_tests {
+    use super::*;
+    use crate::layout_registry::ids;
+    use StatusBarItemLocation::{Hidden, Left, Middle, Right};
+    use collections::HashMap;
+
+    fn placed(item_id: &str, location: StatusBarItemLocation) -> SettingsContent {
+        let mut settings = SettingsContent::default();
+        place_status_control(&mut settings, item_id, location);
+        settings
+    }
+
+    fn locations(settings: &SettingsContent) -> &HashMap<String, StatusBarItemLocation> {
+        settings
+            .status_bar
+            .as_ref()
+            .and_then(|status_bar| status_bar.item_locations.as_ref())
+            .expect("a placement wrote no item_locations map")
+    }
+
+    #[test]
+    fn placing_a_control_records_the_zone_it_was_given() {
+        for location in [Left, Middle, Right, Hidden] {
+            let settings = placed(ids::CURSOR_POSITION, location);
+            assert_eq!(
+                locations(&settings).get(ids::CURSOR_POSITION),
+                Some(&location),
+                "placing at {location:?} did not round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn placing_a_control_leaves_its_legacy_setting_alone() {
+        // The prior art wrote `Some(true)` back into each item's own legacy
+        // boolean whenever it was placed. That is unnecessary here — an explicit
+        // placement already outranks the boolean in
+        // `resolved_status_control_location` — and it would leave two settings
+        // describing one visible state while editing keys the user never named.
+        // This is the witness for that deliberate omission, because a later port
+        // of the same file is exactly how it would come back.
+        let settings = placed(ids::CURSOR_POSITION, Left);
+        let status_bar = settings.status_bar.as_ref().expect("no status_bar written");
+        assert_eq!(
+            status_bar.cursor_position_button, None,
+            "placing a control rewrote its legacy visibility boolean"
+        );
+        assert_eq!(status_bar.show_active_file, None);
+        assert_eq!(status_bar.active_language_button, None);
+        assert_eq!(status_bar.line_endings_button, None);
+        assert_eq!(status_bar.active_encoding_button, None);
+    }
+
+    #[test]
+    fn placing_one_control_does_not_move_another() {
+        let mut settings = placed(ids::CURSOR_POSITION, Left);
+        place_status_control(&mut settings, ids::ACTIVE_LANGUAGE, Middle);
+
+        assert_eq!(locations(&settings).get(ids::CURSOR_POSITION), Some(&Left));
+        assert_eq!(
+            locations(&settings).get(ids::ACTIVE_LANGUAGE),
+            Some(&Middle)
+        );
+        assert_eq!(locations(&settings).len(), 2);
+    }
+
+    #[test]
+    fn replacing_a_placement_overwrites_rather_than_accumulates() {
+        // Every menu choice writes the same key. If it appended instead, the
+        // second choice would be shadowed by the first and the menu would look
+        // dead after one use.
+        let mut settings = placed(ids::CURSOR_POSITION, Left);
+        place_status_control(&mut settings, ids::CURSOR_POSITION, Right);
+
+        assert_eq!(locations(&settings).get(ids::CURSOR_POSITION), Some(&Right));
+        assert_eq!(locations(&settings).len(), 1);
     }
 }
 
