@@ -812,6 +812,7 @@ impl VsCodeSettings {
             cursor_position_button: None,
             line_endings_button: None,
             active_encoding_button: None,
+            item_locations: None,
         })
     }
 

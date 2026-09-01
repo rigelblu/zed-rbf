@@ -529,6 +529,45 @@ pub struct StatusBarSettingsContent {
     ///
     /// Default: non_utf8
     pub active_encoding_button: Option<EncodingDisplayOptions>,
+    /// Placement for individual status bar items.
+    ///
+    /// Missing items use Zed's default placement. Values: left, middle, right, hidden.
+    ///
+    /// This is for pure status controls only. Workspace components — the panels
+    /// with an icon in the bar — are placed through
+    /// `workspace_layout.component_positions`, and an entry naming one here is
+    /// ignored rather than honoured.
+    ///
+    /// Default: {}
+    pub item_locations: Option<HashMap<String, StatusBarItemLocation>>,
+}
+
+/// Where a status control sits in the bottom bar. `Hidden` is a placement value
+/// here, unlike a workspace component, which carries `position` and `hidden`
+/// separately so that hiding preserves the position it will come back to. A
+/// status control has no size or open state to preserve, so the simpler shape is
+/// deliberate — do not "unify" these two without reading the components half.
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Eq,
+    PartialEq,
+    Default,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantNames,
+    strum::VariantArray,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusBarItemLocation {
+    #[default]
+    Left,
+    Middle,
+    Right,
+    Hidden,
 }
 
 #[derive(

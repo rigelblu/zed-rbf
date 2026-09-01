@@ -28,6 +28,36 @@ use ui::IconName;
 pub const SIDE_COLUMN_MIN_WIDTH: Pixels = px(200.);
 pub const BOTTOM_SEGMENT_MIN_WIDTH: Pixels = px(160.);
 
+/// The stable id of every registered item, so a call site and the table cannot
+/// disagree: the table below is written in terms of these, so each id exists in
+/// exactly one place. Name items through these constants rather than by literal —
+/// an unknown id is preserved rather than rejected, by design, which makes a typo
+/// indistinguishable from an item whose crate has not loaded.
+pub mod ids {
+    pub const AGENT_PANEL: &str = "agent_panel";
+    pub const PROJECT_PANEL: &str = "ProjectPanel";
+    pub const TERMINAL_PANEL: &str = "TerminalPanel";
+    pub const GIT_PANEL: &str = "GitPanel";
+    pub const COLLABORATION_PANEL: &str = "CollaborationPanel";
+    pub const OUTLINE_PANEL: &str = "OutlinePanel";
+    pub const DEBUG_PANEL: &str = "DebugPanel";
+    pub const PROJECT_SEARCH: &str = "project_search";
+    pub const LSP_SERVERS: &str = "lsp_servers";
+    pub const DIAGNOSTICS: &str = "diagnostics";
+    pub const ACTIVE_FILE: &str = "active_file";
+    pub const GIT_BLAME: &str = "git_blame";
+    pub const MERGE_CONFLICTS: &str = "merge_conflicts";
+    pub const ACTIVITY: &str = "activity";
+    pub const EDIT_PREDICTION: &str = "edit_prediction";
+    pub const ACTIVE_ENCODING: &str = "active_encoding";
+    pub const ACTIVE_LANGUAGE: &str = "active_language";
+    pub const ACTIVE_TOOLCHAIN: &str = "active_toolchain";
+    pub const LINE_ENDINGS: &str = "line_endings";
+    pub const VIM_MODE: &str = "vim_mode";
+    pub const CURSOR_POSITION: &str = "cursor_position";
+    pub const IMAGE_INFO: &str = "image_info";
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LayoutPosition {
     Left,
@@ -91,7 +121,7 @@ const BAR_ZONES: &[LayoutPosition] = &[
 
 const ITEMS: &[LayoutItem] = &[
     LayoutItem {
-        id: "agent_panel",
+        id: ids::AGENT_PANEL,
         kind: LayoutItemKind::WorkspaceComponent,
         label: "Agent Panel",
         icon: Some(IconName::ZedAssistant),
@@ -103,7 +133,7 @@ const ITEMS: &[LayoutItem] = &[
         valid_positions: SIDES,
     },
     LayoutItem {
-        id: "ProjectPanel",
+        id: ids::PROJECT_PANEL,
         kind: LayoutItemKind::WorkspaceComponent,
         label: "Project Panel",
         icon: Some(IconName::FileTree),
@@ -115,7 +145,7 @@ const ITEMS: &[LayoutItem] = &[
         valid_positions: SIDES,
     },
     LayoutItem {
-        id: "TerminalPanel",
+        id: ids::TERMINAL_PANEL,
         kind: LayoutItemKind::WorkspaceComponent,
         label: "Terminal Panel",
         icon: Some(IconName::TerminalAlt),
@@ -127,7 +157,7 @@ const ITEMS: &[LayoutItem] = &[
         valid_positions: SIDES_AND_BOTTOM,
     },
     LayoutItem {
-        id: "GitPanel",
+        id: ids::GIT_PANEL,
         kind: LayoutItemKind::WorkspaceComponent,
         label: "Git Panel",
         icon: Some(IconName::GitBranch),
@@ -139,7 +169,7 @@ const ITEMS: &[LayoutItem] = &[
         valid_positions: SIDES,
     },
     LayoutItem {
-        id: "CollaborationPanel",
+        id: ids::COLLABORATION_PANEL,
         kind: LayoutItemKind::WorkspaceComponent,
         label: "Collaboration Panel",
         icon: Some(IconName::UserGroup),
@@ -151,7 +181,7 @@ const ITEMS: &[LayoutItem] = &[
         valid_positions: SIDES,
     },
     LayoutItem {
-        id: "OutlinePanel",
+        id: ids::OUTLINE_PANEL,
         kind: LayoutItemKind::WorkspaceComponent,
         label: "Outline Panel",
         icon: Some(IconName::ListTree),
@@ -163,7 +193,7 @@ const ITEMS: &[LayoutItem] = &[
         valid_positions: SIDES,
     },
     LayoutItem {
-        id: "DebugPanel",
+        id: ids::DEBUG_PANEL,
         kind: LayoutItemKind::WorkspaceComponent,
         label: "Debug Panel",
         icon: Some(IconName::Debug),
@@ -175,7 +205,7 @@ const ITEMS: &[LayoutItem] = &[
         valid_positions: SIDES_AND_BOTTOM,
     },
     LayoutItem {
-        id: "project_search",
+        id: ids::PROJECT_SEARCH,
         kind: LayoutItemKind::StatusControl,
         label: "Project Search",
         icon: Some(IconName::MagnifyingGlass),
@@ -187,7 +217,7 @@ const ITEMS: &[LayoutItem] = &[
         valid_positions: BAR_ZONES,
     },
     LayoutItem {
-        id: "lsp_servers",
+        id: ids::LSP_SERVERS,
         kind: LayoutItemKind::StatusControl,
         label: "Language Servers",
         icon: Some(IconName::BoltOutlined),
@@ -199,7 +229,7 @@ const ITEMS: &[LayoutItem] = &[
         valid_positions: BAR_ZONES,
     },
     LayoutItem {
-        id: "diagnostics",
+        id: ids::DIAGNOSTICS,
         kind: LayoutItemKind::StatusControl,
         label: "Diagnostics",
         icon: Some(IconName::Warning),
@@ -211,7 +241,7 @@ const ITEMS: &[LayoutItem] = &[
         valid_positions: BAR_ZONES,
     },
     LayoutItem {
-        id: "active_file",
+        id: ids::ACTIVE_FILE,
         kind: LayoutItemKind::StatusControl,
         label: "Active File Name",
         icon: None,
@@ -223,7 +253,7 @@ const ITEMS: &[LayoutItem] = &[
         valid_positions: BAR_ZONES,
     },
     LayoutItem {
-        id: "git_blame",
+        id: ids::GIT_BLAME,
         kind: LayoutItemKind::StatusControl,
         label: "Git Blame",
         icon: None,
@@ -235,7 +265,7 @@ const ITEMS: &[LayoutItem] = &[
         valid_positions: BAR_ZONES,
     },
     LayoutItem {
-        id: "merge_conflicts",
+        id: ids::MERGE_CONFLICTS,
         kind: LayoutItemKind::StatusControl,
         label: "Merge Conflicts",
         icon: Some(IconName::GitMergeConflict),
@@ -247,7 +277,7 @@ const ITEMS: &[LayoutItem] = &[
         valid_positions: BAR_ZONES,
     },
     LayoutItem {
-        id: "activity",
+        id: ids::ACTIVITY,
         kind: LayoutItemKind::StatusControl,
         label: "Activity",
         icon: None,
@@ -259,7 +289,7 @@ const ITEMS: &[LayoutItem] = &[
         valid_positions: BAR_ZONES,
     },
     LayoutItem {
-        id: "edit_prediction",
+        id: ids::EDIT_PREDICTION,
         kind: LayoutItemKind::StatusControl,
         label: "Edit Prediction",
         icon: None,
@@ -271,7 +301,7 @@ const ITEMS: &[LayoutItem] = &[
         valid_positions: BAR_ZONES,
     },
     LayoutItem {
-        id: "active_encoding",
+        id: ids::ACTIVE_ENCODING,
         kind: LayoutItemKind::StatusControl,
         label: "Active Encoding",
         icon: None,
@@ -283,7 +313,7 @@ const ITEMS: &[LayoutItem] = &[
         valid_positions: BAR_ZONES,
     },
     LayoutItem {
-        id: "active_language",
+        id: ids::ACTIVE_LANGUAGE,
         kind: LayoutItemKind::StatusControl,
         label: "Active Language",
         icon: None,
@@ -295,7 +325,7 @@ const ITEMS: &[LayoutItem] = &[
         valid_positions: BAR_ZONES,
     },
     LayoutItem {
-        id: "active_toolchain",
+        id: ids::ACTIVE_TOOLCHAIN,
         kind: LayoutItemKind::StatusControl,
         label: "Active Toolchain",
         icon: None,
@@ -307,7 +337,7 @@ const ITEMS: &[LayoutItem] = &[
         valid_positions: BAR_ZONES,
     },
     LayoutItem {
-        id: "line_endings",
+        id: ids::LINE_ENDINGS,
         kind: LayoutItemKind::StatusControl,
         label: "Line Endings",
         icon: None,
@@ -319,7 +349,7 @@ const ITEMS: &[LayoutItem] = &[
         valid_positions: BAR_ZONES,
     },
     LayoutItem {
-        id: "vim_mode",
+        id: ids::VIM_MODE,
         kind: LayoutItemKind::StatusControl,
         label: "Vim Mode",
         icon: None,
@@ -331,7 +361,7 @@ const ITEMS: &[LayoutItem] = &[
         valid_positions: BAR_ZONES,
     },
     LayoutItem {
-        id: "cursor_position",
+        id: ids::CURSOR_POSITION,
         kind: LayoutItemKind::StatusControl,
         label: "Cursor Position",
         icon: None,
@@ -343,7 +373,7 @@ const ITEMS: &[LayoutItem] = &[
         valid_positions: BAR_ZONES,
     },
     LayoutItem {
-        id: "image_info",
+        id: ids::IMAGE_INFO,
         kind: LayoutItemKind::StatusControl,
         label: "Image Information",
         icon: None,
@@ -504,6 +534,45 @@ mod tests {
         assert!(get("AgentPanel").is_none());
         assert!(get("ProjectPanel").is_some());
         assert!(get("project_panel").is_none());
+    }
+
+    #[test]
+    fn every_id_constant_still_names_a_registered_item() {
+        // The table is written in terms of these, so a const and a row cannot hold
+        // different strings. What they can do is outlive each other: delete a row
+        // and its const keeps compiling at every call site, resolving to nothing.
+        let named = [
+            ids::AGENT_PANEL,
+            ids::PROJECT_PANEL,
+            ids::TERMINAL_PANEL,
+            ids::GIT_PANEL,
+            ids::COLLABORATION_PANEL,
+            ids::OUTLINE_PANEL,
+            ids::DEBUG_PANEL,
+            ids::PROJECT_SEARCH,
+            ids::LSP_SERVERS,
+            ids::DIAGNOSTICS,
+            ids::ACTIVE_FILE,
+            ids::GIT_BLAME,
+            ids::MERGE_CONFLICTS,
+            ids::ACTIVITY,
+            ids::EDIT_PREDICTION,
+            ids::ACTIVE_ENCODING,
+            ids::ACTIVE_LANGUAGE,
+            ids::ACTIVE_TOOLCHAIN,
+            ids::LINE_ENDINGS,
+            ids::VIM_MODE,
+            ids::CURSOR_POSITION,
+            ids::IMAGE_INFO,
+        ];
+        for id in named {
+            assert!(get(id).is_some(), "{id} has a constant but no row");
+        }
+        assert_eq!(
+            named.len(),
+            all().len(),
+            "a row was added without a constant, so call sites would have to spell it"
+        );
     }
 
     #[test]

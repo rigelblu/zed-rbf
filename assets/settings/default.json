@@ -1863,6 +1863,20 @@
     "line_endings_button": false,
     // Control when to show the active encoding in the status bar.
     "active_encoding_button": "non_utf8",
+    // Placement for individual status controls. Missing items use Zed's default
+    // placement. Values: left, middle, right, hidden.
+    //
+    // Status controls only. Workspace components — the panels with an icon in the
+    // bar — are placed through "workspace_layout.component_positions" above; an
+    // entry naming one here is ignored, because moving its icon without moving the
+    // component is exactly the behavior that setting replaced.
+    //
+    // Known status control ids:
+    // - project_search, lsp_servers, diagnostics, active_file, git_blame
+    // - merge_conflicts, activity, edit_prediction, active_encoding
+    // - active_language, active_toolchain, line_endings, vim_mode
+    // - cursor_position, image_info
+    "item_locations": {},
   },
   // Settings specific to the terminal
   "terminal": {

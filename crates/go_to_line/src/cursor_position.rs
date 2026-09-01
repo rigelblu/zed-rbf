@@ -8,7 +8,9 @@ use ui::{
     Render, Tooltip, Window, div,
 };
 use util::paths::FILE_ROW_COLUMN_DELIMITER;
-use workspace::{HideStatusItem, StatusBarSettings, StatusItemView, Workspace, item::ItemHandle};
+use workspace::{
+    HideStatusItem, StatusBarSettings, StatusItemView, Workspace, item::ItemHandle, layout_registry,
+};
 
 #[derive(Copy, Clone, Debug, Default, PartialOrd, PartialEq)]
 pub(crate) struct SelectionStats {
@@ -209,7 +211,11 @@ impl CursorPosition {
 
 impl Render for CursorPosition {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if !StatusBarSettings::get_global(cx).cursor_position_button {
+        let settings = StatusBarSettings::get_global(cx);
+        if !settings.item_enabled(
+            layout_registry::ids::CURSOR_POSITION,
+            settings.cursor_position_button,
+        ) {
             return div().hidden();
         }
 
