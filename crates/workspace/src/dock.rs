@@ -68,12 +68,71 @@ pub fn effective_component_position(
     cx: &App,
     is_valid: impl Fn(DockPosition) -> bool,
 ) -> DockPosition {
-    WorkspaceLayoutSettings::get_global(cx)
+    let explicit = WorkspaceLayoutSettings::get_global(cx)
         .component(panel_key)
         .position
-        .map(DockPosition::from)
-        .filter(|position| is_valid(*position))
-        .unwrap_or(own_position)
+        .map(DockPosition::from);
+    resolve_component_position(
+        explicit,
+        registered_component_position(panel_key),
+        own_position,
+        is_valid,
+    )
+}
+
+/// The position the registry says a component belongs at, as a dock.
+///
+/// Status controls share this id space and register positions of their own, so
+/// the kind is checked rather than assumed — `cursor_position` registers at Right
+/// and would otherwise hand back a dock it has no business naming.
+fn registered_component_position(panel_key: &str) -> Option<DockPosition> {
+    use crate::layout_registry::{LayoutItemKind, LayoutPosition};
+
+    let item = crate::layout_registry::get(panel_key)?;
+    if item.kind != LayoutItemKind::WorkspaceComponent {
+        return None;
+    }
+    match item.registered_position {
+        LayoutPosition::Left => Some(DockPosition::Left),
+        LayoutPosition::Right => Some(DockPosition::Right),
+        LayoutPosition::Bottom => Some(DockPosition::Bottom),
+        // A bar zone, not a dock. No component registers here.
+        LayoutPosition::Middle => None,
+    }
+}
+
+/// Where a component sits, given what the user asked for, what the registry says,
+/// and what the component's own legacy dock setting says.
+///
+/// The case worth stating: an explicit entry naming a position the component
+/// cannot take does **not** fall through to the legacy dock. Doing that would
+/// resurrect a setting the user may long since have replaced, on the strength of
+/// a newer setting being unusable. The registered position is the defined answer,
+/// and the raw entry stays in the file rather than being silently rewritten.
+fn resolve_component_position(
+    explicit: Option<DockPosition>,
+    registered: Option<DockPosition>,
+    own_position: DockPosition,
+    is_valid: impl Fn(DockPosition) -> bool,
+) -> DockPosition {
+    if let Some(explicit) = explicit.filter(|position| is_valid(*position)) {
+        return explicit;
+    }
+    let fallback = || {
+        registered
+            .filter(|position| is_valid(*position))
+            .unwrap_or(own_position)
+    };
+    if explicit.is_some() {
+        return fallback();
+    }
+    // With no entry at all, the component's own dock setting supplies the
+    // position — but only while it names somewhere the component can go.
+    if is_valid(own_position) {
+        own_position
+    } else {
+        fallback()
+    }
 }
 
 /// Moves a component to a side globally. Its icon follows the component rather
@@ -2202,5 +2261,134 @@ pub mod test {
         fn focus_handle(&self, _cx: &App) -> FocusHandle {
             self.focus_handle.clone()
         }
+    }
+}
+
+#[cfg(test)]
+mod component_position_tests {
+    use super::*;
+
+    /// A side-only component, like every panel but Terminal and Debug.
+    fn sides_only(position: DockPosition) -> bool {
+        matches!(position, DockPosition::Left | DockPosition::Right)
+    }
+
+    #[test]
+    fn a_valid_explicit_entry_beats_the_legacy_dock() {
+        assert_eq!(
+            resolve_component_position(
+                Some(DockPosition::Left),
+                Some(DockPosition::Right),
+                DockPosition::Right,
+                sides_only,
+            ),
+            DockPosition::Left
+        );
+    }
+
+    #[test]
+    fn an_invalid_explicit_entry_falls_to_the_registered_position_not_the_legacy_dock() {
+        // The discriminating case, and the reason this function exists. Asking for
+        // Bottom on a side-only component is unusable; falling through to the
+        // legacy dock would resurrect a setting the user may have replaced long
+        // ago, on the strength of the newer one being wrong.
+        let resolved = resolve_component_position(
+            Some(DockPosition::Bottom),
+            Some(DockPosition::Right),
+            DockPosition::Left,
+            sides_only,
+        );
+        assert_eq!(resolved, DockPosition::Right, "registered position ignored");
+        assert_ne!(
+            resolved,
+            DockPosition::Left,
+            "an unusable explicit entry fell through to the legacy dock"
+        );
+    }
+
+    #[test]
+    fn with_no_entry_a_usable_legacy_dock_supplies_the_position() {
+        assert_eq!(
+            resolve_component_position(
+                None,
+                Some(DockPosition::Right),
+                DockPosition::Left,
+                sides_only,
+            ),
+            DockPosition::Left,
+            "the registered position overrode a perfectly usable legacy dock"
+        );
+    }
+
+    #[test]
+    fn with_no_entry_an_unusable_legacy_dock_falls_to_the_registered_position() {
+        // Reachable today: a component's own dock setting can name a position it
+        // does not support, and the old resolver returned it unchecked.
+        assert_eq!(
+            resolve_component_position(
+                None,
+                Some(DockPosition::Right),
+                DockPosition::Bottom,
+                sides_only,
+            ),
+            DockPosition::Right
+        );
+    }
+
+    #[test]
+    fn an_unknown_component_keeps_its_own_position() {
+        // The registry knows nothing about an extension's panel, so there is no
+        // registered position to fall back to. Preserving what it asked for beats
+        // inventing an answer.
+        assert_eq!(
+            resolve_component_position(
+                Some(DockPosition::Bottom),
+                None,
+                DockPosition::Left,
+                sides_only
+            ),
+            DockPosition::Left
+        );
+        assert_eq!(
+            resolve_component_position(None, None, DockPosition::Bottom, sides_only),
+            DockPosition::Bottom
+        );
+    }
+
+    #[test]
+    fn a_bottom_capable_component_keeps_an_explicit_bottom() {
+        // Terminal and Debug are the two that accept it; the same entry that is a
+        // repair case for a side-only component is simply honoured here.
+        assert_eq!(
+            resolve_component_position(
+                Some(DockPosition::Bottom),
+                Some(DockPosition::Bottom),
+                DockPosition::Left,
+                |_| true,
+            ),
+            DockPosition::Bottom
+        );
+    }
+
+    #[test]
+    fn the_registry_agrees_with_the_canonical_table() {
+        assert_eq!(
+            registered_component_position("ProjectPanel"),
+            Some(DockPosition::Right)
+        );
+        assert_eq!(
+            registered_component_position("TerminalPanel"),
+            Some(DockPosition::Bottom)
+        );
+        assert_eq!(
+            registered_component_position("agent_panel"),
+            Some(DockPosition::Left)
+        );
+        assert_eq!(
+            registered_component_position("cursor_position"),
+            None,
+            "a status control resolved to a dock"
+        );
+        assert_eq!(registered_component_position("not_a_component"), None);
     }
 }
