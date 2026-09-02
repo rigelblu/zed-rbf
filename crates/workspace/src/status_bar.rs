@@ -499,7 +499,7 @@ fn place_status_control(
 ///
 /// The write is completion-aware: the old placement stays on screen until it
 /// lands, and a failure is reported rather than swallowed.
-fn set_status_control_location(
+pub fn set_status_control_location(
     item_id: &'static str,
     location: StatusBarItemLocation,
     window: &mut Window,

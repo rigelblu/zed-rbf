@@ -31,7 +31,7 @@ pub mod workspace_error;
 mod workspace_settings;
 mod workspace_tabs;
 
-pub use dock::Panel;
+pub use dock::{ComponentAdapter, Panel};
 pub use multi_workspace::{
     CloseWorkspaceSidebar, DraggedSidebar, FocusWorkspaceSidebar, MoveProjectToNewWindow,
     MultiWorkspace, MultiWorkspaceEvent, NewThread, NextProject, NextThread, PreviousProject,
@@ -124,7 +124,11 @@ use sqlez::{
     statement::Statement,
 };
 use status_bar::StatusBar;
-pub use status_bar::{HideStatusItem, StatusControlAdapter, StatusItemView, add_hide_button_entry};
+pub use layout_registry::CustomizeWorkspaceLayout;
+pub use status_bar::{
+    HideStatusItem, StatusControlAdapter, StatusItemView, add_hide_button_entry,
+    set_status_control_location,
+};
 use std::{
     any::TypeId,
     borrow::Cow,
@@ -4674,6 +4678,27 @@ impl Workspace {
         self.all_docks()
             .iter()
             .find_map(|dock| dock.read(cx).panel::<T>())
+    }
+
+    /// The live view of a registered workspace component, by its layout-registry
+    /// id.
+    ///
+    /// `None` means no panel has registered under that id in this workspace —
+    /// the id names a status control, an extension whose crate is absent, or a
+    /// panel whose async load has not landed yet. A caller that gets `None` still
+    /// has the static registry row, which is what lets a surface offer to
+    /// un-hide something that is not running.
+    pub fn component_adapter(&self, panel_key: &str, cx: &App) -> Option<ComponentAdapter> {
+        self.all_docks().iter().find_map(|dock| {
+            let dock = dock.read(cx);
+            let panel = dock.panel_for_key(panel_key)?;
+            let panel_id = panel.panel_id();
+            Some(ComponentAdapter::new(
+                panel.clone(),
+                dock.is_panel_open(panel_id),
+                dock.focused_panel_id() == Some(panel_id),
+            ))
+        })
     }
 
     fn dismiss_zoomed_items_to_reveal(
@@ -15475,6 +15500,151 @@ mod tests {
                     .hidden = Some(hidden);
             });
         });
+    }
+
+    #[gpui::test]
+    async fn test_the_component_adapter_finds_a_registered_panel_by_its_key(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+            workspace.add_panel(panel, window, cx);
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| TestPanelB::new(DockPosition::Right, 101, cx));
+            workspace.add_panel(panel, window, cx);
+        });
+
+        workspace.update(cx, |workspace, cx| {
+            assert!(
+                workspace.component_adapter("TestPanel", cx).is_some(),
+                "a registered panel must be reachable by its registry id"
+            );
+            assert!(
+                workspace.component_adapter("NoSuchPanel", cx).is_none(),
+                "an id no panel registered under must not resolve to some other panel"
+            );
+
+            // The two identities are different jobs: `persistent_name` names the
+            // active panel in serialized dock state, `panel_key` is the shared
+            // layout id. They differ in production — "Project Panel" against
+            // "ProjectPanel" — so a lookup keyed on the wrong one works in every
+            // fixture where they happen to match, and fails for every real panel.
+            assert!(
+                workspace.component_adapter("TestPanelB", cx).is_some(),
+                "the lookup must be keyed on panel_key"
+            );
+            assert!(
+                workspace.component_adapter("Test Panel B", cx).is_none(),
+                "and must not answer to persistent_name"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_the_component_adapter_reaches_a_hidden_component(cx: &mut gpui::TestAppContext) {
+        // The whole surface design rests on this. `Customize Workspace Layout`
+        // has to offer to un-hide something, and it can only do that if a hidden
+        // component still answers for its position and its action. Registration
+        // is unconditional — the hidden check only closes a panel — but that is a
+        // property of `initialize_panels` and `add_panel`, not a guarantee anyone
+        // stated, so it is witnessed here rather than assumed.
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+            workspace.add_panel(panel, window, cx);
+        });
+
+        set_panel_hidden(cx, "TestPanel", true);
+        cx.run_until_parked();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let adapter = workspace
+                .component_adapter("TestPanel", cx)
+                .expect("a hidden component must still be reachable, or it can never be recovered");
+            assert!(
+                !adapter.is_open(),
+                "hidden closes the component, so the adapter must not report it open"
+            );
+            assert_eq!(
+                adapter.position(window, cx),
+                DockPosition::Left,
+                "hiding never writes position, so the adapter still reports where it will return to"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_the_component_adapter_tracks_open_and_focused(cx: &mut gpui::TestAppContext) {
+        // The discriminating check. An adapter whose `is_open` were stuck at
+        // `false` passes both tests above, because neither opens anything.
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+
+        workspace.update(cx, |workspace, cx| {
+            assert!(
+                !workspace
+                    .component_adapter("TestPanel", cx)
+                    .expect("registered")
+                    .is_open(),
+                "a component that has not been opened is not open"
+            );
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_panel::<TestPanel>(window, cx);
+        });
+        cx.run_until_parked();
+
+        workspace.update(cx, |workspace, cx| {
+            let adapter = workspace
+                .component_adapter("TestPanel", cx)
+                .expect("registered");
+            assert!(
+                adapter.is_open(),
+                "the adapter must see the open it just did"
+            );
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace
+                .left_dock()
+                .update(cx, |dock, cx| dock.close_panel_at(0, window, cx));
+        });
+        cx.run_until_parked();
+
+        workspace.update(cx, |workspace, cx| {
+            assert!(
+                !workspace
+                    .component_adapter("TestPanel", cx)
+                    .expect("registered")
+                    .is_open(),
+                "and must see the close, so the value is read rather than latched"
+            );
+        });
+
+        drop(panel);
     }
 
     #[gpui::test]

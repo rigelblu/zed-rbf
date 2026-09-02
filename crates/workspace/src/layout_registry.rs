@@ -83,6 +83,19 @@ pub enum SourceRank {
 }
 
 #[derive(Clone, Copy, Debug)]
+/// Opens the layout surface — the one place a user can see every placeable item
+/// and put a hidden one back.
+///
+/// `item_id` focuses the row that opened it, so arriving from an item's own menu
+/// lands on that item rather than at the top of a list of twenty-two.
+#[derive(Clone, Default, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action)]
+#[action(namespace = workspace)]
+#[serde(deny_unknown_fields)]
+pub struct CustomizeWorkspaceLayout {
+    #[serde(default)]
+    pub item_id: Option<String>,
+}
+
 pub struct LayoutItem {
     /// For a workspace component this is its `Panel::panel_key()`. Keys are not
     /// uniformly cased — `agent_panel` is snake_case where every other component

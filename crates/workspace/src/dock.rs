@@ -6,7 +6,7 @@ use crate::{
     DraggedDock, Event, FocusFollowsMouse, ModalLayer, Pane, WorkspaceLayoutSettings,
     WorkspaceSettings,
 };
-use crate::{Workspace, status_bar::StatusItemView};
+use crate::{Workspace, layout_registry::LayoutPosition, status_bar::StatusItemView};
 use anyhow::Context as _;
 use client::proto;
 use db::kvp::KeyValueStore;
@@ -134,6 +134,83 @@ fn resolve_component_position(
         fallback()
     }
 }
+
+/// A registered workspace component as the layout surface must see it.
+///
+/// The static `layout_registry` answers everything that cannot change while the
+/// app runs — label, icon, aliases, registered position, valid positions,
+/// default hidden state. This carries only what needs the running panel: where
+/// it actually sits, what it will accept, whether it is open or focused, its
+/// size floor, and the action that opens it.
+///
+/// **Assembled on demand from the workspace's own docks, not held in a global.**
+/// `initialize_panels` adds every panel to every workspace, and the hidden check
+/// only closes one, so the workspace already holds a handle for every registered
+/// component — hidden, closed, or open. A second map keyed by the same
+/// `panel_key` would be one more pair of sources that can disagree, which is the
+/// hazard this feature has already been bitten by more than once.
+pub struct ComponentAdapter {
+    panel: Arc<dyn PanelHandle>,
+    is_open: bool,
+    is_focused: bool,
+}
+
+impl ComponentAdapter {
+    pub(crate) fn new(panel: Arc<dyn PanelHandle>, is_open: bool, is_focused: bool) -> Self {
+        Self {
+            panel,
+            is_open,
+            is_focused,
+        }
+    }
+
+    /// Where the component actually is, resolved through the shared
+    /// workspace-layout service — not the panel's own legacy dock setting.
+    pub fn position(&self, window: &Window, cx: &App) -> DockPosition {
+        self.panel.position(window, cx)
+    }
+
+    /// Whether the live panel will accept a position. The static table also
+    /// records valid positions, and the two can disagree: this is the panel's
+    /// own answer and is the one to offer a user, so a choice cannot be shown
+    /// that the component then refuses.
+    pub fn accepts(&self, position: DockPosition, cx: &App) -> bool {
+        self.panel.position_is_valid(position, cx)
+    }
+
+    /// Open in this workspace. Closed is workspace-local; hidden is global and
+    /// is a separate question the settings answer without a handle.
+    pub fn is_open(&self) -> bool {
+        self.is_open
+    }
+
+    pub fn is_focused(&self) -> bool {
+        self.is_focused
+    }
+
+    /// The component's own toggle action, so a surface opens it the same way its
+    /// icon and its keybinding do rather than inventing a third path.
+    pub fn toggle_action(&self, window: &Window, cx: &App) -> Box<dyn Action> {
+        self.panel.toggle_action(window, cx)
+    }
+
+    /// The width below which this component stops being usable — its declared
+    /// `min_size` when it has one, else the registry floor for the area it is in.
+    pub fn effective_min_width(&self, window: &Window, cx: &App) -> Pixels {
+        let area = match self.position(window, cx) {
+            DockPosition::Left | DockPosition::Right => LayoutPosition::Left,
+            DockPosition::Bottom => LayoutPosition::Bottom,
+        };
+        area.effective_min_width(self.panel.min_size(window, cx))
+    }
+}
+
+// Two things the design lists for this adapter are deliberately absent until
+// something consumes them. The legacy dock value would need a new `PanelHandle`
+// method to reach `Panel::position` underneath the resolver, and legacy
+// migration is not the next piece. The post-move hook has no side effect to run
+// yet — adding either now would be guessing at a shape the surface has not
+// asked for.
 
 /// Moves a component to a side globally. Its icon follows the component rather
 /// than carrying a placement of its own.
@@ -692,10 +769,21 @@ impl Dock {
     }
 
     pub fn panel_id_for_panel_key(&self, panel_key: &str) -> Option<EntityId> {
+        self.panel_for_key(panel_key).map(|panel| panel.panel_id())
+    }
+
+    /// The live panel registered under a layout-registry id, if it has reached
+    /// this dock.
+    ///
+    /// Registration is unconditional — `initialize_panels` adds every panel to
+    /// every workspace, and the hidden check only closes one — so a component
+    /// that is hidden or closed still answers here. It is `None` only before the
+    /// panel's async load lands, or for an id no crate registers.
+    pub fn panel_for_key(&self, panel_key: &str) -> Option<&Arc<dyn PanelHandle>> {
         self.panel_entries
             .iter()
             .find(|entry| entry.panel.panel_key() == panel_key)
-            .map(|entry| entry.panel.panel_id())
+            .map(|entry| &entry.panel)
     }
 
     pub fn panel_index_for_persistent_name(&self, ui_name: &str, _cx: &App) -> Option<usize> {
@@ -2256,8 +2344,12 @@ pub mod test {
     }
 
     impl Panel for TestPanelB {
+        // Deliberately unequal to `panel_key()`. In production the two identities
+        // differ — Project Panel serializes as "Project Panel" and keys layout as
+        // "ProjectPanel" — so a fixture where they match cannot tell a lookup
+        // keyed on the wrong one from a correct one.
         fn persistent_name() -> &'static str {
-            "TestPanelB"
+            "Test Panel B"
         }
 
         fn panel_key() -> &'static str {
