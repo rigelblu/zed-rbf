@@ -1688,12 +1688,33 @@ impl Dock {
             .map(|entry| entry.size_state)
     }
 
+    /// What this side claims of the window, for the *opposite* dock's resize
+    /// ceiling. Every open column counts, a flexible one by its `default_size`
+    /// because it has no stored width to report.
+    ///
+    /// `open_fixed_size` cannot stand in here. It drops flexible columns rather
+    /// than estimating them, so a side holding only a flexible component answers
+    /// zero — and `resize_left_dock` reads that as "nothing on the right", which
+    /// lets the left dock be dragged clean over the right one. Upstream asks the
+    /// active panel for `size.unwrap_or(default_size)`; this is that same formula
+    /// generalised from one panel to every open one, which is what the
+    /// multi-component model does everywhere else and what this spot missed.
     pub fn stored_active_panel_size(&self, window: &Window, cx: &App) -> Option<Pixels> {
         if !self.is_open() {
             return None;
         }
         match self.position.axis() {
-            Axis::Horizontal => Some(self.open_fixed_size(window, cx)),
+            Axis::Horizontal => Some(
+                self.open_entries()
+                    .into_iter()
+                    .map(|entry| {
+                        entry
+                            .size_state
+                            .size
+                            .unwrap_or_else(|| entry.panel.default_size(window, cx))
+                    })
+                    .fold(Pixels::ZERO, |sum, size| sum + size),
+            ),
             Axis::Vertical => self.open_row_size(window, cx),
         }
     }

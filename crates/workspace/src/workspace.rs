@@ -16737,6 +16737,60 @@ mod tests {
         });
     }
 
+    /// A flexible column reports no stored width, and the *opposite* dock's resize
+    /// ceiling is the one place that mattered: reading zero there let one side be
+    /// dragged clean over the other. Found by dogfood, not by a test — Tom:
+    /// "it lets me drag it past right side bar".
+    #[gpui::test]
+    async fn test_a_side_cannot_be_dragged_over_a_flexible_opposite_dock(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.bounds.size.width = px(1600.);
+
+            // 300px wide by `default_size`, and flexible, so it stores no width.
+            let right = cx.new(|cx| TestPanel::new_flexible(DockPosition::Right, 100, cx));
+            workspace.add_panel(right, window, cx);
+            workspace.right_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+            });
+
+            let left = cx.new(|cx| TestPanelB::new(DockPosition::Left, 101, cx));
+            workspace.add_panel(left, window, cx);
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+            });
+
+            workspace.resize_dock(DockPosition::Left, px(1600.), window, cx);
+            let dock = workspace.left_dock().read(cx);
+            assert_eq!(
+                workspace.dock_size(&dock, window, cx),
+                Some(px(1300.)),
+                "the left side was allowed past the right one; a flexible column \
+                 reporting no width must still be counted at its default size, or \
+                 the opposite ceiling reads the side as empty"
+            );
+        });
+
+        // What must survive: a width that clears the opposite dock is untouched.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.resize_dock(DockPosition::Left, px(1000.), window, cx);
+            let dock = workspace.left_dock().read(cx);
+            assert_eq!(
+                workspace.dock_size(&dock, window, cx),
+                Some(px(1000.)),
+                "a width with room to spare was clamped; the ceiling is firing on \
+                 sizes that never reached it"
+            );
+        });
+    }
+
     /// Two fixed columns on the left, each 400 of an 800px side. The seam is
     /// driven through `resize_dock_seam`, which is what the drag-move listener
     /// calls; `Dock::resize_seam` on its own would skip the geometry entirely.
