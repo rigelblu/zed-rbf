@@ -9138,7 +9138,17 @@ impl Workspace {
 
     fn resize_left_dock(&mut self, new_size: Pixels, window: &mut Window, cx: &mut App) {
         let workspace_width = self.bounds.size.width;
-        let mut size = new_size.min(workspace_width - RESIZE_HANDLE_SIZE);
+        // The floor is raised first and the width ceilings below still win, so a
+        // window too narrow to hold it collapses the side rather than pushing the
+        // editor off-screen. Trading this trapdoor for that one would be a worse
+        // deal; the narrow-window case belongs to per-area scrolling, unbuilt.
+        let floor = self
+            .left_dock
+            .read_with(cx, |left_dock, cx| left_dock.open_min_size(window, cx))
+            .unwrap_or(Pixels::ZERO);
+        let mut size = new_size
+            .max(floor)
+            .min(workspace_width - RESIZE_HANDLE_SIZE);
 
         self.right_dock.read_with(cx, |right_dock, cx| {
             let right_dock_size = right_dock
@@ -9159,7 +9169,13 @@ impl Workspace {
 
     fn resize_right_dock(&mut self, new_size: Pixels, window: &mut Window, cx: &mut App) {
         let workspace_width = self.bounds.size.width;
-        let mut size = new_size.min(workspace_width - RESIZE_HANDLE_SIZE);
+        let floor = self
+            .right_dock
+            .read_with(cx, |right_dock, cx| right_dock.open_min_size(window, cx))
+            .unwrap_or(Pixels::ZERO);
+        let mut size = new_size
+            .max(floor)
+            .min(workspace_width - RESIZE_HANDLE_SIZE);
         self.left_dock.read_with(cx, |left_dock, cx| {
             let left_dock_size = left_dock
                 .stored_active_panel_size(window, cx)
@@ -9175,6 +9191,10 @@ impl Workspace {
     }
 
     fn resize_bottom_dock(&mut self, new_size: Pixels, window: &mut Window, cx: &mut App) {
+        // No floor here yet: the bottom dock resizes on height, and the registry
+        // publishes a bottom *segment width* for the row's internal dividers. The
+        // height a bottom component stops being usable at is a number the design
+        // has not named, so this drag still bottoms out at `RESIZE_HANDLE_SIZE`.
         let size = new_size.min(self.bounds.bottom() - RESIZE_HANDLE_SIZE - self.bounds.top());
         self.bottom_dock.update(cx, |bottom_dock, cx| {
             bottom_dock.resize_active_panel(Some(size), None, window, cx);
@@ -16487,6 +16507,245 @@ mod tests {
                     None
                 );
             });
+        });
+    }
+
+    /// Every witness below drives `resize_dock`, which is what the divider drag
+    /// and the keyboard resize both call. Asserting against `open_min_size`
+    /// directly would pass whether or not anything reached it.
+    #[gpui::test]
+    async fn test_a_side_drag_stops_at_the_summed_component_floor(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        set_panel_pinned(cx, "TestPanel", true);
+        set_panel_pinned(cx, "TestPanelB", true);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.bounds.size.width = px(1600.);
+
+            let first = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+            workspace.add_panel(first, window, cx);
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+            });
+
+            workspace.resize_dock(DockPosition::Left, px(10.), window, cx);
+            let dock = workspace.left_dock().read(cx);
+            assert_eq!(
+                workspace.dock_size(&dock, window, cx),
+                Some(crate::layout_registry::SIDE_COLUMN_MIN_WIDTH),
+                "a component declaring no minimum must take the registry side floor, \
+                 not fall through to the resize handle"
+            );
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let second = cx.new(|cx| TestPanelB::new(DockPosition::Left, 101, cx));
+            workspace.add_panel(second, window, cx);
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.activate_panel(1, window, cx);
+            });
+
+            workspace.resize_dock(DockPosition::Left, px(10.), window, cx);
+            let dock = workspace.left_dock().read(cx);
+            assert_eq!(
+                workspace.dock_size(&dock, window, cx),
+                Some(crate::layout_registry::SIDE_COLUMN_MIN_WIDTH * 2.),
+                "the floor is summed over open components; one constant for the \
+                 whole side would leave the second column a sliver"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_a_declared_minimum_raises_the_side_floor_above_the_registry_default(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        set_panel_pinned(cx, "TestPanel", true);
+        set_panel_pinned(cx, "TestPanelB", true);
+
+        let declared = px(320.);
+        let floor = declared + crate::layout_registry::SIDE_COLUMN_MIN_WIDTH;
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.bounds.size.width = px(1600.);
+
+            let declaring =
+                cx.new(|cx| TestPanel::new_with_min_size(DockPosition::Left, 100, declared, cx));
+            workspace.add_panel(declaring.clone(), window, cx);
+            let silent = cx.new(|cx| TestPanelB::new(DockPosition::Left, 101, cx));
+            workspace.add_panel(silent.clone(), window, cx);
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+                dock.activate_panel(1, window, cx);
+            });
+
+            workspace.resize_dock(DockPosition::Left, px(10.), window, cx);
+            let dock = workspace.left_dock().read(cx);
+            assert_eq!(
+                workspace.dock_size(&dock, window, cx),
+                Some(floor),
+                "the declared minimum must be read; taking the registry floor for \
+                 every component would give {:?}",
+                crate::layout_registry::SIDE_COLUMN_MIN_WIDTH * 2.
+            );
+
+            // The side sitting on its floor is not enough: the column that asked
+            // for 320 must actually hold 320, or the sliver has only moved from
+            // the side's edge to the seam between two columns.
+            workspace.left_dock().update(cx, |dock, _cx| {
+                assert_eq!(
+                    dock.stored_panel_size_state(&declaring)
+                        .and_then(|state| state.size),
+                    Some(declared),
+                    "the declaring column was squeezed below its own minimum"
+                );
+                assert_eq!(
+                    dock.stored_panel_size_state(&silent)
+                        .and_then(|state| state.size),
+                    Some(crate::layout_registry::SIDE_COLUMN_MIN_WIDTH),
+                    "the silent column must survive at the registry floor, not \
+                     absorb what the declaring one gave up"
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn test_a_side_drag_above_the_floor_is_left_alone(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        set_panel_pinned(cx, "TestPanel", true);
+        set_panel_pinned(cx, "TestPanelB", true);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.bounds.size.width = px(1600.);
+
+            let first = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+            workspace.add_panel(first, window, cx);
+            let second = cx.new(|cx| TestPanelB::new(DockPosition::Left, 101, cx));
+            workspace.add_panel(second, window, cx);
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+                dock.activate_panel(1, window, cx);
+            });
+
+            workspace.resize_dock(DockPosition::Left, px(700.), window, cx);
+            let dock = workspace.left_dock().read(cx);
+            assert_eq!(
+                workspace.dock_size(&dock, window, cx),
+                Some(px(700.)),
+                "a width the components can honour must pass through untouched; a \
+                 floor that also raises comfortable widths is over-clamping"
+            );
+        });
+    }
+
+    /// A flexible component takes its width from a flex factor, so the per-column
+    /// distribution never floors it — only the clamp in `resize_*_dock` does, by
+    /// deciding the width the flex factor is derived from. The fixed-panel
+    /// witnesses above pass with that clamp deleted; these do not.
+    #[gpui::test]
+    async fn test_a_flexible_left_component_drag_stops_at_the_floor(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.bounds.size.width = px(1600.);
+
+            let panel = cx.new(|cx| TestPanel::new_flexible(DockPosition::Left, 100, cx));
+            workspace.add_panel(panel, window, cx);
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+            });
+
+            workspace.resize_dock(DockPosition::Left, px(10.), window, cx);
+            let dock = workspace.left_dock().read(cx);
+            assert_eq!(
+                workspace.dock_size(&dock, window, cx),
+                Some(crate::layout_registry::SIDE_COLUMN_MIN_WIDTH),
+                "the flex factor must be derived from the floored width; derived \
+                 from the raw 10px it leaves the side a sliver"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_a_flexible_right_component_drag_stops_at_the_floor(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.bounds.size.width = px(1600.);
+
+            let panel = cx.new(|cx| TestPanel::new_flexible(DockPosition::Right, 100, cx));
+            workspace.add_panel(panel, window, cx);
+            workspace.right_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+            });
+
+            workspace.resize_dock(DockPosition::Right, px(10.), window, cx);
+            let dock = workspace.right_dock().read(cx);
+            assert_eq!(
+                workspace.dock_size(&dock, window, cx),
+                Some(crate::layout_registry::SIDE_COLUMN_MIN_WIDTH),
+                "the right side needs its own witness; the left one passes while \
+                 this clamp is missing"
+            );
+        });
+    }
+
+    /// The bottom dock resizes on height, while the registry publishes a bottom
+    /// *segment width* for the row's internal dividers. No height floor has been
+    /// designed, so this records the gap rather than letting it read as covered.
+    #[gpui::test]
+    async fn test_the_bottom_dock_drag_still_has_no_floor(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.bounds.size.height = px(1000.);
+
+            let panel =
+                cx.new(|cx| TestPanel::new_with_min_size(DockPosition::Bottom, 100, px(250.), cx));
+            workspace.add_panel(panel, window, cx);
+            workspace.bottom_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+            });
+
+            workspace.resize_dock(DockPosition::Bottom, px(1.), window, cx);
+            let dock = workspace.bottom_dock().read(cx);
+            assert_eq!(
+                workspace.dock_size(&dock, window, cx),
+                Some(dock::RESIZE_HANDLE_SIZE),
+                "a bottom height floor would be new behaviour, not this change's; \
+                 when one lands, this assertion is the one to rewrite"
+            );
         });
     }
 

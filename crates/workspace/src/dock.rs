@@ -198,15 +198,31 @@ impl ComponentAdapter {
         self.panel.toggle_action(window, cx)
     }
 
-    /// The width below which this component stops being usable — its declared
-    /// `min_size` when it has one, else the registry floor for the area it is in.
+    /// The width below which this component stops being usable, at the position
+    /// the shared layout service resolves for it.
     pub fn effective_min_width(&self, window: &Window, cx: &App) -> Pixels {
-        let area = match self.position(window, cx) {
-            DockPosition::Left | DockPosition::Right => LayoutPosition::Left,
-            DockPosition::Bottom => LayoutPosition::Bottom,
-        };
-        area.effective_min_width(self.panel.min_size(window, cx))
+        effective_min_width_at(self.position(window, cx), self.panel.as_ref(), window, cx)
     }
+}
+
+/// The width below which a component stops being usable — its declared `min_size`
+/// when it has one, else the registry floor for the area it sits in.
+///
+/// `position` is a parameter rather than read off the panel because the two
+/// callers are authoritative about different things: the layout surface asks
+/// where the shared service says a component belongs, while a dock computing its
+/// own floor already knows which side is being dragged.
+pub(crate) fn effective_min_width_at(
+    position: DockPosition,
+    panel: &dyn PanelHandle,
+    window: &Window,
+    cx: &App,
+) -> Pixels {
+    let area = match position {
+        DockPosition::Left | DockPosition::Right => LayoutPosition::Left,
+        DockPosition::Bottom => LayoutPosition::Bottom,
+    };
+    area.effective_min_width(panel.min_size(window, cx))
 }
 
 // Two things the design lists for this adapter are deliberately absent until
@@ -891,6 +907,19 @@ impl Dock {
             .fold(Pixels::ZERO, |sum, size| sum + size)
     }
 
+    /// Effective minimums of the open fixed-width panels, summed — the counterpart
+    /// to `open_fixed_size`, taken over exactly the same entries so the two can be
+    /// subtracted from one another.
+    fn open_fixed_min_size(&self, window: &Window, cx: &App) -> Pixels {
+        self.open_entries()
+            .into_iter()
+            .filter(|entry| {
+                !panel_uses_flexible_width(self.position, entry.panel.as_ref(), window, cx)
+            })
+            .map(|entry| effective_min_width_at(self.position, entry.panel.as_ref(), window, cx))
+            .fold(Pixels::ZERO, |sum, size| sum + size)
+    }
+
     /// Total flex factor of the open flexible panels, `None` when none is flexible.
     pub fn open_flex(&self, default_flex: Option<f32>, window: &Window, cx: &App) -> Option<f32> {
         let mut total = None;
@@ -903,11 +932,29 @@ impl Dock {
         total
     }
 
-    /// Declared minimum widths of the open panels, summed.
+    /// The width below which this side stops being usable: every open component's
+    /// effective minimum, summed. A component declaring no `min_size` contributes
+    /// its registry area floor rather than nothing, which is the whole point — a
+    /// side holding only undeclared components used to floor at nothing, so the
+    /// editor-facing divider dragged it down to `RESIZE_HANDLE_SIZE`.
+    ///
+    /// `None` for the bottom dock. Its resize axis is height, while the registry's
+    /// bottom number is a segment *width* governing the row's internal dividers —
+    /// a different quantity on a different axis, and summing it here would clamp a
+    /// height against widths.
+    ///
+    /// No caller reaches that branch today: both clamps are on the side docks and
+    /// the render call sits inside its own horizontal arm. It guards this
+    /// function's contract for the bottom-divider work, not a live path — deleting
+    /// it breaks no test, which is the honest reason to leave it documented rather
+    /// than let the next reader defend it as load-bearing.
     pub fn open_min_size(&self, window: &Window, cx: &App) -> Option<Pixels> {
+        if self.position.axis() != Axis::Horizontal {
+            return None;
+        }
         self.open_entries()
             .into_iter()
-            .filter_map(|entry| entry.panel.min_size(window, cx))
+            .map(|entry| effective_min_width_at(self.position, entry.panel.as_ref(), window, cx))
             .reduce(|sum, size| sum + size)
     }
 
@@ -1603,6 +1650,7 @@ impl Dock {
         }
 
         let fixed_total = self.open_fixed_size(window, cx);
+        let fixed_min_total = self.open_fixed_min_size(window, cx);
         let flex_total = self.open_flex(None, window, cx);
         let mut size_states_to_persist = Vec::new();
         for index in open_indices {
@@ -1628,8 +1676,15 @@ impl Dock {
                         .size_state
                         .size
                         .unwrap_or_else(|| entry.panel.default_size(window, cx));
+                    // Each column keeps its own minimum and shares only what is
+                    // left over, in the proportions it had. Scaling the whole
+                    // width proportionally instead lets a skewed pair squeeze one
+                    // column under its minimum while the side as a whole sits on
+                    // the floor — the sliver moves inward rather than closing.
+                    let min = effective_min_width_at(position, entry.panel.as_ref(), window, cx);
+                    let slack = (total - fixed_min_total).max(Pixels::ZERO);
                     let scaled = if fixed_total > Pixels::ZERO {
-                        total * (current / fixed_total)
+                        min + slack * (current / fixed_total)
                     } else {
                         total
                     };
@@ -2201,6 +2256,7 @@ pub mod test {
         pub focus_handle: FocusHandle,
         pub activation_focus_handle: Option<FocusHandle>,
         pub default_size: Pixels,
+        pub min_size: Option<Pixels>,
         pub flexible: bool,
         pub activation_priority: u32,
     }
@@ -2217,8 +2273,23 @@ pub mod test {
                 focus_handle: cx.focus_handle(),
                 activation_focus_handle: None,
                 default_size: px(300.),
+                min_size: None,
                 flexible: false,
                 activation_priority,
+            }
+        }
+
+        /// A panel that declares its own minimum, so a test can tell a declared
+        /// value being read from the registry floor being applied to everything.
+        pub fn new_with_min_size(
+            position: DockPosition,
+            activation_priority: u32,
+            min_size: Pixels,
+            cx: &mut App,
+        ) -> Self {
+            Self {
+                min_size: Some(min_size),
+                ..Self::new(position, activation_priority, cx)
             }
         }
 
@@ -2286,6 +2357,13 @@ pub mod test {
 
         fn default_size(&self, _window: &Window, _: &App) -> Pixels {
             self.default_size
+        }
+
+        // Returned on every axis, unlike the production panels that declare one
+        // only on a side. A bottom panel that does declare a minimum is what
+        // shows the bottom dock ignoring it rather than having none to ignore.
+        fn min_size(&self, _window: &Window, _: &App) -> Option<Pixels> {
+            self.min_size
         }
 
         fn initial_size_state(&self, _window: &Window, _: &App) -> PanelSizeState {
