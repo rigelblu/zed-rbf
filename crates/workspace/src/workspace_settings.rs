@@ -520,17 +520,16 @@ mod status_bar_settings_tests {
             settings.status_control_location("active_file"),
             Some(StatusBarItemLocation::Left)
         );
-        assert_eq!(
-            settings.status_control_location("line_endings"),
-            Some(StatusBarItemLocation::Right)
-        );
+        // `line_endings` has no row: it is not a placeable control, so it has no
+        // registered zone to fall back to either.
+        assert_eq!(settings.status_control_location("line_endings"), None);
     }
 
     #[test]
     fn a_legacy_setting_turned_on_can_still_show_a_factory_hidden_control() {
-        // `active_file` and `line_endings` ship hidden, and `show_active_file` /
-        // `line_endings_button` are how a user asks for them back. A registered
-        // default that outranked those would make the settings inert.
+        // `active_file` ships hidden, and `show_active_file` is how a user asks for
+        // it back. A registered default that outranked it would make the setting
+        // inert.
         let settings = settings_with(&[], NON_UTF8);
 
         assert_eq!(
@@ -552,15 +551,20 @@ mod status_bar_settings_tests {
         // that could drift apart silently, so pin them against each other.
         let defaults = settings_with(&[], NON_UTF8);
         assert!(!defaults.show_active_file);
+
+        // Not part of the pairing below, and pinned here for the opposite reason:
+        // `line_endings` has no registry row, so `line_endings_button` is now the
+        // *only* thing deciding whether the indicator draws. Before the row was
+        // removed this default was one of two agreeing sources; now it is the
+        // single source, which makes it more load-bearing rather than less.
         assert!(!defaults.line_endings_button);
 
-        // The registry says these two ship hidden; `StatusBarSettings` says their
-        // legacy booleans default off. Those are the two halves that have to agree,
-        // and each lives in a different file. Resolution with the legacy value at
-        // its default must land on Hidden for exactly these two.
+        // The registry says which controls ship hidden; `StatusBarSettings` says
+        // their legacy booleans default off. Those are the two halves that have to
+        // agree, and each lives in a different file. Resolution with the legacy
+        // value at its default must land on Hidden for exactly the hidden ones.
         for (id, legacy_default) in [
             ("active_file", defaults.show_active_file),
-            ("line_endings", defaults.line_endings_button),
             ("cursor_position", defaults.cursor_position_button),
             ("active_language", defaults.active_language_button),
         ] {
@@ -587,7 +591,7 @@ mod status_bar_settings_tests {
             .collect();
         assert_eq!(
             factory_hidden,
-            vec!["active_file", "line_endings"],
+            vec!["active_file"],
             "a status control started shipping hidden without its legacy default being checked here"
         );
     }

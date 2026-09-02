@@ -52,7 +52,6 @@ pub mod ids {
     pub const ACTIVE_ENCODING: &str = "active_encoding";
     pub const ACTIVE_LANGUAGE: &str = "active_language";
     pub const ACTIVE_TOOLCHAIN: &str = "active_toolchain";
-    pub const LINE_ENDINGS: &str = "line_endings";
     pub const VIM_MODE: &str = "vim_mode";
     pub const CURSOR_POSITION: &str = "cursor_position";
     pub const IMAGE_INFO: &str = "image_info";
@@ -350,18 +349,6 @@ const ITEMS: &[LayoutItem] = &[
         valid_positions: BAR_ZONES,
     },
     LayoutItem {
-        id: ids::LINE_ENDINGS,
-        kind: LayoutItemKind::StatusControl,
-        label: "Line Endings",
-        icon: None,
-        aliases: &["crlf", "lf", "eol"],
-        clarification: None,
-        registered_position: LayoutPosition::Right,
-        default_hidden: true,
-        source_rank: SourceRank::StatusControl(11),
-        valid_positions: BAR_ZONES,
-    },
-    LayoutItem {
         id: ids::VIM_MODE,
         kind: LayoutItemKind::StatusControl,
         label: "Vim Mode",
@@ -454,7 +441,7 @@ mod tests {
         // The whole reason this table is static: the layout surface has to render
         // a complete list before any panel has registered, or a hidden component
         // could never be recovered.
-        assert_eq!(all().len(), 22);
+        assert_eq!(all().len(), 21);
         for item in all() {
             assert!(!item.id.is_empty(), "{} has no id", item.label);
             assert!(!item.label.is_empty(), "{} has no label", item.id);
@@ -505,15 +492,26 @@ mod tests {
     }
 
     #[test]
-    fn the_two_factory_hidden_items_are_the_only_hidden_ones() {
+    fn active_file_is_the_only_factory_hidden_item() {
         // Reset must reproduce factory state, not a maximally-visible layout that
-        // never existed, so this pair is load-bearing rather than incidental.
+        // never existed, so this is load-bearing rather than incidental.
         let hidden: Vec<_> = all()
             .iter()
             .filter(|item| item.default_hidden)
             .map(|item| item.id)
             .collect();
-        assert_eq!(hidden, vec!["active_file", "line_endings"]);
+        assert_eq!(hidden, vec!["active_file"]);
+    }
+
+    #[test]
+    fn line_endings_is_not_a_placeable_item() {
+        // Deliberately absent. `LineEndingIndicator` gates its own render on
+        // `status_bar.line_endings_button`, and that check is upstream code we do
+        // not carry a patch against. A registry row here would be a second answer
+        // to "is it showing" that the row could never make true: placing it would
+        // move the item into a zone while the gate kept it drawing nothing, which
+        // is exactly what dogfood B4-6 observed before the row was removed.
+        assert!(get("line_endings").is_none());
     }
 
     #[test]
@@ -573,7 +571,6 @@ mod tests {
             ids::ACTIVE_ENCODING,
             ids::ACTIVE_LANGUAGE,
             ids::ACTIVE_TOOLCHAIN,
-            ids::LINE_ENDINGS,
             ids::VIM_MODE,
             ids::CURSOR_POSITION,
             ids::IMAGE_INFO,

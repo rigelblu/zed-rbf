@@ -727,14 +727,11 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
                 window,
                 cx,
             );
-            status_bar.add_status_control(
-                line_ending_indicator,
-                StatusControlAdapter::new(ids::LINE_ENDINGS, |cx| {
-                    StatusBarSettings::get_global(cx).line_endings_button
-                }),
-                window,
-                cx,
-            );
+            // Not a placeable status control: it has no registry row, so it is
+            // added with a fixed zone and no adapter. `LineEndingIndicator`'s own
+            // `line_endings_button` check is the only thing deciding whether it
+            // draws, which is why that check must stay.
+            status_bar.add_right_item(line_ending_indicator, window, cx);
             status_bar.add_status_control(
                 vim_mode_indicator,
                 StatusControlAdapter::new(ids::VIM_MODE, |_| true),
