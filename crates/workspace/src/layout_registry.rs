@@ -82,7 +82,6 @@ pub enum SourceRank {
     StatusControl(u16),
 }
 
-#[derive(Clone, Copy, Debug)]
 /// Opens the layout surface — the one place a user can see every placeable item
 /// and put a hidden one back.
 ///
@@ -96,6 +95,7 @@ pub struct CustomizeWorkspaceLayout {
     pub item_id: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug)]
 pub struct LayoutItem {
     /// For a workspace component this is its `Panel::panel_key()`. Keys are not
     /// uniformly cased — `agent_panel` is snake_case where every other component

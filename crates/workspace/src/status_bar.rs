@@ -629,6 +629,27 @@ impl StatusBar {
         cx.notify();
     }
 
+    /// Where a registered status control actually renders, `Hidden` included.
+    ///
+    /// The bar resolves this through each item's `StatusControlAdapter`, whose
+    /// legacy-setting closure is bound where the bar is assembled and is reachable
+    /// nowhere else. Anything that needs to *display* a control's placement — the
+    /// layout surface — must ask here rather than resolve it again, or the two
+    /// answers drift: `status_control_location` deliberately never returns
+    /// `Hidden`, so a re-derived answer names a zone for an item that is not in
+    /// the bar at all.
+    pub fn effective_location_for(&self, item_id: &str, cx: &App) -> Option<StatusBarItemLocation> {
+        self.items
+            .iter()
+            .find(|entry| {
+                entry
+                    .adapter
+                    .as_ref()
+                    .is_some_and(|adapter| adapter.id() == item_id)
+            })
+            .map(|entry| entry.effective_location(cx))
+    }
+
     pub fn item_of_type<T: StatusItemView>(&self) -> Option<Entity<T>> {
         self.items
             .iter()

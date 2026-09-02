@@ -119,12 +119,12 @@ use settings::{
     update_settings_file,
 };
 
+pub use layout_registry::CustomizeWorkspaceLayout;
 use sqlez::{
     bindable::{Bind, Column, StaticColumnCount},
     statement::Statement,
 };
 use status_bar::StatusBar;
-pub use layout_registry::CustomizeWorkspaceLayout;
 pub use status_bar::{
     HideStatusItem, StatusControlAdapter, StatusItemView, add_hide_button_entry,
     set_status_control_location,

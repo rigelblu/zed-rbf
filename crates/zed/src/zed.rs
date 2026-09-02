@@ -1,4 +1,5 @@
 mod app_menus;
+pub mod customize_workspace_layout;
 pub mod edit_prediction_registry;
 #[cfg(target_os = "macos")]
 pub(crate) mod mac_only_instance;
@@ -6170,6 +6171,7 @@ mod tests {
             collab_ui::init(&app_state, cx);
             git_ui::init(cx);
             project_panel::init(cx);
+            customize_workspace_layout::init(cx);
             outline_panel::init(cx);
             terminal_view::init(cx);
             let credentials_provider = zed_credentials_provider::global(cx);
