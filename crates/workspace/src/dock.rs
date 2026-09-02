@@ -6,7 +6,11 @@ use crate::{
     DraggedDock, Event, FocusFollowsMouse, ModalLayer, Pane, WorkspaceLayoutSettings,
     WorkspaceSettings,
 };
-use crate::{Workspace, layout_registry::LayoutPosition, status_bar::StatusItemView};
+use crate::{
+    Workspace,
+    layout_registry::{CustomizeWorkspaceLayout, LayoutPosition},
+    status_bar::StatusItemView,
+};
 use anyhow::Context as _;
 use client::proto;
 use db::kvp::KeyValueStore;
@@ -1927,6 +1931,17 @@ impl Render for PanelButtons {
                                 // write and did not move — a menu that looked dead
                                 // for exactly the components the user had already
                                 // placed.
+                                // Action entries focus this handle before they
+                                // dispatch, and `CustomizeWorkspaceLayout` is
+                                // registered on `Workspace` — so the workspace's
+                                // own handle is the one that definitely has the
+                                // handler above it. Deliberately not the panel's:
+                                // this menu opens from an icon that is shown for
+                                // closed panels too, and a closed panel's focus
+                                // handle need not be in the dispatch tree at all.
+                                if let Some(workspace) = workspace_for_menu.upgrade() {
+                                    menu = menu.context(workspace.focus_handle(cx));
+                                }
                                 let mut has_position_entries = false;
                                 if POSITIONS
                                     .iter()
@@ -2053,6 +2068,23 @@ impl Render for PanelButtons {
                                     let fs = workspace.read(cx).app_state().fs.clone();
                                     set_component_hidden(fs, panel_key.to_string(), true, cx);
                                 });
+                                // The way back from `Hidden`. Once a component is
+                                // hidden its icon is gone, so this menu is gone
+                                // with it — the exit has to be offered before it
+                                // is needed. Carries `panel_key` so the surface
+                                // opens on this component's row rather than at the
+                                // top of twenty-one.
+                                //
+                                // `.context` is what makes it reach: the action is
+                                // registered on `Workspace`, and without a focus
+                                // handle inside the workspace the menu would
+                                // dispatch into its own tree and find no handler.
+                                menu = menu.separator().action(
+                                    "Customize Workspace Layout…",
+                                    Box::new(CustomizeWorkspaceLayout {
+                                        item_id: Some(panel_key.to_string()),
+                                    }),
+                                );
                                 menu
                             })
                         })

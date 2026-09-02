@@ -1,6 +1,7 @@
 use crate::{
     ItemHandle, MultiWorkspace, Pane, SidebarSide, StatusBarItemLocation, StatusBarSettings,
-    ToggleWorkspaceSidebar, notifications::DetachAndPromptErr, sidebar_side_context_menu,
+    ToggleWorkspaceSidebar, layout_registry::CustomizeWorkspaceLayout,
+    notifications::DetachAndPromptErr, sidebar_side_context_menu,
 };
 use gpui::{
     Anchor, AnyView, App, Context, Decorations, Entity, FocusHandle, Focusable, IntoElement,
@@ -309,7 +310,7 @@ impl StatusBar {
                 // `location` is handed down rather than re-resolved: it is the
                 // zone that actually rendered this item, so a placement menu
                 // cannot mark a zone the item is not in.
-                render_status_bar_item(side, index, entry, location, cx)
+                render_status_bar_item(side, index, entry, location, &self.focus_handle, cx)
             })
             .collect()
     }
@@ -409,6 +410,7 @@ fn render_status_bar_item(
     index: usize,
     entry: &StatusBarItem,
     resolved_location: StatusBarItemLocation,
+    focus_handle: &FocusHandle,
     cx: &App,
 ) -> AnyElement {
     let view = entry.item.to_any();
@@ -416,11 +418,18 @@ fn render_status_bar_item(
 
     if let Some(adapter) = &entry.adapter {
         let item_id = adapter.id();
+        let focus_handle = focus_handle.clone();
         return right_click_menu(menu_id)
             .trigger(move |_is_active, _window, _cx| view)
             .menu(move |window, cx| {
+                let focus_handle = focus_handle.clone();
                 ContextMenu::build(window, cx, move |menu, _window, _cx| {
-                    add_status_control_placement_entries(menu, item_id, resolved_location)
+                    add_status_control_placement_entries(
+                        menu,
+                        item_id,
+                        resolved_location,
+                        focus_handle,
+                    )
                 })
             })
             .into_any_element();
@@ -452,7 +461,13 @@ fn add_status_control_placement_entries(
     mut menu: ContextMenu,
     item_id: &'static str,
     resolved_location: StatusBarItemLocation,
+    focus_handle: FocusHandle,
 ) -> ContextMenu {
+    // Action entries focus this handle before they dispatch, and
+    // `CustomizeWorkspaceLayout` is registered on `Workspace`. The status bar is
+    // inside the workspace's element tree, so its own handle puts the registered
+    // handler above the dispatch; without it the entry would resolve to nothing.
+    menu = menu.context(focus_handle);
     menu = menu.header("Bottom Bar Placement");
     for (location, label) in [
         (StatusBarItemLocation::Left, "Left"),
@@ -468,6 +483,16 @@ fn add_status_control_placement_entries(
             move |window, cx| set_status_control_location(item_id, location, window, cx),
         );
     }
+    // The way back from `Hidden`. An item placed `Hidden` renders in no zone, so
+    // this menu disappears along with it — the exit has to be offered while the
+    // item is still there to right-click. Carries `item_id` so the surface opens
+    // on this control's row rather than at the top of twenty-one.
+    menu = menu.separator().action(
+        "Customize Workspace Layout…",
+        Box::new(CustomizeWorkspaceLayout {
+            item_id: Some(item_id.to_string()),
+        }),
+    );
     menu
 }
 

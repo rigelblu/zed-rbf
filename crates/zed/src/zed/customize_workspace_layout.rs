@@ -249,6 +249,18 @@ impl CustomizeWorkspaceLayoutModal {
                 .show_scrollbar(true)
         });
 
+        // `Picker` never scrolls to the index a delegate starts with:
+        // `render_element_container` builds the list from `match_count` alone and
+        // consults `selected_index` nowhere, so only `set_selected_index` moves the
+        // viewport. Without this, arriving from an item's own menu would select a
+        // row below the fold and show the top of the list — the surface would open
+        // looking exactly as if no item had been named, which is the whole reason
+        // the entry points pass one.
+        let initial_index = picker.read(cx).delegate.selected_index;
+        picker.update(cx, |picker, cx| {
+            picker.set_selected_index(initial_index, None, true, window, cx);
+        });
+
         // Rows read their placement from settings, so a write from any source —
         // this surface, either right-click menu, or a hand edit — has to redraw
         // them or the surface becomes the stale second opinion.
