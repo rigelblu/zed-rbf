@@ -9278,10 +9278,15 @@ impl Panel for ProjectPanel {
         ProjectPanelSettings::get_global(cx).default_width
     }
 
-    fn icon(&self, _: &Window, cx: &App) -> Option<IconName> {
-        ProjectPanelSettings::get_global(cx)
-            .button
-            .then_some(IconName::FileTree)
+    fn icon(&self, _: &Window, _cx: &App) -> Option<IconName> {
+        // Deliberately not gated on the legacy `button` setting. `Dock` decides
+        // whether a component's icon shows, from `component_positions.<key>.hidden`,
+        // and `PanelButtons::render` filters on it. Reading `button` here made that
+        // one fact have two answers, and this one won by returning `None` — the icon
+        // vanished while the component stayed open and placed. The migration
+        // decision of 2026-08-31 already rules `button` ignored; only the read
+        // outlived the gesture that wrote it.
+        Some(IconName::FileTree)
     }
 
     fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {

@@ -1650,9 +1650,16 @@ impl Panel for TerminalPanel {
     }
 
     fn icon(&self, _window: &Window, cx: &App) -> Option<IconName> {
-        if (self.is_enabled(cx) || !self.has_no_terminals(cx))
-            && TerminalSettings::get_global(cx).button
-        {
+        // Deliberately not gated on the legacy `button` setting. `Dock` decides
+        // whether a component's icon shows, from `component_positions.<key>.hidden`,
+        // and `PanelButtons::render` filters on it. Reading `button` here made that
+        // one fact have two answers, and this one won by returning `None` — the icon
+        // vanished while the component stayed open and placed. The migration
+        // decision of 2026-08-31 already rules `button` ignored; only the read
+        // outlived the gesture that wrote it.
+        // The enabled/has-terminals condition stays: it answers whether there is
+        // anything to show, not whether the user placed it.
+        if self.is_enabled(cx) || !self.has_no_terminals(cx) {
             Some(IconName::TerminalAlt)
         } else {
             None

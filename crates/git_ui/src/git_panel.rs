@@ -10580,8 +10580,15 @@ impl Panel for GitPanel {
         GitPanelSettings::get_global(cx).default_width
     }
 
-    fn icon(&self, _: &Window, cx: &App) -> Option<ui::IconName> {
-        Some(ui::IconName::GitBranch).filter(|_| GitPanelSettings::get_global(cx).button)
+    fn icon(&self, _: &Window, _cx: &App) -> Option<ui::IconName> {
+        // Deliberately not gated on the legacy `button` setting. `Dock` decides
+        // whether a component's icon shows, from `component_positions.<key>.hidden`,
+        // and `PanelButtons::render` filters on it. Reading `button` here made that
+        // one fact have two answers, and this one won by returning `None` — the icon
+        // vanished while the component stayed open and placed. The migration
+        // decision of 2026-08-31 already rules `button` ignored; only the read
+        // outlived the gesture that wrote it.
+        Some(ui::IconName::GitBranch)
     }
 
     fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {

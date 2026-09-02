@@ -5028,7 +5028,16 @@ impl Panel for AgentPanel {
     }
 
     fn icon(&self, _window: &Window, cx: &App) -> Option<IconName> {
-        (self.enabled(cx) && AgentSettings::get_global(cx).button).then_some(IconName::ZedAssistant)
+        // Deliberately not gated on the legacy `button` setting. `Dock` decides
+        // whether a component's icon shows, from `component_positions.<key>.hidden`,
+        // and `PanelButtons::render` filters on it. Reading `button` here made that
+        // one fact have two answers, and this one won by returning `None` — the icon
+        // vanished while the component stayed open and placed. The migration
+        // decision of 2026-08-31 already rules `button` ignored; only the read
+        // outlived the gesture that wrote it.
+        // `enabled` stays: it answers whether the feature exists at all, which is
+        // a different question from whether the user placed its icon.
+        self.enabled(cx).then_some(IconName::ZedAssistant)
     }
 
     fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {

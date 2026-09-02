@@ -1514,18 +1514,22 @@ impl Panel for DebugPanel {
         Some(proto::PanelId::DebugPanel)
     }
 
-    fn icon(&self, _window: &Window, cx: &App) -> Option<IconName> {
-        DebuggerSettings::get_global(cx)
-            .button
-            .then_some(IconName::Debug)
+    fn icon(&self, _window: &Window, _cx: &App) -> Option<IconName> {
+        // Deliberately not gated on the legacy `button` setting. `Dock` decides
+        // whether a component's icon shows, from `component_positions.<key>.hidden`,
+        // and `PanelButtons::render` filters on it. Reading `button` here made that
+        // one fact have two answers, and this one won by returning `None` — the icon
+        // vanished while the component stayed open and placed. The migration
+        // decision of 2026-08-31 already rules `button` ignored; only the read
+        // outlived the gesture that wrote it.
+        Some(IconName::Debug)
     }
 
-    fn icon_tooltip(&self, _window: &Window, cx: &App) -> Option<&'static str> {
-        if DebuggerSettings::get_global(cx).button {
-            Some("Debug Panel")
-        } else {
-            None
-        }
+    fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
+        // Gated on `button` too, and a `None` here is worse than a missing icon:
+        // `dock.rs` treats an absent tooltip as an error, logs it, and renders no
+        // button at all.
+        Some("Debug Panel")
     }
 
     fn toggle_action(&self) -> Box<dyn Action> {
