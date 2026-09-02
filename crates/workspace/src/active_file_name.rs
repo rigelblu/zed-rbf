@@ -1,13 +1,10 @@
 use gpui::{
     App, Context, Empty, EventEmitter, IntoElement, ParentElement, Render, SharedString, Window,
 };
-use settings::Settings;
 use ui::{Button, Tooltip, prelude::*};
 use util::paths::PathStyle;
 
-use crate::{
-    HideStatusItem, StatusItemView, item::ItemHandle, workspace_settings::StatusBarSettings,
-};
+use crate::{HideStatusItem, StatusItemView, item::ItemHandle};
 
 pub struct ActiveFileName {
     project_path: Option<SharedString>,
@@ -24,11 +21,16 @@ impl ActiveFileName {
 }
 
 impl Render for ActiveFileName {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if !StatusBarSettings::get_global(cx).show_active_file {
-            return Empty.into_any_element();
-        }
-
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        // Deliberately does not consult `show_active_file`. `StatusBar` already
+        // decides whether this item draws, through
+        // `resolved_status_control_location`, which makes an explicit placement
+        // outrank the legacy boolean and resolves to `Hidden` when there is no
+        // placement and the boolean is off — so the default is unchanged and a
+        // placed item is no longer suppressed. Reading the boolean here too made
+        // "is it showing" a fact with two answers, and this one won by drawing
+        // nothing: placing the item moved it into a zone where it rendered an
+        // empty element. Observed in dogfood B4-6.
         let Some(project_path) = self.project_path.clone() else {
             return Empty.into_any_element();
         };
