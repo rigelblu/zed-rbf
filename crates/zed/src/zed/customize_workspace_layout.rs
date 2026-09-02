@@ -19,7 +19,7 @@ use ui::{
     ToggleButtonSimple, prelude::*,
 };
 use workspace::{
-    CustomizeWorkspaceLayout, ModalView, StatusBarSettings, Workspace,
+    CustomizeWorkspaceLayout, ModalView, Workspace,
     dock::{DockPosition, set_component_hidden, set_component_position},
     layout_registry::{self, LayoutItem, LayoutItemKind, LayoutPosition},
     set_status_control_location,
@@ -488,21 +488,33 @@ impl PickerDelegate for CustomizeWorkspaceLayoutDelegate {
 /// arms below are the real shapes rather than padding every row to four.
 fn render_placement_choices(item: &'static LayoutItem, state: &RowState) -> AnyElement {
     let id: SharedString = format!("layout-placement-{}", item.id).into();
+    // The group must be told which slot is current, rather than each button being
+    // told whether it is: `ToggleButtonGroup` styles a button when
+    // `entry_index == self.selected_index || selected`, and `selected_index`
+    // defaults to 0. Driving this per button leaves that default in place, so slot
+    // 0 lights on every row *in addition to* the real answer — which only looks
+    // intermittent because the rows whose answer is slot 0 then appear correct.
+    //
+    // `usize::MAX` is how "nothing is current" is expressed: the comparison is a
+    // plain `==`, so no slot matches and no button lights. A row can genuinely have
+    // no current placement — `effective_location_for` returns `None` for a
+    // registered control that this workspace's bar never instantiated.
     let selected = state.current.unwrap_or(usize::MAX);
     let button = |slot: usize| {
         let placement = state.choices[slot];
         ToggleButtonSimple::new(placement.label(), move |_, window, cx| {
             apply(item, placement, window, cx)
         })
-        .selected(slot == selected)
     };
 
     match state.choices.len() {
         3 => ToggleButtonGroup::single_row(id, [button(0), button(1), button(2)])
+            .selected_index(selected)
             .style(ToggleButtonGroupStyle::Outlined)
             .width(rems(19.))
             .into_any_element(),
         4 => ToggleButtonGroup::single_row(id, [button(0), button(1), button(2), button(3)])
+            .selected_index(selected)
             .style(ToggleButtonGroupStyle::Outlined)
             .width(rems(19.))
             .into_any_element(),
