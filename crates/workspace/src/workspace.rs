@@ -9190,6 +9190,54 @@ impl Workspace {
         });
     }
 
+    /// Put the seam under the pointer, the same way the editor-facing divider does
+    /// — `resize_left_dock` is handed `position.x - bounds.left()` and nothing is
+    /// remembered between frames.
+    ///
+    /// An earlier version tracked the drag's origin instead, and it jumped: the
+    /// `Point` `on_drag` hands its constructor is `event.position - hitbox.origin`,
+    /// the cursor's offset **inside the 6px handle**, not a window coordinate. Held
+    /// as an origin against absolute move positions, every frame asked for a width
+    /// several hundred pixels off and pinned to the clamp. Deriving the seam from
+    /// geometry each frame cannot drift and needs no state to get wrong.
+    fn resize_dock_seam(
+        &mut self,
+        position: DockPosition,
+        index: usize,
+        x: Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if index == 0 {
+            return;
+        }
+        let dock = self.dock_at_position(position).clone();
+        let Some(dock_total) = dock.read_with(cx, |dock, cx| self.dock_size(dock, window, cx))
+        else {
+            return;
+        };
+        let widths = dock.read_with(cx, |dock, cx| dock.rendered_widths(dock_total, window, cx));
+        if index >= widths.len() {
+            return;
+        }
+        let preceding = widths[..index - 1]
+            .iter()
+            .fold(Pixels::ZERO, |sum, width| sum + *width);
+        // The side is flush against the workspace edge it docks to, which is the
+        // same assumption `resize_left_dock` and `resize_right_dock` already make.
+        let dock_leading_edge = match position {
+            DockPosition::Left => self.bounds.left(),
+            DockPosition::Right => self.bounds.right() - dock_total,
+            DockPosition::Bottom => return,
+        };
+        let target = x - dock_leading_edge - preceding;
+
+        dock.update(cx, |dock, cx| {
+            dock.resize_seam(index, target, dock_total, window, cx);
+        });
+        self.serialize_workspace(window, cx);
+    }
+
     fn resize_bottom_dock(&mut self, new_size: Pixels, window: &mut Window, cx: &mut App) {
         // No floor here yet: the bottom dock resizes on height, and the registry
         // publishes a bottom *segment width* for the row's internal dividers. The
@@ -9713,6 +9761,23 @@ impl Render for DraggedDock {
     }
 }
 
+/// A drag on the seam between two open columns. Deliberately a separate payload
+/// from [`DraggedDock`]: that one sets the side's total width and this one only
+/// redistributes inside it, so a handler cannot serve the wrong one by accident.
+#[derive(Clone)]
+struct DraggedDockSeam {
+    position: DockPosition,
+    /// The seam sits on this column's leading edge, in drawn order, so it is
+    /// always between columns `index - 1` and `index` and never zero.
+    index: usize,
+}
+
+impl Render for DraggedDockSeam {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         static FIRST_PAINT: AtomicBool = AtomicBool::new(true);
@@ -9914,6 +9979,21 @@ impl Render for Workspace {
                                             };
                                             workspace.serialize_workspace(window, cx);
                                         }
+                                    },
+                                ))
+                                .on_drag_move(cx.listener(
+                                    move |workspace,
+                                          e: &DragMoveEvent<DraggedDockSeam>,
+                                          window,
+                                          cx| {
+                                        let seam = e.drag(cx).clone();
+                                        workspace.resize_dock_seam(
+                                            seam.position,
+                                            seam.index,
+                                            e.event.position.x,
+                                            window,
+                                            cx,
+                                        );
                                     },
                                 ))
                             })
@@ -12448,7 +12528,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        dock::{PanelEvent, set_component_hidden, test::TestPanel, test::TestPanelB},
+        dock::{
+            PanelEvent, set_component_hidden, test::TestPanel, test::TestPanelB, test::TestPanelC,
+        },
         item::{
             ItemBufferKind, ItemEvent,
             test::{TestItem, TestProjectItem},
@@ -16651,6 +16733,308 @@ mod tests {
                 Some(px(700.)),
                 "a width the components can honour must pass through untouched; a \
                  floor that also raises comfortable widths is over-clamping"
+            );
+        });
+    }
+
+    /// Two fixed columns on the left, each 400 of an 800px side. The seam is
+    /// driven through `resize_dock_seam`, which is what the drag-move listener
+    /// calls; `Dock::resize_seam` on its own would skip the geometry entirely.
+    /// `x` is an absolute window coordinate, so a target is written as
+    /// `bounds.left() + <the width the leading column should end up>`.
+    async fn two_fixed_left_columns(
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        Entity<Workspace>,
+        Entity<TestPanel>,
+        Entity<TestPanelB>,
+        &mut VisualTestContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        set_panel_pinned(cx, "TestPanel", true);
+        set_panel_pinned(cx, "TestPanelB", true);
+
+        let (leading, trailing) = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.bounds.size.width = px(1600.);
+            let leading = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+            workspace.add_panel(leading.clone(), window, cx);
+            let trailing = cx.new(|cx| TestPanelB::new(DockPosition::Left, 101, cx));
+            workspace.add_panel(trailing.clone(), window, cx);
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+                dock.activate_panel(1, window, cx);
+            });
+            workspace.resize_dock(DockPosition::Left, px(800.), window, cx);
+            (leading, trailing)
+        });
+        (workspace, leading, trailing, cx)
+    }
+
+    #[gpui::test]
+    async fn test_a_seam_moves_width_between_its_two_neighbours_only(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (workspace, leading, trailing, cx) = two_fixed_left_columns(cx).await;
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let dock = workspace.left_dock().read(cx);
+            let before = workspace.dock_size(&dock, window, cx);
+            assert_eq!(
+                before,
+                Some(px(800.)),
+                "the fixture did not set the side up"
+            );
+
+            let left = workspace.bounds.left();
+            workspace.resize_dock_seam(DockPosition::Left, 1, left + px(460.), window, cx);
+
+            workspace.left_dock().update(cx, |dock, _cx| {
+                assert_eq!(
+                    dock.stored_panel_size_state(&leading)
+                        .and_then(|state| state.size),
+                    Some(px(460.)),
+                    "the leading column did not land where the pointer put the seam"
+                );
+                assert_eq!(
+                    dock.stored_panel_size_state(&trailing)
+                        .and_then(|state| state.size),
+                    Some(px(340.)),
+                    "the trailing column did not give up what the leading one gained"
+                );
+            });
+
+            let dock = workspace.left_dock().read(cx);
+            assert_eq!(
+                workspace.dock_size(&dock, window, cx),
+                before,
+                "the side's total width moved; a seam trades inside the side, it \
+                 does not resize it"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_a_seam_stops_at_its_neighbours_minimum(cx: &mut gpui::TestAppContext) {
+        let (workspace, leading, trailing, cx) = two_fixed_left_columns(cx).await;
+        let floor = crate::layout_registry::SIDE_COLUMN_MIN_WIDTH;
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let left = workspace.bounds.left();
+            workspace.resize_dock_seam(DockPosition::Left, 1, left + px(800.), window, cx);
+
+            workspace.left_dock().update(cx, |dock, _cx| {
+                assert_eq!(
+                    dock.stored_panel_size_state(&trailing)
+                        .and_then(|state| state.size),
+                    Some(floor),
+                    "the trailing column was pushed under its own minimum"
+                );
+                assert_eq!(
+                    dock.stored_panel_size_state(&leading)
+                        .and_then(|state| state.size),
+                    Some(px(800.) - floor),
+                    "the leading column took less than the seam had left to give"
+                );
+            });
+        });
+    }
+
+    /// The seam is derived from geometry every frame rather than from a
+    /// remembered origin, so overshooting a clamp costs nothing: come back and it
+    /// is under the pointer again.
+    ///
+    /// No mutation kills this witness on its own, and that is the honest reading:
+    /// under absolute positioning the property falls out of the design rather than
+    /// living in a mechanism of its own. It stays because the first build of this
+    /// feature *did* remember an origin and jumped for it — `on_drag` hands its
+    /// constructor `event.position - hitbox.origin`, an offset inside the handle
+    /// rather than a window coordinate — so this is the regression that would come
+    /// back if anyone reintroduced drag state.
+    #[gpui::test]
+    async fn test_a_seam_returns_to_the_pointer_after_being_clamped(cx: &mut gpui::TestAppContext) {
+        let (workspace, leading, _trailing, cx) = two_fixed_left_columns(cx).await;
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let left = workspace.bounds.left();
+            workspace.resize_dock_seam(DockPosition::Left, 1, left + px(800.), window, cx);
+            workspace.resize_dock_seam(DockPosition::Left, 1, left + px(460.), window, cx);
+
+            workspace.left_dock().update(cx, |dock, _cx| {
+                assert_eq!(
+                    dock.stored_panel_size_state(&leading)
+                        .and_then(|state| state.size),
+                    Some(px(460.)),
+                    "the seam did not come back to the pointer"
+                );
+            });
+        });
+    }
+
+    /// Three columns is the smallest side where a seam has anything before it to
+    /// account for. With two, the columns preceding the seam sum to zero and a
+    /// build that forgets them entirely passes every other witness here.
+    #[gpui::test]
+    async fn test_a_seam_accounts_for_the_columns_before_it(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        set_panel_pinned(cx, "TestPanel", true);
+        set_panel_pinned(cx, "TestPanelB", true);
+        set_panel_pinned(cx, "TestPanelC", true);
+
+        let (first, second, third) = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.bounds.size.width = px(1600.);
+            let first = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+            workspace.add_panel(first.clone(), window, cx);
+            let second = cx.new(|cx| TestPanelB::new(DockPosition::Left, 101, cx));
+            workspace.add_panel(second.clone(), window, cx);
+            let third = cx.new(|cx| TestPanelC::new(DockPosition::Left, 102, cx));
+            workspace.add_panel(third.clone(), window, cx);
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+                dock.activate_panel(1, window, cx);
+                dock.activate_panel(2, window, cx);
+            });
+            workspace.resize_dock(DockPosition::Left, px(900.), window, cx);
+            (first, second, third)
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let left = workspace.bounds.left();
+            // Each column starts at 300, so the pair either side of the second
+            // seam is 600 wide and its leading column may be 200..=400. The target
+            // is chosen to land *strictly inside* that range: at 650 into the side
+            // the answer is 350, while forgetting to subtract the 300 before the
+            // seam asks for 650 and the clamp saturates it to 400. An earlier
+            // version of this test asked for 400 exactly, which both arms produce,
+            // and the mutation that drops `preceding` survived it.
+            workspace.resize_dock_seam(DockPosition::Left, 2, left + px(650.), window, cx);
+
+            workspace.left_dock().update(cx, |dock, _cx| {
+                assert_eq!(
+                    dock.stored_panel_size_state(&first)
+                        .and_then(|state| state.size),
+                    Some(px(300.)),
+                    "a column outside the pair was resized"
+                );
+                assert_eq!(
+                    dock.stored_panel_size_state(&second)
+                        .and_then(|state| state.size),
+                    Some(px(350.)),
+                    "the seam ignored the column before it; without subtracting \
+                     that width the target is 650, which the clamp turns into 400"
+                );
+                assert_eq!(
+                    dock.stored_panel_size_state(&third)
+                        .and_then(|state| state.size),
+                    Some(px(250.)),
+                    "the trailing column did not give up exactly what was taken"
+                );
+            });
+        });
+    }
+
+    /// The right side docks against the opposite edge, so its seams are measured
+    /// from `bounds.right() - dock_total`. A build that uses `bounds.left()` for
+    /// both passes every left-side witness.
+    #[gpui::test]
+    async fn test_a_right_side_seam_is_measured_from_the_right_edge(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        set_panel_pinned(cx, "TestPanel", true);
+        set_panel_pinned(cx, "TestPanelB", true);
+
+        let leading = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.bounds.size.width = px(1600.);
+            let first = cx.new(|cx| TestPanel::new(DockPosition::Right, 100, cx));
+            workspace.add_panel(first.clone(), window, cx);
+            let second = cx.new(|cx| TestPanelB::new(DockPosition::Right, 101, cx));
+            workspace.add_panel(second.clone(), window, cx);
+            workspace.right_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+                dock.activate_panel(1, window, cx);
+            });
+            workspace.resize_dock(DockPosition::Right, px(800.), window, cx);
+            // The right dock draws its entries reversed, so the column drawn first
+            // is the one added last.
+            second
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let dock_left = workspace.bounds.right() - px(800.);
+            workspace.resize_dock_seam(DockPosition::Right, 1, dock_left + px(460.), window, cx);
+
+            workspace.right_dock().update(cx, |dock, _cx| {
+                assert_eq!(
+                    dock.stored_panel_size_state(&leading)
+                        .and_then(|state| state.size),
+                    Some(px(460.)),
+                    "the right side's seam was measured from the wrong edge"
+                );
+            });
+        });
+    }
+
+    /// Records the shape that is deliberately not built, so it cannot read as
+    /// covered: `agent.flexible` and `terminal.flexible` both default to `true`,
+    /// and a flexible column renders whatever the side has left over.
+    #[gpui::test]
+    async fn test_a_seam_beside_a_flexible_column_does_not_move(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        set_panel_pinned(cx, "TestPanel", true);
+        set_panel_pinned(cx, "TestPanelB", true);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.bounds.size.width = px(1600.);
+            let flexible = cx.new(|cx| TestPanel::new_flexible(DockPosition::Left, 100, cx));
+            workspace.add_panel(flexible, window, cx);
+            let fixed = cx.new(|cx| TestPanelB::new(DockPosition::Left, 101, cx));
+            workspace.add_panel(fixed.clone(), window, cx);
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+                dock.activate_panel(1, window, cx);
+            });
+
+            workspace.left_dock().update(cx, |dock, inner_cx| {
+                assert!(
+                    !dock.seam_is_resizable(1, window, inner_cx),
+                    "a seam next to a flexible column must not offer a handle"
+                );
+            });
+
+            let before = workspace
+                .left_dock()
+                .read(cx)
+                .stored_panel_size_state(&fixed)
+                .and_then(|state| state.size);
+            let left = workspace.bounds.left();
+            workspace.resize_dock_seam(DockPosition::Left, 1, left + px(600.), window, cx);
+            let after = workspace
+                .left_dock()
+                .read(cx)
+                .stored_panel_size_state(&fixed)
+                .and_then(|state| state.size);
+            assert_eq!(
+                before, after,
+                "the drag moved a column the handle is not drawn on; the guard \
+                 belongs in the resize too, not only in the render"
             );
         });
     }

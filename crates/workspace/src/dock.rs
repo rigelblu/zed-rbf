@@ -3,8 +3,8 @@ use crate::persistence::WorkspaceDb;
 use crate::persistence::model::DockData;
 use crate::status_bar::HideStatusItem;
 use crate::{
-    DraggedDock, Event, FocusFollowsMouse, ModalLayer, Pane, WorkspaceLayoutSettings,
-    WorkspaceSettings,
+    DraggedDock, DraggedDockSeam, Event, FocusFollowsMouse, ModalLayer, Pane,
+    WorkspaceLayoutSettings, WorkspaceSettings,
 };
 use crate::{
     Workspace,
@@ -871,16 +871,165 @@ impl Dock {
 
     // Display order: `panel_entries` order, reversed on the right so the
     // columns read left-to-right like the reversed icons in the bottom bar.
-    fn open_entries(&self) -> Vec<&PanelEntry> {
-        let mut entries: Vec<&PanelEntry> = self
+    /// Indices into `panel_entries` for the open panels, in the order they are
+    /// drawn left to right. `open_entries` is defined in terms of this so a seam
+    /// index and a rendered column cannot disagree about which pair they name.
+    fn open_entry_indices(&self) -> Vec<usize> {
+        let mut indices: Vec<usize> = self
             .panel_entries
             .iter()
-            .filter(|entry| self.open_panels.contains(&entry.panel.panel_id()))
+            .enumerate()
+            .filter(|(_, entry)| self.open_panels.contains(&entry.panel.panel_id()))
+            .map(|(index, _)| index)
             .collect();
         if self.position == DockPosition::Right {
-            entries.reverse();
+            indices.reverse();
         }
-        entries
+        indices
+    }
+
+    fn open_entries(&self) -> Vec<&PanelEntry> {
+        self.open_entry_indices()
+            .into_iter()
+            .filter_map(|index| self.panel_entries.get(index))
+            .collect()
+    }
+
+    /// What each open column is actually as wide as right now, in drawn order.
+    /// A fixed column reports its stored width; a flexible one has none, so it
+    /// reports the share of the dock's leftover space its flex factor earns —
+    /// which is the number a drag has to reason about, because it is the one on
+    /// screen.
+    pub(crate) fn rendered_widths(
+        &self,
+        dock_total: Pixels,
+        window: &Window,
+        cx: &App,
+    ) -> Vec<Pixels> {
+        let fixed_total = self.open_fixed_size(window, cx);
+        let flex_total = self.open_flex(None, window, cx).unwrap_or(0.0);
+        let leftover = (dock_total - fixed_total).max(Pixels::ZERO);
+        self.open_entries()
+            .into_iter()
+            .map(|entry| {
+                if panel_uses_flexible_width(self.position, entry.panel.as_ref(), window, cx) {
+                    if flex_total > 0.0 {
+                        leftover * (entry.size_state.flex.unwrap_or(1.0) / flex_total)
+                    } else {
+                        leftover
+                    }
+                } else {
+                    entry
+                        .size_state
+                        .size
+                        .unwrap_or_else(|| entry.panel.default_size(window, cx))
+                }
+            })
+            .collect()
+    }
+
+    /// Whether the seam on column `index`'s leading edge can be dragged at all.
+    ///
+    /// Only when **both** neighbours hold a pixel width. A flexible column has no
+    /// width of its own — it renders whatever the side has left over — so moving
+    /// width into or out of one changes the side's total rather than trading
+    /// inside it, which is the opposite of what an internal divider promises. With
+    /// `agent.flexible` and `terminal.flexible` both defaulting to `true`, that is
+    /// a common pair rather than an edge case, and making it behave needs the
+    /// fixed/flexible split in `dock_size` reworked — the same math the
+    /// editor-facing divider depends on. Until then no handle is drawn there: a
+    /// control that looks live and does nothing is the worse defect.
+    pub(crate) fn seam_is_resizable(&self, index: usize, window: &Window, cx: &App) -> bool {
+        let Some(leading_index) = index.checked_sub(1) else {
+            return false;
+        };
+        let entries = self.open_entries();
+        let (Some(leading), Some(trailing)) = (entries.get(leading_index), entries.get(index))
+        else {
+            return false;
+        };
+        ![leading, trailing]
+            .into_iter()
+            .any(|entry| panel_uses_flexible_width(self.position, entry.panel.as_ref(), window, cx))
+    }
+
+    /// Move the seam on column `index`'s leading edge so the column before it
+    /// becomes `leading_target` wide, taking the difference from the column after
+    /// it and leaving every other column and the side's total untouched.
+    pub(crate) fn resize_seam(
+        &mut self,
+        index: usize,
+        leading_target: Pixels,
+        dock_total: Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.seam_is_resizable(index, window, cx) {
+            return;
+        }
+        let indices = self.open_entry_indices();
+        let (Some(&leading_index), Some(&trailing_index)) = (
+            index.checked_sub(1).and_then(|i| indices.get(i)),
+            indices.get(index),
+        ) else {
+            return;
+        };
+        let widths = self.rendered_widths(dock_total, window, cx);
+        let (Some(&leading_width), Some(&trailing_width)) =
+            (widths.get(index - 1), widths.get(index))
+        else {
+            return;
+        };
+
+        let pair_total = leading_width + trailing_width;
+        let leading_min = effective_min_width_at(
+            self.position,
+            self.panel_entries[leading_index].panel.as_ref(),
+            window,
+            cx,
+        );
+        let trailing_min = effective_min_width_at(
+            self.position,
+            self.panel_entries[trailing_index].panel.as_ref(),
+            window,
+            cx,
+        );
+        // Both minimums cannot be honoured when the pair is narrower than their
+        // sum, which the side floor prevents by drag but a restored layout can
+        // still produce. Refusing to move is better than picking a winner.
+        if pair_total < leading_min + trailing_min {
+            return;
+        }
+        let leading_new = leading_target.clamp(leading_min, pair_total - trailing_min);
+        let trailing_new = pair_total - leading_new;
+
+        let resized = [
+            (leading_index, Some(leading_new), None),
+            (trailing_index, Some(trailing_new), None),
+        ];
+
+        let mut size_states_to_persist = Vec::new();
+        for (entry_index, size, flex) in resized {
+            let position = self.position;
+            let Some(entry) = self.panel_entries.get_mut(entry_index) else {
+                continue;
+            };
+            size_states_to_persist
+                .push(resize_panel_entry(position, entry, size, flex, window, cx));
+        }
+
+        let workspace = self.workspace.clone();
+        cx.defer(move |cx| {
+            if let Some(workspace) = workspace.upgrade() {
+                workspace.update(cx, |workspace, cx| {
+                    for (panel_key, size_state) in size_states_to_persist {
+                        workspace.persist_panel_size_state(panel_key, size_state, cx);
+                    }
+                });
+            }
+        });
+
+        cx.notify();
     }
 
     pub fn open_panels(&self) -> Vec<Arc<dyn PanelHandle>> {
@@ -1839,6 +1988,35 @@ impl Render for Dock {
             }
         };
 
+        // One handle per seam, straddling the border the column already draws.
+        // `deferred` is what lets it sit half outside its own column despite the
+        // `overflow_hidden` — the same reason the editor-facing handle uses it.
+        // No `cx.listener` here: the map below borrows `cx` too, and nothing this
+        // handle does needs `&mut Dock`.
+        let seam_is_resizable: Vec<bool> = (0..open_entries.len())
+            .map(|index| self.seam_is_resizable(index, window, cx))
+            .collect();
+        let create_seam_handle = move |index: usize| {
+            deferred(
+                div()
+                    .id(("dock-seam-handle", index))
+                    .on_drag(DraggedDockSeam { position, index }, |seam, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.new(|_| seam.clone())
+                    })
+                    .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _window, cx| {
+                        cx.stop_propagation();
+                    })
+                    .occlude()
+                    .absolute()
+                    .left(-RESIZE_HANDLE_SIZE / 2.)
+                    .top(px(0.))
+                    .h_full()
+                    .w(RESIZE_HANDLE_SIZE)
+                    .cursor_col_resize(),
+            )
+        };
+
         let columns: Vec<AnyElement> = open_entries
             .iter()
             .enumerate()
@@ -1873,6 +2051,9 @@ impl Render for Dock {
                 }
                 if ix > 0 {
                     column = column.border_l_1().border_color(border);
+                    if seam_is_resizable[ix] {
+                        column = column.child(create_seam_handle(ix));
+                    }
                 }
                 column.into_any_element()
             })
@@ -2501,6 +2682,83 @@ pub mod test {
     }
 
     impl Focusable for TestPanelB {
+        fn focus_handle(&self, _cx: &App) -> FocusHandle {
+            self.focus_handle.clone()
+        }
+    }
+
+    /// A third panel type. Pinning and registration are keyed by panel type, so
+    /// three columns on one side needs three types — and three is the smallest
+    /// side on which a seam has any column before it to account for.
+    pub struct TestPanelC {
+        pub position: DockPosition,
+        pub focus_handle: FocusHandle,
+        pub activation_priority: u32,
+    }
+    actions!(test_only, [ToggleTestPanelC]);
+
+    impl EventEmitter<PanelEvent> for TestPanelC {}
+
+    impl TestPanelC {
+        pub fn new(position: DockPosition, activation_priority: u32, cx: &mut App) -> Self {
+            Self {
+                position,
+                focus_handle: cx.focus_handle(),
+                activation_priority,
+            }
+        }
+    }
+
+    impl Render for TestPanelC {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div().id("test-c").track_focus(&self.focus_handle(cx))
+        }
+    }
+
+    impl Panel for TestPanelC {
+        fn persistent_name() -> &'static str {
+            "TestPanelC"
+        }
+
+        fn panel_key() -> &'static str {
+            "TestPanelC"
+        }
+
+        fn position(&self, _window: &Window, _: &App) -> DockPosition {
+            self.position
+        }
+
+        fn position_is_valid(&self, _: DockPosition) -> bool {
+            true
+        }
+
+        fn set_position(&mut self, position: DockPosition, _: &mut Window, cx: &mut Context<Self>) {
+            self.position = position;
+            cx.update_global::<SettingsStore, _>(|_, _| {});
+        }
+
+        fn default_size(&self, _window: &Window, _: &App) -> Pixels {
+            px(300.)
+        }
+
+        fn icon(&self, _window: &Window, _: &App) -> Option<ui::IconName> {
+            None
+        }
+
+        fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
+            None
+        }
+
+        fn toggle_action(&self) -> Box<dyn Action> {
+            ToggleTestPanelC.boxed_clone()
+        }
+
+        fn activation_priority(&self) -> u32 {
+            self.activation_priority
+        }
+    }
+
+    impl Focusable for TestPanelC {
         fn focus_handle(&self, _cx: &App) -> FocusHandle {
             self.focus_handle.clone()
         }
