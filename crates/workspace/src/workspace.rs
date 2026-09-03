@@ -1537,56 +1537,54 @@ pub enum OpenMode {
 /// flexible, and `fixed` was zero whenever flex mattered. The multi-component
 /// model puts fixed and flexible columns on the same side, which is why both
 /// directions now have to name `fixed` explicitly.
-struct DockGeometry {
-    /// Width available to flex once every fixed column on both sides is paid for.
-    available: Pixels,
+pub(crate) struct DockGeometry {
+    /// The workspace's own width — everything below is measured out of it.
+    workspace_width: Pixels,
+    /// The opposite side's fixed columns, summed. Not available to this dock's flex.
+    opposite_fixed: Pixels,
     /// Flex competing with this dock's: the centre's columns plus the opposite side's.
     competing_flex: f32,
-    /// This dock's fixed columns, summed.
-    fixed: Pixels,
 }
 
 impl DockGeometry {
+    /// Width available to flex once every fixed column on both sides is paid for.
+    ///
+    /// `fixed` is a parameter rather than stored state because the callers that
+    /// need this most are the ones that *change* it: a column turning flexible
+    /// releases its width, and a seam beside a flexible column moves width
+    /// between the fixed and flexible halves of the same side.
+    fn available(&self, fixed: Pixels) -> Pixels {
+        (self.workspace_width - fixed - self.opposite_fixed).max(RESIZE_HANDLE_SIZE)
+    }
+
     /// Width this dock's flexible columns occupy for a given total flex factor.
-    fn flex_share(&self, flex: f32) -> Pixels {
-        (flex / (flex + self.competing_flex) * self.available).max(RESIZE_HANDLE_SIZE)
+    fn flex_share(&self, fixed: Pixels, flex: f32) -> Pixels {
+        (flex / (flex + self.competing_flex) * self.available(fixed)).max(RESIZE_HANDLE_SIZE)
     }
 
     /// `flex_share`, but a side with no flexible column occupies nothing rather
     /// than the handle's 6px — the floor exists to keep a *live* flexible column
     /// grabbable, and there is none to keep.
-    fn flex_share_or_zero(&self, flex: f32) -> Pixels {
+    fn flex_share_or_zero(&self, fixed: Pixels, flex: f32) -> Pixels {
         if flex <= 0.0 {
             return Pixels::ZERO;
         }
-        self.flex_share(flex)
+        self.flex_share(fixed, flex)
     }
 
-    /// The inverse of `flex_share`: the flex factor whose share is `share`.
-    fn flex_for_share(&self, share: Pixels) -> f32 {
+    /// The inverse of `flex_share`: the flex factor whose share is `share` when
+    /// the dock's fixed columns total `fixed`.
+    fn flex_for_share(&self, fixed: Pixels, share: Pixels) -> f32 {
         let share = share.max(Pixels::ZERO);
-        let headroom = (self.available - share).max(px(1.));
+        let headroom = (self.available(fixed) - share).max(px(1.));
         (share * self.competing_flex / headroom).max(0.0)
     }
 
     /// The flex factor that lays the dock out at `size` overall, its fixed
     /// columns included. Subtracting them is the step the pre-mixed math had no
-    /// reason to take, and it is only correct while the dock's composition is
-    /// unchanged — a panel *becoming* flexible is still counted in `fixed` here,
-    /// so that path builds its own geometry instead (see
-    /// `Workspace::toggle_dock_panel_flexible_size`).
-    fn flex_for_size(&self, size: Pixels) -> f32 {
-        self.flex_for_share(size - self.fixed)
-    }
-
-    /// The same geometry with `width` no longer paid for out of `fixed` — what a
-    /// column becoming flexible frees up.
-    fn releasing_fixed(&self, width: Pixels) -> Self {
-        Self {
-            available: self.available + width,
-            competing_flex: self.competing_flex,
-            fixed: (self.fixed - width).max(Pixels::ZERO),
-        }
+    /// reason to take.
+    fn flex_for_size(&self, fixed: Pixels, size: Pixels) -> f32 {
+        self.flex_for_share(fixed, size - fixed)
     }
 }
 
@@ -2664,28 +2662,28 @@ impl Workspace {
         // nothing else fixed.
         let current_flex = {
             let read = dock.read(cx);
-            self.dock_geometry(read, position, window, cx)
-                .map(|geometry| {
-                    let width = read
-                        .stored_panel_size_state(panel)
-                        .and_then(|state| state.size)
-                        .unwrap_or_else(|| panel.default_size(window, cx));
-                    let siblings = read
-                        .open_flex(self.default_dock_flex(position), window, cx)
-                        .unwrap_or(0.0);
-                    let target = geometry.flex_share_or_zero(siblings) + width;
-                    let total = geometry.releasing_fixed(width).flex_for_share(target);
-                    (total - siblings).max(0.0)
-                })
+            self.dock_geometry(position, window, cx).map(|geometry| {
+                let fixed = read.open_fixed_size(window, cx);
+                let width = read
+                    .stored_panel_size_state(panel)
+                    .and_then(|state| state.size)
+                    .unwrap_or_else(|| panel.default_size(window, cx));
+                let siblings = read
+                    .open_flex(self.default_dock_flex(position), window, cx)
+                    .unwrap_or(0.0);
+                let target = geometry.flex_share_or_zero(fixed, siblings) + width;
+                // Releasing the column is just a smaller `fixed` now.
+                let total = geometry.flex_for_share((fixed - width).max(Pixels::ZERO), target);
+                (total - siblings).max(0.0)
+            })
         };
         dock.update(cx, |dock, cx| {
             dock.toggle_panel_flexible_size(panel, current_size, current_flex, window, cx);
         });
     }
 
-    fn dock_geometry(
+    pub(crate) fn dock_geometry(
         &self,
-        dock: &Dock,
         position: DockPosition,
         window: &Window,
         cx: &App,
@@ -2694,12 +2692,11 @@ impl Workspace {
         if workspace_width <= Pixels::ZERO {
             return None;
         }
-        let fixed = dock.open_fixed_size(window, cx);
         let (opposite_fixed, opposite_flex) = self.opposite_dock_size_summary(position, window, cx);
         Some(DockGeometry {
-            available: (workspace_width - fixed - opposite_fixed).max(RESIZE_HANDLE_SIZE),
+            workspace_width,
+            opposite_fixed,
             competing_flex: self.center_full_height_column_count() + opposite_flex.unwrap_or(0.0),
-            fixed,
         })
     }
 
@@ -2715,14 +2712,14 @@ impl Workspace {
         let Some(flex) = dock.open_flex(self.default_dock_flex(position), window, cx) else {
             return Some(fixed);
         };
-        let geometry = self.dock_geometry(dock, position, window, cx)?;
+        let geometry = self.dock_geometry(position, window, cx)?;
         let flex = flex.max(0.001);
         // One share for both cases. An opposite side with no flexible column
         // contributes zero competing flex, which reproduces the fixed-opposite
         // branch this replaced; what changes is that the flexible-opposite case
         // now shares `available` rather than the whole workspace width, so a
         // mixed side stops claiming its own fixed columns' pixels twice.
-        Some(fixed + geometry.flex_share(flex))
+        Some(fixed + geometry.flex_share(fixed, flex))
     }
 
     /// The flex factor that lays this dock out at `size` overall — the inverse of
@@ -2742,9 +2739,12 @@ impl Workspace {
         if position.axis() != Axis::Horizontal {
             return None;
         }
-        let dock = self.dock_at_position(position).read(cx);
-        let geometry = self.dock_geometry(dock, position, window, cx)?;
-        Some(geometry.flex_for_size(size))
+        let fixed = self
+            .dock_at_position(position)
+            .read(cx)
+            .open_fixed_size(window, cx);
+        let geometry = self.dock_geometry(position, window, cx)?;
+        Some(geometry.flex_for_size(fixed, size))
     }
 
     /// The opposite side's open panels as one width: fixed px plus total flex.
@@ -9321,8 +9321,11 @@ impl Workspace {
         };
         let target = x - dock_leading_edge - preceding;
 
+        let Some(geometry) = self.dock_geometry(position, window, cx) else {
+            return;
+        };
         dock.update(cx, |dock, cx| {
-            dock.resize_seam(index, target, dock_total, window, cx);
+            dock.resize_seam(index, target, dock_total, &geometry, window, cx);
         });
         self.serialize_workspace(window, cx);
     }
@@ -17102,7 +17105,7 @@ mod tests {
         let leading = workspace.update_in(cx, |workspace, window, cx| {
             workspace.bounds.size.width = px(1600.);
             let first = cx.new(|cx| TestPanel::new(DockPosition::Right, 100, cx));
-            workspace.add_panel(first.clone(), window, cx);
+            workspace.add_panel(first, window, cx);
             let second = cx.new(|cx| TestPanelB::new(DockPosition::Right, 101, cx));
             workspace.add_panel(second.clone(), window, cx);
             workspace.right_dock().update(cx, |dock, cx| {
@@ -17130,11 +17133,14 @@ mod tests {
         });
     }
 
-    /// Records the shape that is deliberately not built, so it cannot read as
-    /// covered: `agent.flexible` and `terminal.flexible` both default to `true`,
-    /// and a flexible column renders whatever the side has left over.
+    /// The shape that used to be refused. `agent.flexible` and `terminal.flexible`
+    /// both default to `true`, so a flexible neighbour is the common pair rather
+    /// than an edge case, and this is the contract that replaced the refusal:
+    /// the seam moves, the pair trades width, and the side's total does not budge.
     #[gpui::test]
-    async fn test_a_seam_beside_a_flexible_column_does_not_move(cx: &mut gpui::TestAppContext) {
+    async fn test_a_seam_beside_a_flexible_column_trades_width_with_it(
+        cx: &mut gpui::TestAppContext,
+    ) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
         let project = Project::test(fs, [], cx).await;
@@ -17153,31 +17159,235 @@ mod tests {
             workspace.left_dock().update(cx, |dock, cx| {
                 dock.activate_panel(0, window, cx);
                 dock.activate_panel(1, window, cx);
+                dock.set_panel_size_state(
+                    &fixed,
+                    dock::PanelSizeState {
+                        size: Some(px(300.)),
+                        flex: None,
+                    },
+                    cx,
+                );
             });
 
             workspace.left_dock().update(cx, |dock, inner_cx| {
                 assert!(
-                    !dock.seam_is_resizable(1, window, inner_cx),
-                    "a seam next to a flexible column must not offer a handle"
+                    dock.seam_is_resizable(1, window, inner_cx),
+                    "a seam next to a flexible column offers a handle now"
                 );
             });
 
-            let before = workspace
+            let total_before = workspace
+                .dock_size(workspace.left_dock().read(cx), window, cx)
+                .expect("the mixed side has a width");
+
+            // The flexible column leads, the fixed one trails. Drag the seam so
+            // the flexible column is 200px narrower than it renders today.
+            let widths = workspace
+                .left_dock()
+                .read(cx)
+                .rendered_widths(total_before, window, cx);
+            let leading_now = widths[0];
+            let left = workspace.bounds.left();
+            workspace.resize_dock_seam(
+                DockPosition::Left,
+                1,
+                left + leading_now - px(200.),
+                window,
+                cx,
+            );
+
+            let fixed_after = workspace
                 .left_dock()
                 .read(cx)
                 .stored_panel_size_state(&fixed)
-                .and_then(|state| state.size);
+                .and_then(|state| state.size)
+                .expect("the fixed column still stores a width");
+            assert!(
+                (fixed_after - (px(300.) + px(200.))).abs() < px(1.5),
+                "the fixed column takes the width the flexible one gave up: \
+                 expected about {:?}, got {fixed_after:?}",
+                px(500.)
+            );
+
+            let total_after = workspace
+                .dock_size(workspace.left_dock().read(cx), window, cx)
+                .expect("the mixed side still has a width");
+            assert!(
+                (total_after - total_before).abs() < px(1.5),
+                "a seam trades width inside the side; it must not move the side's \
+                 total, which is what separates it from the editor-facing divider. \
+                 Went from {total_before:?} to {total_after:?}"
+            );
+        });
+    }
+
+    /// Two flexible neighbours are the case needing no geometry at all: the fixed
+    /// total does not move and the pair's combined share does not either, so the
+    /// seam is a pure redistribution of flex between them.
+    #[gpui::test]
+    async fn test_a_seam_between_two_flexible_columns_redistributes_flex(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        set_panel_pinned(cx, "TestPanel", true);
+        set_panel_pinned(cx, "TestPanelC", true);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.bounds.size.width = px(1600.);
+            let first = cx.new(|cx| TestPanel::new_flexible(DockPosition::Left, 100, cx));
+            workspace.add_panel(first, window, cx);
+            let second = cx.new(|cx| TestPanelC::new_flexible(DockPosition::Left, 101, cx));
+            workspace.add_panel(second, window, cx);
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+                dock.activate_panel(1, window, cx);
+            });
+
+            let total_before = workspace
+                .dock_size(workspace.left_dock().read(cx), window, cx)
+                .expect("the side has a width");
+            let widths = workspace
+                .left_dock()
+                .read(cx)
+                .rendered_widths(total_before, window, cx);
             let left = workspace.bounds.left();
-            workspace.resize_dock_seam(DockPosition::Left, 1, left + px(600.), window, cx);
+            workspace.resize_dock_seam(
+                DockPosition::Left,
+                1,
+                left + widths[0] - px(150.),
+                window,
+                cx,
+            );
+
+            let total_after = workspace
+                .dock_size(workspace.left_dock().read(cx), window, cx)
+                .expect("the side still has a width");
+            assert!(
+                (total_after - total_before).abs() < px(1.5),
+                "two flexible columns trade inside the side: total went from \
+                 {total_before:?} to {total_after:?}"
+            );
+
             let after = workspace
                 .left_dock()
                 .read(cx)
-                .stored_panel_size_state(&fixed)
-                .and_then(|state| state.size);
+                .rendered_widths(total_after, window, cx);
+            assert!(
+                (after[0] - (widths[0] - px(150.))).abs() < px(1.5),
+                "the leading column gives up 150px: {:?} -> {:?}",
+                widths[0],
+                after[0]
+            );
+            assert!(
+                (after[1] - (widths[1] + px(150.))).abs() < px(1.5),
+                "and the trailing column takes it: {:?} -> {:?}",
+                widths[1],
+                after[1]
+            );
+        });
+    }
+
+    /// The trap the design note names: flexible columns divide the leftover in
+    /// proportion to their flex, so moving a seam that changes the *fixed* total
+    /// moves every flexible column — not only the one in the pair — unless each
+    /// one's flex is re-derived to hold its width. Three columns, and the seam is
+    /// nowhere near the third.
+    #[gpui::test]
+    async fn test_a_seam_leaves_a_flexible_column_outside_the_pair_alone(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        set_panel_pinned(cx, "TestPanel", true);
+        set_panel_pinned(cx, "TestPanelB", true);
+        set_panel_pinned(cx, "TestPanelC", true);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.bounds.size.width = px(1600.);
+            // Order follows activation priority: flexible, fixed, flexible.
+            let bystander = cx.new(|cx| TestPanel::new_flexible(DockPosition::Left, 100, cx));
+            workspace.add_panel(bystander, window, cx);
+            let fixed = cx.new(|cx| TestPanelB::new(DockPosition::Left, 101, cx));
+            workspace.add_panel(fixed.clone(), window, cx);
+            let partner = cx.new(|cx| TestPanelC::new_flexible(DockPosition::Left, 102, cx));
+            workspace.add_panel(partner, window, cx);
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+                dock.activate_panel(1, window, cx);
+                dock.activate_panel(2, window, cx);
+                dock.set_panel_size_state(
+                    &fixed,
+                    dock::PanelSizeState {
+                        size: Some(px(300.)),
+                        flex: None,
+                    },
+                    cx,
+                );
+            });
+
+            let total_before = workspace
+                .dock_size(workspace.left_dock().read(cx), window, cx)
+                .expect("the side has a width");
+            let before = workspace
+                .left_dock()
+                .read(cx)
+                .rendered_widths(total_before, window, cx);
+            // Prove the fixture before trusting the assertion: three open columns,
+            // and the one outside the pair is genuinely flexible. A two-column
+            // side cannot express this failure at all.
             assert_eq!(
-                before, after,
-                "the drag moved a column the handle is not drawn on; the guard \
-                 belongs in the resize too, not only in the render"
+                before.len(),
+                3,
+                "this witness needs three open columns; got {before:?}"
+            );
+            assert!(
+                workspace
+                    .left_dock()
+                    .read(cx)
+                    .open_flex(None, window, cx)
+                    .is_some_and(|total| total > 1.0),
+                "two flexible columns must be open, or the bystander is not one"
+            );
+
+            // Seam 2 sits between the fixed column and the trailing flexible one,
+            // so it changes the fixed total. Column 0 is not in the pair.
+            let left = workspace.bounds.left();
+            workspace.resize_dock_seam(
+                DockPosition::Left,
+                2,
+                left + before[0] + before[1] + px(120.),
+                window,
+                cx,
+            );
+
+            let total_after = workspace
+                .dock_size(workspace.left_dock().read(cx), window, cx)
+                .expect("the side still has a width");
+            let after = workspace
+                .left_dock()
+                .read(cx)
+                .rendered_widths(total_after, window, cx);
+
+            assert!(
+                (after[0] - before[0]).abs() < px(1.5),
+                "the flexible column outside the pair must not move: {:?} -> {:?}. \
+                 Its flex has to be re-derived against the new fixed total, or the \
+                 leftover it shares changes underneath it",
+                before[0],
+                after[0]
+            );
+            assert!(
+                (total_after - total_before).abs() < px(1.5),
+                "and the side's total holds: {total_before:?} -> {total_after:?}"
             );
         });
     }

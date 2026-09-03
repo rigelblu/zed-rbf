@@ -930,66 +930,82 @@ impl Dock {
 
     /// Whether the seam on column `index`'s leading edge can be dragged at all.
     ///
-    /// Only when **both** neighbours hold a pixel width. A flexible column has no
-    /// width of its own — it renders whatever the side has left over — so moving
-    /// width into or out of one changes the side's total rather than trading
-    /// inside it, which is the opposite of what an internal divider promises. With
-    /// `agent.flexible` and `terminal.flexible` both defaulting to `true`, that is
-    /// a common pair rather than an edge case, and making it behave needs the
-    /// fixed/flexible split in `dock_size` reworked — the same math the
-    /// editor-facing divider depends on. Until then no handle is drawn there: a
-    /// control that looks live and does nothing is the worse defect.
-    pub(crate) fn seam_is_resizable(&self, index: usize, window: &Window, cx: &App) -> bool {
+    /// Every seam between two open columns now qualifies. A flexible neighbour
+    /// used to disqualify one: a flexible column has no width of its own, so
+    /// moving width into or out of it changed the side's total rather than
+    /// trading inside it, and no handle was drawn rather than shipping a control
+    /// that looks live and does nothing. `resize_seam` holds the side's total by
+    /// construction now — it re-derives every flexible column's flex against the
+    /// fixed total the drag produces — so the refusal is gone.
+    pub(crate) fn seam_is_resizable(&self, index: usize, _window: &Window, _cx: &App) -> bool {
         let Some(leading_index) = index.checked_sub(1) else {
             return false;
         };
         let entries = self.open_entries();
-        let (Some(leading), Some(trailing)) = (entries.get(leading_index), entries.get(index))
-        else {
-            return false;
-        };
-        ![leading, trailing]
-            .into_iter()
-            .any(|entry| panel_uses_flexible_width(self.position, entry.panel.as_ref(), window, cx))
+        entries.get(leading_index).is_some() && entries.get(index).is_some()
     }
 
     /// Move the seam on column `index`'s leading edge so the column before it
     /// becomes `leading_target` wide, taking the difference from the column after
     /// it and leaving every other column and the side's total untouched.
+    ///
+    /// One path covers all four neighbour pairings rather than branching on them.
+    /// Decide the whole side's target widths, split them into the fixed total the
+    /// drag produces and the width left for flex, then derive one flex factor for
+    /// that share and hand each flexible column its proportion of it:
+    ///
+    /// - **two fixed** — nothing flexible, so this reduces to writing the pair
+    /// - **two flexible** — the fixed total does not move and the pair's combined
+    ///   share does not either, so it is a pure redistribution between them
+    /// - **one of each** — the fixed column takes its new width, the flexible one
+    ///   absorbs the complement, and the side's total holds because the fixed
+    ///   total grew by exactly what the flexible share lost
+    ///
+    /// Only the pair is written, and a flexible column outside it provably does
+    /// not need touching. Its flex is `Sf * width / T`, and `Sf / T` reduces to
+    /// `C / (available(fixed) - T)`, whose denominator is `W - opposite - total`.
+    /// A seam holds the side's `total` by contract, so that ratio is invariant
+    /// across the drag and re-deriving a bystander returns the number it already
+    /// had. The bystander witness proves the outcome; this is why it is free —
+    /// and a drag that *did* move the side's total would break the invariant.
     pub(crate) fn resize_seam(
         &mut self,
         index: usize,
         leading_target: Pixels,
         dock_total: Pixels,
+        geometry: &crate::DockGeometry,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if !self.seam_is_resizable(index, window, cx) {
             return;
         }
+        let Some(leading_slot) = index.checked_sub(1) else {
+            return;
+        };
         let indices = self.open_entry_indices();
-        let (Some(&leading_index), Some(&trailing_index)) = (
-            index.checked_sub(1).and_then(|i| indices.get(i)),
-            indices.get(index),
-        ) else {
+        let (Some(&leading_index), Some(&trailing_index)) =
+            (indices.get(leading_slot), indices.get(index))
+        else {
             return;
         };
         let widths = self.rendered_widths(dock_total, window, cx);
         let (Some(&leading_width), Some(&trailing_width)) =
-            (widths.get(index - 1), widths.get(index))
+            (widths.get(leading_slot), widths.get(index))
         else {
             return;
         };
 
         let pair_total = leading_width + trailing_width;
+        let position = self.position;
         let leading_min = effective_min_width_at(
-            self.position,
+            position,
             self.panel_entries[leading_index].panel.as_ref(),
             window,
             cx,
         );
         let trailing_min = effective_min_width_at(
-            self.position,
+            position,
             self.panel_entries[trailing_index].panel.as_ref(),
             window,
             cx,
@@ -1001,16 +1017,57 @@ impl Dock {
             return;
         }
         let leading_new = leading_target.clamp(leading_min, pair_total - trailing_min);
-        let trailing_new = pair_total - leading_new;
 
-        let resized = [
-            (leading_index, Some(leading_new), None),
-            (trailing_index, Some(trailing_new), None),
-        ];
+        let mut targets = widths;
+        targets[leading_slot] = leading_new;
+        targets[index] = pair_total - leading_new;
+
+        let flexible: Vec<bool> = indices
+            .iter()
+            .map(|&entry_index| {
+                panel_uses_flexible_width(
+                    position,
+                    self.panel_entries[entry_index].panel.as_ref(),
+                    window,
+                    cx,
+                )
+            })
+            .collect();
+
+        let mut new_fixed = Pixels::ZERO;
+        let mut flexible_share = Pixels::ZERO;
+        for (slot, &is_flexible) in flexible.iter().enumerate() {
+            if is_flexible {
+                flexible_share += targets[slot];
+            } else {
+                new_fixed += targets[slot];
+            }
+        }
+        let total_flex = if flexible_share > Pixels::ZERO {
+            geometry.flex_for_share(new_fixed, flexible_share)
+        } else {
+            0.0
+        };
 
         let mut size_states_to_persist = Vec::new();
-        for (entry_index, size, flex) in resized {
-            let position = self.position;
+        for (slot, &entry_index) in indices.iter().enumerate() {
+            let in_pair = slot == leading_slot || slot == index;
+            if !in_pair {
+                // Untouched by construction. A fixed bystander keeps whatever it
+                // stored, including having stored nothing — writing its rendered
+                // width back would silently pin it to today's default. A flexible
+                // bystander keeps its flex because re-deriving it is a no-op
+                // while the side's total holds; see the note above.
+                continue;
+            }
+            let (size, flex) = if flexible[slot] {
+                (
+                    None,
+                    Some(total_flex * (targets[slot] / flexible_share).max(0.0)),
+                )
+            } else {
+                (Some(targets[slot]), None)
+            };
             let Some(entry) = self.panel_entries.get_mut(entry_index) else {
                 continue;
             };
@@ -2727,6 +2784,7 @@ pub mod test {
         pub position: DockPosition,
         pub focus_handle: FocusHandle,
         pub activation_priority: u32,
+        pub flexible: bool,
     }
     actions!(test_only, [ToggleTestPanelC]);
 
@@ -2738,6 +2796,21 @@ pub mod test {
                 position,
                 focus_handle: cx.focus_handle(),
                 activation_priority,
+                flexible: false,
+            }
+        }
+
+        /// A second flexible type, so a side can hold two flexible columns — the
+        /// case where changing the fixed total moves every flexible column at
+        /// once, not just the one a seam touches.
+        pub fn new_flexible(
+            position: DockPosition,
+            activation_priority: u32,
+            cx: &mut App,
+        ) -> Self {
+            Self {
+                flexible: true,
+                ..Self::new(position, activation_priority, cx)
             }
         }
     }
@@ -2749,6 +2822,19 @@ pub mod test {
     }
 
     impl Panel for TestPanelC {
+        fn has_flexible_size(&self, _window: &Window, _: &App) -> bool {
+            self.flexible
+        }
+
+        fn set_flexible_size(
+            &mut self,
+            flexible: bool,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) {
+            self.flexible = flexible;
+        }
+
         fn persistent_name() -> &'static str {
             "TestPanelC"
         }
