@@ -1530,6 +1530,66 @@ pub enum OpenMode {
     Activate,
 }
 
+/// The geometry a mixed side dock is laid out from, gathered once so
+/// `dock_size` and `dock_flex_for_size` cannot disagree about it.
+///
+/// Upstream a dock held one panel, so it was *either* wholly fixed *or* wholly
+/// flexible, and `fixed` was zero whenever flex mattered. The multi-component
+/// model puts fixed and flexible columns on the same side, which is why both
+/// directions now have to name `fixed` explicitly.
+struct DockGeometry {
+    /// Width available to flex once every fixed column on both sides is paid for.
+    available: Pixels,
+    /// Flex competing with this dock's: the centre's columns plus the opposite side's.
+    competing_flex: f32,
+    /// This dock's fixed columns, summed.
+    fixed: Pixels,
+}
+
+impl DockGeometry {
+    /// Width this dock's flexible columns occupy for a given total flex factor.
+    fn flex_share(&self, flex: f32) -> Pixels {
+        (flex / (flex + self.competing_flex) * self.available).max(RESIZE_HANDLE_SIZE)
+    }
+
+    /// `flex_share`, but a side with no flexible column occupies nothing rather
+    /// than the handle's 6px — the floor exists to keep a *live* flexible column
+    /// grabbable, and there is none to keep.
+    fn flex_share_or_zero(&self, flex: f32) -> Pixels {
+        if flex <= 0.0 {
+            return Pixels::ZERO;
+        }
+        self.flex_share(flex)
+    }
+
+    /// The inverse of `flex_share`: the flex factor whose share is `share`.
+    fn flex_for_share(&self, share: Pixels) -> f32 {
+        let share = share.max(Pixels::ZERO);
+        let headroom = (self.available - share).max(px(1.));
+        (share * self.competing_flex / headroom).max(0.0)
+    }
+
+    /// The flex factor that lays the dock out at `size` overall, its fixed
+    /// columns included. Subtracting them is the step the pre-mixed math had no
+    /// reason to take, and it is only correct while the dock's composition is
+    /// unchanged — a panel *becoming* flexible is still counted in `fixed` here,
+    /// so that path builds its own geometry instead (see
+    /// `Workspace::toggle_dock_panel_flexible_size`).
+    fn flex_for_size(&self, size: Pixels) -> f32 {
+        self.flex_for_share(size - self.fixed)
+    }
+
+    /// The same geometry with `width` no longer paid for out of `fixed` — what a
+    /// column becoming flexible frees up.
+    fn releasing_fixed(&self, width: Pixels) -> Self {
+        Self {
+            available: self.available + width,
+            competing_flex: self.competing_flex,
+            fixed: (self.fixed - width).max(Pixels::ZERO),
+        }
+    }
+}
+
 impl Workspace {
     pub fn new(
         workspace_id: Option<WorkspaceId>,
@@ -2594,11 +2654,53 @@ impl Workspace {
     ) {
         let position = dock.read(cx).position();
         let current_size = self.dock_size(&dock.read(cx), window, cx);
-        let current_flex =
-            current_size.and_then(|size| self.dock_flex_for_size(position, size, window, cx));
+        // A panel going fixed -> flexible needs *its own* flex factor, and two
+        // things make that more than one inversion. It is still counted in
+        // `fixed` here, so `dock_flex_for_size` would hand back a share of zero;
+        // and `flex_for_share` inverts the dock's *total* flex, so any flexible
+        // sibling already on this side is part of the answer. Solve for the total
+        // the side should reach, then subtract what the siblings already supply.
+        // Upstream needed neither step: one panel per dock means no siblings and
+        // nothing else fixed.
+        let current_flex = {
+            let read = dock.read(cx);
+            self.dock_geometry(read, position, window, cx)
+                .map(|geometry| {
+                    let width = read
+                        .stored_panel_size_state(panel)
+                        .and_then(|state| state.size)
+                        .unwrap_or_else(|| panel.default_size(window, cx));
+                    let siblings = read
+                        .open_flex(self.default_dock_flex(position), window, cx)
+                        .unwrap_or(0.0);
+                    let target = geometry.flex_share_or_zero(siblings) + width;
+                    let total = geometry.releasing_fixed(width).flex_for_share(target);
+                    (total - siblings).max(0.0)
+                })
+        };
         dock.update(cx, |dock, cx| {
             dock.toggle_panel_flexible_size(panel, current_size, current_flex, window, cx);
         });
+    }
+
+    fn dock_geometry(
+        &self,
+        dock: &Dock,
+        position: DockPosition,
+        window: &Window,
+        cx: &App,
+    ) -> Option<DockGeometry> {
+        let workspace_width = self.bounds.size.width;
+        if workspace_width <= Pixels::ZERO {
+            return None;
+        }
+        let fixed = dock.open_fixed_size(window, cx);
+        let (opposite_fixed, opposite_flex) = self.opposite_dock_size_summary(position, window, cx);
+        Some(DockGeometry {
+            available: (workspace_width - fixed - opposite_fixed).max(RESIZE_HANDLE_SIZE),
+            competing_flex: self.center_full_height_column_count() + opposite_flex.unwrap_or(0.0),
+            fixed,
+        })
     }
 
     fn dock_size(&self, dock: &Dock, window: &Window, cx: &App) -> Option<Pixels> {
@@ -2613,23 +2715,23 @@ impl Workspace {
         let Some(flex) = dock.open_flex(self.default_dock_flex(position), window, cx) else {
             return Some(fixed);
         };
-        let workspace_width = self.bounds.size.width;
-        if workspace_width <= Pixels::ZERO {
-            return None;
-        }
+        let geometry = self.dock_geometry(dock, position, window, cx)?;
         let flex = flex.max(0.001);
-        let center_column_count = self.center_full_height_column_count();
-        let (opposite_fixed, opposite_flex) = self.opposite_dock_size_summary(position, window, cx);
-        let flex_share = if let Some(opposite_flex) = opposite_flex {
-            let total_flex = flex + center_column_count + opposite_flex;
-            (flex / total_flex * workspace_width).max(RESIZE_HANDLE_SIZE)
-        } else {
-            let available = (workspace_width - opposite_fixed - fixed).max(RESIZE_HANDLE_SIZE);
-            (flex / (flex + center_column_count) * available).max(RESIZE_HANDLE_SIZE)
-        };
-        Some(fixed + flex_share)
+        // One share for both cases. An opposite side with no flexible column
+        // contributes zero competing flex, which reproduces the fixed-opposite
+        // branch this replaced; what changes is that the flexible-opposite case
+        // now shares `available` rather than the whole workspace width, so a
+        // mixed side stops claiming its own fixed columns' pixels twice.
+        Some(fixed + geometry.flex_share(flex))
     }
 
+    /// The flex factor that lays this dock out at `size` overall — the inverse of
+    /// the share `dock_size` computes, and derived from the same `DockGeometry`
+    /// so the two cannot drift apart again.
+    ///
+    /// `size` is the whole dock, fixed columns included. Subtracting them is the
+    /// step upstream never needed: with one panel per dock a flexible dock *was*
+    /// its flex share, so `size` and the share were the same number.
     pub fn dock_flex_for_size(
         &self,
         position: DockPosition,
@@ -2640,22 +2742,9 @@ impl Workspace {
         if position.axis() != Axis::Horizontal {
             return None;
         }
-
-        let workspace_width = self.bounds.size.width;
-        if workspace_width <= Pixels::ZERO {
-            return None;
-        }
-
-        let center_column_count = self.center_full_height_column_count();
-        let (opposite_fixed, opposite_flex) = self.opposite_dock_size_summary(position, window, cx);
-        if let Some(opposite_flex) = opposite_flex {
-            let size = size.clamp(px(0.), workspace_width - px(1.));
-            Some((size * (center_column_count + opposite_flex) / (workspace_width - size)).max(0.0))
-        } else {
-            let available = (workspace_width - opposite_fixed).max(RESIZE_HANDLE_SIZE);
-            let remaining = (available - size).max(px(1.));
-            Some((size * center_column_count / remaining).max(0.0))
-        }
+        let dock = self.dock_at_position(position).read(cx);
+        let geometry = self.dock_geometry(dock, position, window, cx)?;
+        Some(geometry.flex_for_size(size))
     }
 
     /// The opposite side's open panels as one width: fixed px plus total flex.
@@ -17089,6 +17178,351 @@ mod tests {
                 before, after,
                 "the drag moved a column the handle is not drawn on; the guard \
                  belongs in the resize too, not only in the render"
+            );
+        });
+    }
+
+    /// A side holding *both* a fixed and a flexible column is what upstream's math
+    /// never had to describe: with one panel per dock a dock was wholly fixed or
+    /// wholly flexible, so `fixed` was zero whenever flex mattered. These three
+    /// pin the mixed case in both directions.
+    ///
+    /// The pre-rework code shares the whole workspace width among flex factors and
+    /// then adds `fixed` on top, so a mixed side claims its own fixed pixels twice.
+    #[gpui::test]
+    async fn test_a_mixed_side_does_not_claim_its_fixed_pixels_twice(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        set_panel_pinned(cx, "TestPanel", true);
+        set_panel_pinned(cx, "TestPanelB", true);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.bounds.size.width = px(1600.);
+
+            // Left: one flexible column (flex 1.0) beside one fixed column at 300px.
+            let flexible = cx.new(|cx| TestPanel::new_flexible(DockPosition::Left, 100, cx));
+            workspace.add_panel(flexible, window, cx);
+            let fixed = cx.new(|cx| TestPanelB::new(DockPosition::Left, 101, cx));
+            workspace.add_panel(fixed.clone(), window, cx);
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+                dock.activate_panel(1, window, cx);
+                dock.set_panel_size_state(
+                    &fixed,
+                    dock::PanelSizeState {
+                        size: Some(px(300.)),
+                        flex: None,
+                    },
+                    cx,
+                );
+            });
+
+            // Right: one flexible column, so the opposite side contributes flex and
+            // this exercises the branch that used to divide the whole width.
+            let right = cx.new(|cx| TestPanel::new_flexible(DockPosition::Right, 102, cx));
+            workspace.add_panel(right, window, cx);
+            workspace.toggle_dock(DockPosition::Right, window, cx);
+
+            let left_dock = workspace.left_dock().read(cx);
+            let width = workspace
+                .dock_size(&left_dock, window, cx)
+                .expect("an open mixed left dock has a width");
+
+            // available = 1600 - 300 (own fixed) - 0 (right is wholly flexible)
+            // share     = 1/(1 + 1 centre + 1 right) * 1300
+            // width     = 300 + 433.33..
+            let expected = px(300.) + px(1300.) / 3.;
+            assert!(
+                (width - expected).abs() < px(0.5),
+                "a mixed side must share only what its fixed columns leave: \
+                 expected about {expected:?}, got {width:?}. Dividing the whole \
+                 workspace width and then adding `fixed` gives {:?}",
+                px(300.) + px(1600.) / 3.
+            );
+        });
+    }
+
+    /// `dock_size` and `dock_flex_for_size` are inverses, and this is the identity
+    /// that says so: laying a dock out and asking what flex produces that layout
+    /// must return the flex it already has. The pre-rework inverse omits `fixed`
+    /// from both its numerator and its denominator, so it fails here by roughly
+    /// the ratio the fixed column contributes.
+    #[gpui::test]
+    async fn test_dock_size_and_dock_flex_for_size_round_trip_on_a_mixed_side(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        set_panel_pinned(cx, "TestPanel", true);
+        set_panel_pinned(cx, "TestPanelB", true);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.bounds.size.width = px(1600.);
+
+            let flexible = cx.new(|cx| TestPanel::new_flexible(DockPosition::Left, 100, cx));
+            workspace.add_panel(flexible, window, cx);
+            let fixed = cx.new(|cx| TestPanelB::new(DockPosition::Left, 101, cx));
+            workspace.add_panel(fixed.clone(), window, cx);
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+                dock.activate_panel(1, window, cx);
+                dock.set_panel_size_state(
+                    &fixed,
+                    dock::PanelSizeState {
+                        size: Some(px(420.)),
+                        flex: None,
+                    },
+                    cx,
+                );
+            });
+
+            let right = cx.new(|cx| TestPanel::new_flexible(DockPosition::Right, 102, cx));
+            workspace.add_panel(right, window, cx);
+            workspace.toggle_dock(DockPosition::Right, window, cx);
+
+            let left_dock = workspace.left_dock().read(cx);
+            let width = workspace
+                .dock_size(&left_dock, window, cx)
+                .expect("an open mixed left dock has a width");
+            let stored_flex = left_dock
+                .open_flex(workspace.default_dock_flex(DockPosition::Left), window, cx)
+                .expect("a mixed left dock has a flexible column");
+
+            let derived = workspace
+                .dock_flex_for_size(DockPosition::Left, width, window, cx)
+                .expect("a horizontal dock derives a flex");
+
+            assert!(
+                (derived - stored_flex).abs() < 0.01,
+                "laying the dock out at {width:?} and asking what flex produces it \
+                 must return the flex it already has: expected {stored_flex}, got \
+                 {derived}. A round trip that does not close means one direction \
+                 counts the fixed column and the other does not"
+            );
+        });
+    }
+
+    /// The branch that was already correct — an opposite side with no flexible
+    /// column — must not move. `competing_flex` is the centre alone there, which
+    /// is what the replaced `flex / (flex + centre) * available` computed.
+    #[gpui::test]
+    async fn test_a_mixed_side_is_unchanged_when_the_opposite_side_is_wholly_fixed(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        set_panel_pinned(cx, "TestPanel", true);
+        set_panel_pinned(cx, "TestPanelB", true);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.bounds.size.width = px(1600.);
+
+            let flexible = cx.new(|cx| TestPanel::new_flexible(DockPosition::Left, 100, cx));
+            workspace.add_panel(flexible, window, cx);
+            let fixed = cx.new(|cx| TestPanelB::new(DockPosition::Left, 101, cx));
+            workspace.add_panel(fixed.clone(), window, cx);
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+                dock.activate_panel(1, window, cx);
+                dock.set_panel_size_state(
+                    &fixed,
+                    dock::PanelSizeState {
+                        size: Some(px(300.)),
+                        flex: None,
+                    },
+                    cx,
+                );
+            });
+
+            // Right holds a fixed column, so it contributes width but no flex.
+            let right = cx.new(|cx| TestPanelC::new(DockPosition::Right, 102, cx));
+            workspace.add_panel(right.clone(), window, cx);
+            workspace.toggle_dock(DockPosition::Right, window, cx);
+            workspace.right_dock().update(cx, |dock, cx| {
+                dock.set_panel_size_state(
+                    &right,
+                    dock::PanelSizeState {
+                        size: Some(px(200.)),
+                        flex: None,
+                    },
+                    cx,
+                );
+            });
+
+            let left_dock = workspace.left_dock().read(cx);
+            let width = workspace
+                .dock_size(&left_dock, window, cx)
+                .expect("an open mixed left dock has a width");
+
+            // available = 1600 - 300 (own fixed) - 200 (opposite fixed) = 1100
+            // share     = 1/(1 + 1 centre) * 1100
+            let expected = px(300.) + px(1100.) / 2.;
+            assert!(
+                (width - expected).abs() < px(0.5),
+                "the wholly-fixed-opposite branch must be unchanged: expected about \
+                 {expected:?}, got {width:?}"
+            );
+        });
+    }
+
+    /// Dragging the editor-facing divider on a mixed side leaves the fixed column
+    /// alone and moves the whole change into the flexible one (Tom, 2026-09-03).
+    /// The wholly-fixed side keeps its slack distribution, which the floor
+    /// witnesses above pin; this is the case where the two rules differ.
+    #[gpui::test]
+    async fn test_a_fixed_column_holds_its_width_beside_a_flexible_one(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        set_panel_pinned(cx, "TestPanel", true);
+        set_panel_pinned(cx, "TestPanelB", true);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.bounds.size.width = px(1600.);
+
+            let flexible = cx.new(|cx| TestPanel::new_flexible(DockPosition::Left, 100, cx));
+            workspace.add_panel(flexible.clone(), window, cx);
+            let fixed = cx.new(|cx| TestPanelB::new(DockPosition::Left, 101, cx));
+            workspace.add_panel(fixed.clone(), window, cx);
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+                dock.activate_panel(1, window, cx);
+                dock.set_panel_size_state(
+                    &fixed,
+                    dock::PanelSizeState {
+                        size: Some(px(300.)),
+                        flex: None,
+                    },
+                    cx,
+                );
+            });
+
+            let before = workspace
+                .dock_size(workspace.left_dock().read(cx), window, cx)
+                .expect("the mixed side has a width");
+            let flex_before = workspace
+                .left_dock()
+                .read(cx)
+                .stored_panel_size_state(&flexible)
+                .and_then(|state| state.flex)
+                .unwrap_or(1.0);
+
+            workspace.resize_dock(DockPosition::Left, before + px(120.), window, cx);
+
+            let fixed_after = workspace
+                .left_dock()
+                .read(cx)
+                .stored_panel_size_state(&fixed)
+                .and_then(|state| state.size);
+            assert_eq!(
+                fixed_after,
+                Some(px(300.)),
+                "the editor-facing divider must not rewrite a pinned width; the \
+                 internal seam is the control for that"
+            );
+
+            let flex_after = workspace
+                .left_dock()
+                .read(cx)
+                .stored_panel_size_state(&flexible)
+                .and_then(|state| state.flex)
+                .expect("the flexible column still stores a flex");
+            assert!(
+                flex_after > flex_before,
+                "the flexible column must absorb the whole change: flex went from \
+                 {flex_before} to {flex_after}"
+            );
+
+            let after = workspace
+                .dock_size(workspace.left_dock().read(cx), window, cx)
+                .expect("the mixed side still has a width");
+            assert!(
+                (after - (before + px(120.))).abs() < px(1.),
+                "the side must actually reach the requested width: asked for \
+                 {:?}, got {after:?}",
+                before + px(120.)
+            );
+        });
+    }
+
+    /// Toggling a column from fixed to flexible must leave it the width it had.
+    /// `test_flexible_panel_left_dock_sizing` cannot witness this: it reads the
+    /// stored flex back and checks the layout agrees with it, which is true of any
+    /// self-consistent pair of numbers. This pins the value.
+    #[gpui::test]
+    async fn test_toggling_a_mixed_column_to_flexible_keeps_its_width(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        set_panel_pinned(cx, "TestPanel", true);
+        set_panel_pinned(cx, "TestPanelB", true);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.bounds.size.width = px(1600.);
+
+            let flexible = cx.new(|cx| TestPanel::new_flexible(DockPosition::Left, 100, cx));
+            workspace.add_panel(flexible, window, cx);
+            let fixed = cx.new(|cx| TestPanelB::new(DockPosition::Left, 101, cx));
+            workspace.add_panel(fixed.clone(), window, cx);
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+                dock.activate_panel(1, window, cx);
+                dock.set_panel_size_state(
+                    &fixed,
+                    dock::PanelSizeState {
+                        size: Some(px(360.)),
+                        flex: None,
+                    },
+                    cx,
+                );
+            });
+
+            let dock = workspace.left_dock().clone();
+            workspace.toggle_dock_panel_flexible_size(&dock, &fixed, window, cx);
+
+            let stored = dock
+                .read(cx)
+                .stored_panel_size_state(&fixed)
+                .expect("the toggled column keeps a size state");
+            let flex = stored
+                .flex
+                .expect("it is flexible now, so it stores a flex");
+
+            // Its own 360px is what becomes the flexible share, and releasing it
+            // grows the space that share competes for: available goes from
+            // 1600 - 360 - 0 to 1600, and the sibling flexible column plus the
+            // centre are what it competes with.
+            //   flex = 360 * (1 centre + 1 sibling) / (1600 - 360)
+            let expected = 360.0 * 2.0 / (1600.0 - 360.0);
+            assert!(
+                (flex - expected).abs() < 0.01,
+                "a column becoming flexible keeps its width: expected flex about \
+                 {expected}, got {flex}. Leaving it counted as fixed while deriving \
+                 its own share is what makes this drift"
             );
         });
     }

@@ -1841,16 +1841,28 @@ impl Dock {
                     };
                     (None, share)
                 }
+                // A fixed column beside a flexible one holds its width: the
+                // flexible column absorbs the whole change (Tom, 2026-09-03).
+                // The 2026-08-31 "scales every column proportionally" ruling was
+                // taken when a side was wholly fixed or wholly flexible, where
+                // the two are indistinguishable. Fixed has to mean fixed once
+                // they mix, or every drag silently rewrites a width the user
+                // pinned — and the internal seam is already the deliberate way
+                // to change one.
+                (Some(_), Axis::Horizontal) if flex_total.is_some() => {
+                    (entry.size_state.size, None)
+                }
                 (Some(total), Axis::Horizontal) => {
                     let current = entry
                         .size_state
                         .size
                         .unwrap_or_else(|| entry.panel.default_size(window, cx));
-                    // Each column keeps its own minimum and shares only what is
-                    // left over, in the proportions it had. Scaling the whole
-                    // width proportionally instead lets a skewed pair squeeze one
-                    // column under its minimum while the side as a whole sits on
-                    // the floor — the sliver moves inward rather than closing.
+                    // Wholly fixed side: each column keeps its own minimum and
+                    // shares only what is left over, in the proportions it had.
+                    // Scaling the whole width proportionally instead lets a
+                    // skewed pair squeeze one column under its minimum while the
+                    // side as a whole sits on the floor — the sliver moves
+                    // inward rather than closing.
                     let min = effective_min_width_at(position, entry.panel.as_ref(), window, cx);
                     let slack = (total - fixed_min_total).max(Pixels::ZERO);
                     let scaled = if fixed_total > Pixels::ZERO {
