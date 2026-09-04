@@ -17221,6 +17221,78 @@ mod tests {
         });
     }
 
+    /// Every other sizing witness in this file grades the *model* — `rendered_widths`,
+    /// `dock_size`, the stored flex — and every one of them would pass while the panel
+    /// inside a flexible column drew at zero width beside a full-width column. A fixed
+    /// column gets `w(size)`, so the cached view's `size_full` resolves against a width
+    /// the layout engine already knows; a flexible column's width is decided by flexbox
+    /// during the same pass, and a percentage against a container that is not yet
+    /// resolved is the thing this pins. Found by looking, not by the suite — Tom, on the
+    /// two panels that declare `has_flexible_size` and on no others: *"the right side of
+    /// the terminal has a grey unfilled area"*.
+    #[gpui::test]
+    async fn test_a_flexible_column_is_filled_by_the_panel_it_holds(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        set_panel_pinned(cx, "TestPanel", true);
+        set_panel_pinned(cx, "TestPanelC", true);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let first = cx.new(|cx| TestPanel::new_flexible(DockPosition::Left, 100, cx));
+            workspace.add_panel(first, window, cx);
+            let second = cx.new(|cx| TestPanelC::new_flexible(DockPosition::Left, 101, cx));
+            workspace.add_panel(second, window, cx);
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+                dock.activate_panel(1, window, cx);
+                dock.set_open(true, window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        // The workspace is the window's root view, so the window draws it for us.
+        // Re-drawing it through `cx.draw` as a detached element panics the arena:
+        // the dock's resize handles are deferred draws, and the second pass tries to
+        // prepaint ArenaRefs the first pass already cleared.
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+
+        for (column_selector, panel_selector) in [
+            ("DOCK-COLUMN-TestPanel", "TEST-PANEL-ROOT"),
+            ("DOCK-COLUMN-TestPanelC", "TEST-PANEL-C-ROOT"),
+        ] {
+            let column = cx
+                .debug_bounds(column_selector)
+                .unwrap_or_else(|| panic!("{column_selector} renders"));
+            let panel = cx
+                .debug_bounds(panel_selector)
+                .unwrap_or_else(|| panic!("{panel_selector} renders"));
+
+            assert!(
+                column.size.width > px(1.),
+                "{column_selector} must have a width for this witness to mean \
+                 anything, got {:?}",
+                column.size.width
+            );
+            // Every column after the first carries `border_l_1`, which takes a
+            // pixel out of the content box the panel gets. One pixel of slack is
+            // that border and nothing else — the failure this pins is a panel
+            // drawing at its own content width inside a column sized by flexbox,
+            // which is a gap of tens or hundreds of pixels, not one.
+            let shortfall = column.size.width - panel.size.width;
+            assert!(
+                shortfall >= px(0.) && shortfall <= px(1.),
+                "{panel_selector} must fill {column_selector}: column {:?}, panel {:?}",
+                column.size.width,
+                panel.size.width
+            );
+        }
+    }
+
     /// Two flexible neighbours are the case needing no geometry at all: the fixed
     /// total does not move and the pair's combined share does not either, so the
     /// seam is a pure redistribution of flex between them.

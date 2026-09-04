@@ -2140,7 +2140,14 @@ impl Render for Dock {
                     .panel
                     .to_any()
                     .cached(StyleRefinement::default().v_flex().size_full());
-                let mut column = div().h_full().overflow_hidden().child(panel);
+                let mut column = div()
+                    .debug_selector({
+                        let panel_key = entry.panel.panel_key();
+                        move || format!("DOCK-COLUMN-{panel_key}")
+                    })
+                    .h_full()
+                    .overflow_hidden()
+                    .child(panel);
                 match position.axis() {
                     Axis::Horizontal => {
                         if panel_uses_flexible_width(position, entry.panel.as_ref(), window, cx) {
@@ -2176,6 +2183,10 @@ impl Render for Dock {
 
         div()
             .id("dock-panel")
+            .debug_selector({
+                let position = self.position;
+                move || format!("DOCK-PANEL-{position:?}")
+            })
             .key_context(dispatch_context)
             .track_focus(&self.focus_handle(cx))
             .focus_follows_mouse(self.focus_follows_mouse, cx)
@@ -2614,8 +2625,13 @@ pub mod test {
 
     impl Render for TestPanel {
         fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            // `size_full` for the same reason as `TestPanelC`: so the element's
+            // bounds report the space its column gave it rather than its own
+            // empty content.
             div()
                 .id("test")
+                .size_full()
+                .debug_selector(|| "TEST-PANEL-ROOT".to_string())
                 .track_focus(&self.focus_handle(cx))
                 .children(self.activation_focus_handle.iter().map(|focus_handle| {
                     div().id("test-activation-child").track_focus(focus_handle)
@@ -2842,7 +2858,15 @@ pub mod test {
 
     impl Render for TestPanelC {
         fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            div().id("test-c").track_focus(&self.focus_handle(cx))
+            // `size_full` so this element's bounds report the space the dock's
+            // column actually handed the panel. A bare div sizes to its own
+            // (empty) content and would report zero however wide the column got,
+            // which is the one thing a fill witness must not do.
+            div()
+                .id("test-c")
+                .size_full()
+                .debug_selector(|| "TEST-PANEL-C-ROOT".to_string())
+                .track_focus(&self.focus_handle(cx))
         }
     }
 
