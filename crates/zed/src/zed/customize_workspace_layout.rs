@@ -21,7 +21,10 @@ use ui::{
 };
 use workspace::{
     CustomizeWorkspaceLayout, ModalView, Workspace,
-    dock::{DockPosition, set_component_hidden, set_component_pinned, set_component_position},
+    dock::{
+        DockPosition, seed_component_position, set_component_hidden, set_component_pinned,
+        set_component_position,
+    },
     layout_registry::{self, LayoutItem, LayoutItemKind, LayoutPosition},
     set_status_control_location,
 };
@@ -168,7 +171,13 @@ fn layout_position(position: DockPosition) -> LayoutPosition {
 /// and neither writer touches a legacy key. Un-hiding a component runs the open-row
 /// scrub before the settings write, which is what stops a workspace that was
 /// dormant across the hide from resurrecting it.
-fn apply(item: &LayoutItem, placement: Placement, window: &mut Window, cx: &mut App) {
+fn apply(
+    item: &LayoutItem,
+    placement: Placement,
+    current: Option<Placement>,
+    window: &mut Window,
+    cx: &mut App,
+) {
     match (item.kind, placement) {
         (LayoutItemKind::StatusControl, Placement::Zone(zone)) => {
             let location = match zone {
@@ -195,6 +204,15 @@ fn apply(item: &LayoutItem, placement: Placement, window: &mut Window, cx: &mut 
         }
         (LayoutItemKind::WorkspaceComponent, Placement::Hidden) => {
             let fs = <dyn fs::Fs>::global(cx);
+            // Hiding creates this component's first entry if it has none, and an
+            // entry ends its legacy dock's authority. Record where it is now, so
+            // un-hiding later — including by hand-editing `hidden` back to false —
+            // returns it where it was rather than to its registered position.
+            if let Some(Placement::Zone(zone)) = current
+                && let Some(position) = dock_position(zone)
+            {
+                seed_component_position(fs.clone(), item.id.to_string(), position.into(), cx);
+            }
             set_component_hidden(fs, item.id.to_string(), true, cx);
         }
     }
@@ -538,10 +556,13 @@ fn render_placement_choices(item: &'static LayoutItem, state: &RowState) -> AnyE
     // no current placement — `effective_location_for` returns `None` for a
     // registered control that this workspace's bar never instantiated.
     let selected = state.current.unwrap_or(usize::MAX);
+    let current = state
+        .current
+        .and_then(|slot| state.choices.get(slot).copied());
     let button = |slot: usize| {
         let placement = state.choices[slot];
         ToggleButtonSimple::new(placement.label(), move |_, window, cx| {
-            apply(item, placement, window, cx)
+            apply(item, placement, current, window, cx)
         })
     };
 
@@ -665,6 +686,60 @@ mod tests {
     use super::*;
     use gpui::TestAppContext;
     use workspace::WorkspaceLayoutSettings;
+
+    /// Seeding is what makes the entry-presence rule safe. Once a component has an
+    /// entry, its legacy `<panel>.dock` no longer applies — so a first pin or hide
+    /// that created a bare entry would have relocated the component to its
+    /// registered position. Writing its current position down first turns that move
+    /// into a record. The second half matters as much: seeding must not overwrite a
+    /// position the user already chose.
+    #[gpui::test]
+    async fn test_seeding_records_a_position_once_and_never_overwrites_one(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = crate::zed::tests::init_test(cx);
+        let fs = app_state.fs.clone();
+        let key = workspace::layout_registry::ids::PROJECT_PANEL;
+
+        cx.update(|cx| {
+            assert!(
+                !workspace::WorkspaceLayoutSettings::get_global(cx).has_component(key),
+                "the fixture must start with no entry, or this witness proves nothing"
+            );
+            workspace::dock::seed_component_position(
+                fs.clone(),
+                key.to_string(),
+                settings::DockPosition::Left,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(
+                workspace::WorkspaceLayoutSettings::get_global(cx)
+                    .component(key)
+                    .position,
+                Some(settings::DockPosition::Left),
+                "seeding records the position it was given"
+            );
+            workspace::dock::seed_component_position(
+                fs.clone(),
+                key.to_string(),
+                settings::DockPosition::Right,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(
+                workspace::WorkspaceLayoutSettings::get_global(cx)
+                    .component(key)
+                    .position,
+                Some(settings::DockPosition::Left),
+                "and leaves an existing entry alone"
+            );
+        });
+    }
 
     /// `Restore Default Positions…` promised position, hidden state *and* pinned
     /// state, and delivered the first two. `set_component_pinned` existed the whole

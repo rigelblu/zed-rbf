@@ -72,12 +72,14 @@ pub fn effective_component_position(
     cx: &App,
     is_valid: impl Fn(DockPosition) -> bool,
 ) -> DockPosition {
-    let explicit = WorkspaceLayoutSettings::get_global(cx)
+    let settings = WorkspaceLayoutSettings::get_global(cx);
+    let explicit = settings
         .component(panel_key)
         .position
         .map(DockPosition::from);
     resolve_component_position(
         explicit,
+        settings.has_component(panel_key),
         registered_component_position(panel_key),
         own_position,
         is_valid,
@@ -115,6 +117,7 @@ fn registered_component_position(panel_key: &str) -> Option<DockPosition> {
 /// and the raw entry stays in the file rather than being silently rewritten.
 fn resolve_component_position(
     explicit: Option<DockPosition>,
+    entry_exists: bool,
     registered: Option<DockPosition>,
     own_position: DockPosition,
     is_valid: impl Fn(DockPosition) -> bool,
@@ -127,7 +130,13 @@ fn resolve_component_position(
             .filter(|position| is_valid(*position))
             .unwrap_or(own_position)
     };
-    if explicit.is_some() {
+    // The branch is on the *entry*, not on the position within it. A malformed
+    // token deserializes to `None` (`with_fallible_options` records the error and
+    // substitutes the default), so branching on `explicit.is_some()` sent a typo
+    // down the legacy path and resurrected a setting the 2026-09-01 ruling
+    // retired. An entry existing at all is what ends legacy's authority; entries
+    // without a position are prevented at the source by `seed_component_position`.
+    if entry_exists {
         return fallback();
     }
     // With no entry at all, the component's own dock setting supplies the
@@ -241,6 +250,36 @@ pub fn set_component_position(
     cx: &mut App,
 ) {
     write_component_setting(fs, panel_key, ComponentSetting::Position(position), cx);
+}
+
+/// Writes a component's current position into `component_positions`, but only if
+/// it has no entry there yet.
+///
+/// Pinning or hiding a component creates an entry through `or_default()`, with no
+/// position in it. Once an entry exists the component's legacy `<panel>.dock` no
+/// longer applies — that is the whole point of the entry — so without this, the
+/// first pin would silently relocate a component to its registered position. This
+/// writes down where it already is, so managing a component through the new
+/// system records its position instead of changing it.
+///
+/// Callers pass the component's *effective* position, which needs the live panel;
+/// it cannot be derived here from the key alone.
+pub fn seed_component_position(
+    fs: Arc<dyn Fs>,
+    panel_key: String,
+    position: settings::DockPosition,
+    cx: &mut App,
+) {
+    settings::update_settings_file(fs, cx, move |settings, _| {
+        let components = &mut settings
+            .workspace_layout
+            .get_or_insert_default()
+            .component_positions;
+        if components.contains_key(&panel_key) {
+            return;
+        }
+        components.entry(panel_key).or_default().position = Some(position);
+    });
 }
 
 /// Decides whether a component keeps its own column or shares its side's single
@@ -2376,6 +2415,17 @@ impl Render for PanelButtons {
                                             return;
                                         };
                                         let fs = workspace.read(cx).app_state().fs.clone();
+                                        // Pinning creates this component's first
+                                        // entry, which ends its legacy dock's
+                                        // authority. Write where it already is, so
+                                        // pinning records a position rather than
+                                        // moving the component to its registered one.
+                                        seed_component_position(
+                                            fs.clone(),
+                                            panel_key.to_string(),
+                                            dock_position.into(),
+                                            cx,
+                                        );
                                         set_component_pinned(
                                             fs,
                                             panel_key.to_string(),
@@ -2445,6 +2495,14 @@ impl Render for PanelButtons {
                                         return;
                                     };
                                     let fs = workspace.read(cx).app_state().fs.clone();
+                                    // Same reason as pinning: hiding creates
+                                    // the entry, so record the position first.
+                                    seed_component_position(
+                                        fs.clone(),
+                                        panel_key.to_string(),
+                                        dock_position.into(),
+                                        cx,
+                                    );
                                     set_component_hidden(fs, panel_key.to_string(), true, cx);
                                 });
                                 // The way back from `Hidden`. Once a component is
@@ -2964,6 +3022,7 @@ mod component_position_tests {
         assert_eq!(
             resolve_component_position(
                 Some(DockPosition::Left),
+                true,
                 Some(DockPosition::Right),
                 DockPosition::Right,
                 sides_only,
@@ -2980,6 +3039,7 @@ mod component_position_tests {
         // ago, on the strength of the newer one being wrong.
         let resolved = resolve_component_position(
             Some(DockPosition::Bottom),
+            true,
             Some(DockPosition::Right),
             DockPosition::Left,
             sides_only,
@@ -2993,10 +3053,33 @@ mod component_position_tests {
     }
 
     #[test]
+    fn an_entry_whose_position_did_not_parse_still_beats_the_legacy_dock() {
+        // The defect this argument exists for. `#[with_fallible_options]` turns a
+        // malformed `position` into `None` — the error is recorded and the file
+        // still loads — so branching on the position rather than the entry sent a
+        // typo down the legacy path and resurrected a setting the 2026-09-01
+        // ruling retired. One character was enough, and no witness caught it: the
+        // repair-path tests all use a well-formed *unsupported* value, which
+        // arrives as `Some`.
+        assert_eq!(
+            resolve_component_position(
+                None,
+                true,
+                Some(DockPosition::Right),
+                DockPosition::Left,
+                sides_only,
+            ),
+            DockPosition::Right,
+            "an entry exists, so the registered position answers — not the legacy dock"
+        );
+    }
+
+    #[test]
     fn with_no_entry_a_usable_legacy_dock_supplies_the_position() {
         assert_eq!(
             resolve_component_position(
                 None,
+                false,
                 Some(DockPosition::Right),
                 DockPosition::Left,
                 sides_only,
@@ -3013,6 +3096,7 @@ mod component_position_tests {
         assert_eq!(
             resolve_component_position(
                 None,
+                false,
                 Some(DockPosition::Right),
                 DockPosition::Bottom,
                 sides_only,
@@ -3031,6 +3115,7 @@ mod component_position_tests {
         assert_eq!(
             resolve_component_position(
                 Some(DockPosition::Bottom),
+                true,
                 Some(DockPosition::Right),
                 DockPosition::Left,
                 |position| position == DockPosition::Left,
@@ -3047,6 +3132,7 @@ mod component_position_tests {
         assert_eq!(
             resolve_component_position(
                 Some(DockPosition::Bottom),
+                true,
                 None,
                 DockPosition::Left,
                 sides_only
@@ -3054,7 +3140,7 @@ mod component_position_tests {
             DockPosition::Left
         );
         assert_eq!(
-            resolve_component_position(None, None, DockPosition::Bottom, sides_only),
+            resolve_component_position(None, false, None, DockPosition::Bottom, sides_only),
             DockPosition::Bottom
         );
     }
@@ -3066,6 +3152,7 @@ mod component_position_tests {
         assert_eq!(
             resolve_component_position(
                 Some(DockPosition::Bottom),
+                true,
                 Some(DockPosition::Bottom),
                 DockPosition::Left,
                 |_| true,

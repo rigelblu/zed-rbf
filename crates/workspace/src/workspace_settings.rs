@@ -370,6 +370,16 @@ pub struct WorkspaceComponentPosition {
 }
 
 impl WorkspaceLayoutSettings {
+    /// Whether the user has an entry for this component at all.
+    ///
+    /// Distinct from `component(..).position.is_some()`: a malformed position
+    /// deserializes to `None` while its entry still exists, and an entry created
+    /// by pinning or hiding carries no position either. Position resolution turns
+    /// on the entry, not on what is inside it.
+    pub fn has_component(&self, panel_key: &str) -> bool {
+        self.component_positions.contains_key(panel_key)
+    }
+
     pub fn component(&self, panel_key: &str) -> WorkspaceComponentPosition {
         self.component_positions
             .get(panel_key)
