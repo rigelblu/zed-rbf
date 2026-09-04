@@ -2593,6 +2593,36 @@ impl Workspace {
         dock::Dock::load_persisted_size_state(self, panel_key, cx)
     }
 
+    /// Returns every open component on every side to its default width, and
+    /// persists that so the reset survives a restart.
+    ///
+    /// This used to reset `visible_panel` — one component per side, which was the
+    /// whole side back when a side held one. A side now holds several columns, so
+    /// resetting one left every other column at exactly the width the user was
+    /// reaching for this command to undo. Nothing was persisted either, so what
+    /// little did reset came back on the next launch.
+    pub fn reset_open_docks_size(&mut self, cx: &mut Context<Self>) {
+        let mut size_states_to_persist = Vec::new();
+        for dock in self.all_docks() {
+            let panels = dock.read(cx).open_panels();
+            dock.update(cx, |dock, cx| {
+                for panel in panels {
+                    if dock.set_panel_size_state(
+                        panel.as_ref(),
+                        dock::PanelSizeState::default(),
+                        cx,
+                    ) {
+                        size_states_to_persist
+                            .push((panel.panel_key(), dock::PanelSizeState::default()));
+                    }
+                }
+            });
+        }
+        for (panel_key, size_state) in size_states_to_persist {
+            self.persist_panel_size_state(panel_key, size_state, cx);
+        }
+    }
+
     pub fn persist_panel_size_state(
         &self,
         panel_key: &str,
@@ -8536,18 +8566,7 @@ impl Workspace {
             ))
             .on_action(cx.listener(
                 |workspace: &mut Workspace, _: &ResetOpenDocksSize, _window, cx| {
-                    for dock in workspace.all_docks() {
-                        let panel = dock.read(cx).visible_panel().cloned();
-                        if let Some(panel) = panel {
-                            dock.update(cx, |dock, cx| {
-                                dock.set_panel_size_state(
-                                    panel.as_ref(),
-                                    dock::PanelSizeState::default(),
-                                    cx,
-                                );
-                            });
-                        }
-                    }
+                    workspace.reset_open_docks_size(cx);
                 },
             ))
             .on_action(cx.listener(
@@ -17217,6 +17236,66 @@ mod tests {
                 "a seam trades width inside the side; it must not move the side's \
                  total, which is what separates it from the editor-facing divider. \
                  Went from {total_before:?} to {total_after:?}"
+            );
+        });
+    }
+
+    /// `ResetOpenDocksSize` reset `visible_panel` — one component per side. That was
+    /// the whole side when a side held one component; this feature made sides hold
+    /// several, and the command silently stopped covering them. The trailing column
+    /// is the one that catches it: a fixture with a single open component passes
+    /// against both the old code and the new.
+    #[gpui::test]
+    async fn test_resetting_a_sides_size_reaches_every_column_on_it(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        set_panel_pinned(cx, "TestPanel", true);
+        set_panel_pinned(cx, "TestPanelB", true);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let first = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+            workspace.add_panel(first.clone(), window, cx);
+            let second = cx.new(|cx| TestPanelB::new(DockPosition::Left, 101, cx));
+            workspace.add_panel(second.clone(), window, cx);
+
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+                dock.activate_panel(1, window, cx);
+                dock.set_open(true, window, cx);
+                dock.set_panel_size_state(
+                    &first,
+                    dock::PanelSizeState {
+                        size: Some(px(511.)),
+                        flex: None,
+                    },
+                    cx,
+                );
+                dock.set_panel_size_state(
+                    &second,
+                    dock::PanelSizeState {
+                        size: Some(px(377.)),
+                        flex: None,
+                    },
+                    cx,
+                );
+            });
+
+            workspace.reset_open_docks_size(cx);
+
+            let dock = workspace.left_dock().read(cx);
+            assert_eq!(
+                dock.stored_panel_size_state(&first),
+                Some(dock::PanelSizeState::default()),
+                "the visible column resets"
+            );
+            assert_eq!(
+                dock.stored_panel_size_state(&second),
+                Some(dock::PanelSizeState::default()),
+                "and so does the column beside it — the one the old code missed"
             );
         });
     }

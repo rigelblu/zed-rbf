@@ -9,7 +9,8 @@
 
 use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, IntoElement,
-    ParentElement, Render, SharedString, Styled, Subscription, Task, WeakEntity, Window,
+    ParentElement, PromptLevel, Render, SharedString, Styled, Subscription, Task, WeakEntity,
+    Window,
 };
 use picker::{Picker, PickerDelegate};
 use settings::{Settings as _, SettingsStore, StatusBarItemLocation};
@@ -20,7 +21,7 @@ use ui::{
 };
 use workspace::{
     CustomizeWorkspaceLayout, ModalView, Workspace,
-    dock::{DockPosition, set_component_hidden, set_component_position},
+    dock::{DockPosition, set_component_hidden, set_component_pinned, set_component_position},
     layout_registry::{self, LayoutItem, LayoutItemKind, LayoutPosition},
     set_status_control_location,
 };
@@ -202,6 +203,30 @@ fn apply(item: &LayoutItem, placement: Placement, window: &mut Window, cx: &mut 
 /// Puts every item back to what it registered with — position and hidden state
 /// together, so the result is the factory layout rather than a maximally visible
 /// one that never existed.
+/// The one destructive click in this surface. It rewrites every registered item's
+/// position, hidden state and pinned state at once, and the writes are sequential
+/// by decision (2026-09-04) — so there is no transaction to roll back and a misclick
+/// is unwindable only by hand. The prompt is the whole guard.
+fn confirm_then_restore_defaults(window: &mut Window, cx: &mut App) {
+    let answer = window.prompt(
+        PromptLevel::Warning,
+        "Restore default positions?",
+        Some(
+            "Every workspace component and status control returns to where it shipped, \
+             including its hidden and pinned state. This cannot be undone.",
+        ),
+        &["Restore Defaults", "Cancel"],
+        cx,
+    );
+    window
+        .spawn(cx, async move |cx| {
+            if answer.await.ok() == Some(0) {
+                cx.update(|window, cx| restore_defaults(window, cx)).ok();
+            }
+        })
+        .detach();
+}
+
 fn restore_defaults(window: &mut Window, cx: &mut App) {
     for item in layout_registry::all() {
         match item.kind {
@@ -221,6 +246,7 @@ fn restore_defaults(window: &mut Window, cx: &mut App) {
             LayoutItemKind::WorkspaceComponent => {
                 let fs = <dyn fs::Fs>::global(cx);
                 set_component_hidden(fs.clone(), item.id.to_string(), item.default_hidden, cx);
+                set_component_pinned(fs.clone(), item.id.to_string(), item.default_pinned, cx);
                 if let Some(position) = dock_position(item.registered_position) {
                     set_component_position(fs, item.id.to_string(), position.into(), cx);
                 }
@@ -442,7 +468,7 @@ impl PickerDelegate for CustomizeWorkspaceLayoutDelegate {
                 .border_color(_cx.theme().colors().border)
                 .child(
                     ui::Button::new("restore-default-positions", "Restore Default Positions…")
-                        .on_click(|_, window, cx| restore_defaults(window, cx)),
+                        .on_click(|_, window, cx| confirm_then_restore_defaults(window, cx)),
                 )
                 .into_any_element(),
         )
@@ -631,5 +657,57 @@ mod list_tests {
         // The empty state has to be reachable, or `no_matches_text` is dead code
         // that never renders.
         assert!(matching_indices("zzzz-no-such-item").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+    use workspace::WorkspaceLayoutSettings;
+
+    /// `Restore Default Positions…` promised position, hidden state *and* pinned
+    /// state, and delivered the first two. `set_component_pinned` existed the whole
+    /// time and was never reached from this surface, so a reset left every pin
+    /// standing — the one thing a user pins deliberately and would most expect a
+    /// reset to clear. Dogfood check B4-6 marked reset PASS with nothing pinned on
+    /// screen, which is why the gap survived a human check as well as the suite.
+    #[gpui::test]
+    async fn test_restoring_defaults_clears_a_pin(cx: &mut TestAppContext) {
+        let app_state = crate::zed::tests::init_test(cx);
+        let window = cx.add_window(|_, _| gpui::Empty);
+        let fs = app_state.fs.clone();
+
+        cx.update(|cx| {
+            workspace::dock::set_component_pinned(
+                fs.clone(),
+                workspace::layout_registry::ids::PROJECT_PANEL.to_string(),
+                true,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(
+                WorkspaceLayoutSettings::get_global(cx)
+                    .component(workspace::layout_registry::ids::PROJECT_PANEL)
+                    .pinned,
+                "the fixture must actually pin something, or this witness proves nothing"
+            );
+        });
+
+        window
+            .update(cx, |_, window, cx| restore_defaults(window, cx))
+            .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            assert!(
+                !WorkspaceLayoutSettings::get_global(cx)
+                    .component(workspace::layout_registry::ids::PROJECT_PANEL)
+                    .pinned,
+                "the reset clears the pin"
+            );
+        });
     }
 }
