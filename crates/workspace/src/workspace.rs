@@ -17293,6 +17293,67 @@ mod tests {
         }
     }
 
+    /// Tom, watching the real thing: *"it looks correct initially, but when I make
+    /// the width smaller, the grey area grows."* A gap that widens as the side
+    /// narrows is not a panel drawing at its content width — that would be a
+    /// constant shortfall. It is the dock painting its own background across space
+    /// its columns have stopped claiming, which no model-level witness can see
+    /// because `rendered_widths` reports what the columns were *told*, not what
+    /// flexbox gave them.
+    #[gpui::test]
+    async fn test_a_narrowed_side_is_still_filled_by_its_columns(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        set_panel_pinned(cx, "TestPanel", true);
+        set_panel_pinned(cx, "TestPanelC", true);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let first = cx.new(|cx| TestPanel::new_flexible(DockPosition::Left, 100, cx));
+            workspace.add_panel(first, window, cx);
+            let second = cx.new(|cx| TestPanelC::new_flexible(DockPosition::Left, 101, cx));
+            workspace.add_panel(second, window, cx);
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+                dock.activate_panel(1, window, cx);
+                dock.set_open(true, window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        for width in [px(900.), px(700.), px(500.), px(400.)] {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.resize_dock(DockPosition::Left, width, window, cx);
+            });
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+
+            let dock = cx
+                .debug_bounds("DOCK-PANEL-Left")
+                .expect("the left dock renders");
+            let first = cx
+                .debug_bounds("DOCK-COLUMN-TestPanel")
+                .expect("the first column renders");
+            let second = cx
+                .debug_bounds("DOCK-COLUMN-TestPanelC")
+                .expect("the second column renders");
+
+            let claimed = first.size.width + second.size.width;
+            let unclaimed = dock.size.width - claimed;
+            assert!(
+                unclaimed <= px(1.),
+                "at side width {width:?} the columns must fill the side: side {:?}, \
+                 columns {:?} + {:?} = {claimed:?}, unclaimed {unclaimed:?}",
+                dock.size.width,
+                first.size.width,
+                second.size.width
+            );
+        }
+    }
+
     /// Two flexible neighbours are the case needing no geometry at all: the fixed
     /// total does not move and the pair's combined share does not either, so the
     /// seam is a pure redistribution of flex between them.

@@ -2132,6 +2132,19 @@ impl Render for Dock {
             )
         };
 
+        // Flexbox distributes only `sum(flex_grow)` of the free space when that sum
+        // is below 1, so passing a stored share straight through leaves the rest of
+        // the side painted in dock background — 12% of it for two columns storing
+        // 0.44 each. The shares are meaningful only relative to each other inside
+        // this dock, so normalising them to sum to 1 keeps every column's proportion
+        // and makes them claim the whole side (Tom, dogfooding: "when I make the
+        // width smaller, the grey area grows").
+        let total_flex: f32 = open_entries
+            .iter()
+            .filter(|entry| panel_uses_flexible_width(position, entry.panel.as_ref(), window, cx))
+            .map(|entry| entry.size_state.flex.unwrap_or(1.0).max(0.001))
+            .sum();
+
         let columns: Vec<AnyElement> = open_entries
             .iter()
             .enumerate()
@@ -2153,7 +2166,11 @@ impl Render for Dock {
                         if panel_uses_flexible_width(position, entry.panel.as_ref(), window, cx) {
                             let flex = entry.size_state.flex.unwrap_or(1.0).max(0.001);
                             let style = column.style();
-                            style.flex_grow = Some(flex);
+                            style.flex_grow = Some(if total_flex > 0. {
+                                flex / total_flex
+                            } else {
+                                flex
+                            });
                             style.flex_shrink = Some(1.0);
                             style.flex_basis = Some(relative(0.).into());
                         } else {
