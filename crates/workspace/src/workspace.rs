@@ -17737,6 +17737,58 @@ mod tests {
         });
     }
 
+    /// A fixed column beside a flexible one holds its stored width, so the side's
+    /// floor is that width plus the flexible column's minimum — not both minimums.
+    /// Summing minimums leaves the side free to shrink into a gap its contents
+    /// cannot occupy, which renders as columns that stop tracking the pointer and
+    /// get clipped. Found by dogfooding, not by the suite: both halves are locally
+    /// correct and the gap is exactly the fixed column's own headroom, so it is
+    /// zero whenever a fixture stores a width equal to the minimum.
+    #[gpui::test]
+    async fn test_a_mixed_side_floors_on_the_fixed_width_not_its_minimum(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        set_panel_pinned(cx, "TestPanel", true);
+        set_panel_pinned(cx, "TestPanelB", true);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.bounds.size.width = px(1600.);
+
+            let flexible = cx.new(|cx| TestPanel::new_flexible(DockPosition::Left, 100, cx));
+            workspace.add_panel(flexible, window, cx);
+            let fixed = cx.new(|cx| TestPanelB::new(DockPosition::Left, 101, cx));
+            workspace.add_panel(fixed.clone(), window, cx);
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+                dock.activate_panel(1, window, cx);
+                dock.set_panel_size_state(
+                    &fixed,
+                    dock::PanelSizeState {
+                        size: Some(px(300.)),
+                        flex: None,
+                    },
+                    cx,
+                );
+            });
+
+            workspace.resize_dock(DockPosition::Left, px(10.), window, cx);
+            let dock = workspace.left_dock().read(cx);
+            assert_eq!(
+                workspace.dock_size(&dock, window, cx),
+                Some(px(300.) + crate::layout_registry::SIDE_COLUMN_MIN_WIDTH),
+                "the floor must pay for the fixed column's stored 300px, not its \
+                 200px minimum; summing minimums floors 100px too low and the \
+                 columns stop tracking the pointer inside that gap"
+            );
+        });
+    }
+
     /// A flexible component takes its width from a flex factor, so the per-column
     /// distribution never floors it — only the clamp in `resize_*_dock` does, by
     /// deciding the width the flex factor is derived from. The fixed-panel

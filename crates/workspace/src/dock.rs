@@ -1138,11 +1138,13 @@ impl Dock {
         total
     }
 
-    /// The width below which this side stops being usable: every open component's
-    /// effective minimum, summed. A component declaring no `min_size` contributes
-    /// its registry area floor rather than nothing, which is the whole point — a
-    /// side holding only undeclared components used to floor at nothing, so the
-    /// editor-facing divider dragged it down to `RESIZE_HANDLE_SIZE`.
+    /// The width below which this side stops being usable. A flexible column
+    /// contributes its effective minimum; a fixed column beside one contributes
+    /// its stored width, because that is what it holds through a drag. A component
+    /// declaring no `min_size` contributes its registry area floor rather than
+    /// nothing, which is the whole point — a side holding only undeclared
+    /// components used to floor at nothing, so the editor-facing divider dragged
+    /// it down to `RESIZE_HANDLE_SIZE`.
     ///
     /// `None` for the bottom dock. Its resize axis is height, while the registry's
     /// bottom number is a segment *width* governing the row's internal dividers —
@@ -1158,9 +1160,32 @@ impl Dock {
         if self.position.axis() != Axis::Horizontal {
             return None;
         }
-        self.open_entries()
+        let entries = self.open_entries();
+        // A fixed column beside a flexible one holds its stored width instead of
+        // scaling toward its minimum, so the side cannot go below that width plus
+        // the flexible columns' minimums. Summing every minimum was right while a
+        // drag scaled every column together; once fixed means fixed it under-counts
+        // by the fixed column's own headroom, and the side is free to shrink past
+        // what its contents can occupy. The columns then stop tracking the pointer
+        // and `overflow_hidden` clips them (Tom, dogfooding F-3, 2026-09-03).
+        let mixed = entries.iter().any(|entry| {
+            panel_uses_flexible_width(self.position, entry.panel.as_ref(), window, cx)
+        });
+        entries
             .into_iter()
-            .map(|entry| effective_min_width_at(self.position, entry.panel.as_ref(), window, cx))
+            .map(|entry| {
+                let min = effective_min_width_at(self.position, entry.panel.as_ref(), window, cx);
+                if !mixed
+                    || panel_uses_flexible_width(self.position, entry.panel.as_ref(), window, cx)
+                {
+                    return min;
+                }
+                entry
+                    .size_state
+                    .size
+                    .unwrap_or_else(|| entry.panel.default_size(window, cx))
+                    .max(min)
+            })
             .reduce(|sum, size| sum + size)
     }
 
