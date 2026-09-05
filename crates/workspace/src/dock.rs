@@ -2219,9 +2219,18 @@ impl Render for Dock {
                                 .unwrap_or_else(|| entry.panel.default_size(window, cx));
                             column = column.w(size).flex_none();
                         }
-                        if let Some(min) = entry.panel.min_size(window, cx) {
-                            column = column.min_w(min);
-                        }
+                        // The *effective* minimum, not just the declared one. A
+                        // component declaring nothing took no `min_w` at all and
+                        // could be squeezed to a sliver by a shrinking window,
+                        // which is the state the registry floor exists to prevent.
+                        // Holding the floor is also what makes the side overflow
+                        // rather than squash, which is what there is to scroll.
+                        column = column.min_w(effective_min_width_at(
+                            position,
+                            entry.panel.as_ref(),
+                            window,
+                            cx,
+                        ));
                     }
                     Axis::Vertical => {
                         column = column.flex_1().min_w_0();
@@ -2251,7 +2260,14 @@ impl Render for Dock {
             .size_full()
             .bg(cx.theme().colors().panel_background)
             .border_color(border)
-            .overflow_hidden()
+            // The side's laid-out width is the scroll viewport. Columns hold their
+            // effective minimums, so once those exceed the width the row overflows
+            // and can be scrolled instead of collapsing — a window narrow enough to
+            // squeeze a side used to make its components unreachable, because
+            // `overflow_hidden` clipped whatever did not fit
+            // (Decision 2026-08-31; `clamp_panel_size` is the path that gets here,
+            // since the drag path is floored by `open_min_size`).
+            .overflow_x_scroll()
             .map(|this| match position {
                 DockPosition::Left => this.border_r_1(),
                 DockPosition::Right => this.border_l_1(),

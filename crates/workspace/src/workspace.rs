@@ -17372,6 +17372,61 @@ mod tests {
         }
     }
 
+    /// A window narrow enough to squeeze a side used to make its components
+    /// unreachable: every column was inside `overflow_hidden`, so whatever did not
+    /// fit was clipped rather than scrolled to. The drag path cannot get here —
+    /// `open_min_size` floors it — so the route in is `clamp_panel_size`, which runs
+    /// on window resize and deliberately has no floor of its own.
+    ///
+    /// The witness is that the columns keep their effective minimums while the side
+    /// is narrower than their sum: that overflow is the thing there is to scroll.
+    #[gpui::test]
+    async fn test_a_side_too_narrow_for_its_components_overflows_instead_of_squashing(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        set_panel_pinned(cx, "TestPanel", true);
+        set_panel_pinned(cx, "TestPanelB", true);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            // Neither declares a `min_size`, so both take the registry's
+            // `SIDE_COLUMN_MIN_WIDTH`. That is the case with no `min_w` at all
+            // before this change, and the one a fixture declaring minimums hides.
+            let first = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+            workspace.add_panel(first, window, cx);
+            let second = cx.new(|cx| TestPanelB::new(DockPosition::Left, 101, cx));
+            workspace.add_panel(second, window, cx);
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+                dock.activate_panel(1, window, cx);
+                dock.set_open(true, window, cx);
+                // The window-shrink path, not a drag.
+                dock.clamp_panel_size(px(120.), window, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+
+        let floor = crate::layout_registry::SIDE_COLUMN_MIN_WIDTH;
+        for selector in ["DOCK-COLUMN-TestPanel", "DOCK-COLUMN-TestPanelB"] {
+            let column = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} renders"));
+            assert!(
+                column.size.width >= floor - px(1.),
+                "{selector} must hold its effective minimum so the side overflows \
+                 rather than squashing: got {:?}, floor {floor:?}",
+                column.size.width
+            );
+        }
+    }
+
     /// Tom, watching the real thing: *"it looks correct initially, but when I make
     /// the width smaller, the grey area grows."* A gap that widens as the side
     /// narrows is not a panel drawing at its content width — that would be a
