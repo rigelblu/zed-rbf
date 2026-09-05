@@ -1848,7 +1848,15 @@
   "workspace_layout": {
     // Where each workspace component lives, whether it is hidden everywhere,
     // and whether it keeps its own column, keyed by the component's stable id.
-    "component_positions": {}
+    "component_positions": {},
+    // The order component icons take in the bottom bar, and so the order their
+    // columns take on a side, by stable id. Ids named here come first in this
+    // order; anything unnamed keeps its registered order behind them. An id
+    // nothing recognises is kept and ignored.
+    //
+    // Set through each icon's right-click menu ("Move Earlier" / "Move Later"),
+    // which writes the whole sequence. Null means the registered order.
+    "component_order": null
   },
   "status_bar": {
     // Whether to show the status bar.

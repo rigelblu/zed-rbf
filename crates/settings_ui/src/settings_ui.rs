@@ -420,6 +420,17 @@ impl Focusable for NonFocusableHandle {
 
 #[derive(Default)]
 struct SettingsFieldMetadata {
+    /// The variant names a dropdown row may offer, when its field's type is wider
+    /// than the row's own item allows. Named rather than typed because this struct
+    /// is shared by every field type; `render_dropdown` matches against
+    /// `strum::VariantNames`.
+    ///
+    /// `component_positions` stores a `DockPosition` for every component, but five
+    /// of the seven components dock only to a side. Without this a user could
+    /// choose Bottom for Project Panel from the one surface that should not be able
+    /// to produce it, writing the exact entry `registry_accepts_position` exists to
+    /// warn about.
+    allowed_variants: Option<&'static [&'static str]>,
     placeholder: Option<&'static str>,
     should_do_titlecase: Option<bool>,
     display_confirm_button: bool,
@@ -557,6 +568,7 @@ fn init_renderers(cx: &mut App) {
         .add_basic_renderer::<settings::TerminalDockPosition>(render_dropdown)
         .add_basic_renderer::<settings::DockPosition>(render_dropdown)
         .add_basic_renderer::<settings::SidebarDockPosition>(render_dropdown)
+        .add_basic_renderer::<settings::StatusBarItemLocation>(render_dropdown)
         .add_basic_renderer::<settings::GitGutterSetting>(render_dropdown)
         .add_basic_renderer::<settings::GitHunkStyleSetting>(render_dropdown)
         .add_basic_renderer::<settings::GitDiffBaseSetting>(render_dropdown)
@@ -5003,8 +5015,8 @@ fn render_dropdown<T>(
 where
     T: strum::VariantArray + strum::VariantNames + Copy + PartialEq + Send + Sync + 'static,
 {
-    let variants = || -> &'static [T] { <T as strum::VariantArray>::VARIANTS };
-    let labels = || -> &'static [&'static str] { <T as strum::VariantNames>::VARIANTS };
+    let all_variants = <T as strum::VariantArray>::VARIANTS;
+    let all_labels = <T as strum::VariantNames>::VARIANTS;
     let should_do_titlecase = metadata
         .and_then(|metadata| metadata.should_do_titlecase)
         .unwrap_or(true);
@@ -5012,9 +5024,21 @@ where
     let current_value = get_current_value(&SettingsStore::global(cx), &file, &field, cx);
     let (current_value, disabled) = current_value
         .map(|current_value| (*current_value.value, current_value.disabled))
-        .unwrap_or((variants()[0], false));
+        .unwrap_or((all_variants[0], false));
 
-    EnumVariantDropdown::new("dropdown", current_value, variants(), labels(), {
+    let allowed = metadata.and_then(|metadata| metadata.allowed_variants);
+    let (variants, labels): (Vec<T>, Vec<&'static str>) = std::iter::zip(all_variants, all_labels)
+        .filter(|(value, label)| match allowed {
+            // The value already in the file is offered whether or not the row still
+            // allows it. Hiding it would leave the dropdown showing a choice the
+            // menu does not contain, with no way to select off it.
+            Some(allowed) => allowed.contains(*label) || **value == current_value,
+            None => true,
+        })
+        .map(|(value, label)| (*value, *label))
+        .unzip();
+
+    EnumVariantDropdown::new("dropdown", current_value, variants, labels, {
         move |value, window, cx| {
             if value == current_value {
                 return;

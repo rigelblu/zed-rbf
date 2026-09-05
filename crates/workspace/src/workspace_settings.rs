@@ -360,6 +360,9 @@ fn registered_status_control_location(item_id: &str) -> Option<StatusBarItemLoca
 #[derive(Clone, Debug, Default, PartialEq, RegisterSetting)]
 pub struct WorkspaceLayoutSettings {
     pub component_positions: collections::HashMap<String, WorkspaceComponentPosition>,
+    /// The user's icon sequence, ids first-to-last. Empty until something writes
+    /// one, which is the state every install starts in and most stay in.
+    pub component_order: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -388,6 +391,30 @@ impl WorkspaceLayoutSettings {
     }
 }
 
+/// Whether the registry says a component can take a position.
+///
+/// The live panel can narrow this further, so `true` here is not a promise the
+/// position will be used. It is what the static table can rule out with no window
+/// open, which is where a settings-load warning has to be decided — and it is
+/// deliberately permissive about ids it does not recognise, since an unregistered
+/// key is a different complaint from an unusable position.
+fn registry_accepts_position(panel_key: &str, position: settings::DockPosition) -> bool {
+    use crate::layout_registry::{LayoutItemKind, LayoutPosition};
+
+    let Some(item) = crate::layout_registry::get(panel_key) else {
+        return true;
+    };
+    if item.kind != LayoutItemKind::WorkspaceComponent {
+        return true;
+    }
+    let position = match position {
+        settings::DockPosition::Left => LayoutPosition::Left,
+        settings::DockPosition::Right => LayoutPosition::Right,
+        settings::DockPosition::Bottom => LayoutPosition::Bottom,
+    };
+    item.valid_positions.contains(&position)
+}
+
 impl Settings for WorkspaceLayoutSettings {
     fn from_settings(content: &settings::SettingsContent) -> Self {
         let layout = content.workspace_layout.clone().unwrap_or_default();
@@ -396,6 +423,20 @@ impl Settings for WorkspaceLayoutSettings {
                 .component_positions
                 .into_iter()
                 .map(|(key, entry)| {
+                    // A position that does not parse is already reported: the
+                    // settings machinery raises `Invalid user settings file`
+                    // naming the line, and hands this code `None`. One that parses
+                    // and names a side the component cannot take arrives here
+                    // looking perfectly well-formed, and was ignored in silence.
+                    if let Some(position) = entry.position
+                        && !registry_accepts_position(&key, position)
+                    {
+                        log::warn!(
+                            "workspace_layout.component_positions.{key}.position is \
+                             {position:?}, which that component does not support. The saved \
+                             value is ignored and left in the settings file."
+                        );
+                    }
                     (
                         key,
                         WorkspaceComponentPosition {
@@ -406,6 +447,7 @@ impl Settings for WorkspaceLayoutSettings {
                     )
                 })
                 .collect(),
+            component_order: layout.component_order.unwrap_or_default(),
         }
     }
 }
@@ -430,6 +472,35 @@ mod status_bar_settings_tests {
                 .map(|(id, location)| (id.to_string(), *location))
                 .collect(),
         }
+    }
+
+    /// The static half of the invalid-position check — what can be decided at
+    /// settings-load time, with no window open and no live panel to ask. It is
+    /// what decides whether a saved value gets a log entry.
+    #[test]
+    fn the_registry_rules_out_a_side_a_component_cannot_take() {
+        use crate::layout_registry::ids;
+
+        assert!(
+            !registry_accepts_position(ids::PROJECT_PANEL, settings::DockPosition::Bottom),
+            "Project Panel docks left or right, and a saved Bottom has to be caught"
+        );
+        assert!(registry_accepts_position(
+            ids::PROJECT_PANEL,
+            settings::DockPosition::Left
+        ));
+        assert!(
+            registry_accepts_position(ids::TERMINAL_PANEL, settings::DockPosition::Bottom),
+            "Terminal does dock bottom, so the check must be per component"
+        );
+        assert!(
+            registry_accepts_position(ids::CURSOR_POSITION, settings::DockPosition::Left),
+            "a status control is not placed by this setting and must not be warned about"
+        );
+        assert!(
+            registry_accepts_position("no-such-component", settings::DockPosition::Bottom),
+            "an unregistered id is a different complaint from an unusable position"
+        );
     }
 
     #[test]

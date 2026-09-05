@@ -16,11 +16,12 @@ use client::proto;
 use db::kvp::KeyValueStore;
 use fs::Fs;
 
+use futures::channel::oneshot;
 use gpui::{
     Action, Anchor, AnyView, App, Axis, Context, Entity, EntityId, EventEmitter, FocusHandle,
-    Focusable, IntoElement, KeyContext, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement,
-    Render, SharedString, StyleRefinement, Styled, Subscription, WeakEntity, Window, deferred, div,
-    px,
+    Focusable, Global, IntoElement, KeyContext, MouseButton, MouseDownEvent, MouseUpEvent,
+    ParentElement, PromptLevel, Render, ScrollHandle, SharedString, StyleRefinement, Styled,
+    Subscription, WeakEntity, Window, deferred, div, px,
 };
 use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsStore, TerminalDockPosition};
@@ -39,13 +40,99 @@ enum ComponentSetting {
     Pinned(bool),
 }
 
-fn write_component_setting(
+impl ComponentSetting {
+    /// What the user was trying to do, for the prompt a failed write raises.
+    ///
+    /// Named after the gesture rather than the settings key: the key is where the
+    /// write failed, the gesture is what the user will try again.
+    fn failure_message(&self, panel_key: &str) -> SharedString {
+        placement_failure_message(
+            panel_key,
+            match self {
+                ComponentSetting::Position(_) => "move",
+                ComponentSetting::Hidden(true) => "hide",
+                ComponentSetting::Hidden(false) => "show",
+                ComponentSetting::Pinned(true) => "pin",
+                ComponentSetting::Pinned(false) => "unpin",
+            },
+        )
+    }
+}
+
+/// "Failed to move Project Panel" — the gesture and the item, never the settings
+/// key the write failed at. Shared by both item kinds so a component and a status
+/// control report a failure in one voice; the status half used to say "Failed to
+/// update bottom bar placement", which named neither.
+pub(crate) fn placement_failure_message(item_id: &str, verb: &str) -> SharedString {
+    let label = crate::layout_registry::get(item_id)
+        .map(|item| item.label)
+        .unwrap_or(item_id);
+    format!("Failed to {verb} {label}").into()
+}
+
+/// A component icon being dragged along its strip to a new place in the sequence.
+///
+/// Carries the dock it left so a drag can be refused at another side's icons
+/// rather than silently doing nothing there: arranging a strip and moving a
+/// component between sides are two gestures, and `Workspace Position` already owns
+/// the second one.
+#[derive(Clone)]
+pub struct DraggedComponentIcon {
+    panel_key: SharedString,
+    icon: IconName,
+    from: DockPosition,
+    /// Where it sat on the strip when the drag began, so each icon it passes over
+    /// can mark the edge the drop would arrive from.
+    at: usize,
+    /// The sides this component will take, captured here because the drop lands on
+    /// another dock's button, which has no way to reach the dragged panel's handle.
+    accepts: Vec<DockPosition>,
+    /// So the sequence can name it even when the target dock has never seen it and
+    /// the registry does not know it either.
+    activation_priority: u32,
+}
+
+impl Render for DraggedComponentIcon {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        // The icon alone, at the size it sits in the bar. A label would be a
+        // second thing to aim with when the target is a 14px glyph in a row of
+        // them.
+        div()
+            .p_1()
+            .rounded_sm()
+            .child(Icon::new(self.icon).size(IconSize::Small))
+    }
+}
+
+/// The windows currently showing a failed-write prompt.
+///
+/// Placement writes share one serialized queue and fail for one reason — a
+/// settings file that cannot be written — so a gesture that queues two writes, or
+/// `Restore Default Positions…` which queues dozens, would otherwise stack one
+/// dialog per write on a user who has already read the first.
+///
+/// Keyed by window rather than a single flag, because the prompt is window-local
+/// while the failure is not: a second window's gesture failing while the first
+/// window's dialog is up must still reach the person looking at the second window
+/// (Flow 8, "in the initiating window").
+#[derive(Default)]
+struct LayoutWritePromptOpen(collections::HashSet<gpui::WindowId>);
+
+impl Global for LayoutWritePromptOpen {}
+
+/// Queues one component setting and hands back the write's completion.
+///
+/// Split from the reporting because the two need different contexts: the write
+/// must go through whether or not the window that asked is still there, and only
+/// the report needs a window.
+fn queue_component_setting(
     fs: Arc<dyn Fs>,
     panel_key: String,
     setting: ComponentSetting,
     cx: &mut App,
-) {
-    settings::update_settings_file(fs, cx, move |settings, _| {
+) -> (oneshot::Receiver<anyhow::Result<()>>, SharedString) {
+    let message = setting.failure_message(&panel_key);
+    let update = settings::update_settings_file_with_completion(fs, cx, move |settings, _| {
         let entry = settings
             .workspace_layout
             .get_or_insert_default()
@@ -58,6 +145,416 @@ fn write_component_setting(
             ComponentSetting::Pinned(pinned) => entry.pinned = Some(pinned),
         }
     });
+    (update, message)
+}
+
+/// Persists one component setting, reporting a failure rather than swallowing it.
+///
+/// The write is completion-aware, and nothing here is optimistic: the settings
+/// store takes the new value only once the file is on disk, and every surface
+/// reads a component's position, hidden state and pinned state from that store.
+/// So a failed write needs no rollback — the prior state was never left.
+fn write_component_setting(
+    fs: Arc<dyn Fs>,
+    panel_key: String,
+    setting: ComponentSetting,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let (update, message) = queue_component_setting(fs, panel_key, setting, cx);
+    report_layout_write(update, message, window, cx);
+}
+
+/// Reports a failed placement write, then hands focus back to whatever made the
+/// choice.
+///
+/// Shared by both item kinds deliberately. A component and a status control write
+/// different settings keys but make the same promise, and `Restore Default
+/// Positions…` queues both in one gesture — two prompt policies for one gesture is
+/// how the dialog storm this guards against gets back in.
+///
+/// The prompt takes keyboard focus, and Q13 requires the surface that made the
+/// choice to still be open and still driveable once the prompt is gone. The
+/// layout surface's placement buttons are not themselves focusable — the picker
+/// holding them is — so refocusing the handle that was focused when the write was
+/// queued is what puts the keyboard back on the attempted choice.
+///
+/// Spawned on the app and not on the window, with the flag cleared through the app
+/// too: a window closing while its prompt is up must not strand the flag set,
+/// which would silence every later failure for the rest of the session.
+pub(crate) fn report_layout_write(
+    update: oneshot::Receiver<anyhow::Result<()>>,
+    message: SharedString,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let previously_focused = window.focused(cx);
+    let window_handle = window.window_handle();
+    cx.spawn(async move |cx| {
+        let error = match update.await {
+            Ok(Ok(())) => return,
+            Ok(Err(error)) => error,
+            Err(_) => anyhow::anyhow!("the settings write was canceled"),
+        };
+        log::error!("{message}: {error:#}");
+        let already_open = cx.update(|cx| {
+            !cx.default_global::<LayoutWritePromptOpen>()
+                .0
+                .insert(window_handle.window_id())
+        });
+        if already_open {
+            return;
+        }
+        let prompt = cx.update_window(window_handle, |_, window, cx| {
+            window.prompt(
+                PromptLevel::Critical,
+                &message,
+                Some(&format!("{error:#}")),
+                &["OK"],
+                cx,
+            )
+        });
+        if let Ok(prompt) = prompt {
+            prompt.await.ok();
+        }
+        cx.update(|cx| {
+            cx.default_global::<LayoutWritePromptOpen>()
+                .0
+                .remove(&window_handle.window_id());
+        });
+        if let Some(handle) = previously_focused {
+            // A window that closed while its prompt was up has no focus to restore.
+            cx.update_window(window_handle, |_, window, cx| window.focus(&handle, cx))
+                .ok();
+        }
+    })
+    .detach();
+}
+
+/// Where a component's icon sits in the bottom bar, and so where its column sits
+/// on its side, as a sort key.
+///
+/// **The registry decides, and until 2026-09-05 it did not.** `add_panel` sorted on
+/// `Panel::activation_priority()` — a constant each panel declares in its own crate,
+/// across seven upstream files — while `layout_registry` carried the identical
+/// numbers, gap at `Panel(4)` included, and was read by nothing outside its own
+/// tests. Two sources of truth for one order, with the live one spread where a fork
+/// cannot cheaply change it, which left `v0.45.2`'s user ordering no single sequence
+/// to write to.
+///
+/// An id the table does not know keeps sorting by the trait constant and lands after
+/// every registered one. That covers an extension's panel and every test fixture, so
+/// the table became authoritative without becoming a gate — and it is why switching
+/// the sort was provably a no-op: the numbers already agreed.
+///
+/// `order` is the user's sequence from `workspace_layout.component_order`, and it
+/// outranks the table. Three bands, not two: a listed id sorts by its place in the
+/// list, an unlisted registered one keeps its `source_rank` behind every listed id,
+/// and an unregistered one keeps the trait constant behind both. So a partial list
+/// is meaningful — naming two components orders those two and disturbs nothing else
+/// — and an empty list reproduces the table exactly.
+fn icon_order(panel_key: &str, activation_priority: u32, order: &[String]) -> (u8, u32) {
+    use crate::layout_registry::SourceRank;
+
+    if let Some(index) = order.iter().position(|id| id == panel_key) {
+        return (0, index as u32);
+    }
+    match crate::layout_registry::get(panel_key).map(|item| item.source_rank) {
+        Some(SourceRank::Panel(rank)) => (1, rank as u32),
+        // A status control is not a panel. If the table ever says one is, sort it
+        // with the unregistered rather than give it a place in the panel sequence.
+        Some(SourceRank::StatusControl(_)) | None => (2, activation_priority),
+    }
+}
+
+/// The user's icon sequence, or an empty list when they have not set one.
+fn component_order(cx: &App) -> Vec<String> {
+    WorkspaceLayoutSettings::get_global(cx)
+        .component_order
+        .clone()
+}
+
+/// The complete icon sequence as it currently reads, ready to be written back.
+///
+/// Every registered component, every id the user's list already names, and every
+/// panel live on the dock making the move — so a panel the table does not know is
+/// still named, and can still be moved past.
+///
+/// **The whole sequence is written on the first move, not just the pair that
+/// changed.** That is what makes every later move a plain list splice, and it is
+/// why a component whose crate loads late does not jump: it is already named, in
+/// the place the table gave it. The cost is a settings file that lists components
+/// the user never touched, which is also the thing that makes the list readable
+/// and hand-editable.
+///
+/// `live` carries each panel's `activation_priority` because that is the only
+/// tiebreak left for an id that is neither registered nor listed. A registered id
+/// never reaches that band and a listed one never reaches it either, so the zeros
+/// below are never compared against anything.
+fn materialized_order(live: &[(String, u32)], order: &[String]) -> Vec<String> {
+    use crate::layout_registry::LayoutItemKind;
+
+    let mut seen = collections::HashSet::default();
+    let mut ids: Vec<(String, u32)> = Vec::new();
+    let mut add = |id: String, priority: u32, ids: &mut Vec<(String, u32)>| {
+        if seen.insert(id.clone()) {
+            ids.push((id, priority));
+        }
+    };
+
+    for item in crate::layout_registry::of_kind(LayoutItemKind::WorkspaceComponent) {
+        add(item.id.to_string(), 0, &mut ids);
+    }
+    for (key, priority) in live {
+        add(key.clone(), *priority, &mut ids);
+    }
+    for id in order {
+        add(id.clone(), 0, &mut ids);
+    }
+
+    ids.sort_by_key(|(id, priority)| icon_order(id, *priority, order));
+    ids.into_iter().map(|(id, _)| id).collect()
+}
+
+/// The sequence after `moved` is placed where `target` currently sits on their
+/// shared strip.
+///
+/// **Only this dock's keys change places.** They occupy a fixed set of slots in the
+/// global sequence, and the rearrangement permutes which key sits in which slot —
+/// so a component on another side keeps its exact index even when it sits between
+/// the two that moved. Rewriting the sequence by index would not.
+///
+/// `strip` is the dock's keys **as drawn**, so a drop lands where the user aimed.
+/// `drawn_in_reverse` comes from [`Dock::strip_is_drawn_in_reverse`], the single
+/// owner of that fact.
+///
+/// `None` also when either key is off the strip, or when they are the same key —
+/// there is nothing to write that the file does not already say.
+fn order_after_placing(
+    full: &[String],
+    strip: &[String],
+    drawn_in_reverse: bool,
+    moved: &str,
+    target: &str,
+) -> Option<Vec<String>> {
+    if moved == target {
+        return None;
+    }
+    let from = strip.iter().position(|key| key == moved)?;
+    let to = strip.iter().position(|key| key == target)?;
+
+    let mut slots: Vec<usize> = strip
+        .iter()
+        .map(|key| full.iter().position(|id| id == key))
+        .collect::<Option<Vec<_>>>()?;
+
+    let mut rearranged = strip.to_vec();
+    let key = rearranged.remove(from);
+    rearranged.insert(to, key);
+    if drawn_in_reverse {
+        rearranged.reverse();
+    }
+
+    slots.sort_unstable();
+    let mut sequence = full.to_vec();
+    for (slot, key) in slots.into_iter().zip(rearranged) {
+        sequence[slot] = key;
+    }
+    Some(sequence)
+}
+
+/// The sequence after `moved` leaves its own strip and joins the one `target` is
+/// on, landing where `target` currently sits.
+///
+/// The bar is the placement surface, so dragging across a boundary re-places the
+/// component rather than being refused — the caller writes its new position too,
+/// and this decides where it lands once it is there.
+///
+/// Unlike [`order_after_placing`] this cannot permute fixed slots: the target
+/// strip gains a key and the source strip loses one, so the slot sets themselves
+/// change. It works on the global sequence directly instead — lift `moved` out,
+/// then set it down beside `target`. `drawn_in_reverse` is the **target** dock's,
+/// because display-left is sequence-later on the right and landing on the wrong
+/// side of the target is the whole failure mode here.
+/// Which side of the icon it was dropped on the component comes to rest, **as
+/// drawn**. Dropping onto an icon means taking its place, so it is `Before`; the
+/// end-of-strip zone is the only `After`, and the only way to name the slot past
+/// the last icon.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum LandsOn {
+    Before,
+    After,
+}
+
+fn order_after_joining(
+    full: &[String],
+    drawn_in_reverse: bool,
+    moved: &str,
+    target: &str,
+    lands: LandsOn,
+) -> Option<Vec<String>> {
+    let mut sequence = full.to_vec();
+    let from = sequence.iter().position(|id| id == moved)?;
+    sequence.remove(from);
+    // A drop onto its own icon needs no guard: `moved` has just been lifted out,
+    // so the lookup below cannot find it and the whole call declines. The same
+    // guard *is* load-bearing in `order_after_placing`, where removing and
+    // reinserting at one index rebuilds the sequence it started from.
+    let at = sequence.iter().position(|id| id == target)?;
+    // Display-left is sequence-later on a reversed strip, so the side the user
+    // aimed at and the index to insert at agree exactly when the two disagree.
+    let after_in_sequence = (lands == LandsOn::After) != drawn_in_reverse;
+    sequence.insert(
+        if after_in_sequence { at + 1 } else { at },
+        moved.to_string(),
+    );
+    Some(sequence)
+}
+
+/// The sequence after moving `panel_key` one place along its own strip.
+///
+/// A nudge is a placement onto the icon next door, so it shares
+/// [`order_after_placing`] with the drag rather than reimplementing the rule that
+/// the other sides must not move.
+///
+/// `None` when the icon is already at that end of its strip. The caller disables
+/// the menu entry rather than writing back the sequence it already has.
+fn order_after_move(
+    full: &[String],
+    strip: &[String],
+    drawn_in_reverse: bool,
+    panel_key: &str,
+    later: bool,
+) -> Option<Vec<String>> {
+    let at = strip.iter().position(|key| key == panel_key)?;
+    let neighbour = if later {
+        strip.get(at + 1)?
+    } else {
+        strip.get(at.checked_sub(1)?)?
+    };
+    order_after_placing(full, strip, drawn_in_reverse, panel_key, neighbour)
+}
+
+/// Whether a drop on this dock would change anything, which is also whether it
+/// should promise to. `target` is the icon under the pointer, or `None` for the
+/// end-of-strip zone — which always has somewhere to put an icon that is not
+/// already last.
+fn drop_would_land(
+    dragged: &DraggedComponentIcon,
+    onto: DockPosition,
+    target: Option<&str>,
+) -> bool {
+    if dragged.from != onto {
+        return dragged.accepts.contains(&onto);
+    }
+    match target {
+        Some(key) => key != dragged.panel_key.as_ref(),
+        None => true,
+    }
+}
+
+/// Applies a dropped component icon to this dock: the side it joins, if it is
+/// joining, and where it lands once there.
+///
+/// Shared by the icons and the end-of-strip zone because they differ in one thing
+/// — an icon means *take this one's place*, the zone means *go last* — and every
+/// other step, including which of the two sequence rules applies, is the same.
+#[allow(clippy::too_many_arguments)]
+fn apply_icon_drop(
+    dragged: &DraggedComponentIcon,
+    target: Option<&str>,
+    dock: &Entity<Dock>,
+    onto: DockPosition,
+    workspace: &WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if !drop_would_land(dragged, onto, target) {
+        return;
+    }
+    let joining = dragged.from != onto;
+    let Some(workspace) = workspace.upgrade() else {
+        return;
+    };
+
+    let (full, strip, reversed) = {
+        let dock = dock.read(cx);
+        let mut live: Vec<(String, u32)> = dock
+            .panel_entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.panel.panel_key().to_string(),
+                    entry.panel.activation_priority(cx),
+                )
+            })
+            .collect();
+        if joining {
+            // So the sequence names it even when this dock has never seen it and
+            // the registry does not know it either.
+            live.push((dragged.panel_key.to_string(), dragged.activation_priority));
+        }
+        (
+            materialized_order(&live, &component_order(cx)),
+            dock.displayed_panel_keys(window, cx),
+            dock.strip_is_drawn_in_reverse(),
+        )
+    };
+
+    let (target, lands) = match target {
+        Some(key) => (key.to_string(), LandsOn::Before),
+        // An empty strip has no icon to go after. It is also unreachable by drag,
+        // since there is nothing drawn there to aim at — the menu covers it.
+        None => match strip.last() {
+            Some(last) => (last.clone(), LandsOn::After),
+            None => return,
+        },
+    };
+    let sequence = if joining {
+        order_after_joining(&full, reversed, &dragged.panel_key, &target, lands)
+    } else {
+        order_after_placing(&full, &strip, reversed, &dragged.panel_key, &target)
+    };
+    let Some(sequence) = sequence else {
+        return;
+    };
+
+    let fs = workspace.read(cx).app_state().fs.clone();
+    let message = placement_failure_message(&dragged.panel_key, "move");
+    // The side first, then where it lands on it. Both ride the one serialized
+    // queue, so the order the component arrives in is the order written here.
+    if joining {
+        set_component_position(
+            fs.clone(),
+            dragged.panel_key.to_string(),
+            onto.into(),
+            window,
+            cx,
+        );
+    }
+    set_component_order(fs, Some(sequence), message, window, cx);
+}
+
+/// Persists a whole icon sequence, or clears it when `order` is `None`, reporting
+/// a failure the same way every other placement write does.
+///
+/// The caller supplies the message because the two callers are doing different
+/// things: a move names the component the user right-clicked, and a reset names
+/// no component at all.
+pub fn set_component_order(
+    fs: Arc<dyn Fs>,
+    order: Option<Vec<String>>,
+    message: SharedString,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let update = settings::update_settings_file_with_completion(fs, cx, move |settings, _| {
+        settings
+            .workspace_layout
+            .get_or_insert_default()
+            .component_order = order;
+    });
+    report_layout_write(update, message, window, cx);
 }
 
 /// A component's effective side.
@@ -247,9 +744,16 @@ pub fn set_component_position(
     fs: Arc<dyn Fs>,
     panel_key: String,
     position: settings::DockPosition,
+    window: &mut Window,
     cx: &mut App,
 ) {
-    write_component_setting(fs, panel_key, ComponentSetting::Position(position), cx);
+    write_component_setting(
+        fs,
+        panel_key,
+        ComponentSetting::Position(position),
+        window,
+        cx,
+    );
 }
 
 /// Writes a component's current position into `component_positions`, but only if
@@ -270,7 +774,7 @@ pub fn seed_component_position(
     position: settings::DockPosition,
     cx: &mut App,
 ) {
-    settings::update_settings_file(fs, cx, move |settings, _| {
+    let update = settings::update_settings_file_with_completion(fs, cx, move |settings, _| {
         let components = &mut settings
             .workspace_layout
             .get_or_insert_default()
@@ -280,12 +784,29 @@ pub fn seed_component_position(
         }
         components.entry(panel_key).or_default().position = Some(position);
     });
+    // Logged, never prompted. A seed is never issued alone — every caller follows
+    // it with the pin or hide it exists to protect, on the same serialized queue,
+    // and that write carries the report. Prompting here as well would put "Failed
+    // to move X" in front of someone who was pinning, because the seed is queued
+    // first and the first failure is the one the dialog shows.
+    cx.spawn(async move |_| {
+        if let Ok(Err(error)) = update.await {
+            log::error!("failed to record a component's position before a pin or hide: {error:#}");
+        }
+    })
+    .detach();
 }
 
 /// Decides whether a component keeps its own column or shares its side's single
 /// unpinned slot.
-pub fn set_component_pinned(fs: Arc<dyn Fs>, panel_key: String, pinned: bool, cx: &mut App) {
-    write_component_setting(fs, panel_key, ComponentSetting::Pinned(pinned), cx);
+pub fn set_component_pinned(
+    fs: Arc<dyn Fs>,
+    panel_key: String,
+    pinned: bool,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    write_component_setting(fs, panel_key, ComponentSetting::Pinned(pinned), window, cx);
 }
 
 /// Hides or restores a component everywhere.
@@ -297,21 +818,38 @@ pub fn set_component_pinned(fs: Arc<dyn Fs>, panel_key: String, pinned: bool, cx
 /// the moment it became visible again.
 ///
 /// Both unhide paths share this function precisely so neither can skip it.
-pub fn set_component_hidden(fs: Arc<dyn Fs>, panel_key: String, hidden: bool, cx: &mut App) {
+pub fn set_component_hidden(
+    fs: Arc<dyn Fs>,
+    panel_key: String,
+    hidden: bool,
+    window: &mut Window,
+    cx: &mut App,
+) {
     if hidden {
-        write_component_setting(fs, panel_key, ComponentSetting::Hidden(true), cx);
+        write_component_setting(fs, panel_key, ComponentSetting::Hidden(true), window, cx);
         return;
     }
 
     let db = WorkspaceDb::global(cx);
+    let window_handle = window.window_handle();
+    // App-scoped, not window-scoped. The window that asked may be gone by the time
+    // the scrub returns, and a component left hidden with its open rows already
+    // deleted is the one outcome this path must not produce — so the write goes
+    // through regardless, and only the failure report needs a window.
     cx.spawn(async move |cx| {
         // Ordered deliberately: the rows go before the setting turns visible.
         // A crash between the two leaves only forgotten openness, which is what
         // Hidden promised anyway.
         db.scrub_open_component(panel_key.clone()).await.log_err();
         cx.update(|cx| {
-            write_component_setting(fs, panel_key, ComponentSetting::Hidden(false), cx);
-        });
+            let (update, message) =
+                queue_component_setting(fs, panel_key, ComponentSetting::Hidden(false), cx);
+            window_handle
+                .update(cx, |_, window, cx| {
+                    report_layout_write(update, message, window, cx)
+                })
+                .ok();
+        })
     })
     .detach();
 }
@@ -387,12 +925,6 @@ pub trait Panel: Focusable + EventEmitter<PanelEvent> + Render + Sized {
     fn is_agent_panel(&self) -> bool {
         false
     }
-    /// Returns metadata describing how to hide this panel's button from the
-    /// status bar by writing to user settings. Implementors should return
-    /// `None` if the panel button cannot be hidden through settings.
-    fn hide_button_setting(&self, _: &App) -> Option<HideStatusItem> {
-        None
-    }
 }
 
 pub trait PanelHandle: Send + Sync {
@@ -425,7 +957,6 @@ pub trait PanelHandle: Send + Sync {
     fn activation_priority(&self, cx: &App) -> u32;
     fn enabled(&self, cx: &App) -> bool;
     fn is_agent_panel(&self, cx: &App) -> bool;
-    fn hide_button_setting(&self, cx: &App) -> Option<HideStatusItem>;
     fn move_to_next_position(&self, window: &mut Window, cx: &mut App) {
         let current_position = self.position(window, cx);
         let next_position = [
@@ -477,6 +1008,7 @@ where
             <dyn Fs>::global(cx),
             T::panel_key().to_string(),
             position.into(),
+            window,
             cx,
         );
         self.update(cx, |this, cx| this.set_position(position, window, cx))
@@ -569,10 +1101,6 @@ where
     fn is_agent_panel(&self, cx: &App) -> bool {
         self.read(cx).is_agent_panel()
     }
-
-    fn hide_button_setting(&self, cx: &App) -> Option<HideStatusItem> {
-        self.read(cx).hide_button_setting(cx)
-    }
 }
 
 impl From<&dyn PanelHandle> for AnyView {
@@ -604,8 +1132,13 @@ pub struct Dock {
     /// whether the side is open) has already been applied.
     serialized_dock_applied: bool,
     zoom_layer_open: bool,
+    /// The side's horizontal scroll position, so a component that does not fit can
+    /// still be reached — and so opening one brings it into view rather than
+    /// focusing something the user cannot see. Runtime state by design: the
+    /// 2026-08-31 ruling says scroll positions need not survive a restart.
+    scroll_handle: ScrollHandle,
     modal_layer: Entity<ModalLayer>,
-    _subscriptions: [Subscription; 2],
+    _subscriptions: [Subscription; 3],
 }
 
 impl Focusable for Dock {
@@ -673,6 +1206,16 @@ pub struct PanelSizeState {
     pub size: Option<Pixels>,
     #[serde(default)]
     pub flex: Option<f32>,
+    /// A bottom-row segment's share of the row's width. Its own field rather than
+    /// a second meaning for `flex`: `flex` is a side column's factor against the
+    /// editor on the horizontal axis, and Q8 rules it has no meaning at Bottom.
+    /// Overloading it is how `dock_size` and `dock_flex_for_size` drifted apart
+    /// before `DockGeometry` unified them, and the same trap is available here.
+    ///
+    /// `None` means an equal share, which is what every row did before this field
+    /// existed — so an absent value reproduces the old behaviour exactly.
+    #[serde(default)]
+    pub weight: Option<f32>,
 }
 
 struct PanelEntry {
@@ -741,6 +1284,9 @@ impl Dock {
                     dock.zoom_layer_open = is_zoomed;
                 }
             });
+            let order_subscription = cx.observe_global::<SettingsStore>(|dock: &mut Dock, cx| {
+                dock.resort_icons(cx);
+            });
             Self {
                 position,
                 workspace: workspace.downgrade(),
@@ -750,11 +1296,12 @@ impl Dock {
                 focused_panel: None,
                 focus_handle: focus_handle.clone(),
                 focus_follows_mouse: WorkspaceSettings::get_global(cx).focus_follows_mouse,
-                _subscriptions: [focus_subscription, zoom_subscription],
+                _subscriptions: [focus_subscription, zoom_subscription, order_subscription],
                 serialized_dock: None,
                 serialized_open_components: None,
                 serialized_dock_applied: false,
                 zoom_layer_open: false,
+                scroll_handle: ScrollHandle::new(),
                 modal_layer,
             }
         });
@@ -927,6 +1474,43 @@ impl Dock {
         indices
     }
 
+    /// This dock's component keys in the order its icons draw — `panel_entries`
+    /// order, reversed on the right like `open_entry_indices` reverses the
+    /// columns.
+    ///
+    /// `Move Earlier` and `Move Later` mean earlier and later *as seen*, so the
+    /// neighbour they swap with has to come from here. Reading `panel_entries`
+    /// directly would send both entries the wrong way on the right dock, on the
+    /// one side where nobody would think to check.
+    ///
+    /// Filtered exactly as the button loop filters, because an entry that draws
+    /// no icon is not a neighbour of anything.
+    pub(crate) fn displayed_panel_keys(&self, window: &Window, cx: &App) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .panel_entries
+            .iter()
+            .filter(|entry| {
+                !Dock::is_hidden(entry.panel.as_ref(), cx) && entry.panel.icon(window, cx).is_some()
+            })
+            .map(|entry| entry.panel.panel_key().to_string())
+            .collect();
+        if self.strip_is_drawn_in_reverse() {
+            keys.reverse();
+        }
+        keys
+    }
+
+    /// Whether this dock draws its strip against the sequence order.
+    ///
+    /// True on the right, where `open_entry_indices` reverses the columns to
+    /// match. **The single owner of that fact** — the strip builder above and both
+    /// order rules read it from here rather than each re-deriving it, because a
+    /// strip and a direction that disagree place a drop on the wrong side, and a
+    /// one-icon strip has no direction to derive.
+    pub(crate) fn strip_is_drawn_in_reverse(&self) -> bool {
+        self.position == DockPosition::Right
+    }
+
     fn open_entries(&self) -> Vec<&PanelEntry> {
         self.open_entry_indices()
             .into_iter()
@@ -945,6 +1529,27 @@ impl Dock {
         window: &Window,
         cx: &App,
     ) -> Vec<Pixels> {
+        // The bottom row divides one width by saved weights; a side divides its
+        // width into fixed px plus flex shares. Same question, different arithmetic
+        // — `dock_total` is the row's width here, never its height.
+        if self.position.axis() == Axis::Vertical {
+            let entries = self.open_entries();
+            let total_weight: f32 = entries
+                .iter()
+                .map(|entry| entry.size_state.weight.unwrap_or(1.0).max(0.001))
+                .sum();
+            return entries
+                .into_iter()
+                .map(|entry| {
+                    let weight = entry.size_state.weight.unwrap_or(1.0).max(0.001);
+                    if total_weight > 0.0 {
+                        dock_total * (weight / total_weight)
+                    } else {
+                        dock_total
+                    }
+                })
+                .collect();
+        }
         let fixed_total = self.open_fixed_size(window, cx);
         let flex_total = self.open_flex(None, window, cx).unwrap_or(0.0);
         let leftover = (dock_total - fixed_total).max(Pixels::ZERO);
@@ -982,6 +1587,81 @@ impl Dock {
         };
         let entries = self.open_entries();
         entries.get(leading_index).is_some() && entries.get(index).is_some()
+    }
+
+    /// Move a bottom-row seam: the column before `index` becomes `leading_target`
+    /// wide and the one after it absorbs the difference, leaving every other
+    /// segment and the row's total untouched.
+    ///
+    /// Weights rather than pixels, because the row has no px to store — it divides
+    /// whatever width its `bottom_dock_layout` geometry gives it. Widths go in,
+    /// weights come out, and they are written proportionally so the pair's shares
+    /// change and nobody else's does.
+    pub fn resize_row_seam(
+        &mut self,
+        index: usize,
+        leading_target: Pixels,
+        row_total: Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(leading_index) = index.checked_sub(1) else {
+            return;
+        };
+        let mut widths = self.rendered_widths(row_total, window, cx);
+        if index >= widths.len() {
+            return;
+        }
+        let open_indices = self.open_entry_indices();
+        let Some(&leading_entry) = open_indices.get(leading_index) else {
+            return;
+        };
+        let Some(&trailing_entry) = open_indices.get(index) else {
+            return;
+        };
+        let min_of = |entry_index: usize, this: &Self, window: &Window, cx: &App| {
+            this.panel_entries
+                .get(entry_index)
+                .map(|entry| {
+                    effective_min_width_at(this.position, entry.panel.as_ref(), window, cx)
+                })
+                .unwrap_or(Pixels::ZERO)
+        };
+        let leading_min = min_of(leading_entry, self, window, cx);
+        let trailing_min = min_of(trailing_entry, self, window, cx);
+        let pair = widths[leading_index] + widths[index];
+        // Both minimums bound the same slider, so a pair too narrow to hold them
+        // has no valid position and the drag is a no-op rather than a squash.
+        if pair < leading_min + trailing_min {
+            return;
+        }
+        let leading = leading_target.max(leading_min).min(pair - trailing_min);
+        widths[leading_index] = leading;
+        widths[index] = pair - leading;
+
+        let total: Pixels = widths.iter().fold(Pixels::ZERO, |sum, w| sum + *w);
+        if total <= Pixels::ZERO {
+            return;
+        }
+        let mut to_persist = Vec::new();
+        for (slot, &entry_index) in open_indices.iter().enumerate() {
+            let Some(entry) = self.panel_entries.get_mut(entry_index) else {
+                continue;
+            };
+            entry.size_state.weight = Some((widths[slot] / total).max(0.001));
+            to_persist.push((entry.panel.panel_key(), entry.size_state));
+        }
+        let workspace = self.workspace.clone();
+        cx.defer(move |cx| {
+            if let Some(workspace) = workspace.upgrade() {
+                workspace.update(cx, |workspace, cx| {
+                    for (panel_key, size_state) in to_persist {
+                        workspace.persist_panel_size_state(panel_key, size_state, cx);
+                    }
+                });
+            }
+        });
+        cx.notify();
     }
 
     /// Move the seam on column `index`'s leading edge so the column before it
@@ -1177,36 +1857,38 @@ impl Dock {
         total
     }
 
-    /// The width below which this side stops being usable. A flexible column
-    /// contributes its effective minimum; a fixed column beside one contributes
-    /// its stored width, because that is what it holds through a drag. A component
-    /// declaring no `min_size` contributes its registry area floor rather than
-    /// nothing, which is the whole point — a side holding only undeclared
-    /// components used to floor at nothing, so the editor-facing divider dragged
-    /// it down to `RESIZE_HANDLE_SIZE`.
+    /// The narrowest this side can be dragged: enough for every open column at
+    /// once, so no component is ever left off-window by a drag.
     ///
-    /// `None` for the bottom dock. Its resize axis is height, while the registry's
-    /// bottom number is a segment *width* governing the row's internal dividers —
-    /// a different quantity on a different axis, and summing it here would clamp a
-    /// height against widths.
+    /// A fixed column beside a flexible one contributes its **stored width**, not
+    /// its minimum, because that is what it holds through a drag (Decision
+    /// 2026-09-03). Summing every minimum under-counts by the fixed column's own
+    /// headroom, and the side shrinks into a gap its contents cannot occupy.
     ///
-    /// No caller reaches that branch today: both clamps are on the side docks and
-    /// the render call sits inside its own horizontal arm. It guards this
-    /// function's contract for the bottom-divider work, not a live path — deleting
-    /// it breaks no test, which is the honest reason to leave it documented rather
-    /// than let the next reader defend it as load-bearing.
+    /// Three floors were built and dogfooded on 2026-09-05 before this one stuck.
+    /// No floor at all let the scroll viewport reach `RESIZE_HANDLE_SIZE`, so the
+    /// columns went off-screen with nothing to look through. A floor of one whole
+    /// column kept a viewport but still put the rest past the window edge — the
+    /// overhang is arithmetic, not a clipping bug: three 200px columns need 600
+    /// inside whatever the side was dragged to. Tom's call was that reachable-by-
+    /// scrolling is not good enough when the alternative is simply fitting.
+    ///
+    /// The drag clamps are the only callers, and they pair this floor with a
+    /// ceiling of `workspace_width - CENTER_MIN_WIDTH - opposite`. Both ends are
+    /// needed: a floor alone still let a wide drag store widths the viewport could
+    /// not hold, because the editor minimum is a layout `min_w` with no term in
+    /// the clamp — found by a cold read, not by use. `Dock::render` stays
+    /// unfloored, which is what lets `clamp_panel_size` overflow and scroll on
+    /// window shrink — the case per-area scrolling was built for, and now the only
+    /// route a drag cannot reach.
+    ///
+    /// `None` for the bottom dock, whose resize axis is height while the registry
+    /// publishes a bottom segment *width*. No caller reaches that branch.
     pub fn open_min_size(&self, window: &Window, cx: &App) -> Option<Pixels> {
         if self.position.axis() != Axis::Horizontal {
             return None;
         }
         let entries = self.open_entries();
-        // A fixed column beside a flexible one holds its stored width instead of
-        // scaling toward its minimum, so the side cannot go below that width plus
-        // the flexible columns' minimums. Summing every minimum was right while a
-        // drag scaled every column together; once fixed means fixed it under-counts
-        // by the fixed column's own headroom, and the side is free to shrink past
-        // what its contents can occupy. The columns then stop tracking the pointer
-        // and `overflow_hidden` clips them (Tom, dogfooding F-3, 2026-09-03).
         let mixed = entries.iter().any(|entry| {
             panel_uses_flexible_width(self.position, entry.panel.as_ref(), window, cx)
         });
@@ -1588,15 +2270,30 @@ impl Dock {
                 ),
             ];
 
+        let order = component_order(cx);
+        let new_order = icon_order(T::panel_key(), panel.read(cx).activation_priority(), &order);
         let index = match self
             .panel_entries
-            .binary_search_by_key(&panel.read(cx).activation_priority(), |entry| {
-                entry.panel.activation_priority(cx)
+            .binary_search_by_key(&new_order, |entry| {
+                icon_order(
+                    entry.panel.panel_key(),
+                    entry.panel.activation_priority(cx),
+                    &order,
+                )
             }) {
             Ok(ix) => {
-                if cfg!(debug_assertions) {
+                // Two *registered* components sharing a rank is a defect in the
+                // table. Two unregistered ones are not — they sort by the trait
+                // constant, and a fixture is free to reuse a number. A collision
+                // inside the user's list is not a defect either: a hand-written
+                // duplicate id resolves to one index, which is a tie the sort can
+                // break arbitrarily without misleading anyone.
+                if cfg!(debug_assertions)
+                    && crate::layout_registry::get(T::panel_key()).is_some()
+                    && new_order.0 != 0
+                {
                     panic!(
-                        "Panels `{}` and `{}` have the same activation priority. Each panel must have a unique priority so the status bar order is deterministic.",
+                        "Components `{}` and `{}` share a `source_rank` in the layout registry. Each needs a unique rank, or the icon order is not deterministic.",
                         T::panel_key(),
                         self.panel_entries[ix].panel.panel_key()
                     );
@@ -1625,6 +2322,32 @@ impl Dock {
 
         cx.notify();
         index
+    }
+
+    /// Re-sorts the icon strip after the user's order changes.
+    ///
+    /// Safe to do in place: the dock tracks what is open, what is collapsed and
+    /// what is focused by `EntityId`, and `active_panel_index` is derived from
+    /// `focused_panel` — so no stored index survives this call to go stale.
+    /// `add_panel` holds the sorted invariant at insert time; this holds it when
+    /// the order moves under a dock that is already populated.
+    fn resort_icons(&mut self, cx: &mut Context<Self>) {
+        let order = component_order(cx);
+        let app: &App = cx;
+        let key = |entry: &PanelEntry| {
+            icon_order(
+                entry.panel.panel_key(),
+                entry.panel.activation_priority(app),
+                &order,
+            )
+        };
+        // Every settings change reaches this, not only an order change, so the
+        // common call does no work and raises no redraw.
+        if self.panel_entries.is_sorted_by_key(key) {
+            return;
+        }
+        self.panel_entries.sort_by_key(key);
+        cx.notify();
     }
 
     /// Arms this dock with saved state for the next `restore_state`.
@@ -1747,6 +2470,17 @@ impl Dock {
         let opened = self.open_panel_id(panel_id, window, cx);
         let refocused = self.focused_panel != Some(panel_id);
         self.focused_panel = Some(panel_id);
+        // Bring it into view. On a side too narrow for its components the column
+        // may be scrolled off, and opening or focusing something the user cannot
+        // see reads as a button that did nothing. The slot is taken after opening,
+        // because opening is what decides which columns there are.
+        if let Some(slot) = self
+            .open_entry_indices()
+            .iter()
+            .position(|&index| index == panel_ix)
+        {
+            self.scroll_handle.scroll_to_item(slot);
+        }
         if opened || refocused {
             cx.notify();
         }
@@ -1911,16 +2645,6 @@ impl Dock {
         self.resize_open_panels(size, flex, window, cx);
     }
 
-    pub fn resize_all_panels(
-        &mut self,
-        size: Option<Pixels>,
-        flex: Option<f32>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.resize_open_panels(size, flex, window, cx);
-    }
-
     fn resize_open_panels(
         &mut self,
         size: Option<Pixels>,
@@ -1985,11 +2709,20 @@ impl Dock {
                     // side as a whole sits on the floor — the sliver moves
                     // inward rather than closing.
                     let min = effective_min_width_at(position, entry.panel.as_ref(), window, cx);
-                    let slack = (total - fixed_min_total).max(Pixels::ZERO);
-                    let scaled = if fixed_total > Pixels::ZERO {
-                        min + slack * (current / fixed_total)
-                    } else {
+                    let scaled = if fixed_total <= Pixels::ZERO {
                         total
+                    } else if total >= fixed_min_total {
+                        min + (total - fixed_min_total) * (current / fixed_total)
+                    } else {
+                        // Past the point where every column can be shown at its
+                        // minimum. Clamping to `min` here was the second half of
+                        // the stop-dead floor: it held the side at its contents'
+                        // width, so `Dock::render` had nothing to overflow and the
+                        // scroll container could never fire. Scaling on through
+                        // lets the side follow the drag while `min_w` holds each
+                        // column, which is the overflow there is to scroll
+                        // (Decision 2026-09-05, superseding 2026-09-03's stop).
+                        total * (current / fixed_total)
                     };
                     (Some(scaled), None)
                 }
@@ -2184,6 +2917,15 @@ impl Render for Dock {
             .map(|entry| entry.size_state.flex.unwrap_or(1.0).max(0.001))
             .sum();
 
+        // The bottom row's counterpart, normalised for the same reason: shares are
+        // meaningful only against each other, and `flex_grow` summing under 1 leaves
+        // the row's tail painted in `panel_background`. An absent weight is an equal
+        // share, so a row that never set one lays out exactly as it always did.
+        let total_weight: f32 = open_entries
+            .iter()
+            .map(|entry| entry.size_state.weight.unwrap_or(1.0).max(0.001))
+            .sum();
+
         let columns: Vec<AnyElement> = open_entries
             .iter()
             .enumerate()
@@ -2233,7 +2975,27 @@ impl Render for Dock {
                         ));
                     }
                     Axis::Vertical => {
-                        column = column.flex_1().min_w_0();
+                        // Saved weights, not equal shares, and a real minimum. The
+                        // row used to be `flex_1().min_w_0()`: every segment took
+                        // the same width whatever the user had set, and `min_w_0`
+                        // let a narrow window squash them all to nothing — the
+                        // sliver the registry floor exists to prevent, still live on
+                        // this axis long after the sides were fixed.
+                        let weight = entry.size_state.weight.unwrap_or(1.0).max(0.001);
+                        let style = column.style();
+                        style.flex_grow = Some(if total_weight > 0. {
+                            weight / total_weight
+                        } else {
+                            weight
+                        });
+                        style.flex_shrink = Some(1.0);
+                        style.flex_basis = Some(relative(0.).into());
+                        column = column.min_w(effective_min_width_at(
+                            position,
+                            entry.panel.as_ref(),
+                            window,
+                            cx,
+                        ));
                     }
                 }
                 if ix > 0 {
@@ -2262,12 +3024,14 @@ impl Render for Dock {
             .border_color(border)
             // The side's laid-out width is the scroll viewport. Columns hold their
             // effective minimums, so once those exceed the width the row overflows
-            // and can be scrolled instead of collapsing — a window narrow enough to
-            // squeeze a side used to make its components unreachable, because
-            // `overflow_hidden` clipped whatever did not fit
-            // (Decision 2026-08-31; `clamp_panel_size` is the path that gets here,
-            // since the drag path is floored by `open_min_size`).
+            // and can be scrolled instead of collapsing — a side narrow enough to
+            // squeeze its components used to make them unreachable, because
+            // `overflow_hidden` clipped whatever did not fit (Decision 2026-08-31,
+            // the floor question settled 2026-09-05 after four dogfooded builds).
+            // One route gets here: `clamp_panel_size` on window resize. The divider
+            // drag is clamped at both ends and cannot produce an overflow.
             .overflow_x_scroll()
+            .track_scroll(&self.scroll_handle)
             .map(|this| match position {
                 DockPosition::Left => this.border_r_1(),
                 DockPosition::Right => this.border_l_1(),
@@ -2303,6 +3067,24 @@ impl Render for PanelButtons {
 
         let dock_entity = self.dock.clone();
         let workspace = dock.workspace.clone();
+
+        // What `Move Earlier` and `Move Later` operate on. `siblings` is the strip
+        // exactly as it renders, so the neighbour a user sees beside an icon is the
+        // one the move swaps with — the same two filters the button loop applies,
+        // because an entry that draws nothing is not a neighbour of anything.
+        let live_keys: Vec<(String, u32)> = dock
+            .panel_entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.panel.panel_key().to_string(),
+                    entry.panel.activation_priority(cx),
+                )
+            })
+            .collect();
+        let siblings = dock.displayed_panel_keys(window, cx);
+        let strip_reversed = dock.strip_is_drawn_in_reverse();
+
         let mut buttons: Vec<_> = dock
             .panel_entries
             .iter()
@@ -2325,15 +3107,23 @@ impl Render for PanelButtons {
                     .log_err()?;
                 let name = entry.panel.persistent_name();
                 let panel = entry.panel.clone();
+                let panel_for_drag = entry.panel.clone();
                 let supports_flexible = panel.supports_flexible_size(cx);
                 let currently_flexible = panel.has_flexible_size(window, cx);
                 let dock_for_menu = dock_entity.clone();
                 let workspace_for_menu = workspace.clone();
+                let live_for_menu = live_keys.clone();
+                let siblings_for_menu = siblings.clone();
                 let dock_for_click = dock_entity.clone();
                 let workspace_for_click = workspace.clone();
+                let dock_for_drop = dock_entity.clone();
+                let workspace_for_drop = workspace.clone();
 
                 let panel_id = entry.panel.panel_id();
                 let panel_key = entry.panel.panel_key();
+                // Where this icon is drawn, not where its entry sits — the right
+                // dock draws its strip reversed, and a drop lands where aimed.
+                let strip_index = siblings.iter().position(|key| key == panel_key);
                 let is_pinned_button = Dock::is_pinned(entry.panel.as_ref(), cx);
                 let is_open_button = dock.is_panel_open(panel_id);
                 let is_focused_button = is_open_button && dock.focused_panel_id() == Some(panel_id);
@@ -2376,6 +3166,55 @@ impl Render for PanelButtons {
                                 if let Some(workspace) = workspace_for_menu.upgrade() {
                                     menu = menu.context(workspace.focus_handle(cx));
                                 }
+                                // Reordering comes first because it is the move
+                                // that keeps the component where it is. Labelled
+                                // "Earlier"/"Later" rather than a direction: the
+                                // same entry moves an icon left along the bottom
+                                // bar and up a side column, and "Left" already
+                                // means a dock in the section below.
+                                let full_order =
+                                    materialized_order(&live_for_menu, &component_order(cx));
+                                menu = menu.header("Position in Bar");
+                                for (label, later) in
+                                    [("Move Earlier", false), ("Move Later", true)]
+                                {
+                                    let moved = order_after_move(
+                                        &full_order,
+                                        &siblings_for_menu,
+                                        strip_reversed,
+                                        panel_key,
+                                        later,
+                                    );
+                                    // Already at that end of the strip. Shown
+                                    // disabled rather than dropped, so the menu
+                                    // keeps its shape as an icon moves along.
+                                    let at_the_end = moved.is_none();
+                                    let workspace_for_move = workspace_for_menu.clone();
+                                    menu = menu.toggleable_entry_disabled_when(
+                                        label,
+                                        false,
+                                        at_the_end,
+                                        IconPosition::Start,
+                                        None,
+                                        move |window, cx| {
+                                            let (Some(workspace), Some(moved)) =
+                                                (workspace_for_move.upgrade(), moved.clone())
+                                            else {
+                                                return;
+                                            };
+                                            let fs = workspace.read(cx).app_state().fs.clone();
+                                            set_component_order(
+                                                fs,
+                                                Some(moved),
+                                                placement_failure_message(panel_key, "move"),
+                                                window,
+                                                cx,
+                                            );
+                                        },
+                                    );
+                                }
+                                menu = menu.separator();
+
                                 let mut has_position_entries = false;
                                 if POSITIONS
                                     .iter()
@@ -2392,7 +3231,7 @@ impl Render for PanelButtons {
                                             is_current,
                                             IconPosition::Start,
                                             None,
-                                            move |_, cx| {
+                                            move |window, cx| {
                                                 if is_current {
                                                     return;
                                                 }
@@ -2406,6 +3245,7 @@ impl Render for PanelButtons {
                                                     fs,
                                                     panel_key.to_string(),
                                                     position.into(),
+                                                    window,
                                                     cx,
                                                 );
                                             },
@@ -2426,7 +3266,7 @@ impl Render for PanelButtons {
                                     is_pinned_button,
                                     IconPosition::Start,
                                     None,
-                                    move |_, cx| {
+                                    move |window, cx| {
                                         let Some(workspace) = workspace_for_pin.upgrade() else {
                                             return;
                                         };
@@ -2446,6 +3286,7 @@ impl Render for PanelButtons {
                                             fs,
                                             panel_key.to_string(),
                                             !is_pinned_button,
+                                            window,
                                             cx,
                                         );
                                     },
@@ -2506,7 +3347,7 @@ impl Render for PanelButtons {
                                 // Check 3 disproved. Hiding a component takes the
                                 // component and its icon together, everywhere.
                                 let workspace_for_hide = workspace_for_menu.clone();
-                                menu = menu.separator().entry("Hidden", None, move |_, cx| {
+                                menu = menu.separator().entry("Hidden", None, move |window, cx| {
                                     let Some(workspace) = workspace_for_hide.upgrade() else {
                                         return;
                                     };
@@ -2519,7 +3360,13 @@ impl Render for PanelButtons {
                                         dock_position.into(),
                                         cx,
                                     );
-                                    set_component_hidden(fs, panel_key.to_string(), true, cx);
+                                    set_component_hidden(
+                                        fs,
+                                        panel_key.to_string(),
+                                        true,
+                                        window,
+                                        cx,
+                                    );
                                 });
                                 // The way back from `Hidden`. Once a component is
                                 // hidden its icon is gone, so this menu is gone
@@ -2574,6 +3421,7 @@ impl Render for PanelButtons {
                                 });
 
                             div()
+                                .id(("component-icon", i))
                                 .relative()
                                 .child(button)
                                 // `Indicator` is deliberately not used for the pin: it draws a
@@ -2599,6 +3447,82 @@ impl Render for PanelButtons {
                                         .and_then(|label| label.parse::<usize>().ok()),
                                     |this, count| this.child(CountBadge::new(count)),
                                 )
+                                // Arranging a strip is the gesture the menu
+                                // entries cannot carry: they close after every
+                                // move, so a three-place move is three
+                                // right-clicks. Dogfooded 2026-09-06 and that is
+                                // exactly what it cost.
+                                .when_some(strip_index, |this, at| {
+                                    this.on_drag(
+                                        DraggedComponentIcon {
+                                            panel_key: panel_key.into(),
+                                            icon,
+                                            from: dock_position,
+                                            at,
+                                            accepts: [
+                                                DockPosition::Left,
+                                                DockPosition::Bottom,
+                                                DockPosition::Right,
+                                            ]
+                                            .into_iter()
+                                            .filter(|position| {
+                                                panel_for_drag.position_is_valid(*position, cx)
+                                            })
+                                            .collect(),
+                                            activation_priority: panel_for_drag
+                                                .activation_priority(cx),
+                                        },
+                                        |dragged, _, _, cx| cx.new(|_| dragged.clone()),
+                                    )
+                                    .drag_over::<DraggedComponentIcon>(
+                                        move |style, dragged, _, cx| {
+                                            // Nothing would change, so nothing is
+                                            // promised. Same rule the drop uses, so
+                                            // an indicator cannot appear over a
+                                            // drop that would do nothing.
+                                            if !drop_would_land(
+                                                dragged,
+                                                dock_position,
+                                                Some(panel_key),
+                                            ) {
+                                                return style;
+                                            }
+                                            let same_dock = dragged.from == dock_position;
+                                            let style = style
+                                                .border_color(
+                                                    cx.theme().colors().drop_target_border,
+                                                )
+                                                .border_0();
+                                            // Mark the edge the icon would arrive
+                                            // from, so the indicator reads as a
+                                            // destination rather than a highlight.
+                                            // A component arriving from another
+                                            // side takes this icon's place and
+                                            // pushes it along, which is the same
+                                            // as arriving from the left.
+                                            if !same_dock || at < dragged.at {
+                                                style.border_l_2()
+                                            } else {
+                                                style.border_r_2()
+                                            }
+                                        },
+                                    )
+                                    .on_drop({
+                                        let dock = dock_for_drop.clone();
+                                        let workspace = workspace_for_drop.clone();
+                                        move |dragged: &DraggedComponentIcon, window, cx| {
+                                            apply_icon_drop(
+                                                dragged,
+                                                Some(panel_key),
+                                                &dock,
+                                                dock_position,
+                                                &workspace,
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                    })
+                                })
                         }),
                 )
             })
@@ -2610,17 +3534,71 @@ impl Render for PanelButtons {
 
         let has_buttons = !buttons.is_empty();
 
+        // The divider carries `mx_1`, so the gap across a boundary is visibly wider
+        // than the `gap_1` between icons inside a strip. The line alone did not
+        // read: every gap in the row was 4px, so seven icons from three different
+        // docks looked like one strip. Dogfooded 2026-09-06 — Tom hit the boundary
+        // by having a drag refused there, which is finding it the hard way, and
+        // now a drop on either side of it means two different things.
+        let boundary = || {
+            Divider::vertical()
+                .color(DividerColor::Border)
+                .mx_1()
+                .h(px(18.))
+        };
+
+        // The one slot a drop cannot otherwise name. Dropping onto an icon means
+        // taking its place, so it always lands to that icon's left, leaving the
+        // position past the last icon unreachable from another dock. Dogfooded
+        // 2026-09-06 — Tom: *"i can drop it on the left of the collab panel, but
+        // not to the right of it"*. With this the space is complete: one target
+        // before each icon, and one after the last.
+        let strip_end_id: &'static str = match dock_position {
+            DockPosition::Left => "component-strip-end-left",
+            DockPosition::Bottom => "component-strip-end-bottom",
+            DockPosition::Right => "component-strip-end-right",
+        };
+        let strip_end = has_buttons.then(|| {
+            let dock = dock_entity.clone();
+            let workspace_for_end = workspace.clone();
+            div()
+                .id(strip_end_id)
+                .w(px(12.))
+                .h(px(18.))
+                .border_0()
+                .drag_over::<DraggedComponentIcon>(move |style, dragged, _, cx| {
+                    if !drop_would_land(dragged, dock_position, None) {
+                        return style;
+                    }
+                    style
+                        .border_color(cx.theme().colors().drop_target_border)
+                        .border_l_2()
+                })
+                .on_drop(move |dragged: &DraggedComponentIcon, window, cx| {
+                    apply_icon_drop(
+                        dragged,
+                        None,
+                        &dock,
+                        dock_position,
+                        &workspace_for_end,
+                        window,
+                        cx,
+                    );
+                })
+        });
+
         h_flex()
             .gap_1()
             .when(
                 has_buttons
                     && (dock.position == DockPosition::Bottom
                         || dock.position == DockPosition::Right),
-                |this| this.child(Divider::vertical().color(DividerColor::Border)),
+                |this| this.child(boundary()),
             )
             .children(buttons)
+            .children(strip_end)
             .when(has_buttons && dock.position == DockPosition::Left, |this| {
-                this.child(Divider::vertical().color(DividerColor::Border))
+                this.child(boundary())
             })
     }
 }
@@ -2657,6 +3635,8 @@ pub mod test {
         pub min_size: Option<Pixels>,
         pub flexible: bool,
         pub activation_priority: u32,
+        /// See [`TestPanelB::icon`].
+        pub icon: Option<ui::IconName>,
     }
     actions!(test_only, [ToggleTestPanel]);
 
@@ -2674,6 +3654,7 @@ pub mod test {
                 min_size: None,
                 flexible: false,
                 activation_priority,
+                icon: None,
             }
         }
 
@@ -2773,6 +3754,7 @@ pub mod test {
             PanelSizeState {
                 size: None,
                 flex: None,
+                weight: None,
             }
         }
 
@@ -2794,7 +3776,7 @@ pub mod test {
         }
 
         fn icon(&self, _window: &Window, _: &App) -> Option<ui::IconName> {
-            None
+            self.icon
         }
 
         fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
@@ -2835,6 +3817,10 @@ pub mod test {
         pub position: DockPosition,
         pub focus_handle: FocusHandle,
         pub activation_priority: u32,
+        /// `None` like every fixture, matching the live panels that draw no icon
+        /// — the agent panel with the feature off, the terminal panel with no
+        /// terminals. Set it to put the fixture on the icon strip.
+        pub icon: Option<ui::IconName>,
     }
     actions!(test_only, [ToggleTestPanelB]);
 
@@ -2846,6 +3832,7 @@ pub mod test {
                 position,
                 focus_handle: cx.focus_handle(),
                 activation_priority,
+                icon: None,
             }
         }
     }
@@ -2887,7 +3874,7 @@ pub mod test {
         }
 
         fn icon(&self, _window: &Window, _: &App) -> Option<ui::IconName> {
-            None
+            self.icon
         }
 
         fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
@@ -2917,6 +3904,8 @@ pub mod test {
         pub focus_handle: FocusHandle,
         pub activation_priority: u32,
         pub flexible: bool,
+        /// See [`TestPanelB::icon`].
+        pub icon: Option<ui::IconName>,
     }
     actions!(test_only, [ToggleTestPanelC]);
 
@@ -2929,6 +3918,7 @@ pub mod test {
                 focus_handle: cx.focus_handle(),
                 activation_priority,
                 flexible: false,
+                icon: None,
             }
         }
 
@@ -3001,7 +3991,7 @@ pub mod test {
         }
 
         fn icon(&self, _window: &Window, _: &App) -> Option<ui::IconName> {
-            None
+            self.icon
         }
 
         fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
@@ -3197,5 +4187,413 @@ mod component_position_tests {
             "a status control resolved to a dock"
         );
         assert_eq!(registered_component_position("not_a_component"), None);
+    }
+}
+
+#[cfg(test)]
+mod icon_order_tests {
+    use super::{
+        DockPosition, DraggedComponentIcon, LandsOn, drop_would_land, icon_order,
+        materialized_order, order_after_joining, order_after_move, order_after_placing,
+    };
+    use crate::layout_registry::{SourceRank, get, ids};
+
+    fn ids_of(keys: &[&str]) -> Vec<String> {
+        keys.iter().map(|key| key.to_string()).collect()
+    }
+
+    /// The registry outranks the trait constant. Before 2026-09-05 the constant
+    /// decided and this table was read only by its own tests, so `v0.45.2`'s user
+    /// ordering had two sequences and no single one to write to.
+    #[test]
+    fn a_registered_component_takes_its_place_from_the_table() {
+        let SourceRank::Panel(project) = get(ids::PROJECT_PANEL).unwrap().source_rank else {
+            panic!("Project Panel must be ranked as a panel");
+        };
+
+        assert_eq!(
+            icon_order(ids::PROJECT_PANEL, 999, &[]),
+            (1, project as u32),
+            "a wildly wrong activation priority changes nothing for a registered id"
+        );
+    }
+
+    /// An extension's panel, and every test fixture, keeps the old behaviour. The
+    /// table became authoritative without becoming a gate — an id it does not know
+    /// is preserved elsewhere in this feature for the same reason.
+    #[test]
+    fn an_unregistered_component_still_sorts_by_its_trait_constant() {
+        assert_eq!(icon_order("NoSuchPanel", 7, &[]), (2, 7));
+        assert!(
+            icon_order("NoSuchPanel", 0, &[]) > icon_order(ids::PROJECT_PANEL, 999, &[]),
+            "and lands after every registered component, whatever its priority"
+        );
+    }
+
+    /// Status controls share this id space and carry ranks of their own. One
+    /// appearing here would mean the table had been edited wrongly, and borrowing
+    /// its rank would silently interleave it into the panel sequence.
+    #[test]
+    fn a_status_control_id_is_not_given_a_place_in_the_panel_sequence() {
+        assert!(matches!(
+            get(ids::CURSOR_POSITION).unwrap().source_rank,
+            SourceRank::StatusControl(_)
+        ));
+        assert_eq!(
+            icon_order(ids::CURSOR_POSITION, 7, &[]),
+            (2, 7),
+            "it sorts with the unregistered rather than among the panels"
+        );
+    }
+
+    /// The user's list is the top band, so naming a component moves it ahead of
+    /// every component the table ranks — including one the table ranks first.
+    #[test]
+    fn a_listed_component_outranks_every_unlisted_one() {
+        let order = ids_of(&[ids::DEBUG_PANEL]);
+
+        assert_eq!(icon_order(ids::DEBUG_PANEL, 0, &order), (0, 0));
+        assert!(
+            icon_order(ids::DEBUG_PANEL, 0, &order) < icon_order(ids::AGENT_PANEL, 0, &order),
+            "Debug Panel is ranked last in the table and first in the list; the list wins"
+        );
+    }
+
+    /// A partial list is meaningful on its own: naming two components orders those
+    /// two and leaves every other component where the table had it. Without this
+    /// the only writable list would be a complete one, and a hand-edited pair would
+    /// silently reshuffle everything it did not mention.
+    #[test]
+    fn a_partial_list_disturbs_only_what_it_names() {
+        let order = ids_of(&[ids::GIT_PANEL, ids::AGENT_PANEL]);
+
+        assert!(icon_order(ids::GIT_PANEL, 0, &order) < icon_order(ids::AGENT_PANEL, 0, &order));
+        assert_eq!(
+            icon_order(ids::PROJECT_PANEL, 0, &order) < icon_order(ids::TERMINAL_PANEL, 0, &order),
+            icon_order(ids::PROJECT_PANEL, 0, &[]) < icon_order(ids::TERMINAL_PANEL, 0, &[]),
+            "the unnamed components keep the order they had between themselves"
+        );
+    }
+
+    /// The empty list is every install's starting state and most installs' only
+    /// state, so it has to reproduce the table exactly rather than merely closely.
+    #[test]
+    fn an_empty_list_reproduces_the_table_exactly() {
+        assert_eq!(
+            materialized_order(&[], &[]),
+            ids_of(&[
+                ids::AGENT_PANEL,
+                ids::PROJECT_PANEL,
+                ids::TERMINAL_PANEL,
+                ids::GIT_PANEL,
+                ids::COLLABORATION_PANEL,
+                ids::OUTLINE_PANEL,
+                ids::DEBUG_PANEL,
+            ])
+        );
+    }
+
+    /// The first move writes the whole sequence, not the pair that changed. That
+    /// is what makes every later move a plain list splice, and it is why a
+    /// component whose crate loads after the write does not jump — it is already
+    /// named, in the place the table gave it.
+    #[test]
+    fn the_written_sequence_starts_from_what_the_user_can_already_see() {
+        let order = ids_of(&[ids::DEBUG_PANEL, ids::GIT_PANEL]);
+
+        assert_eq!(
+            materialized_order(&[], &order),
+            ids_of(&[
+                ids::DEBUG_PANEL,
+                ids::GIT_PANEL,
+                ids::AGENT_PANEL,
+                ids::PROJECT_PANEL,
+                ids::TERMINAL_PANEL,
+                ids::COLLABORATION_PANEL,
+                ids::OUTLINE_PANEL,
+            ]),
+            "the two listed ids lead, and the rest follow in table order"
+        );
+    }
+
+    /// An extension's panel is on the strip and has to be movable past, so the
+    /// sequence has to name it even though the table never will.
+    #[test]
+    fn a_live_panel_the_table_does_not_know_is_still_named() {
+        let live = vec![("ExtensionPanel".to_string(), 42)];
+        let sequence = materialized_order(&live, &[]);
+
+        assert_eq!(
+            sequence.last().map(String::as_str),
+            Some("ExtensionPanel"),
+            "behind every registered component, which is where it already sorted"
+        );
+        assert_eq!(sequence.len(), 8);
+    }
+
+    /// A stale id — a component whose crate is gone, or a typo — is kept and
+    /// obeyed rather than dropped, matching how `component_positions` treats a key
+    /// it does not recognise. Dropping it would quietly rewrite a user's file.
+    #[test]
+    fn a_listed_id_nothing_recognises_survives_the_sequence() {
+        let sequence = materialized_order(&[], &ids_of(&["Ghost"]));
+
+        assert_eq!(sequence.first().map(String::as_str), Some("Ghost"));
+        assert_eq!(sequence.len(), 8);
+    }
+
+    #[test]
+    fn moving_later_swaps_with_the_next_icon_on_the_strip() {
+        let full = ids_of(&["a", "b", "c"]);
+
+        assert_eq!(
+            order_after_move(&full, &full, false, "b", true),
+            Some(ids_of(&["a", "c", "b"]))
+        );
+        assert_eq!(
+            order_after_move(&full, &full, false, "b", false),
+            Some(ids_of(&["b", "a", "c"]))
+        );
+    }
+
+    /// The neighbour is the icon the user sees, which is a neighbour on this
+    /// dock's strip and not in the global sequence. Components sitting between the
+    /// two on other sides must come through the move untouched — swapping the pair
+    /// in place is what guarantees it, and reindexing the list would not.
+    #[test]
+    fn a_move_on_one_strip_leaves_the_other_sides_where_they_were() {
+        let full = ids_of(&["a", "b", "c", "d"]);
+        let siblings = ids_of(&["a", "d"]);
+
+        assert_eq!(
+            order_after_move(&full, &siblings, false, "a", true),
+            Some(ids_of(&["d", "b", "c", "a"])),
+            "b and c hold indices 1 and 2 across the move"
+        );
+    }
+
+    /// The end of a strip is a real state, not an error — the menu entry is shown
+    /// disabled. Writing back the sequence it already has would be a settings
+    /// write, a file rewrite and a redraw for a gesture that changes nothing.
+    #[test]
+    fn an_icon_at_the_end_of_its_strip_has_nowhere_to_move() {
+        let full = ids_of(&["a", "b", "c"]);
+
+        assert_eq!(order_after_move(&full, &full, false, "a", false), None);
+        assert_eq!(order_after_move(&full, &full, false, "c", true), None);
+    }
+
+    /// The exact case Tom dogfooded on 2026-09-06, kept as a witness because the
+    /// screen agreed and the file is what proved *why*. Right dock drawn
+    /// `Outline · Git · Project`; `Move Later` on Git reads `Outline · Project ·
+    /// Git`. `TerminalPanel` sits between the two that swapped and is on the
+    /// *bottom* dock — it must come through untouched.
+    #[test]
+    fn the_dogfooded_right_dock_move_writes_the_sequence_it_wrote() {
+        let full = ids_of(&[
+            ids::AGENT_PANEL,
+            ids::PROJECT_PANEL,
+            ids::TERMINAL_PANEL,
+            ids::GIT_PANEL,
+            ids::COLLABORATION_PANEL,
+            ids::OUTLINE_PANEL,
+            ids::DEBUG_PANEL,
+        ]);
+        let strip = ids_of(&[ids::OUTLINE_PANEL, ids::GIT_PANEL, ids::PROJECT_PANEL]);
+
+        assert_eq!(
+            order_after_move(&full, &strip, true, ids::GIT_PANEL, true),
+            Some(ids_of(&[
+                ids::AGENT_PANEL,
+                ids::GIT_PANEL,
+                ids::TERMINAL_PANEL,
+                ids::PROJECT_PANEL,
+                ids::COLLABORATION_PANEL,
+                ids::OUTLINE_PANEL,
+                ids::DEBUG_PANEL,
+            ]))
+        );
+    }
+
+    /// A drag crosses several icons at once, which a nudge cannot. The dragged
+    /// icon lands *at* the target and the icons it passed close up behind it —
+    /// it does not trade places with the one it was dropped on.
+    #[test]
+    fn a_drop_lands_at_the_target_and_closes_the_gap_behind_it() {
+        let full = ids_of(&["a", "b", "c", "d"]);
+
+        assert_eq!(
+            order_after_placing(&full, &full, false, "a", "d"),
+            Some(ids_of(&["b", "c", "d", "a"])),
+            "dropping the first icon on the last puts it last, not swapped with it"
+        );
+        assert_eq!(
+            order_after_placing(&full, &full, false, "d", "a"),
+            Some(ids_of(&["d", "a", "b", "c"])),
+            "and dragging back the other way is its inverse"
+        );
+    }
+
+    /// A drag that ends where it started, and a drag from another dock's strip,
+    /// both have nothing to write. Writing the sequence the file already holds
+    /// would still be a disk write, a reparse and a redraw.
+    #[test]
+    fn a_drop_with_nothing_to_change_writes_nothing() {
+        let full = ids_of(&["a", "b", "c"]);
+        let strip = ids_of(&["a", "b"]);
+
+        assert_eq!(order_after_placing(&full, &full, false, "b", "b"), None);
+        assert_eq!(
+            order_after_placing(&full, &strip, false, "c", "a"),
+            None,
+            "an icon dragged in from another dock's strip is not placed here"
+        );
+    }
+
+    /// Dropping a right-dock icon onto a left-dock one moves the component to the
+    /// left, landing where the icon it was dropped on sits. The bar is the
+    /// placement surface, so a drag across a boundary re-places rather than being
+    /// refused — dogfooded 2026-09-06, Tom: *"I think I should be able to drag
+    /// something from the right to the left side too."*
+    #[test]
+    fn a_drop_across_a_boundary_lands_where_the_target_sits() {
+        let full = ids_of(&["left", "bottom", "right_a", "right_b"]);
+
+        assert_eq!(
+            order_after_joining(&full, false, "right_a", "left", LandsOn::Before),
+            Some(ids_of(&["right_a", "left", "bottom", "right_b"])),
+            "onto a forward strip it takes the target's place and pushes it along"
+        );
+    }
+
+    /// The target dock's direction decides which side of the target the component
+    /// lands on, and it is the **target's**, not the one it came from. On the right
+    /// dock display-left is sequence-later, so landing on the wrong side of the
+    /// target is the whole failure mode of a cross-boundary drop.
+    #[test]
+    fn a_drop_onto_a_reversed_strip_lands_on_the_side_the_user_aimed_at() {
+        let full = ids_of(&["left", "bottom", "right_a", "right_b"]);
+
+        assert_eq!(
+            order_after_joining(&full, true, "bottom", "right_a", LandsOn::Before),
+            Some(ids_of(&["left", "right_a", "bottom", "right_b"])),
+            "sequence-after, which on a reversed strip is drawn where right_a was"
+        );
+        assert_eq!(
+            order_after_joining(&full, false, "bottom", "right_a", LandsOn::Before),
+            Some(ids_of(&["left", "bottom", "right_a", "right_b"])),
+            "and the same drop read forward would land on the other side of it"
+        );
+    }
+
+    /// The slot past the last icon has no icon to aim at, so dropping onto one can
+    /// never name it — a strip's final position was unreachable from another dock
+    /// until the end-of-strip zone existed. Dogfooded 2026-09-06, Tom: *"i can
+    /// drop it on the left of the collab panel, but not to the right of it."*
+    #[test]
+    fn the_end_of_a_strip_is_reachable_only_by_landing_after_its_last_icon() {
+        let full = ids_of(&["left_a", "left_b", "bottom", "right"]);
+
+        assert_eq!(
+            order_after_joining(&full, false, "bottom", "left_b", LandsOn::Before),
+            Some(ids_of(&["left_a", "bottom", "left_b", "right"])),
+            "dropping onto the last icon takes its place, which is not the end"
+        );
+        assert_eq!(
+            order_after_joining(&full, false, "bottom", "left_b", LandsOn::After),
+            Some(ids_of(&["left_a", "left_b", "bottom", "right"])),
+            "and only landing after it reaches the slot past it"
+        );
+    }
+
+    /// On a reversed strip the end is at the other end of the sequence, so the
+    /// two flips have to cancel rather than compound.
+    #[test]
+    fn the_end_of_a_reversed_strip_is_the_start_of_its_sequence() {
+        let full = ids_of(&["bottom", "right_a", "right_b"]);
+
+        assert_eq!(
+            order_after_joining(&full, true, "bottom", "right_a", LandsOn::After),
+            Some(ids_of(&["bottom", "right_a", "right_b"])),
+            "right_a is drawn last on a reversed strip, and landing after it is \
+             sequence-before it"
+        );
+    }
+
+    /// The indicator and the drop ask the same question, so an indicator cannot
+    /// appear over a drop that would do nothing — and a drop cannot act where no
+    /// indicator promised it would. The two answering separately is how a
+    /// cross-boundary drop starts looking broken while behaving correctly.
+    #[test]
+    fn a_drop_promises_exactly_what_it_would_do() {
+        let dragged = |from, accepts: &[DockPosition]| DraggedComponentIcon {
+            panel_key: "GitPanel".into(),
+            icon: ui::IconName::GitBranch,
+            from,
+            at: 0,
+            accepts: accepts.to_vec(),
+            activation_priority: 3,
+        };
+
+        let staying = dragged(DockPosition::Right, &[DockPosition::Right]);
+        assert!(!drop_would_land(
+            &staying,
+            DockPosition::Right,
+            Some("GitPanel")
+        ));
+        assert!(drop_would_land(
+            &staying,
+            DockPosition::Right,
+            Some("OutlinePanel")
+        ));
+        assert!(
+            drop_would_land(&staying, DockPosition::Right, None),
+            "the end of its own strip is somewhere to go, whatever it was aimed at"
+        );
+
+        let sides_only = dragged(
+            DockPosition::Right,
+            &[DockPosition::Left, DockPosition::Right],
+        );
+        assert!(drop_would_land(
+            &sides_only,
+            DockPosition::Left,
+            Some("agent_panel")
+        ));
+        assert!(
+            !drop_would_land(&sides_only, DockPosition::Bottom, Some("TerminalPanel")),
+            "a component that does not take the bottom is not offered it"
+        );
+        assert!(
+            !drop_would_land(&sides_only, DockPosition::Bottom, None),
+            "and its end zone is no more droppable than its icons"
+        );
+    }
+
+    #[test]
+    fn a_drop_on_the_icon_it_started_from_writes_nothing() {
+        let full = ids_of(&["a", "b", "c"]);
+        assert_eq!(
+            order_after_joining(&full, false, "b", "b", LandsOn::Before),
+            None
+        );
+        assert_eq!(
+            order_after_joining(&full, false, "z", "a", LandsOn::Before),
+            None,
+            "and a key the sequence does not name cannot be lifted out of it"
+        );
+    }
+
+    #[test]
+    fn a_component_that_is_not_on_the_strip_does_not_move() {
+        let full = ids_of(&["a", "b", "c"]);
+        let siblings = ids_of(&["a", "b"]);
+
+        assert_eq!(order_after_move(&full, &siblings, false, "c", false), None);
+        assert_eq!(
+            order_after_move(&full, &siblings, false, "b", true),
+            None,
+            "and the strip's own last icon has no neighbour, whatever follows it globally"
+        );
     }
 }

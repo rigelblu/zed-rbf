@@ -1117,13 +1117,34 @@ pub struct WorkspaceLayoutContent {
     /// Default: {}
     #[serde(default)]
     pub component_positions: HashMap<String, WorkspaceComponentPositionContent>,
+    /// The order component icons take in the bottom bar, and so the order their
+    /// columns take on a side, by stable id. Ids named here come first in this
+    /// order; anything unnamed keeps its registered order behind them.
+    ///
+    /// One flat list rather than a number per component, because order is a
+    /// relation between components and not a property of one: a list cannot
+    /// express a tie or a gap, so there is no rule about what either would mean.
+    /// It spans every side rather than being keyed by side, so a component moved
+    /// to another dock keeps its place relative to the components already there.
+    ///
+    /// An id nothing recognises is inert — kept, ignored, and never a reason to
+    /// reject the list, matching how `component_positions` treats an unknown key.
+    ///
+    /// Default: null
+    pub component_order: Option<Vec<String>>,
 }
 
 #[with_fallible_options]
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
 pub struct WorkspaceComponentPositionContent {
-    /// The side the component occupies. When absent, the component's own dock
-    /// setting applies, then its registered default.
+    /// The side the component occupies.
+    ///
+    /// An entry existing at all is what ends the component's own `dock` setting's
+    /// authority — so if this is absent, or names a side the component cannot
+    /// take, the component's registered default applies and not its `dock`. Only
+    /// a component with no entry here falls back to `dock`. Without that rule a
+    /// mistyped side resurrected a `dock` value the user may have replaced long
+    /// ago, since a token that does not parse arrives here as `None`.
     pub position: Option<crate::DockPosition>,
     /// Whether the component and its icon are removed in every workspace.
     ///

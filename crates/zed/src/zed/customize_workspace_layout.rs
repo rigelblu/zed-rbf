@@ -78,6 +78,33 @@ impl Placement {
 struct RowState {
     choices: Vec<Placement>,
     current: Option<usize>,
+    /// The warning for a saved position the component will not take. `None` for a
+    /// status control, which accepts every zone it can be given.
+    unsupported: Option<SharedString>,
+}
+
+/// The row message for a saved position the component cannot take.
+///
+/// `None` when nothing is saved, or when what is saved is usable. The settings
+/// file keeps the value either way — the resolver falls back rather than
+/// rewriting it, so this row is the only thing that says the value is being
+/// ignored.
+fn unsupported_saved_position(
+    saved: Option<DockPosition>,
+    accepts: impl Fn(DockPosition) -> bool,
+    used: DockPosition,
+) -> Option<SharedString> {
+    let saved = saved?;
+    if accepts(saved) {
+        return None;
+    }
+    Some(
+        format!(
+            "Unsupported saved position; using {}",
+            Placement::Zone(layout_position(used)).label()
+        )
+        .into(),
+    )
 }
 
 fn row_state(item: &LayoutItem, workspace: &Workspace, window: &Window, cx: &App) -> RowState {
@@ -104,7 +131,11 @@ fn row_state(item: &LayoutItem, workspace: &Workspace, window: &Window, cx: &App
                     StatusBarItemLocation::Right => 2,
                     StatusBarItemLocation::Hidden => 3,
                 });
-            RowState { choices, current }
+            RowState {
+                choices,
+                current,
+                unsupported: None,
+            }
         }
         LayoutItemKind::WorkspaceComponent => {
             let adapter = workspace.component_adapter(item.id, cx);
@@ -141,7 +172,21 @@ fn row_state(item: &LayoutItem, workspace: &Workspace, window: &Window, cx: &App
                         .position(|choice| *choice == Placement::Zone(position))
                 })
             };
-            RowState { choices, current }
+            let unsupported = adapter.as_ref().and_then(|adapter| {
+                unsupported_saved_position(
+                    workspace::WorkspaceLayoutSettings::get_global(cx)
+                        .component(item.id)
+                        .position
+                        .map(DockPosition::from),
+                    |position| adapter.accepts(position, cx),
+                    adapter.position(window, cx),
+                )
+            });
+            RowState {
+                choices,
+                current,
+                unsupported,
+            }
         }
     }
 }
@@ -199,8 +244,8 @@ fn apply(
             // Choosing a position for a hidden component restores it: the
             // placement is what the user asked for, and leaving it hidden would
             // make the choice do nothing visible.
-            set_component_hidden(fs.clone(), item.id.to_string(), false, cx);
-            set_component_position(fs, item.id.to_string(), position.into(), cx);
+            set_component_hidden(fs.clone(), item.id.to_string(), false, window, cx);
+            set_component_position(fs, item.id.to_string(), position.into(), window, cx);
         }
         (LayoutItemKind::WorkspaceComponent, Placement::Hidden) => {
             let fs = <dyn fs::Fs>::global(cx);
@@ -213,7 +258,7 @@ fn apply(
             {
                 seed_component_position(fs.clone(), item.id.to_string(), position.into(), cx);
             }
-            set_component_hidden(fs, item.id.to_string(), true, cx);
+            set_component_hidden(fs, item.id.to_string(), true, window, cx);
         }
     }
 }
@@ -246,6 +291,16 @@ fn confirm_then_restore_defaults(window: &mut Window, cx: &mut App) {
 }
 
 fn restore_defaults(window: &mut Window, cx: &mut App) {
+    // The icon sequence is part of "where it shipped". Leaving it standing would
+    // let the one action that promises the factory layout return every component
+    // to its registered side and still draw the strips in the user's order.
+    workspace::dock::set_component_order(
+        <dyn fs::Fs>::global(cx),
+        None,
+        "Failed to restore the icon order".into(),
+        window,
+        cx,
+    );
     for item in layout_registry::all() {
         match item.kind {
             LayoutItemKind::StatusControl => {
@@ -263,10 +318,22 @@ fn restore_defaults(window: &mut Window, cx: &mut App) {
             }
             LayoutItemKind::WorkspaceComponent => {
                 let fs = <dyn fs::Fs>::global(cx);
-                set_component_hidden(fs.clone(), item.id.to_string(), item.default_hidden, cx);
-                set_component_pinned(fs.clone(), item.id.to_string(), item.default_pinned, cx);
+                set_component_hidden(
+                    fs.clone(),
+                    item.id.to_string(),
+                    item.default_hidden,
+                    window,
+                    cx,
+                );
+                set_component_pinned(
+                    fs.clone(),
+                    item.id.to_string(),
+                    item.default_pinned,
+                    window,
+                    cx,
+                );
                 if let Some(position) = dock_position(item.registered_position) {
-                    set_component_position(fs, item.id.to_string(), position.into(), cx);
+                    set_component_position(fs, item.id.to_string(), position.into(), window, cx);
                 }
             }
         }
@@ -519,6 +586,14 @@ impl PickerDelegate for CustomizeWorkspaceLayoutDelegate {
                             .color(Color::Muted)
                             .truncate(),
                     )
+                })
+                .when_some(state.unsupported.clone(), |this, unsupported| {
+                    this.child(
+                        Label::new(unsupported)
+                            .size(LabelSize::Small)
+                            .color(Color::Warning)
+                            .truncate(),
+                    )
                 }),
         );
 
@@ -673,6 +748,31 @@ mod list_tests {
         assert!(!labels("terminal").is_empty());
     }
 
+    /// A saved position the component cannot take used to be swallowed whole: the
+    /// resolver fell back, the file kept the value, and nothing anywhere said so.
+    /// A token that does not parse at all is a different case, already reported by
+    /// the settings machinery as `Invalid user settings file`.
+    #[test]
+    fn a_saved_position_the_component_refuses_says_what_is_used_instead() {
+        let sides_only = |position| position != DockPosition::Bottom;
+
+        assert_eq!(
+            unsupported_saved_position(Some(DockPosition::Bottom), sides_only, DockPosition::Left)
+                .as_deref(),
+            Some("Unsupported saved position; using Left"),
+        );
+        assert_eq!(
+            unsupported_saved_position(Some(DockPosition::Right), sides_only, DockPosition::Right),
+            None,
+            "a saved position the component accepts is not a problem to report"
+        );
+        assert_eq!(
+            unsupported_saved_position(None, sides_only, DockPosition::Left),
+            None,
+            "and a component with nothing saved has nothing to warn about"
+        );
+    }
+
     #[test]
     fn a_query_matching_nothing_returns_nothing() {
         // The empty state has to be reachable, or `no_matches_text` is dead code
@@ -741,6 +841,58 @@ mod tests {
         });
     }
 
+    /// Same gap, one field later. `Restore Default Positions…` promises the
+    /// layout each item shipped with, and an icon sequence is part of where a
+    /// component sits — a reset that returned every component to its registered
+    /// side while the strips kept the user's order would be the factory layout in
+    /// name only. Written with the reset, not after it, because the pin above is
+    /// what this class of defect looks like when it is found late.
+    #[gpui::test]
+    async fn test_restoring_defaults_clears_the_icon_order(cx: &mut TestAppContext) {
+        let app_state = crate::zed::tests::init_test(cx);
+        let window = cx.add_window(|_, _| gpui::Empty);
+        let fs = app_state.fs.clone();
+
+        window
+            .update(cx, |_, window, cx| {
+                workspace::dock::set_component_order(
+                    fs.clone(),
+                    Some(vec![
+                        workspace::layout_registry::ids::DEBUG_PANEL.to_string(),
+                        workspace::layout_registry::ids::AGENT_PANEL.to_string(),
+                    ]),
+                    "Failed to move".into(),
+                    window,
+                    cx,
+                );
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(
+                WorkspaceLayoutSettings::get_global(cx)
+                    .component_order
+                    .len(),
+                2,
+                "the fixture must actually set an order, or this witness proves nothing"
+            );
+        });
+
+        window
+            .update(cx, |_, window, cx| restore_defaults(window, cx))
+            .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            assert!(
+                WorkspaceLayoutSettings::get_global(cx)
+                    .component_order
+                    .is_empty(),
+                "the reset hands every strip back to its registered order"
+            );
+        });
+    }
+
     /// `Restore Default Positions…` promised position, hidden state *and* pinned
     /// state, and delivered the first two. `set_component_pinned` existed the whole
     /// time and was never reached from this surface, so a reset left every pin
@@ -753,14 +905,17 @@ mod tests {
         let window = cx.add_window(|_, _| gpui::Empty);
         let fs = app_state.fs.clone();
 
-        cx.update(|cx| {
-            workspace::dock::set_component_pinned(
-                fs.clone(),
-                workspace::layout_registry::ids::PROJECT_PANEL.to_string(),
-                true,
-                cx,
-            );
-        });
+        window
+            .update(cx, |_, window, cx| {
+                workspace::dock::set_component_pinned(
+                    fs.clone(),
+                    workspace::layout_registry::ids::PROJECT_PANEL.to_string(),
+                    true,
+                    window,
+                    cx,
+                );
+            })
+            .unwrap();
         cx.run_until_parked();
         cx.update(|cx| {
             assert!(

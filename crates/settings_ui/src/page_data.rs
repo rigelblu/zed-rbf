@@ -82,6 +82,138 @@ pub(crate) fn settings_data(cx: &App) -> Vec<SettingsPage> {
     ]
 }
 
+/// Where a component's Settings UI row reads its position, and `None` when the
+/// component has no entry at all.
+///
+/// The nesting is the point. `Some(None)` — an entry with no position in it — is
+/// **not** the same as no entry: `resolve_component_position` branches on the
+/// entry existing, not on what is inside it, so a bare entry already ends the
+/// legacy key's authority and puts the component at its registered position. A row
+/// that fell back to the legacy key there would show one side while the component
+/// sat on another.
+fn component_position<'a>(
+    settings_content: &'a SettingsContent,
+    key: &str,
+) -> Option<Option<&'a settings::DockPosition>> {
+    Some(
+        settings_content
+            .workspace_layout
+            .as_ref()?
+            .component_positions
+            .get(key)?
+            .position
+            .as_ref(),
+    )
+}
+
+/// Writes a component's position, and on a reset leaves no entry behind.
+///
+/// Clearing the field alone would leave `"ProjectPanel": {}`, and a bare entry
+/// still ends the legacy key's authority — so "reset to default" would relocate the
+/// component to its registered position instead of restoring what it had. The entry
+/// only survives a reset if it is carrying a `hidden` or `pinned` flag of its own.
+fn write_component_position(
+    settings_content: &mut SettingsContent,
+    key: &str,
+    value: Option<settings::DockPosition>,
+) {
+    let components = &mut settings_content
+        .workspace_layout
+        .get_or_insert_default()
+        .component_positions;
+    match value {
+        Some(position) => {
+            components.entry(key.to_string()).or_default().position = Some(position);
+        }
+        None => {
+            if let Some(entry) = components.get_mut(key) {
+                entry.position = None;
+                if entry.hidden.is_none() && entry.pinned.is_none() {
+                    components.remove(key);
+                }
+            }
+        }
+    }
+}
+
+/// A component's legacy `<panel>.dock`, as the position its row displays.
+///
+/// Display only: it is what a row shows when the component has no entry yet, and
+/// nothing writes back to it. `render_dropdown` has no unset state — it shows the
+/// first variant — so a row reading only the new key told every user who had never
+/// opened the layout surface that their component was on the Left.
+fn legacy_dock_side(side: Option<&settings::DockSide>) -> Option<&'static settings::DockPosition> {
+    match side? {
+        settings::DockSide::Left => Some(&settings::DockPosition::Left),
+        settings::DockSide::Right => Some(&settings::DockPosition::Right),
+    }
+}
+
+/// Terminal is the one component whose legacy dock names three sides. See
+/// [`legacy_dock_side`] for why the fallback exists at all.
+fn legacy_terminal_dock(
+    dock: Option<&settings::TerminalDockPosition>,
+) -> Option<&'static settings::DockPosition> {
+    match dock? {
+        settings::TerminalDockPosition::Left => Some(&settings::DockPosition::Left),
+        settings::TerminalDockPosition::Bottom => Some(&settings::DockPosition::Bottom),
+        settings::TerminalDockPosition::Right => Some(&settings::DockPosition::Right),
+    }
+}
+
+/// The sides a component that cannot dock at the bottom may be given.
+///
+/// `component_positions` stores a `DockPosition` for every component, so without
+/// this the row would offer Bottom to Project Panel and write the exact entry
+/// `registry_accepts_position` exists to warn about — from the one surface that
+/// should not be able to produce it (Flow 2, "show only valid choices").
+const SIDES_ONLY: &[&str] = &["Left", "Right"];
+
+/// Where a status control's Settings UI row reads its placement.
+///
+/// Mirrors `StatusBarSettings::resolved_status_control_location`: an explicit entry
+/// wins, and with none the item's legacy boolean chooses between its registered
+/// zone and Hidden.
+fn status_control_location<'a>(
+    settings_content: &'a SettingsContent,
+    item_id: &str,
+    legacy_enabled: Option<bool>,
+    registered: &'static settings::StatusBarItemLocation,
+) -> Option<&'a settings::StatusBarItemLocation> {
+    settings_content
+        .status_bar
+        .as_ref()
+        .and_then(|status_bar| status_bar.item_locations.as_ref())
+        .and_then(|locations| locations.get(item_id))
+        .or(match legacy_enabled? {
+            true => Some(registered),
+            false => Some(&settings::StatusBarItemLocation::Hidden),
+        })
+}
+
+/// Writes a status control's placement, and on a reset removes the entry rather
+/// than storing one. Unlike a component entry, an absent one has no side effect —
+/// the item falls back to its legacy boolean, which is what a reset should restore.
+fn write_status_control_location(
+    settings_content: &mut SettingsContent,
+    item_id: &str,
+    value: Option<settings::StatusBarItemLocation>,
+) {
+    let locations = settings_content
+        .status_bar
+        .get_or_insert_default()
+        .item_locations
+        .get_or_insert_default();
+    match value {
+        Some(location) => {
+            locations.insert(item_id.to_string(), location);
+        }
+        None => {
+            locations.remove(item_id);
+        }
+    }
+}
+
 fn developer_page(cx: &App) -> SettingsPage {
     use feature_flags::FeatureFlagAppExt as _;
 
@@ -3855,23 +3987,21 @@ fn window_and_layout_page() -> SettingsPage {
         [
             SettingsPageItem::SectionHeader("Status Bar"),
             SettingsPageItem::SettingItem(SettingItem {
-                title: "Active Language Button",
-                description: "Show the active language button in the status bar.",
+                title: "Active Language",
+                description: "Where the active language indicator sits in the status bar.",
                 field: Box::new(SettingField {
                     organization_override: None,
-                    json_path: Some("status_bar.active_language_button"),
+                    json_path: Some("status_bar.item_locations.active_language"),
                     pick: |settings_content| {
-                        settings_content
-                            .status_bar
-                            .as_ref()?
-                            .active_language_button
-                            .as_ref()
+                        status_control_location(
+                            settings_content,
+                            "active_language",
+                            settings_content.status_bar.as_ref()?.active_language_button,
+                            &settings::StatusBarItemLocation::Right,
+                        )
                     },
                     write: |settings_content, value, _| {
-                        settings_content
-                            .status_bar
-                            .get_or_insert_default()
-                            .active_language_button = value;
+                        write_status_control_location(settings_content, "active_language", value);
                     },
                 }),
                 metadata: None,
@@ -3901,57 +4031,63 @@ fn window_and_layout_page() -> SettingsPage {
                 files: USER,
             }),
             SettingsPageItem::SettingItem(SettingItem {
-                title: "Cursor Position Button",
-                description: "Show the cursor position button in the status bar.",
+                title: "Cursor Position",
+                description: "Where the cursor position indicator sits in the status bar.",
                 field: Box::new(SettingField {
                     organization_override: None,
-                    json_path: Some("status_bar.cursor_position_button"),
+                    json_path: Some("status_bar.item_locations.cursor_position"),
                     pick: |settings_content| {
-                        settings_content
-                            .status_bar
-                            .as_ref()?
-                            .cursor_position_button
-                            .as_ref()
+                        status_control_location(
+                            settings_content,
+                            "cursor_position",
+                            settings_content.status_bar.as_ref()?.cursor_position_button,
+                            &settings::StatusBarItemLocation::Right,
+                        )
                     },
                     write: |settings_content, value, _| {
-                        settings_content
-                            .status_bar
-                            .get_or_insert_default()
-                            .cursor_position_button = value;
+                        write_status_control_location(settings_content, "cursor_position", value);
                     },
                 }),
                 metadata: None,
                 files: USER,
             }),
             SettingsPageItem::SettingItem(SettingItem {
-                title: "Diagnostics Button",
-                description: "Show the project diagnostics button in the status bar.",
+                title: "Diagnostics",
+                description: "Where the project diagnostics indicator sits in the status bar.",
                 field: Box::new(SettingField {
                     organization_override: None,
-                    json_path: Some("diagnostics.button"),
-                    pick: |settings_content| settings_content.diagnostics.as_ref()?.button.as_ref(),
+                    json_path: Some("status_bar.item_locations.diagnostics"),
+                    pick: |settings_content| {
+                        status_control_location(
+                            settings_content,
+                            "diagnostics",
+                            settings_content.diagnostics.as_ref()?.button,
+                            &settings::StatusBarItemLocation::Left,
+                        )
+                    },
                     write: |settings_content, value, _| {
-                        settings_content.diagnostics.get_or_insert_default().button = value;
+                        write_status_control_location(settings_content, "diagnostics", value);
                     },
                 }),
                 metadata: None,
                 files: USER,
             }),
             SettingsPageItem::SettingItem(SettingItem {
-                title: "Project Search Button",
-                description: "Show the project search button in the status bar.",
+                title: "Project Search",
+                description: "Where the project search button sits in the status bar.",
                 field: Box::new(SettingField {
                     organization_override: None,
-                    json_path: Some("search.button"),
+                    json_path: Some("status_bar.item_locations.project_search"),
                     pick: |settings_content| {
-                        settings_content.editor.search.as_ref()?.button.as_ref()
+                        status_control_location(
+                            settings_content,
+                            "project_search",
+                            settings_content.editor.search.as_ref()?.button,
+                            &settings::StatusBarItemLocation::Left,
+                        )
                     },
                     write: |settings_content, value, _| {
-                        settings_content
-                            .editor
-                            .search
-                            .get_or_insert_default()
-                            .button = value;
+                        write_status_control_location(settings_content, "project_search", value);
                     },
                 }),
                 metadata: None,
@@ -3959,22 +4095,20 @@ fn window_and_layout_page() -> SettingsPage {
             }),
             SettingsPageItem::SettingItem(SettingItem {
                 title: "Active File Name",
-                description: "Show the name of the active file in the status bar.",
+                description: "Where the active file name sits in the status bar.",
                 field: Box::new(SettingField {
                     organization_override: None,
-                    json_path: Some("status_bar.show_active_file"),
+                    json_path: Some("status_bar.item_locations.active_file"),
                     pick: |settings_content| {
-                        settings_content
-                            .status_bar
-                            .as_ref()?
-                            .show_active_file
-                            .as_ref()
+                        status_control_location(
+                            settings_content,
+                            "active_file",
+                            settings_content.status_bar.as_ref()?.show_active_file,
+                            &settings::StatusBarItemLocation::Left,
+                        )
                     },
                     write: |settings_content, value, _| {
-                        settings_content
-                            .status_bar
-                            .get_or_insert_default()
-                            .show_active_file = value;
+                        write_status_control_location(settings_content, "active_file", value);
                     },
                 }),
                 metadata: None,
@@ -4974,13 +5108,24 @@ fn panels_page() -> SettingsPage {
                 description: "Where to dock the project panel.",
                 field: Box::new(SettingField {
                     organization_override: None,
-                    json_path: Some("project_panel.dock"),
-                    pick: |settings_content| settings_content.project_panel.as_ref()?.dock.as_ref(),
+                    json_path: Some("workspace_layout.component_positions.ProjectPanel.position"),
+                    pick: |settings_content| match component_position(
+                        settings_content,
+                        "ProjectPanel",
+                    ) {
+                        Some(position) => position,
+                        None => {
+                            legacy_dock_side(settings_content.project_panel.as_ref()?.dock.as_ref())
+                        }
+                    },
                     write: |settings_content, value, _| {
-                        settings_content.project_panel.get_or_insert_default().dock = value;
+                        write_component_position(settings_content, "ProjectPanel", value);
                     },
                 }),
-                metadata: None,
+                metadata: Some(Box::new(SettingsFieldMetadata {
+                    allowed_variants: Some(SIDES_ONLY),
+                    ..Default::default()
+                })),
                 files: USER,
             }),
             SettingsPageItem::SettingItem(SettingItem {
@@ -5617,10 +5762,18 @@ fn panels_page() -> SettingsPage {
                 description: "Where to dock the terminal panel.",
                 field: Box::new(SettingField {
                     organization_override: None,
-                    json_path: Some("terminal.dock"),
-                    pick: |settings_content| settings_content.terminal.as_ref()?.dock.as_ref(),
+                    json_path: Some("workspace_layout.component_positions.TerminalPanel.position"),
+                    pick: |settings_content| match component_position(
+                        settings_content,
+                        "TerminalPanel",
+                    ) {
+                        Some(position) => position,
+                        None => {
+                            legacy_terminal_dock(settings_content.terminal.as_ref()?.dock.as_ref())
+                        }
+                    },
                     write: |settings_content, value, _| {
-                        settings_content.terminal.get_or_insert_default().dock = value;
+                        write_component_position(settings_content, "TerminalPanel", value);
                     },
                 }),
                 metadata: None,
@@ -5674,13 +5827,24 @@ fn panels_page() -> SettingsPage {
                 description: "Where to dock the outline panel.",
                 field: Box::new(SettingField {
                     organization_override: None,
-                    json_path: Some("outline_panel.dock"),
-                    pick: |settings_content| settings_content.outline_panel.as_ref()?.dock.as_ref(),
+                    json_path: Some("workspace_layout.component_positions.OutlinePanel.position"),
+                    pick: |settings_content| match component_position(
+                        settings_content,
+                        "OutlinePanel",
+                    ) {
+                        Some(position) => position,
+                        None => {
+                            legacy_dock_side(settings_content.outline_panel.as_ref()?.dock.as_ref())
+                        }
+                    },
                     write: |settings_content, value, _| {
-                        settings_content.outline_panel.get_or_insert_default().dock = value;
+                        write_component_position(settings_content, "OutlinePanel", value);
                     },
                 }),
-                metadata: None,
+                metadata: Some(Box::new(SettingsFieldMetadata {
+                    allowed_variants: Some(SIDES_ONLY),
+                    ..Default::default()
+                })),
                 files: USER,
             }),
             SettingsPageItem::SettingItem(SettingItem {
@@ -5874,13 +6038,20 @@ fn panels_page() -> SettingsPage {
                 description: "Where to dock the Git panel.",
                 field: Box::new(SettingField {
                     organization_override: None,
-                    json_path: Some("git_panel.dock"),
-                    pick: |settings_content| settings_content.git_panel.as_ref()?.dock.as_ref(),
+                    json_path: Some("workspace_layout.component_positions.GitPanel.position"),
+                    pick: |settings_content| match component_position(settings_content, "GitPanel")
+                    {
+                        Some(position) => position,
+                        None => settings_content.git_panel.as_ref()?.dock.as_ref(),
+                    },
                     write: |settings_content, value, _| {
-                        settings_content.git_panel.get_or_insert_default().dock = value;
+                        write_component_position(settings_content, "GitPanel", value);
                     },
                 }),
-                metadata: None,
+                metadata: Some(Box::new(SettingsFieldMetadata {
+                    allowed_variants: Some(SIDES_ONLY),
+                    ..Default::default()
+                })),
                 files: USER,
             }),
             SettingsPageItem::SettingItem(SettingItem {
@@ -6177,10 +6348,16 @@ fn panels_page() -> SettingsPage {
                 description: "The dock position of the debug panel.",
                 field: Box::new(SettingField {
                     organization_override: None,
-                    json_path: Some("debugger.dock"),
-                    pick: |settings_content| settings_content.debugger.as_ref()?.dock.as_ref(),
+                    json_path: Some("workspace_layout.component_positions.DebugPanel.position"),
+                    pick: |settings_content| match component_position(
+                        settings_content,
+                        "DebugPanel",
+                    ) {
+                        Some(position) => position,
+                        None => settings_content.debugger.as_ref()?.dock.as_ref(),
+                    },
                     write: |settings_content, value, _| {
-                        settings_content.debugger.get_or_insert_default().dock = value;
+                        write_component_position(settings_content, "DebugPanel", value);
                     },
                 }),
                 metadata: None,
@@ -6197,18 +6374,24 @@ fn panels_page() -> SettingsPage {
                 description: "Where to dock the collaboration panel.",
                 field: Box::new(SettingField {
                     organization_override: None,
-                    json_path: Some("collaboration_panel.dock"),
-                    pick: |settings_content| {
-                        settings_content.collaboration_panel.as_ref()?.dock.as_ref()
+                    json_path: Some(
+                        "workspace_layout.component_positions.CollaborationPanel.position",
+                    ),
+                    pick: |settings_content| match component_position(
+                        settings_content,
+                        "CollaborationPanel",
+                    ) {
+                        Some(position) => position,
+                        None => settings_content.collaboration_panel.as_ref()?.dock.as_ref(),
                     },
                     write: |settings_content, value, _| {
-                        settings_content
-                            .collaboration_panel
-                            .get_or_insert_default()
-                            .dock = value;
+                        write_component_position(settings_content, "CollaborationPanel", value);
                     },
                 }),
-                metadata: None,
+                metadata: Some(Box::new(SettingsFieldMetadata {
+                    allowed_variants: Some(SIDES_ONLY),
+                    ..Default::default()
+                })),
                 files: USER,
             }),
             SettingsPageItem::SettingItem(SettingItem {
@@ -6216,7 +6399,10 @@ fn panels_page() -> SettingsPage {
                 description: "Default width of the collaboration panel in pixels.",
                 field: Box::new(SettingField {
                     organization_override: None,
-                    json_path: Some("collaboration_panel.dock"),
+                    // Was labelled `collaboration_panel.dock` while reading and
+                    // writing `default_width` — a copy-paste, found while converting
+                    // the dock dropdowns on 2026-09-05.
+                    json_path: Some("collaboration_panel.default_width"),
                     pick: |settings_content| {
                         settings_content
                             .collaboration_panel
@@ -6245,13 +6431,22 @@ fn panels_page() -> SettingsPage {
                 description: "Where to dock the agent panel.",
                 field: Box::new(SettingField {
                     organization_override: None,
-                    json_path: Some("agent.dock"),
-                    pick: |settings_content| settings_content.agent.as_ref()?.dock.as_ref(),
+                    json_path: Some("workspace_layout.component_positions.agent_panel.position"),
+                    pick: |settings_content| match component_position(
+                        settings_content,
+                        "agent_panel",
+                    ) {
+                        Some(position) => position,
+                        None => settings_content.agent.as_ref()?.dock.as_ref(),
+                    },
                     write: |settings_content, value, _| {
-                        settings_content.agent.get_or_insert_default().dock = value;
+                        write_component_position(settings_content, "agent_panel", value);
                     },
                 }),
-                metadata: None,
+                metadata: Some(Box::new(SettingsFieldMetadata {
+                    allowed_variants: Some(SIDES_ONLY),
+                    ..Default::default()
+                })),
                 files: USER,
             }),
             SettingsPageItem::SettingItem(SettingItem {
@@ -10592,5 +10787,154 @@ mod tests {
         write_vim_mode_inner(&mut settings, Some(true));
         assert_eq!(settings.vim_mode, Some(true));
         assert_eq!(settings.helix_mode, Some(false));
+    }
+
+    /// Reset on a component's dock row must leave no entry behind. Clearing the
+    /// field alone leaves `"ProjectPanel": {}`, and a bare entry still ends the
+    /// legacy key's authority — so the reset would move the component to its
+    /// registered position instead of restoring what it had.
+    #[test]
+    fn resetting_a_component_dock_row_removes_the_entry_it_created() {
+        let mut settings = SettingsContent::default();
+        write_component_position(
+            &mut settings,
+            "ProjectPanel",
+            Some(settings::DockPosition::Left),
+        );
+        assert_eq!(
+            component_position(&settings, "ProjectPanel"),
+            Some(Some(&settings::DockPosition::Left))
+        );
+
+        write_component_position(&mut settings, "ProjectPanel", None);
+        assert_eq!(
+            component_position(&settings, "ProjectPanel"),
+            None,
+            "a reset leaves no entry, so the legacy dock key decides again"
+        );
+    }
+
+    /// The exception: an entry the user is also using for something else survives,
+    /// carrying only the field the row owns.
+    #[test]
+    fn resetting_a_component_dock_row_keeps_an_entry_that_holds_a_flag() {
+        let mut settings = SettingsContent::default();
+        settings
+            .workspace_layout
+            .get_or_insert_default()
+            .component_positions
+            .entry("ProjectPanel".to_string())
+            .or_default()
+            .pinned = Some(true);
+        write_component_position(
+            &mut settings,
+            "ProjectPanel",
+            Some(settings::DockPosition::Left),
+        );
+
+        write_component_position(&mut settings, "ProjectPanel", None);
+        assert_eq!(
+            component_position(&settings, "ProjectPanel"),
+            Some(None),
+            "the entry stays because it is still pinning the component"
+        );
+        assert_eq!(
+            settings
+                .workspace_layout
+                .as_ref()
+                .unwrap()
+                .component_positions
+                .get("ProjectPanel")
+                .unwrap()
+                .pinned,
+            Some(true),
+            "and the reset touched only the field its row owns"
+        );
+    }
+
+    /// The row must read the way `resolve_component_position` decides. An entry
+    /// with no position in it still ends the legacy key's authority, so falling
+    /// back there would show one side while the component sat on another.
+    #[test]
+    fn a_component_entry_without_a_position_does_not_fall_back_to_the_legacy_key() {
+        let mut settings = SettingsContent::default();
+        settings.project_panel.get_or_insert_default().dock = Some(settings::DockSide::Left);
+
+        assert_eq!(
+            component_position(&settings, "ProjectPanel"),
+            None,
+            "with no entry the row falls back, which is what the resolver does"
+        );
+
+        settings
+            .workspace_layout
+            .get_or_insert_default()
+            .component_positions
+            .entry("ProjectPanel".to_string())
+            .or_default()
+            .hidden = Some(true);
+        assert_eq!(
+            component_position(&settings, "ProjectPanel"),
+            Some(None),
+            "and once an entry exists the row stops reading the legacy key"
+        );
+    }
+
+    /// `component_positions` stores a `DockPosition` for every component, so the
+    /// five side-only rows would otherwise offer Bottom and write the exact entry
+    /// `registry_accepts_position` exists to warn about.
+    #[test]
+    fn the_sides_only_filter_excludes_bottom() {
+        assert!(!SIDES_ONLY.contains(&"Bottom"));
+        assert!(SIDES_ONLY.contains(&"Left") && SIDES_ONLY.contains(&"Right"));
+    }
+
+    /// A status control's reset has the opposite shape: no entry is the state its
+    /// legacy boolean decides, so removing it is exactly what a reset means.
+    #[test]
+    fn a_status_control_row_reads_and_resets_the_way_the_bar_resolves_it() {
+        let mut settings = SettingsContent::default();
+        let read = |settings: &SettingsContent| {
+            status_control_location(
+                settings,
+                "cursor_position",
+                settings
+                    .status_bar
+                    .as_ref()
+                    .and_then(|status_bar| status_bar.cursor_position_button),
+                &settings::StatusBarItemLocation::Right,
+            )
+            .copied()
+        };
+
+        assert_eq!(read(&settings), None, "nothing saved, nothing to show");
+
+        settings
+            .status_bar
+            .get_or_insert_default()
+            .cursor_position_button = Some(false);
+        assert_eq!(
+            read(&settings),
+            Some(settings::StatusBarItemLocation::Hidden),
+            "the legacy boolean decides between the registered zone and Hidden"
+        );
+
+        write_status_control_location(
+            &mut settings,
+            "cursor_position",
+            Some(settings::StatusBarItemLocation::Middle),
+        );
+        assert_eq!(
+            read(&settings),
+            Some(settings::StatusBarItemLocation::Middle),
+            "an explicit placement outranks the boolean"
+        );
+
+        write_status_control_location(&mut settings, "cursor_position", None);
+        assert_eq!(
+            read(&settings),
+            Some(settings::StatusBarItemLocation::Hidden),
+            "and a reset hands the decision back to the boolean, which is still false"
+        );
     }
 }

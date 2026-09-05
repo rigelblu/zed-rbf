@@ -28,6 +28,63 @@ use ui::IconName;
 pub const SIDE_COLUMN_MIN_WIDTH: Pixels = px(200.);
 pub const BOTTOM_SEGMENT_MIN_WIDTH: Pixels = px(160.);
 
+/// The width below which the editor stops being an editor. Held by the flex item
+/// that sits between the side docks, because that is the item flexbox shrinks.
+///
+/// The brief said twice not to add this — Q8 (*"this slice introduces no editor
+/// minimum width"*) and Flow 4 (*"do not add an editor minimum"*) — and dogfooding
+/// on 2026-09-05 falsified both. Every side column carries `min_w`; the editor
+/// carried nothing and its chain sets `min-width: 0` through `overflow_hidden`, so
+/// flexbox drained the editor to a sliver to pay for the columns, and when that ran
+/// out the dock overflowed the window and its columns rendered off-screen. Tom,
+/// looking at it: *"we don't apply the MIN 200 on the editor pane. I'm guessing we
+/// should."* Per-area scrolling needs a stable viewport to scroll inside, and there
+/// is no stable viewport while one neighbour can be squeezed to nothing.
+pub const CENTER_MIN_WIDTH: Pixels = px(200.);
+
+/// The height below which the editor stops being an editor. Held by the flex item
+/// that holds the centre, because that is the item flexbox shrinks when the bottom
+/// dock grows.
+///
+/// **`CENTER_MIN_WIDTH` on the other axis, and it exists for the same reason.**
+/// Dogfooding on 2026-09-05 found the editor with no minimum width while every side
+/// column had one, so flexbox drained the editor to pay for them. The fix went onto
+/// the four `bottom_dock_layout` geometries as `min_w`, and the bottom dock resizes
+/// on *height* — so the identical hole stayed open on the axis that session never
+/// touched. A drag of the bottom dock's divider could take the editor to nothing.
+///
+/// **Derived from the editor's own chrome, not from the constant below it.** A tab
+/// bar is `Tab::container_height`, which is `DynamicSpacing::Base32` — 32px at
+/// default density — and four lines at default line height is roughly 80px more.
+/// That it lands on the same figure as `BOTTOM_DOCK_MIN_HEIGHT` is a coincidence of
+/// two independent sums, not one value copied: the trap that constant's own comment
+/// names is picking a number because it sits nearby, and 120 here would be just as
+/// wrong if the arithmetic said otherwise.
+///
+/// Dogfood-tunable, like the other three.
+pub const CENTER_MIN_HEIGHT: Pixels = px(120.);
+
+/// The height below which the bottom dock stops being usable — a tab strip and a
+/// couple of terminal rows, and nothing more.
+///
+/// **Its own constant, and not derived from anything.** The bottom dock resizes on
+/// height while `BOTTOM_SEGMENT_MIN_WIDTH` is a segment *width* governing the row's
+/// internal dividers; reaching for that number because it sits nearby would be
+/// picking a value by its name rather than its meaning. Three figures were
+/// defensible on 2026-09-02 and the arithmetic was never the question — 160px
+/// matches the segment width, but that symmetry is coincidence; 260px keeps the
+/// ratio the 200px side floor has to the 240px side default. Tom took ~120px: the
+/// floor closes the trapdoor and does nothing else.
+///
+/// **No per-panel override, unlike the side floors.** `Panel::min_size` is one
+/// number with no axis, and it is already read as a width at Bottom by
+/// `effective_min_width_at`. Agent's implementation says as much itself — it
+/// returns `Some(MIN_PANEL_WIDTH)` at the sides and `None` at Bottom. A bottom
+/// component that wants a taller floor has no way to ask for one today.
+///
+/// Dogfood-tunable, like the other two.
+pub const BOTTOM_DOCK_MIN_HEIGHT: Pixels = px(120.);
+
 /// The stable id of every registered item, so a call site and the table cannot
 /// disagree: the table below is written in terms of these, so each id exists in
 /// exactly one place. Name items through these constants rather than by literal —

@@ -14,8 +14,11 @@ where
 {
     id: ElementId,
     current_value: T,
-    variants: &'static [T],
-    labels: &'static [&'static str],
+    /// Owned rather than `&'static [T]` so a row can offer fewer choices than its
+    /// type has variants — `component_positions` stores a `DockPosition` for every
+    /// component while most components take only the sides.
+    variants: Vec<T>,
+    labels: Vec<&'static str>,
     should_do_title_case: bool,
     tab_index: Option<isize>,
     disabled: bool,
@@ -31,8 +34,8 @@ where
     pub fn new(
         id: impl Into<ElementId>,
         current_value: T,
-        variants: &'static [T],
-        labels: &'static [&'static str],
+        variants: Vec<T>,
+        labels: Vec<&'static str>,
         on_change: impl Fn(T, &mut ui::Window, &mut App) + 'static,
     ) -> Self {
         Self {
@@ -84,15 +87,20 @@ where
     T: strum::VariantArray + strum::VariantNames + Copy + PartialEq + Send + Sync + 'static,
 {
     fn render(self, window: &mut ui::Window, cx: &mut ui::App) -> impl gpui::IntoElement {
-        let current_value_label = self.labels[self
+        // A saved value the row does not offer still has to render. It happens when
+        // a hand edit, or an older build, put a choice in the file that this row
+        // has since stopped offering — showing it is how the user sees what to
+        // change, and `unwrap` here would crash the settings page instead.
+        let current_value_label = self
             .variants
             .iter()
             .position(|v| *v == self.current_value)
-            .unwrap()];
+            .and_then(|index| self.labels.get(index).copied())
+            .unwrap_or("");
 
         let context_menu = window.use_keyed_state(current_value_label, cx, |window, cx| {
             ContextMenu::new(window, cx, move |mut menu, _, _| {
-                for (&value, &label) in std::iter::zip(self.variants, self.labels) {
+                for (value, label) in std::iter::zip(self.variants, self.labels) {
                     let on_change = self.on_change.clone();
                     let current_value = self.current_value;
                     menu = menu.toggleable_entry(

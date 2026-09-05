@@ -2835,6 +2835,7 @@ impl Workspace {
                         let state = dock::PanelSizeState {
                             size: Some(size),
                             flex: None,
+                            weight: None,
                         };
                         self.persist_panel_size_state(T::panel_key(), state, cx);
                         state
@@ -8987,9 +8988,6 @@ impl Workspace {
                     let style = container.style();
                     style.flex_shrink = Some(1.0);
                 }
-                if let Some(min) = dock.open_min_size(window, cx) {
-                    container = container.min_w(min);
-                }
             } else if let Some(size) = dock.open_row_size(window, cx) {
                 container = container.h(size);
             }
@@ -9148,6 +9146,7 @@ impl Workspace {
     ) -> impl IntoElement {
         div()
             .id("editor-region")
+            .debug_selector(|| "EDITOR-REGION".to_string())
             .role(gpui::Role::Main)
             .aria_label("Editor")
             .when(window.is_a11y_active(), |this| {
@@ -9246,26 +9245,32 @@ impl Workspace {
 
     fn resize_left_dock(&mut self, new_size: Pixels, window: &mut Window, cx: &mut App) {
         let workspace_width = self.bounds.size.width;
-        // The floor is raised first and the width ceilings below still win, so a
-        // window too narrow to hold it collapses the side rather than pushing the
-        // editor off-screen. Trading this trapdoor for that one would be a worse
-        // deal; the narrow-window case belongs to per-area scrolling, unbuilt.
+        // Floored so every open column still fits, and ceilinged so the editor
+        // keeps `CENTER_MIN_WIDTH`. Both ends matter and for the same reason: a
+        // drag must never store a width the viewport cannot hold. Three narrower
+        // floors were dogfooded and each left a column off-window (Decision
+        // 2026-09-05); the ceiling was then found by a cold read to have the same
+        // hole in the other direction — the editor minimum is a layout `min_w`, so
+        // without a term here a wide drag stored widths that shrank the container
+        // while the columns held, and the side scrolled.
+        //
+        // `Dock::render` stays unfloored on purpose, so `clamp_panel_size` can
+        // still overflow on window shrink — the one route to a scroll that
+        // remains, and the one per-area scrolling was built for.
         let floor = self
             .left_dock
             .read_with(cx, |left_dock, cx| left_dock.open_min_size(window, cx))
             .unwrap_or(Pixels::ZERO);
-        let mut size = new_size
-            .max(floor)
-            .min(workspace_width - RESIZE_HANDLE_SIZE);
-
-        self.right_dock.read_with(cx, |right_dock, cx| {
-            let right_dock_size = right_dock
+        let opposite = self.right_dock.read_with(cx, |right_dock, cx| {
+            right_dock
                 .stored_active_panel_size(window, cx)
-                .unwrap_or(Pixels::ZERO);
-            if right_dock_size + size > workspace_width {
-                size = workspace_width - right_dock_size
-            }
+                .unwrap_or(Pixels::ZERO)
         });
+        let ceiling = (workspace_width - crate::layout_registry::CENTER_MIN_WIDTH - opposite)
+            .max(Pixels::ZERO);
+        // Ceiling last: on a window too narrow to hold the floor it wins, which
+        // collapses the side rather than pushing the editor off-screen.
+        let size = new_size.max(floor).min(ceiling);
 
         let flex_grow = self.dock_flex_for_size(DockPosition::Left, size, window, cx);
         // `resize_all_panels_in_dock` is accepted and ignored: every open panel is
@@ -9281,17 +9286,14 @@ impl Workspace {
             .right_dock
             .read_with(cx, |right_dock, cx| right_dock.open_min_size(window, cx))
             .unwrap_or(Pixels::ZERO);
-        let mut size = new_size
-            .max(floor)
-            .min(workspace_width - RESIZE_HANDLE_SIZE);
-        self.left_dock.read_with(cx, |left_dock, cx| {
-            let left_dock_size = left_dock
+        let opposite = self.left_dock.read_with(cx, |left_dock, cx| {
+            left_dock
                 .stored_active_panel_size(window, cx)
-                .unwrap_or(Pixels::ZERO);
-            if left_dock_size + size > workspace_width {
-                size = workspace_width - left_dock_size
-            }
+                .unwrap_or(Pixels::ZERO)
         });
+        let ceiling = (workspace_width - crate::layout_registry::CENTER_MIN_WIDTH - opposite)
+            .max(Pixels::ZERO);
+        let size = new_size.max(floor).min(ceiling);
         let flex_grow = self.dock_flex_for_size(DockPosition::Right, size, window, cx);
         self.right_dock.update(cx, |right_dock, cx| {
             right_dock.resize_active_panel(Some(size), flex_grow, window, cx);
@@ -9308,6 +9310,39 @@ impl Workspace {
     /// as an origin against absolute move positions, every frame asked for a width
     /// several hundred pixels off and pinned to the clamp. Deriving the seam from
     /// geometry each frame cannot drift and needs no state to get wrong.
+    /// Where the bottom row starts and how wide it is — the two numbers a bottom
+    /// seam needs and `dock_size` cannot give, because a vertical dock's size is
+    /// its height.
+    ///
+    /// The row's horizontal extent is whatever its `bottom_dock_layout` leaves it,
+    /// so this reproduces the four arms of `Workspace::render`: `Full` spans the
+    /// workspace, `Contained` sits between both sides, and the aligned variants
+    /// keep one side full-height and span the other.
+    fn bottom_row_extent(&self, window: &Window, cx: &App) -> Option<(Pixels, Pixels)> {
+        let left = self
+            .left_dock
+            .read(cx)
+            .is_open()
+            .then(|| self.dock_size(self.left_dock.read(cx), window, cx))
+            .flatten()
+            .unwrap_or(Pixels::ZERO);
+        let right = self
+            .right_dock
+            .read(cx)
+            .is_open()
+            .then(|| self.dock_size(self.right_dock.read(cx), window, cx))
+            .flatten()
+            .unwrap_or(Pixels::ZERO);
+        let (leading, trailing) = match WorkspaceSettings::get_global(cx).bottom_dock_layout {
+            BottomDockLayout::Full => (Pixels::ZERO, Pixels::ZERO),
+            BottomDockLayout::Contained => (left, right),
+            BottomDockLayout::LeftAligned => (Pixels::ZERO, right),
+            BottomDockLayout::RightAligned => (left, Pixels::ZERO),
+        };
+        let width = self.bounds.size.width - leading - trailing;
+        (width > Pixels::ZERO).then(|| (self.bounds.left() + leading, width))
+    }
+
     fn resize_dock_seam(
         &mut self,
         position: DockPosition,
@@ -9320,6 +9355,24 @@ impl Workspace {
             return;
         }
         let dock = self.dock_at_position(position).clone();
+        if position == DockPosition::Bottom {
+            let Some((leading_edge, row_total)) = self.bottom_row_extent(window, cx) else {
+                return;
+            };
+            let widths = dock.read_with(cx, |dock, cx| dock.rendered_widths(row_total, window, cx));
+            if index >= widths.len() {
+                return;
+            }
+            let preceding = widths[..index - 1]
+                .iter()
+                .fold(Pixels::ZERO, |sum, width| sum + *width);
+            let target = x - leading_edge - preceding;
+            dock.update(cx, |dock, cx| {
+                dock.resize_row_seam(index, target, row_total, window, cx);
+            });
+            self.serialize_workspace(window, cx);
+            return;
+        }
         let Some(dock_total) = dock.read_with(cx, |dock, cx| self.dock_size(dock, window, cx))
         else {
             return;
@@ -9336,6 +9389,8 @@ impl Workspace {
         let dock_leading_edge = match position {
             DockPosition::Left => self.bounds.left(),
             DockPosition::Right => self.bounds.right() - dock_total,
+            // Handled above: a bottom seam divides the row's width, which its
+            // `bottom_dock_layout` geometry decides, not the dock's own size.
             DockPosition::Bottom => return,
         };
         let target = x - dock_leading_edge - preceding;
@@ -9350,11 +9405,22 @@ impl Workspace {
     }
 
     fn resize_bottom_dock(&mut self, new_size: Pixels, window: &mut Window, cx: &mut App) {
-        // No floor here yet: the bottom dock resizes on height, and the registry
-        // publishes a bottom *segment width* for the row's internal dividers. The
-        // height a bottom component stops being usable at is a number the design
-        // has not named, so this drag still bottoms out at `RESIZE_HANDLE_SIZE`.
-        let size = new_size.min(self.bounds.bottom() - RESIZE_HANDLE_SIZE - self.bounds.top());
+        // Floored so the dock stays usable, and ceilinged so the editor keeps
+        // `CENTER_MIN_HEIGHT` — the same pair of ends the side drags carry, for the
+        // same reason. Until now the ceiling was the whole workspace less the
+        // handle, so a drag to the top stored a height that left the editor with
+        // nothing: the width half of this was found and fixed on 2026-09-05 and the
+        // vertical half went with it untouched.
+        let ceiling = (self.bounds.size.height
+            - RESIZE_HANDLE_SIZE
+            - crate::layout_registry::CENTER_MIN_HEIGHT)
+            .max(Pixels::ZERO);
+        // Ceiling last, the same order the side drags use, so a window too short to
+        // hold the floor yields a dock that fits inside it rather than one that
+        // overflows to satisfy a minimum.
+        let size = new_size
+            .max(crate::layout_registry::BOTTOM_DOCK_MIN_HEIGHT)
+            .min(ceiling);
         self.bottom_dock.update(cx, |bottom_dock, cx| {
             bottom_dock.resize_active_panel(Some(size), None, window, cx);
         });
@@ -10131,10 +10197,12 @@ impl Render for Workspace {
                                                         .flex()
                                                         .flex_col()
                                                         .flex_1()
+                                                        .min_w(crate::layout_registry::CENTER_MIN_WIDTH)
                                                         .overflow_hidden()
                                                         .child(
                                                             h_flex()
                                                                 .flex_1()
+                                                                .min_h(crate::layout_registry::CENTER_MIN_HEIGHT)
                                                                 .when_some(paddings.0, |this, p| {
                                                                     this.child(p.border_r_1())
                                                                 })
@@ -10191,10 +10259,12 @@ impl Render for Workspace {
                                                                 .flex()
                                                                 .flex_col()
                                                                 .flex_1()
+                                                                .min_w(crate::layout_registry::CENTER_MIN_WIDTH)
                                                                 .overflow_hidden()
                                                                 .child(
                                                                     h_flex()
                                                                         .flex_1()
+                                                                        .min_h(crate::layout_registry::CENTER_MIN_HEIGHT)
                                                                         .when_some(
                                                                             paddings.0,
                                                                             |this, p| {
@@ -10258,10 +10328,12 @@ impl Render for Workspace {
                                                                 .flex()
                                                                 .flex_col()
                                                                 .flex_1()
+                                                                .min_w(crate::layout_registry::CENTER_MIN_WIDTH)
                                                                 .overflow_hidden()
                                                                 .child(
                                                                     h_flex()
                                                                         .flex_1()
+                                                                        .min_h(crate::layout_registry::CENTER_MIN_HEIGHT)
                                                                         .when_some(
                                                                             paddings.0,
                                                                             |this, p| {
@@ -10314,10 +10386,12 @@ impl Render for Workspace {
                                                 .flex()
                                                 .flex_col()
                                                 .flex_1()
+                                                .min_w(crate::layout_registry::CENTER_MIN_WIDTH)
                                                 .overflow_hidden()
                                                 .child(
                                                     h_flex()
                                                         .flex_1()
+                                                        .min_h(crate::layout_registry::CENTER_MIN_HEIGHT)
                                                         .when_some(paddings.0, |this, p| {
                                                             this.child(p.border_r_1())
                                                         })
@@ -12640,7 +12714,8 @@ mod tests {
     use super::*;
     use crate::{
         dock::{
-            PanelEvent, set_component_hidden, test::TestPanel, test::TestPanelB, test::TestPanelC,
+            PanelEvent, set_component_hidden, set_component_pinned, test::TestPanel,
+            test::TestPanelB, test::TestPanelC,
         },
         item::{
             ItemBufferKind, ItemEvent,
@@ -15348,6 +15423,18 @@ mod tests {
         });
     }
 
+    fn set_component_order(cx: &mut VisualTestContext, order: &[&str]) {
+        let order: Vec<String> = order.iter().map(|key| key.to_string()).collect();
+        cx.update_global(|store: &mut SettingsStore, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings
+                    .workspace_layout
+                    .get_or_insert_default()
+                    .component_order = Some(order.clone());
+            });
+        });
+    }
+
     fn set_panel_pinned(cx: &mut VisualTestContext, panel_key: &str, pinned: bool) {
         cx.update_global(|store: &mut SettingsStore, cx| {
             store.update_user_settings(cx, |settings| {
@@ -15418,6 +15505,189 @@ mod tests {
                 vec![right_high.panel_id(), right_low.panel_id()],
                 "the right dock reverses entry order so columns read like its reversed icons"
             );
+        });
+    }
+
+    /// The order the user writes reaches a dock that is already populated, not
+    /// only one still being built. `add_panel` holds the sorted invariant at
+    /// insert time; nothing held it when the order moved underneath.
+    #[gpui::test]
+    async fn test_a_new_icon_order_reaches_a_dock_that_is_already_open(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let first = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+            workspace.add_panel(first, window, cx);
+            let second = cx.new(|cx| TestPanelB::new(DockPosition::Left, 101, cx));
+            workspace.add_panel(second, window, cx);
+        });
+
+        let keys = |cx: &mut VisualTestContext| {
+            workspace.update(cx, |workspace, cx| {
+                let dock = workspace.left_dock().read(cx);
+                (0..dock.panels_len())
+                    .filter_map(|ix| dock.panel_at(ix).map(|panel| panel.panel_key()))
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        assert_eq!(
+            keys(cx),
+            vec!["TestPanel", "TestPanelB"],
+            "with no order set, the activation priorities decide"
+        );
+
+        set_component_order(cx, &["TestPanelB", "TestPanel"]);
+        cx.run_until_parked();
+
+        assert_eq!(
+            keys(cx),
+            vec!["TestPanelB", "TestPanel"],
+            "the written sequence reorders the strip in place"
+        );
+
+        set_component_order(cx, &[]);
+        cx.run_until_parked();
+
+        assert_eq!(
+            keys(cx),
+            vec!["TestPanel", "TestPanelB"],
+            "and clearing it hands the order back to the priorities"
+        );
+    }
+
+    /// The right dock draws its icons and its columns reversed, so "later" there
+    /// is the other direction along `panel_entries`. Reading the entry list
+    /// directly would send both menu entries the wrong way on the one side nobody
+    /// thinks to check.
+    #[gpui::test]
+    async fn test_later_means_later_as_seen_on_the_right_dock(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        // The fixtures draw no icon by default, like a live panel whose feature is
+        // off — and an entry that draws nothing is not on the strip at all.
+        workspace.update_in(cx, |workspace, window, cx| {
+            let first = cx.new(|cx| {
+                let mut panel = TestPanelB::new(DockPosition::Right, 101, cx);
+                panel.icon = Some(ui::IconName::GitBranch);
+                panel
+            });
+            workspace.add_panel(first, window, cx);
+            let second = cx.new(|cx| {
+                let mut panel = TestPanelC::new(DockPosition::Right, 102, cx);
+                panel.icon = Some(ui::IconName::TerminalAlt);
+                panel
+            });
+            workspace.add_panel(second, window, cx);
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let dock = workspace.right_dock().read(cx);
+            assert_eq!(
+                (0..dock.panels_len())
+                    .filter_map(|ix| dock.panel_at(ix).map(|panel| panel.panel_key()))
+                    .collect::<Vec<_>>(),
+                vec!["TestPanelB", "TestPanelC"],
+                "the entry list keeps the sorted order every side shares"
+            );
+            assert_eq!(
+                dock.displayed_panel_keys(window, cx),
+                vec!["TestPanelC".to_string(), "TestPanelB".to_string()],
+                "and the right dock draws it reversed, so the later entry reads first"
+            );
+        });
+    }
+
+    /// A component that draws no icon is not on the strip, so it is not a
+    /// neighbour either — moving past it would look like nothing happening. The
+    /// agent panel with the feature off and the terminal panel with no terminals
+    /// both reach this state live.
+    #[gpui::test]
+    async fn test_a_component_without_an_icon_is_not_a_neighbour(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let drawn = cx.new(|cx| {
+                let mut panel = TestPanel::new(DockPosition::Left, 100, cx);
+                panel.icon = Some(ui::IconName::FileTree);
+                panel
+            });
+            workspace.add_panel(drawn, window, cx);
+            let undrawn = cx.new(|cx| TestPanelB::new(DockPosition::Left, 101, cx));
+            workspace.add_panel(undrawn, window, cx);
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let dock = workspace.left_dock().read(cx);
+            assert_eq!(dock.panels_len(), 2, "both components are on the side");
+            assert_eq!(
+                dock.displayed_panel_keys(window, cx),
+                vec!["TestPanel".to_string()],
+                "but only the one that draws an icon is on the strip"
+            );
+        });
+    }
+
+    /// Reordering must not disturb what is open or what has emphasis. The dock
+    /// tracks both by `EntityId` and derives `active_panel_index` from the focused
+    /// id, so a sort moves no state — this is the witness that keeps it that way.
+    #[gpui::test]
+    async fn test_reordering_icons_keeps_the_same_panel_open_and_focused(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        let second = workspace.update_in(cx, |workspace, window, cx| {
+            let first = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+            workspace.add_panel(first, window, cx);
+            let second = cx.new(|cx| TestPanelB::new(DockPosition::Left, 101, cx));
+            workspace.add_panel(second.clone(), window, cx);
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.activate_panel(1, window, cx);
+            });
+            second
+        });
+
+        workspace.update(cx, |workspace, cx| {
+            let dock = workspace.left_dock().read(cx);
+            assert_eq!(dock.focused_panel_id(), Some(second.panel_id()));
+            assert_eq!(dock.active_panel_index(), Some(1));
+        });
+
+        set_component_order(cx, &["TestPanelB", "TestPanel"]);
+        cx.run_until_parked();
+
+        workspace.update(cx, |workspace, cx| {
+            let dock = workspace.left_dock().read(cx);
+            assert_eq!(
+                dock.focused_panel_id(),
+                Some(second.panel_id()),
+                "the same panel keeps emphasis across the sort"
+            );
+            assert_eq!(
+                dock.active_panel_index(),
+                Some(0),
+                "and its index follows the icon rather than the icon following the index"
+            );
+            assert!(dock.is_panel_open(second.panel_id()));
         });
     }
 
@@ -15992,8 +16262,8 @@ mod tests {
         // Hiding must leave the rows alone. They are exactly what a later
         // unhide has to find and delete; live workspaces close the component
         // through the settings observer instead.
-        workspace.update_in(cx, |_, _, cx| {
-            set_component_hidden(fs.clone(), KEY.to_string(), true, cx);
+        workspace.update_in(cx, |_, window, cx| {
+            set_component_hidden(fs.clone(), KEY.to_string(), true, window, cx);
         });
         cx.run_until_parked();
         assert_eq!(
@@ -16002,14 +16272,196 @@ mod tests {
             "hiding leaves the saved open rows in place"
         );
 
-        workspace.update_in(cx, |_, _, cx| {
-            set_component_hidden(fs.clone(), KEY.to_string(), false, cx);
+        workspace.update_in(cx, |_, window, cx| {
+            set_component_hidden(fs.clone(), KEY.to_string(), false, window, cx);
         });
         cx.run_until_parked();
         assert!(
             db.open_components(workspace_id).unwrap().is_empty(),
             "unhiding forgets the component's openness in every serialized workspace"
         );
+    }
+
+    /// Puts a settings file in place that cannot be written, so every component
+    /// write in the test fails where a read-only home or a full disk would fail
+    /// it. A directory standing in for the file is what does it: the write's own
+    /// read of the current text hits it first.
+    async fn with_unwritable_settings(cx: &mut VisualTestContext, workspace: &Entity<Workspace>) {
+        // Both filesystems: component writes take the workspace's, and
+        // `set_status_control_location` reaches for the global one. In this harness
+        // they are not the same object, and blocking only one made the status-half
+        // witness pass for the wrong reason.
+        let app_state_fs = workspace.read_with(cx, |workspace, _| workspace.app_state().fs.clone());
+        let global_fs = cx.update(|_, cx| <dyn fs::Fs>::global(cx));
+        for fs in [app_state_fs, global_fs] {
+            fs.create_dir(paths::settings_file()).await.log_err();
+        }
+    }
+
+    /// A component write that fails has to say so. Every one of these went
+    /// through `update_settings_file`, which drops its result on the floor — so a
+    /// settings file the app could not write left a user clicking a control that
+    /// silently did nothing, which is the state Q13 exists to forbid.
+    #[gpui::test]
+    async fn test_a_failed_component_write_is_reported_and_changes_nothing(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        with_unwritable_settings(cx, &workspace).await;
+
+        let fs = workspace.read_with(cx, |workspace, _| workspace.app_state().fs.clone());
+        let key = crate::layout_registry::ids::PROJECT_PANEL;
+        workspace.update_in(cx, |_, window, cx| {
+            set_component_pinned(fs.clone(), key.to_string(), true, window, cx);
+        });
+        cx.run_until_parked();
+
+        let (title, _) = cx.pending_prompt().expect("the failure is reported");
+        assert_eq!(
+            title, "Failed to pin Project Panel",
+            "and the report names the gesture and the component, not the settings key"
+        );
+        cx.simulate_prompt_answer("OK");
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            assert!(
+                !WorkspaceLayoutSettings::get_global(cx)
+                    .component(key)
+                    .pinned,
+                "and the setting the write could not make never takes effect"
+            );
+        });
+    }
+
+    /// One gesture, one dialog. `Restore Default Positions…` queues three writes
+    /// per component and one per status control — around sixty. They share one
+    /// serialized queue and fail for one reason, so a dialog per write would bury
+    /// a user who has already read the first.
+    #[gpui::test]
+    async fn test_a_burst_of_failed_placement_writes_raises_one_prompt(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        with_unwritable_settings(cx, &workspace).await;
+
+        let fs = workspace.read_with(cx, |workspace, _| workspace.app_state().fs.clone());
+        let key = crate::layout_registry::ids::PROJECT_PANEL;
+        workspace.update_in(cx, |_, window, cx| {
+            set_component_pinned(fs.clone(), key.to_string(), true, window, cx);
+            set_component_hidden(fs.clone(), key.to_string(), true, window, cx);
+            set_status_control_location(
+                crate::layout_registry::ids::CURSOR_POSITION,
+                StatusBarItemLocation::Hidden,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert!(cx.has_pending_prompt(), "the gesture is reported once");
+        cx.simulate_prompt_answer("OK");
+        cx.run_until_parked();
+        assert!(
+            !cx.has_pending_prompt(),
+            "and the gesture's later failed writes do not stack more dialogs behind it"
+        );
+    }
+
+    /// The status half of the same contract. It had a prompt before this, with a
+    /// message naming the bottom bar rather than the item and no focus
+    /// restoration — so it reported, but not what Q13 asks for. Both halves now
+    /// go through one reporter, which is also what makes the single dialog above
+    /// hold for a gesture that touches both kinds.
+    #[gpui::test]
+    async fn test_a_failed_status_control_write_names_the_item(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        with_unwritable_settings(cx, &workspace).await;
+
+        workspace.update_in(cx, |_, window, cx| {
+            set_status_control_location(
+                crate::layout_registry::ids::CURSOR_POSITION,
+                StatusBarItemLocation::Hidden,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let (title, _) = cx.pending_prompt().expect("the failure is reported");
+        assert_eq!(
+            title, "Failed to hide Cursor Position",
+            "and names the item and the gesture, not the settings key or the bar"
+        );
+        cx.simulate_prompt_answer("OK");
+        cx.run_until_parked();
+    }
+
+    /// Two focusables that are actually in the element tree. A handle that never
+    /// renders is dropped from focus at the next draw, which would make a
+    /// focus-restoration witness pass or fail for reasons unrelated to the code
+    /// under test.
+    struct TwoFocusables {
+        chooser: FocusHandle,
+        elsewhere: FocusHandle,
+    }
+
+    impl Render for TwoFocusables {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .track_focus(&self.chooser)
+                .child(div().track_focus(&self.elsewhere))
+        }
+    }
+
+    /// The prompt takes keyboard focus, and Q13 requires the surface that made
+    /// the choice to still be driveable once the prompt is gone. Focus moving
+    /// away while the write is in flight stands in for the prompt taking it — the
+    /// test platform's prompt does not move GPUI focus, so without that move the
+    /// witness would pass whether or not anything restored it.
+    #[gpui::test]
+    async fn test_a_failed_component_write_hands_focus_back(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.create_dir(paths::settings_file()).await.unwrap();
+        let fs: Arc<dyn fs::Fs> = fs;
+
+        let (view, cx) = cx.add_window_view(|_, cx| TwoFocusables {
+            chooser: cx.focus_handle(),
+            elsewhere: cx.focus_handle(),
+        });
+        let (chooser, elsewhere) =
+            view.read_with(cx, |view, _| (view.chooser.clone(), view.elsewhere.clone()));
+        cx.update(|window, cx| window.focus(&chooser, cx));
+        cx.run_until_parked();
+
+        let key = crate::layout_registry::ids::PROJECT_PANEL;
+        cx.update(|window, cx| {
+            set_component_pinned(fs.clone(), key.to_string(), true, window, cx);
+            window.focus(&elsewhere, cx);
+        });
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt(), "the fixture must fail the write");
+        cx.simulate_prompt_answer("OK");
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            assert_eq!(
+                window.focused(cx),
+                Some(chooser),
+                "focus returns to what made the choice, not to wherever the prompt left it"
+            );
+        });
     }
 
     fn set_panel_position(
@@ -16627,6 +17079,7 @@ mod tests {
                     dock::PanelSizeState {
                         size: None,
                         flex: Some(1.0),
+                        weight: None,
                     },
                     cx,
                 );
@@ -16704,10 +17157,17 @@ mod tests {
     }
 
     /// Every witness below drives `resize_dock`, which is what the divider drag
-    /// and the keyboard resize both call. Asserting against `open_min_size`
+    /// and the keyboard resize both call. Asserting against the distribution
     /// directly would pass whether or not anything reached it.
+    ///
+    /// A wholly-fixed side has the floor twice over, and that redundancy hid a
+    /// defect for a day: removing the clamp in `resize_*_dock` alone left this
+    /// witness green, because `resize_open_panels` also gives each column
+    /// `min + its share of the slack`. Both are load-bearing again by the
+    /// 2026-09-05 ruling, which put the drag floor back after three narrower
+    /// floors were built and dogfooded and each left a column off-window.
     #[gpui::test]
-    async fn test_a_side_drag_stops_at_the_summed_component_floor(cx: &mut gpui::TestAppContext) {
+    async fn test_a_side_drag_stops_where_all_its_columns_still_fit(cx: &mut gpui::TestAppContext) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
         let project = Project::test(fs, [], cx).await;
@@ -16731,8 +17191,8 @@ mod tests {
             assert_eq!(
                 workspace.dock_size(&dock, window, cx),
                 Some(crate::layout_registry::SIDE_COLUMN_MIN_WIDTH),
-                "a component declaring no minimum must take the registry side floor, \
-                 not fall through to the resize handle"
+                "one column: the viewport floor is that column's own minimum, so \
+                 the side stops exactly where its single component does"
             );
         });
 
@@ -16745,17 +17205,26 @@ mod tests {
 
             workspace.resize_dock(DockPosition::Left, px(10.), window, cx);
             let dock = workspace.left_dock().read(cx);
+            // The whole point of the change, and the half a one-column fixture
+            // cannot see: a second column must not raise the floor. Summing is
+            // what stopped the divider dead at the contents' width.
             assert_eq!(
                 workspace.dock_size(&dock, window, cx),
                 Some(crate::layout_registry::SIDE_COLUMN_MIN_WIDTH * 2.),
-                "the floor is summed over open components; one constant for the \
-                 whole side would leave the second column a sliver"
+                "two columns: the floor is summed over them, so neither is left \
+                 off-window by a drag"
             );
         });
     }
 
+    /// A declared `min_size` no longer raises a floor on the *side* — nothing does
+    /// (Decision 2026-09-05). What it still governs is the width its own column
+    /// holds once the side is narrower than its contents, which is the half that
+    /// decides whether the component stays usable. That is a draw-time fact:
+    /// `min_w` is what flexbox honours, and the stored number says nothing about
+    /// it, so this asserts on rendered bounds rather than on `size_state`.
     #[gpui::test]
-    async fn test_a_declared_minimum_raises_the_side_floor_above_the_registry_default(
+    async fn test_a_declared_minimum_is_what_its_column_holds_when_the_side_overflows(
         cx: &mut gpui::TestAppContext,
     ) {
         init_test(cx);
@@ -16768,50 +17237,66 @@ mod tests {
         set_panel_pinned(cx, "TestPanelB", true);
 
         let declared = px(320.);
-        let floor = declared + crate::layout_registry::SIDE_COLUMN_MIN_WIDTH;
 
         workspace.update_in(cx, |workspace, window, cx| {
             workspace.bounds.size.width = px(1600.);
 
             let declaring =
                 cx.new(|cx| TestPanel::new_with_min_size(DockPosition::Left, 100, declared, cx));
-            workspace.add_panel(declaring.clone(), window, cx);
+            workspace.add_panel(declaring, window, cx);
             let silent = cx.new(|cx| TestPanelB::new(DockPosition::Left, 101, cx));
-            workspace.add_panel(silent.clone(), window, cx);
+            workspace.add_panel(silent, window, cx);
             workspace.left_dock().update(cx, |dock, cx| {
                 dock.activate_panel(0, window, cx);
                 dock.activate_panel(1, window, cx);
+                dock.set_open(true, window, cx);
             });
 
-            workspace.resize_dock(DockPosition::Left, px(10.), window, cx);
-            let dock = workspace.left_dock().read(cx);
-            assert_eq!(
-                workspace.dock_size(&dock, window, cx),
-                Some(floor),
-                "the declared minimum must be read; taking the registry floor for \
-                 every component would give {:?}",
-                crate::layout_registry::SIDE_COLUMN_MIN_WIDTH * 2.
-            );
-
-            // The side sitting on its floor is not enough: the column that asked
-            // for 320 must actually hold 320, or the sliver has only moved from
-            // the side's edge to the seam between two columns.
-            workspace.left_dock().update(cx, |dock, _cx| {
-                assert_eq!(
-                    dock.stored_panel_size_state(&declaring)
-                        .and_then(|state| state.size),
-                    Some(declared),
-                    "the declaring column was squeezed below its own minimum"
-                );
-                assert_eq!(
-                    dock.stored_panel_size_state(&silent)
-                        .and_then(|state| state.size),
-                    Some(crate::layout_registry::SIDE_COLUMN_MIN_WIDTH),
-                    "the silent column must survive at the registry floor, not \
-                     absorb what the declaring one gave up"
-                );
+            // The window-shrink path, not a drag: the drag is floored at the
+            // columns' summed width now, so it can no longer produce an overflow.
+            // `clamp_panel_size` still has no floor, which is what keeps per-area
+            // scrolling reachable at all.
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.clamp_panel_size(px(120.), window, cx);
             });
         });
+        cx.run_until_parked();
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+
+        let registry_floor = crate::layout_registry::SIDE_COLUMN_MIN_WIDTH;
+        let side = cx
+            .debug_bounds("DOCK-PANEL-Left")
+            .expect("the left side renders");
+        let declaring = cx
+            .debug_bounds("DOCK-COLUMN-TestPanel")
+            .expect("the declaring column renders");
+        let silent = cx
+            .debug_bounds("DOCK-COLUMN-TestPanelB")
+            .expect("the silent column renders");
+
+        assert!(
+            declaring.size.width >= declared - px(1.),
+            "the column that asked for {declared:?} must hold it; taking the \
+             registry floor for every component would draw it at {registry_floor:?} \
+             (got {:?})",
+            declaring.size.width
+        );
+        assert!(
+            silent.size.width >= registry_floor - px(1.),
+            "the silent column must survive at the registry floor rather than \
+             absorbing what the declaring one refused to give up (got {:?})",
+            silent.size.width
+        );
+        assert!(
+            declaring.size.width + silent.size.width > side.size.width + px(1.),
+            "the columns must together exceed the side: that overflow is the thing \
+             there is to scroll, and without it the side merely stopped early \
+             (columns {:?} + {:?}, side {:?})",
+            declaring.size.width,
+            silent.size.width,
+            side.size.width
+        );
     }
 
     #[gpui::test]
@@ -16880,12 +17365,16 @@ mod tests {
 
             workspace.resize_dock(DockPosition::Left, px(1600.), window, cx);
             let dock = workspace.left_dock().read(cx);
+            // 1600 window - 300 opposite - 200 editor floor. The 1300 this
+            // asserted until 2026-09-05 left the editor nothing: the opposite dock
+            // was the only term in the ceiling. Both are in it now.
             assert_eq!(
                 workspace.dock_size(&dock, window, cx),
-                Some(px(1300.)),
-                "the left side was allowed past the right one; a flexible column \
-                 reporting no width must still be counted at its default size, or \
-                 the opposite ceiling reads the side as empty"
+                Some(px(1100.)),
+                "the left side was allowed past the right one, or past the \
+                 editor's floor; a flexible column reporting no width must still \
+                 be counted at its default size, or the ceiling reads the \
+                 opposite side as empty"
             );
         });
 
@@ -17183,6 +17672,7 @@ mod tests {
                     dock::PanelSizeState {
                         size: Some(px(300.)),
                         flex: None,
+                        weight: None,
                     },
                     cx,
                 );
@@ -17271,6 +17761,7 @@ mod tests {
                     dock::PanelSizeState {
                         size: Some(px(511.)),
                         flex: None,
+                        weight: None,
                     },
                     cx,
                 );
@@ -17279,6 +17770,7 @@ mod tests {
                     dock::PanelSizeState {
                         size: Some(px(377.)),
                         flex: None,
+                        weight: None,
                     },
                     cx,
                 );
@@ -17372,6 +17864,76 @@ mod tests {
         }
     }
 
+    /// Piece 1 created a state nothing accounted for: on a side too narrow for its
+    /// components, a column can sit outside the viewport. Opening or focusing one
+    /// then did its work invisibly — the component took focus somewhere the user
+    /// could not see, which reads as a button that did nothing.
+    ///
+    /// The witness activates the *last* column, the one furthest off-screen, and
+    /// asserts it lands inside the side's bounds. The first column would pass
+    /// without any reveal at all, since it is already where the viewport starts.
+    #[gpui::test]
+    async fn test_opening_a_component_scrolls_it_into_view_on_a_narrow_side(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        set_panel_pinned(cx, "TestPanel", true);
+        set_panel_pinned(cx, "TestPanelB", true);
+        set_panel_pinned(cx, "TestPanelC", true);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let first = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+            workspace.add_panel(first, window, cx);
+            let second = cx.new(|cx| TestPanelB::new(DockPosition::Left, 101, cx));
+            workspace.add_panel(second, window, cx);
+            let third = cx.new(|cx| TestPanelC::new(DockPosition::Left, 102, cx));
+            workspace.add_panel(third, window, cx);
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+                dock.activate_panel(1, window, cx);
+                dock.activate_panel(2, window, cx);
+                dock.set_open(true, window, cx);
+                // Three columns at the 200px floor cannot fit; the side overflows.
+                dock.clamp_panel_size(px(150.), window, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace
+                .left_dock()
+                .update(cx, |dock, cx| dock.activate_panel(2, window, cx));
+        });
+        cx.run_until_parked();
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+
+        let side = cx
+            .debug_bounds("DOCK-PANEL-Left")
+            .expect("the left side renders");
+        let third = cx
+            .debug_bounds("DOCK-COLUMN-TestPanelC")
+            .expect("the third column renders");
+
+        assert!(
+            third.origin.x >= side.origin.x - px(1.)
+                && third.origin.x + third.size.width <= side.origin.x + side.size.width + px(1.),
+            "activating the last column must bring it inside the side: side {:?} wide from \
+             {:?}, column {:?} wide from {:?}",
+            side.size.width,
+            side.origin.x,
+            third.size.width,
+            third.origin.x
+        );
+    }
+
     /// A window narrow enough to squeeze a side used to make its components
     /// unreachable: every column was inside `overflow_hidden`, so whatever did not
     /// fit was clipped rather than scrolled to. The drag path cannot get here —
@@ -17414,6 +17976,7 @@ mod tests {
         cx.run_until_parked();
 
         let floor = crate::layout_registry::SIDE_COLUMN_MIN_WIDTH;
+        let mut total = Pixels::ZERO;
         for selector in ["DOCK-COLUMN-TestPanel", "DOCK-COLUMN-TestPanelB"] {
             let column = cx
                 .debug_bounds(selector)
@@ -17424,9 +17987,135 @@ mod tests {
                  rather than squashing: got {:?}, floor {floor:?}",
                 column.size.width
             );
+            total += column.size.width;
         }
+
+        // Columns at their minimums are only half the claim, and on their own they
+        // cannot see a floor on the container: restore one and they still measure
+        // 200px each, inside a side widened to hold them exactly. The overflow is
+        // what there is to scroll, so it is what has to be asserted.
+        let side = cx
+            .debug_bounds("DOCK-PANEL-Left")
+            .expect("the left side renders");
+        assert!(
+            total > side.size.width + px(1.),
+            "the columns must together exceed the side: columns {total:?}, \
+             side {:?}",
+            side.size.width
+        );
     }
 
+    /// The floor's counterpart, and the hole a cold read found on 2026-09-05 after
+    /// the floor was already settled: `CENTER_MIN_WIDTH` is a layout `min_w` with
+    /// no term in the drag clamp, so a side dragged near the old
+    /// `workspace_width - RESIZE_HANDLE_SIZE` ceiling stored widths the viewport
+    /// could not hold. The editor kept its 200px, the dock container shrank to fit,
+    /// the columns are `flex_none` at their stored widths and did not — and the
+    /// side overflowed and scrolled. A drag reaching the scroll state is exactly
+    /// what the 2026-09-05 Decision says cannot happen.
+    ///
+    /// `test_the_editor_keeps_its_floor_when_a_side_is_dragged_wide` could not see
+    /// it: it asserts the editor's width and never the side's. This asserts the
+    /// side's, which is the half that was missing.
+    #[gpui::test]
+    async fn test_a_wide_drag_cannot_store_more_than_the_viewport_can_hold(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        set_panel_pinned(cx, "TestPanel", true);
+        set_panel_pinned(cx, "TestPanelB", true);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.bounds.size.width = px(1600.);
+
+            let first = cx.new(|cx| TestPanel::new(DockPosition::Right, 100, cx));
+            workspace.add_panel(first, window, cx);
+            let second = cx.new(|cx| TestPanelB::new(DockPosition::Right, 101, cx));
+            workspace.add_panel(second, window, cx);
+            workspace.right_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+                dock.activate_panel(1, window, cx);
+                dock.set_open(true, window, cx);
+            });
+
+            // Drag far past anything the window can honour.
+            workspace.resize_dock(DockPosition::Right, px(5000.), window, cx);
+
+            let dock = workspace.right_dock().read(cx);
+            let size = workspace
+                .dock_size(&dock, window, cx)
+                .expect("an open dock reports a size");
+            let ceiling = px(1600.) - crate::layout_registry::CENTER_MIN_WIDTH;
+            assert!(
+                size <= ceiling + px(1.),
+                "a drag must not store a side wider than the window minus the \
+                 editor's floor, or the columns overflow a viewport that shrank \
+                 without them: got {size:?}, ceiling {ceiling:?}"
+            );
+        });
+    }
+    /// Tom, dogfooding the viewport floor: *"Dragging left works fine. Dragging
+    /// right is where the other panes go outside of the window."* Then, on the
+    /// cause: *"we don't apply the MIN 200 on the editor pane. I'm guessing we
+    /// should."* He was right, and it is why per-area scrolling could not work.
+    ///
+    /// Every side column carries `min_w`; the editor's chain carries
+    /// `overflow_hidden`, which sets `min-width: 0` and makes it the item flexbox
+    /// drains first. So a wide side did not overflow *within* its own viewport — it
+    /// ate the editor, and once the editor was gone the dock's box ran past the
+    /// window edge and its columns rendered off-screen, unreachable by scrolling
+    /// because there was no viewport left to scroll in.
+    ///
+    /// The witness is that the editor holds its floor while a side is dragged wider
+    /// than the space left for it. No model-level assertion can see this:
+    /// `dock_size` happily reports a side wider than the window.
+    #[gpui::test]
+    async fn test_the_editor_keeps_its_floor_when_a_side_is_dragged_wide(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        set_panel_pinned(cx, "TestPanel", true);
+        set_panel_pinned(cx, "TestPanelB", true);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let first = cx.new(|cx| TestPanel::new(DockPosition::Right, 100, cx));
+            workspace.add_panel(first, window, cx);
+            let second = cx.new(|cx| TestPanelB::new(DockPosition::Right, 101, cx));
+            workspace.add_panel(second, window, cx);
+            workspace.right_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+                dock.activate_panel(1, window, cx);
+                dock.set_open(true, window, cx);
+            });
+            // Ask for a side far wider than the window can spare — the gesture that
+            // stored 480px per column on Tom's 1536px window.
+            workspace.resize_dock(DockPosition::Right, px(5000.), window, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+
+        let editor = cx
+            .debug_bounds("EDITOR-REGION")
+            .expect("the editor region renders");
+        assert!(
+            editor.size.width >= crate::layout_registry::CENTER_MIN_WIDTH - px(1.),
+            "the editor must keep its floor rather than being drained to pay for \
+             the side: got {:?}, floor {:?}",
+            editor.size.width,
+            crate::layout_registry::CENTER_MIN_WIDTH
+        );
+    }
     /// Tom, watching the real thing: *"it looks correct initially, but when I make
     /// the width smaller, the grey area grows."* A gap that widens as the side
     /// narrows is not a panel drawing at its content width — that would be a
@@ -17596,6 +18285,7 @@ mod tests {
                     dock::PanelSizeState {
                         size: Some(px(300.)),
                         flex: None,
+                        weight: None,
                     },
                     cx,
                 );
@@ -17695,6 +18385,7 @@ mod tests {
                     dock::PanelSizeState {
                         size: Some(px(300.)),
                         flex: None,
+                        weight: None,
                     },
                     cx,
                 );
@@ -17758,6 +18449,7 @@ mod tests {
                     dock::PanelSizeState {
                         size: Some(px(420.)),
                         flex: None,
+                        weight: None,
                     },
                     cx,
                 );
@@ -17820,6 +18512,7 @@ mod tests {
                     dock::PanelSizeState {
                         size: Some(px(300.)),
                         flex: None,
+                        weight: None,
                     },
                     cx,
                 );
@@ -17835,6 +18528,7 @@ mod tests {
                     dock::PanelSizeState {
                         size: Some(px(200.)),
                         flex: None,
+                        weight: None,
                     },
                     cx,
                 );
@@ -17888,6 +18582,7 @@ mod tests {
                     dock::PanelSizeState {
                         size: Some(px(300.)),
                         flex: None,
+                        weight: None,
                     },
                     cx,
                 );
@@ -17973,6 +18668,7 @@ mod tests {
                     dock::PanelSizeState {
                         size: Some(px(360.)),
                         flex: None,
+                        weight: None,
                     },
                     cx,
                 );
@@ -18004,15 +18700,18 @@ mod tests {
         });
     }
 
-    /// A fixed column beside a flexible one holds its stored width, so the side's
-    /// floor is that width plus the flexible column's minimum — not both minimums.
-    /// Summing minimums leaves the side free to shrink into a gap its contents
-    /// cannot occupy, which renders as columns that stop tracking the pointer and
-    /// get clipped. Found by dogfooding, not by the suite: both halves are locally
-    /// correct and the gap is exactly the fixed column's own headroom, so it is
-    /// zero whenever a fixture stores a width equal to the minimum.
+    /// A fixed column beside a flexible one holds its stored width (Decision
+    /// 2026-09-03, which the 2026-09-05 scroll ruling leaves standing — it removed
+    /// the stop-dead floor, not fixed-means-fixed). So the drag can take away only
+    /// what the flexible column contributes, and the side bottoms out at the fixed
+    /// column's stored width rather than at anything summed from minimums.
+    ///
+    /// This is not the old floor wearing a new name. The old one refused to go
+    /// below what every column needed; this one is a consequence of one column
+    /// declining to move, and the flexible column beside it is still 200px wide at
+    /// draw time inside a side that no longer has room for it.
     #[gpui::test]
-    async fn test_a_mixed_side_floors_on_the_fixed_width_not_its_minimum(
+    async fn test_a_mixed_side_gives_up_only_what_its_flexible_column_holds(
         cx: &mut gpui::TestAppContext,
     ) {
         init_test(cx);
@@ -18039,6 +18738,7 @@ mod tests {
                     dock::PanelSizeState {
                         size: Some(px(300.)),
                         flex: None,
+                        weight: None,
                     },
                     cx,
                 );
@@ -18046,22 +18746,28 @@ mod tests {
 
             workspace.resize_dock(DockPosition::Left, px(10.), window, cx);
             let dock = workspace.left_dock().read(cx);
+            let size = workspace
+                .dock_size(&dock, window, cx)
+                .expect("an open dock reports a size");
             assert_eq!(
-                workspace.dock_size(&dock, window, cx),
-                Some(px(300.) + crate::layout_registry::SIDE_COLUMN_MIN_WIDTH),
+                size,
+                px(300.) + crate::layout_registry::SIDE_COLUMN_MIN_WIDTH,
                 "the floor must pay for the fixed column's stored 300px, not its \
-                 200px minimum; summing minimums floors 100px too low and the \
-                 columns stop tracking the pointer inside that gap"
+                 200px minimum: summing minimums floors 100px too low and the side \
+                 shrinks into a gap its contents cannot occupy"
             );
         });
     }
 
-    /// A flexible component takes its width from a flex factor, so the per-column
-    /// distribution never floors it — only the clamp in `resize_*_dock` does, by
-    /// deciding the width the flex factor is derived from. The fixed-panel
-    /// witnesses above pass with that clamp deleted; these do not.
+    /// One column on the side, so the viewport floor *is* that column's minimum
+    /// and the side stops there — there is no second column to scroll to, so
+    /// going further would only hide the one component behind a sliver. The
+    /// multi-column case is the interesting one and lives above: the floor is the
+    /// widest single minimum, well below their sum.
     #[gpui::test]
-    async fn test_a_flexible_left_component_drag_stops_at_the_floor(cx: &mut gpui::TestAppContext) {
+    async fn test_a_flexible_left_component_drag_floors_at_its_one_whole_column(
+        cx: &mut gpui::TestAppContext,
+    ) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
         let project = Project::test(fs, [], cx).await;
@@ -18082,14 +18788,15 @@ mod tests {
             assert_eq!(
                 workspace.dock_size(&dock, window, cx),
                 Some(crate::layout_registry::SIDE_COLUMN_MIN_WIDTH),
-                "the flex factor must be derived from the floored width; derived \
-                 from the raw 10px it leaves the side a sliver"
+                "a lone column's minimum is the viewport floor: below it the side \
+                 is a sliver onto the only thing it holds, which is what dogfooding \
+                 the unfloored build found"
             );
         });
     }
 
     #[gpui::test]
-    async fn test_a_flexible_right_component_drag_stops_at_the_floor(
+    async fn test_a_flexible_right_component_drag_floors_at_its_one_whole_column(
         cx: &mut gpui::TestAppContext,
     ) {
         init_test(cx);
@@ -18112,17 +18819,137 @@ mod tests {
             assert_eq!(
                 workspace.dock_size(&dock, window, cx),
                 Some(crate::layout_registry::SIDE_COLUMN_MIN_WIDTH),
-                "the right side needs its own witness; the left one passes while \
-                 this clamp is missing"
+                "the right side needs its own witness; the left one passed while \
+                 the right clamp was missing entirely"
             );
         });
     }
 
+    /// The bottom row divided its width equally whatever the user had set, and
+    /// `min_w_0` let a narrow window squash every segment to nothing — the sliver
+    /// the registry floor exists to prevent, still live on this axis long after the
+    /// sides were fixed. Both are draw-time facts, so both are asserted on bounds.
+    #[gpui::test]
+    async fn test_bottom_segments_keep_their_weights_and_their_minimum(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        set_panel_pinned(cx, "TestPanel", true);
+        set_panel_pinned(cx, "TestPanelB", true);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let first = cx.new(|cx| TestPanel::new(DockPosition::Bottom, 100, cx));
+            workspace.add_panel(first.clone(), window, cx);
+            let second = cx.new(|cx| TestPanelB::new(DockPosition::Bottom, 101, cx));
+            workspace.add_panel(second, window, cx);
+            workspace.bottom_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+                dock.activate_panel(1, window, cx);
+                dock.set_open(true, window, cx);
+                // Three parts to one: an equal-share row would draw them the same.
+                dock.set_panel_size_state(
+                    &first,
+                    dock::PanelSizeState {
+                        size: None,
+                        flex: None,
+                        weight: Some(3.0),
+                    },
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+
+        let wide = cx
+            .debug_bounds("DOCK-COLUMN-TestPanel")
+            .expect("the weighted segment renders");
+        let narrow = cx
+            .debug_bounds("DOCK-COLUMN-TestPanelB")
+            .expect("the unweighted segment renders");
+        assert!(
+            wide.size.width > narrow.size.width * 2.,
+            "a saved weight of 3 against a default 1 must draw wider than double; \
+             equal shares would draw them the same (got {:?} and {:?})",
+            wide.size.width,
+            narrow.size.width
+        );
+        let floor = crate::layout_registry::BOTTOM_SEGMENT_MIN_WIDTH;
+        assert!(
+            narrow.size.width >= floor - px(1.),
+            "the lighter segment must still hold the registry bottom floor rather \
+             than being squeezed toward nothing (got {:?}, floor {floor:?})",
+            narrow.size.width
+        );
+    }
+
+    /// The bottom row drew `cursor_col_resize` seam handles that did nothing:
+    /// `Dock::render` adds one on every axis, while `resize_dock_seam` returned
+    /// early for Bottom. A control that looks live and does nothing is the defect
+    /// class this feature already fixed twice elsewhere.
+    ///
+    /// The seam works in weight space, because the row has no px to store — it
+    /// divides whatever width its `bottom_dock_layout` geometry gives it.
+    #[gpui::test]
+    async fn test_a_bottom_seam_moves_width_between_its_two_segments(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        set_panel_pinned(cx, "TestPanel", true);
+        set_panel_pinned(cx, "TestPanelB", true);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.bounds = gpui::Bounds {
+                origin: gpui::Point::default(),
+                size: gpui::size(px(1600.), px(900.)),
+            };
+
+            let first = cx.new(|cx| TestPanel::new(DockPosition::Bottom, 100, cx));
+            workspace.add_panel(first, window, cx);
+            let second = cx.new(|cx| TestPanelB::new(DockPosition::Bottom, 101, cx));
+            workspace.add_panel(second, window, cx);
+            workspace.bottom_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+                dock.activate_panel(1, window, cx);
+                dock.set_open(true, window, cx);
+            });
+
+            // Equal weights to start: the seam sits at 800 on a 1600 row.
+            workspace.resize_dock_seam(DockPosition::Bottom, 1, px(500.), window, cx);
+
+            let dock = workspace.bottom_dock().read(cx);
+            let widths = dock.rendered_widths(px(1600.), window, cx);
+            assert_eq!(widths.len(), 2, "two open segments");
+            assert!(
+                (widths[0] - px(500.)).abs() < px(2.),
+                "the leading segment must take the seam's target (got {:?})",
+                widths[0]
+            );
+            assert!(
+                (widths[0] + widths[1] - px(1600.)).abs() < px(2.),
+                "the row's total must be untouched — a seam trades between its two \
+                 neighbours and moves nothing else (got {:?} + {:?})",
+                widths[0],
+                widths[1]
+            );
+        });
+    }
     /// The bottom dock resizes on height, while the registry publishes a bottom
     /// *segment width* for the row's internal dividers. No height floor has been
     /// designed, so this records the gap rather than letting it read as covered.
     #[gpui::test]
-    async fn test_the_bottom_dock_drag_still_has_no_floor(cx: &mut gpui::TestAppContext) {
+    async fn test_the_bottom_dock_drag_stops_at_its_height_floor(cx: &mut gpui::TestAppContext) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
         let project = Project::test(fs, [], cx).await;
@@ -18132,6 +18959,10 @@ mod tests {
         workspace.update_in(cx, |workspace, window, cx| {
             workspace.bounds.size.height = px(1000.);
 
+            // The panel declares 250px, and the floor is 120px. The declared number
+            // is deliberately ignored here: `Panel::min_size` is a width — Agent
+            // returns `Some` at the sides and `None` at Bottom for exactly this
+            // reason — so a bottom component cannot raise its own height floor.
             let panel =
                 cx.new(|cx| TestPanel::new_with_min_size(DockPosition::Bottom, 100, px(250.), cx));
             workspace.add_panel(panel, window, cx);
@@ -18143,9 +18974,116 @@ mod tests {
             let dock = workspace.bottom_dock().read(cx);
             assert_eq!(
                 workspace.dock_size(&dock, window, cx),
-                Some(dock::RESIZE_HANDLE_SIZE),
-                "a bottom height floor would be new behaviour, not this change's; \
-                 when one lands, this assertion is the one to rewrite"
+                Some(crate::layout_registry::BOTTOM_DOCK_MIN_HEIGHT),
+                "the drag stops at the floor instead of the 6px sliver it used to reach"
+            );
+        });
+    }
+
+    /// The floor must not win against a window too short to hold it. Floor then
+    /// ceiling is the order both side drags use, and the reason is the same: a dock
+    /// that overflows its window to satisfy a minimum is worse than a short one.
+    /// The width half of this was found by dogfooding on 2026-09-05 — the editor
+    /// had no minimum while every side column had one, so flexbox drained it to pay
+    /// for them. The fix went onto the four geometries as `min_w`, and the bottom
+    /// dock resizes on *height*, so the identical hole stayed open on the axis that
+    /// session never touched. Dragging the divider to the top took the editor to
+    /// nothing.
+    #[gpui::test]
+    async fn test_the_bottom_drag_leaves_the_editor_its_height(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        let height = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| TestPanel::new(DockPosition::Bottom, 100, cx));
+            workspace.add_panel(panel, window, cx);
+            workspace.bottom_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+                dock.set_open(true, window, cx);
+            });
+            // Ask for a dock taller than the window, which is what dragging the
+            // divider to the top asks for.
+            workspace.resize_dock(DockPosition::Bottom, px(5000.), window, cx);
+            let dock = workspace.bottom_dock().read(cx);
+            workspace.dock_size(&dock, window, cx).unwrap()
+        });
+
+        let workspace_height = workspace.update(cx, |workspace, _| workspace.bounds.size.height);
+        assert!(
+            workspace_height - height >= crate::layout_registry::CENTER_MIN_HEIGHT,
+            "the drag must leave the editor its floor rather than storing a height \
+             the window cannot spare: dock {height:?} of {workspace_height:?}, floor {:?}",
+            crate::layout_registry::CENTER_MIN_HEIGHT
+        );
+    }
+
+    /// The drag is only one route in. `clamp_panel_size` on window shrink carries no
+    /// floor by design, so the render has to hold the editor's height itself — and
+    /// on the width axis that floor shipped with no witness at all, found only by
+    /// mutation. This is the one it was missing, on the other axis.
+    #[gpui::test]
+    async fn test_the_editor_keeps_its_height_when_the_bottom_dock_is_tall(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| TestPanel::new(DockPosition::Bottom, 100, cx));
+            workspace.add_panel(panel, window, cx);
+            workspace.bottom_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+                dock.set_open(true, window, cx);
+                // Straight past the drag clamp into the stored state, the way a
+                // window shrink reaches it.
+                dock.resize_active_panel(Some(px(5000.)), None, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+
+        let editor = cx
+            .debug_bounds("EDITOR-REGION")
+            .expect("the editor region renders");
+        assert!(
+            editor.size.height >= crate::layout_registry::CENTER_MIN_HEIGHT - px(1.),
+            "the editor must keep its floor rather than being drained to pay for the \
+             bottom dock: got {:?}, floor {:?}",
+            editor.size.height,
+            crate::layout_registry::CENTER_MIN_HEIGHT
+        );
+    }
+
+    #[gpui::test]
+    async fn test_a_short_window_beats_the_bottom_height_floor(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.bounds.size.height = px(80.);
+
+            let panel = cx.new(|cx| TestPanel::new(DockPosition::Bottom, 100, cx));
+            workspace.add_panel(panel, window, cx);
+            workspace.bottom_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+            });
+
+            workspace.resize_dock(DockPosition::Bottom, px(1.), window, cx);
+            let dock = workspace.bottom_dock().read(cx);
+            let height = workspace.dock_size(&dock, window, cx).unwrap();
+            assert!(
+                height < crate::layout_registry::BOTTOM_DOCK_MIN_HEIGHT,
+                "an 80px window cannot hold a 120px floor, and the window wins: got {height:?}"
             );
         });
     }

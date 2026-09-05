@@ -1,7 +1,6 @@
 use crate::{
     ItemHandle, MultiWorkspace, Pane, SidebarSide, StatusBarItemLocation, StatusBarSettings,
-    ToggleWorkspaceSidebar, layout_registry::CustomizeWorkspaceLayout,
-    notifications::DetachAndPromptErr, sidebar_side_context_menu,
+    ToggleWorkspaceSidebar, layout_registry::CustomizeWorkspaceLayout, sidebar_side_context_menu,
 };
 use gpui::{
     Anchor, AnyView, App, Context, Decorations, Entity, FocusHandle, Focusable, IntoElement,
@@ -522,30 +521,28 @@ fn place_status_control(
 /// boolean too would leave two settings describing one visible state — and it
 /// would silently edit keys the user never touched.
 ///
-/// The write is completion-aware: the old placement stays on screen until it
-/// lands, and a failure is reported rather than swallowed.
+/// The write is completion-aware and goes through the same reporter a component
+/// write does: the old placement stays on screen until it lands, a failure names
+/// the item rather than the settings key, focus returns to the surface that made
+/// the choice, and one gesture raises one dialog however many writes it queued.
 pub fn set_status_control_location(
     item_id: &'static str,
     location: StatusBarItemLocation,
     window: &mut Window,
-    cx: &App,
+    cx: &mut App,
 ) {
     let fs = <dyn fs::Fs>::global(cx);
     let update = update_settings_file_with_completion(fs, cx, move |settings, _cx| {
         place_status_control(settings, item_id, location);
     });
-    window
-        .spawn(cx, async move |_| match update.await {
-            Ok(Ok(())) => anyhow::Ok(()),
-            Ok(Err(error)) => Err(error),
-            Err(_) => anyhow::bail!("settings update task was canceled"),
-        })
-        .detach_and_prompt_err(
-            "Failed to update bottom bar placement",
-            window,
-            cx,
-            |_, _, _| None,
-        );
+    let message = crate::dock::placement_failure_message(
+        item_id,
+        match location {
+            StatusBarItemLocation::Hidden => "hide",
+            _ => "move",
+        },
+    );
+    crate::dock::report_layout_write(update, message, window, cx);
 }
 
 /// Appends a "Hide Button" entry aligned with surrounding toggleable entries.
