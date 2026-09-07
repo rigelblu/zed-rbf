@@ -17872,6 +17872,104 @@ mod tests {
     /// The witness activates the *last* column, the one furthest off-screen, and
     /// asserts it lands inside the side's bounds. The first column would pass
     /// without any reveal at all, since it is already where the viewport starts.
+    /// The brief said for days that the bottom row holds its minimums but does not
+    /// scroll. It does: `Dock::render` applies `overflow_x_scroll().track_scroll(..)`
+    /// **before** it branches on position, so the viewport exists at Bottom exactly
+    /// as at the sides, and `activate_panel` calls `scroll_to_item` with no position
+    /// gate. What was missing was evidence — the witness above is side-only, so the
+    /// bottom half of that mechanism has never been asserted on.
+    #[gpui::test]
+    async fn test_opening_a_component_scrolls_it_into_view_on_a_narrow_bottom_row(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        set_panel_pinned(cx, "TestPanel", true);
+        set_panel_pinned(cx, "TestPanelB", true);
+        set_panel_pinned(cx, "TestPanelC", true);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let first = cx.new(|cx| TestPanel::new(DockPosition::Bottom, 100, cx));
+            workspace.add_panel(first, window, cx);
+            let second = cx.new(|cx| TestPanelB::new(DockPosition::Bottom, 101, cx));
+            workspace.add_panel(second, window, cx);
+            let third = cx.new(|cx| TestPanelC::new(DockPosition::Bottom, 102, cx));
+            workspace.add_panel(third, window, cx);
+            workspace.bottom_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+                dock.activate_panel(1, window, cx);
+                dock.activate_panel(2, window, cx);
+                dock.set_open(true, window, cx);
+            });
+        });
+
+        // Three segments at the 160px floor need 480px. The row's width is the
+        // window's, so the window is what has to be too narrow — unlike a side,
+        // where the dock's own size is the constrained axis.
+        cx.simulate_resize(size(px(300.), px(700.)));
+        cx.run_until_parked();
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace
+                .bottom_dock()
+                .update(cx, |dock, cx| dock.activate_panel(2, window, cx));
+        });
+        cx.run_until_parked();
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+
+        let row = cx
+            .debug_bounds("DOCK-PANEL-Bottom")
+            .expect("the bottom row renders");
+        let third = cx
+            .debug_bounds("DOCK-COLUMN-TestPanelC")
+            .expect("the third segment renders");
+        let first = cx
+            .debug_bounds("DOCK-COLUMN-TestPanel")
+            .expect("the first segment renders");
+
+        // The premise, asserted rather than assumed. Without it every check below
+        // passes on a row that simply fits, which is how the side-only witness
+        // above was carried as vacuous for a day.
+        assert!(
+            first.size.width + third.size.width * 2. > row.size.width,
+            "the row must be too narrow for its segments, or this proves nothing: \
+             row {:?}, segments {:?} each",
+            row.size.width,
+            third.size.width
+        );
+        assert!(
+            first.origin.x < row.origin.x,
+            "and the first segment must actually be scrolled out of view: {:?} vs \
+             row {:?}",
+            first.origin.x,
+            row.origin.x
+        );
+
+        assert!(
+            third.size.width >= crate::layout_registry::BOTTOM_SEGMENT_MIN_WIDTH - px(1.),
+            "the segment must hold its floor rather than squash: got {:?}, floor {:?}",
+            third.size.width,
+            crate::layout_registry::BOTTOM_SEGMENT_MIN_WIDTH
+        );
+        assert!(
+            third.origin.x >= row.origin.x - px(1.)
+                && third.origin.x + third.size.width <= row.origin.x + row.size.width + px(1.),
+            "activating the third segment must scroll it into the row's viewport: \
+             segment {:?}..{:?}, row {:?}..{:?}",
+            third.origin.x,
+            third.origin.x + third.size.width,
+            row.origin.x,
+            row.origin.x + row.size.width
+        );
+    }
+
     #[gpui::test]
     async fn test_opening_a_component_scrolls_it_into_view_on_a_narrow_side(
         cx: &mut gpui::TestAppContext,

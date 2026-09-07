@@ -160,17 +160,55 @@ impl StatusBarItem {
 /// Split out of rendering because this is the half that can be wrong, and the
 /// rendered half cannot be asserted on — `cx.draw` panics once an element
 /// registers a deferred draw, which a tooltip does.
-fn zone_order(locations: &[StatusBarItemLocation], zone: StatusBarItemLocation) -> Vec<usize> {
+fn zone_order(
+    locations: &[StatusBarItemLocation],
+    ids: &[Option<&'static str>],
+    zone: StatusBarItemLocation,
+) -> Vec<usize> {
     let mut indices: Vec<usize> = locations
         .iter()
         .enumerate()
         .filter(|(_, location)| **location == zone && zone != StatusBarItemLocation::Hidden)
         .map(|(index, _)| index)
         .collect();
+    indices.sort_by_key(|index| zone_rank(ids.get(*index).copied().flatten(), *index));
     if zone == StatusBarItemLocation::Right {
         indices.reverse();
     }
     indices
+}
+
+/// Where an item sits inside its zone, as a sort key.
+///
+/// **The registry decides, and until 2026-09-06 it did not.** `zone_order` sorted by
+/// registration index — the order `add_status_control` happens to be called in, in
+/// one function in the `zed` crate — while `layout_registry` carried the identical
+/// numbers, gap at 11 included, and the `n` in `SourceRank::StatusControl(n)` was
+/// read by nothing: both call sites matched `StatusControl(_)` and discarded it. Two
+/// sources of truth for one order, and the live one was a call order rather than a
+/// table, which left status-control ordering no single sequence to write to.
+///
+/// Exactly the shape panels had before 2026-09-05, and switched the same way and for
+/// the same reason. Checked rather than assumed: the fourteen table ranks and the
+/// fourteen `add_status_control` calls name the same ids in the same order, which is
+/// why this is a no-op and the unchanged suite is the proof.
+///
+/// An item the table does not know keeps its registration index and sorts **ahead**
+/// of every registered control, because that is where it already sits — the dock
+/// button strips carry no adapter and are added in `Workspace::new`, before any
+/// status control exists.
+fn zone_rank(id: Option<&str>, registration_index: usize) -> (u8, u32) {
+    use crate::layout_registry::SourceRank;
+
+    match id
+        .and_then(crate::layout_registry::get)
+        .map(|item| item.source_rank)
+    {
+        Some(SourceRank::StatusControl(rank)) => (1, rank as u32),
+        // A panel is not a status control. If the table ever says one is, sort it
+        // with the unregistered rather than give it a place in this sequence.
+        Some(SourceRank::Panel(_)) | None => (0, registration_index as u32),
+    }
 }
 
 pub struct StatusBar {
@@ -299,7 +337,12 @@ impl StatusBar {
             .iter()
             .map(|entry| entry.effective_location(cx))
             .collect();
-        zone_order(&locations, location)
+        let ids: Vec<Option<&'static str>> = self
+            .items
+            .iter()
+            .map(|entry| entry.adapter.as_ref().map(|adapter| adapter.id))
+            .collect();
+        zone_order(&locations, &ids, location)
             .into_iter()
             .filter_map(|index| self.items.get(index).map(|entry| (index, entry)))
             .map(|(index, entry)| {
@@ -882,13 +925,26 @@ mod zone_tests {
     use super::*;
     use StatusBarItemLocation::{Hidden, Left, Middle, Right};
 
+    /// These assertions are about zone membership and the Right reversal, not about
+    /// ranking, so every item here is unregistered — which makes `zone_rank` fall to
+    /// the registration index and reproduces the order they were written against.
+    fn unregistered(locations: &[StatusBarItemLocation]) -> Vec<Option<&'static str>> {
+        vec![None; locations.len()]
+    }
+
     const ZONES: [StatusBarItemLocation; 3] = [Left, Middle, Right];
 
     #[test]
     fn a_zone_takes_only_its_own_items_and_keeps_their_order() {
         let locations = [Left, Right, Left, Middle, Left];
-        assert_eq!(zone_order(&locations, Left), vec![0, 2, 4]);
-        assert_eq!(zone_order(&locations, Middle), vec![3]);
+        assert_eq!(
+            zone_order(&locations, &unregistered(&locations), Left),
+            vec![0, 2, 4]
+        );
+        assert_eq!(
+            zone_order(&locations, &unregistered(&locations), Middle),
+            vec![3]
+        );
     }
 
     #[test]
@@ -897,9 +953,12 @@ mod zone_tests {
         // lists used to encode this by iterating one of them backwards; with one
         // list it has to be stated.
         let locations = [Right, Right, Right];
-        assert_eq!(zone_order(&locations, Right), vec![2, 1, 0]);
+        assert_eq!(
+            zone_order(&locations, &unregistered(&locations), Right),
+            vec![2, 1, 0]
+        );
         assert_ne!(
-            zone_order(&locations, Right),
+            zone_order(&locations, &unregistered(&locations), Right),
             vec![0, 1, 2],
             "source order and render order are indistinguishable here, so this \
              fixture cannot tell a reversal from its absence"
@@ -909,8 +968,14 @@ mod zone_tests {
     #[test]
     fn only_the_right_zone_reverses() {
         let locations = [Left, Left, Middle, Middle];
-        assert_eq!(zone_order(&locations, Left), vec![0, 1]);
-        assert_eq!(zone_order(&locations, Middle), vec![2, 3]);
+        assert_eq!(
+            zone_order(&locations, &unregistered(&locations), Left),
+            vec![0, 1]
+        );
+        assert_eq!(
+            zone_order(&locations, &unregistered(&locations), Middle),
+            vec![2, 3]
+        );
     }
 
     #[test]
@@ -920,16 +985,19 @@ mod zone_tests {
         let locations = [Hidden, Left, Hidden];
         for zone in ZONES {
             assert!(
-                !zone_order(&locations, zone).contains(&0),
+                !zone_order(&locations, &unregistered(&locations), zone).contains(&0),
                 "a hidden item reached the {zone:?} zone"
             );
-            assert!(!zone_order(&locations, zone).contains(&2));
+            assert!(!zone_order(&locations, &unregistered(&locations), zone).contains(&2));
         }
         assert!(
-            zone_order(&locations, Hidden).is_empty(),
+            zone_order(&locations, &unregistered(&locations), Hidden).is_empty(),
             "asking for the Hidden zone returned items to render"
         );
-        assert_eq!(zone_order(&locations, Left), vec![1]);
+        assert_eq!(
+            zone_order(&locations, &unregistered(&locations), Left),
+            vec![1]
+        );
     }
 
     #[test]
@@ -942,7 +1010,9 @@ mod zone_tests {
         for (index, location) in locations.iter().enumerate() {
             let appearances = ZONES
                 .iter()
-                .filter(|zone| zone_order(&locations, **zone).contains(&index))
+                .filter(|zone| {
+                    zone_order(&locations, &unregistered(&locations), **zone).contains(&index)
+                })
                 .count();
             let expected = if *location == Hidden { 0 } else { 1 };
             assert_eq!(
@@ -953,12 +1023,71 @@ mod zone_tests {
 
         let total: usize = ZONES
             .iter()
-            .map(|zone| zone_order(&locations, *zone).len())
+            .map(|zone| zone_order(&locations, &unregistered(&locations), *zone).len())
             .sum();
         assert_eq!(
             total,
             locations.iter().filter(|l| **l != Hidden).count(),
             "the zones together render a different number of items than are placed"
+        );
+    }
+    /// The registry decides where a status control sits in its zone, and until
+    /// 2026-09-06 it did not: `zone_order` sorted by registration index while
+    /// `SourceRank::StatusControl(n)`'s number was read by nothing. Two sequences
+    /// for one order, and the live one was a call order in the `zed` crate — which
+    /// is why status-control ordering had nothing to write to. Exactly the shape
+    /// panels had before 2026-09-05.
+    #[test]
+    fn a_registered_control_takes_its_place_from_the_table() {
+        use crate::layout_registry::{SourceRank, get, ids};
+
+        let SourceRank::StatusControl(cursor) = get(ids::CURSOR_POSITION).unwrap().source_rank
+        else {
+            panic!("Cursor Position must be ranked as a status control");
+        };
+        assert_eq!(
+            super::zone_rank(Some(ids::CURSOR_POSITION), 999),
+            (1, cursor as u32),
+            "a wildly wrong registration index changes nothing for a registered id"
+        );
+        assert!(
+            super::zone_rank(Some(ids::PROJECT_SEARCH), 999)
+                < super::zone_rank(Some(ids::CURSOR_POSITION), 0),
+            "and the table's order wins over the order they happened to be added in"
+        );
+    }
+
+    /// The dock button strips carry no adapter and are added in `Workspace::new`,
+    /// before any status control exists — so they already sit ahead of every control
+    /// in their zone, and the switch has to leave them there. Sorting the
+    /// unregistered behind would have moved the panel icons, which is the one thing
+    /// a no-op change must not do.
+    #[test]
+    fn an_item_the_table_does_not_know_keeps_its_place_ahead_of_every_control() {
+        use crate::layout_registry::ids;
+
+        assert_eq!(super::zone_rank(None, 7), (0, 7));
+        assert!(
+            super::zone_rank(None, 999) < super::zone_rank(Some(ids::PROJECT_SEARCH), 0),
+            "a dock button strip stays ahead of the first-ranked control"
+        );
+    }
+
+    /// Panels share this id space and carry ranks of their own. One appearing as a
+    /// status control's adapter id would mean the table had been edited wrongly, and
+    /// borrowing its rank would interleave it into the control sequence.
+    #[test]
+    fn a_panel_id_is_not_given_a_place_in_the_control_sequence() {
+        use crate::layout_registry::{SourceRank, get, ids};
+
+        assert!(matches!(
+            get(ids::PROJECT_PANEL).unwrap().source_rank,
+            SourceRank::Panel(_)
+        ));
+        assert_eq!(
+            super::zone_rank(Some(ids::PROJECT_PANEL), 7),
+            (0, 7),
+            "it sorts with the unregistered rather than among the controls"
         );
     }
 }
