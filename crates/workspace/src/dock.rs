@@ -3247,10 +3247,23 @@ impl Render for PanelButtons {
                                 + 4 * (is_pinned_button as u64);
                             let button = IconButton::new((name, button_state), icon)
                                 .icon_size(IconSize::Small)
+                                // `toggle_state` reaches assistive tech on its own —
+                                // `ButtonLike` renders it as `aria_toggled`. Focused and
+                                // pinned do not, and accent alone and a 4px dot alone are
+                                // each invisible to a reader, so both are named in the
+                                // label. It goes in the *label* rather than
+                                // `aria_description` because `IconButton` forwards only
+                                // `aria_label` and `aria_expanded`; adding a forwarder
+                                // would diverge another upstream file for one string.
                                 .toggle_state(is_open_button)
                                 .when(is_focused_button, |this| this.icon_color(Color::Accent))
                                 .tab_index(0isize)
-                                .aria_label(icon_tooltip)
+                                .aria_label(match (is_focused_button, is_pinned_button) {
+                                    (true, true) => format!("{icon_tooltip}, focused, pinned"),
+                                    (true, false) => format!("{icon_tooltip}, focused"),
+                                    (false, true) => format!("{icon_tooltip}, pinned"),
+                                    (false, false) => icon_tooltip.to_string(),
+                                })
                                 .on_click({
                                     let dock = dock_for_click.clone();
                                     let workspace = workspace_for_click.clone();

@@ -369,17 +369,19 @@ impl StatusBar {
         let order = StatusBarSettings::get_global(cx).item_order.clone();
         let strip = zone_control_strip(&locations, &ids, &order, location);
         let full = materialized_control_order(&order);
-        zone_order(&locations, &ids, &order, location)
+        let zone_indices = zone_order(&locations, &ids, &order, location);
+        let last_control = zone_end_target_follows(&zone_indices, &ids);
+        zone_indices
             .into_iter()
             .filter_map(|index| self.items.get(index).map(|entry| (index, entry)))
-            .map(|(index, entry)| {
+            .flat_map(|(index, entry)| {
                 // The index is the item's position in the merged list, not a
                 // per-zone counter, so ids stay unique when an item changes zone.
                 //
                 // `location` is handed down rather than re-resolved: it is the
                 // zone that actually rendered this item, so a placement menu
                 // cannot mark a zone the item is not in.
-                render_status_bar_item(
+                let item = render_status_bar_item(
                     side,
                     index,
                     entry,
@@ -388,9 +390,12 @@ impl StatusBar {
                     &full,
                     &self.focus_handle,
                     cx,
-                )
+                );
+                let end = (Some(index) == last_control)
+                    .then(|| zone_end_drop_target(location, &strip, &full))
+                    .flatten();
+                std::iter::once(item).chain(end)
             })
-            .chain(zone_end_drop_target(location, &strip, &full))
             .collect()
     }
 
@@ -858,6 +863,29 @@ fn materialized_control_order(order: &[String]) -> Vec<String> {
     }
     ids.sort_by_key(|id| zone_rank(Some(id), 0, order));
     ids
+}
+
+/// Which item the zone's end drop target is drawn after: the last **control** in
+/// drawn order, not the last item in the zone.
+///
+/// The dock button strips share these zones and sort to band 0, so the Right zone —
+/// ranked, then reversed — draws them *after* every control. Appending the target to
+/// the end of the zone therefore put it on the far side of those icons from the slot
+/// a drop there writes, which is after `zone_control_strip`'s last entry. The Left
+/// zone draws the strips first, so the two positions coincide there and the defect
+/// was invisible on the only side anyone checked.
+///
+/// `None` when the zone draws no control — there is no end of a sequence that has no
+/// members, which is the same condition `zone_end_drop_target` refuses on.
+fn zone_end_target_follows(zone_indices: &[usize], ids: &[Option<&'static str>]) -> Option<usize> {
+    zone_indices.iter().rev().copied().find(|index| {
+        ids.get(*index).copied().flatten().is_some_and(|id| {
+            matches!(
+                crate::layout_registry::get(id).map(|item| item.kind),
+                Some(crate::layout_registry::LayoutItemKind::StatusControl)
+            )
+        })
+    })
 }
 
 /// The registered controls drawn in `zone`, in the order they are drawn.
@@ -1365,6 +1393,59 @@ mod zone_tests {
         assert!(
             super::zone_rank(None, 999, &[]) < super::zone_rank(Some(ids::PROJECT_SEARCH), 0, &[]),
             "a dock button strip stays ahead of the first-ranked control"
+        );
+    }
+
+    /// The Right zone is the whole point: it ranks then reverses, so the dock button
+    /// strips it shares with band 0 draw *after* every control. The end drop target
+    /// has to follow the last control, which is where a drop on it writes — not the
+    /// last item drawn, which is an icon strip several positions further right.
+    #[test]
+    fn the_end_drop_target_follows_the_last_control_not_the_last_item() {
+        use crate::layout_registry::ids;
+
+        // Index 0 is a dock button strip: no id, so band 0.
+        let ids: Vec<Option<&'static str>> =
+            vec![None, Some(ids::CURSOR_POSITION), Some(ids::ACTIVE_LANGUAGE)];
+        let locations = [Right, Right, Right];
+
+        let drawn = zone_order(&locations, &ids, &[], Right);
+        assert_eq!(
+            drawn.last().copied(),
+            Some(0),
+            "the strip draws last in the Right zone — the precondition this is about"
+        );
+        assert_eq!(
+            super::zone_end_target_follows(&drawn, &ids),
+            Some(drawn[drawn.len() - 2]),
+            "so the target follows the control before it, not the strip"
+        );
+        assert_ne!(
+            super::zone_end_target_follows(&drawn, &ids),
+            drawn.last().copied(),
+            "appending to the end of the zone is the defect, not the fix"
+        );
+
+        // Left draws the strip first, so both readings coincide — which is exactly
+        // why checking only this side reported the Right zone as correct.
+        let locations = [Left, Left, Left];
+        let drawn = zone_order(&locations, &ids, &[], Left);
+        assert_eq!(
+            super::zone_end_target_follows(&drawn, &ids),
+            drawn.last().copied(),
+            "the two positions agree on the left, and agreeing proves nothing here"
+        );
+    }
+
+    #[test]
+    fn a_zone_with_no_control_has_no_end_target_to_place() {
+        let ids: Vec<Option<&'static str>> = vec![None, None];
+        let locations = [Right, Right];
+        let drawn = zone_order(&locations, &ids, &[], Right);
+        assert_eq!(
+            super::zone_end_target_follows(&drawn, &ids),
+            None,
+            "strips alone are not a sequence, so there is no end of one to aim at"
         );
     }
 

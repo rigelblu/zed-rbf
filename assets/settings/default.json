@@ -1882,16 +1882,21 @@
     // Known status control ids:
     // - project_search, lsp_servers, diagnostics, active_file, git_blame
     // - merge_conflicts, activity, edit_prediction, active_encoding
-    // - active_language, active_toolchain, line_endings, vim_mode
+    // - active_language, active_toolchain, vim_mode
     // - cursor_position, image_info
+    //
+    // Line Endings is not among them: it has no registry row, so naming it here
+    // does nothing. Use "line_endings_button" to show or hide it.
     "item_locations": {},
     // The order status controls take inside their bar zone, by stable id. Ids named
     // here come first in this order; anything unnamed keeps its registered order
-    // behind them, and the panel icon strips stay in front of both.
+    // behind them, and the panel icon strips stay in front of both — as does any
+    // bar item with no registry row of its own, such as Line Endings.
     //
-    // Set by dragging a control along its zone. Null means the registered order. Component ids are inert here, as they are in
-    // "item_locations" above — components are ordered by
-    // "workspace_layout.component_order", which also places their columns.
+    // Set by dragging a control along its zone. Null means the registered order.
+    // Component ids are inert here, as they are in "item_locations" above —
+    // components are ordered by "workspace_layout.component_order", which also
+    // places their columns.
     "item_order": null
   },
   // Settings specific to the terminal

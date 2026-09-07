@@ -185,7 +185,11 @@ fn status_control_location<'a>(
         .as_ref()
         .and_then(|status_bar| status_bar.item_locations.as_ref())
         .and_then(|locations| locations.get(item_id))
-        .or(match legacy_enabled? {
+        // `or_else`, not `or`: the argument to `or` is evaluated eagerly, so a `?`
+        // inside it returns `None` from this whole function and discards the entry
+        // the chain just found. The layout surface writes `item_locations` and never
+        // the legacy boolean, so that is the state it always produces.
+        .or_else(|| match legacy_enabled? {
             true => Some(registered),
             false => Some(&settings::StatusBarItemLocation::Hidden),
         })
@@ -3996,7 +4000,10 @@ fn window_and_layout_page() -> SettingsPage {
                         status_control_location(
                             settings_content,
                             "active_language",
-                            settings_content.status_bar.as_ref()?.active_language_button,
+                            settings_content
+                                .status_bar
+                                .as_ref()
+                                .and_then(|status_bar| status_bar.active_language_button),
                             &settings::StatusBarItemLocation::Right,
                         )
                     },
@@ -4040,7 +4047,10 @@ fn window_and_layout_page() -> SettingsPage {
                         status_control_location(
                             settings_content,
                             "cursor_position",
-                            settings_content.status_bar.as_ref()?.cursor_position_button,
+                            settings_content
+                                .status_bar
+                                .as_ref()
+                                .and_then(|status_bar| status_bar.cursor_position_button),
                             &settings::StatusBarItemLocation::Right,
                         )
                     },
@@ -4061,7 +4071,10 @@ fn window_and_layout_page() -> SettingsPage {
                         status_control_location(
                             settings_content,
                             "diagnostics",
-                            settings_content.diagnostics.as_ref()?.button,
+                            settings_content
+                                .diagnostics
+                                .as_ref()
+                                .and_then(|diagnostics| diagnostics.button),
                             &settings::StatusBarItemLocation::Left,
                         )
                     },
@@ -4082,7 +4095,11 @@ fn window_and_layout_page() -> SettingsPage {
                         status_control_location(
                             settings_content,
                             "project_search",
-                            settings_content.editor.search.as_ref()?.button,
+                            settings_content
+                                .editor
+                                .search
+                                .as_ref()
+                                .and_then(|search| search.button),
                             &settings::StatusBarItemLocation::Left,
                         )
                     },
@@ -4103,7 +4120,10 @@ fn window_and_layout_page() -> SettingsPage {
                         status_control_location(
                             settings_content,
                             "active_file",
-                            settings_content.status_bar.as_ref()?.show_active_file,
+                            settings_content
+                                .status_bar
+                                .as_ref()
+                                .and_then(|status_bar| status_bar.show_active_file),
                             &settings::StatusBarItemLocation::Left,
                         )
                     },
@@ -10908,6 +10928,28 @@ mod tests {
         };
 
         assert_eq!(read(&settings), None, "nothing saved, nothing to show");
+
+        // The state the layout surface actually writes: an explicit entry and no
+        // legacy boolean. Asserted before any boolean is set, because setting one
+        // first is what let an eagerly-evaluated `?` in the fallback go unnoticed —
+        // the row then read the Default layer's `true` and showed the registered
+        // zone while the bar rendered Middle.
+        write_status_control_location(
+            &mut settings,
+            "cursor_position",
+            Some(settings::StatusBarItemLocation::Middle),
+        );
+        assert_eq!(
+            read(&settings),
+            Some(settings::StatusBarItemLocation::Middle),
+            "an explicit placement stands on its own, with no boolean beside it"
+        );
+        write_status_control_location(&mut settings, "cursor_position", None);
+        assert_eq!(
+            read(&settings),
+            None,
+            "and resetting it leaves nothing for this layer to say"
+        );
 
         settings
             .status_bar
