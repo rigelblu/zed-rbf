@@ -540,6 +540,23 @@ pub struct StatusBarSettingsContent {
     ///
     /// Default: {}
     pub item_locations: Option<HashMap<String, StatusBarItemLocation>>,
+    /// The order status controls take inside their bar zone, by stable id. Ids
+    /// named here come first in this order; anything unnamed keeps its registered
+    /// order behind them.
+    ///
+    /// One flat list read per zone by filtering, so a control moved to another zone
+    /// keeps its place relative to the controls already there — the same shape and
+    /// the same reason as `workspace_layout.component_order`.
+    ///
+    /// **Separate from that list, not merged with it.** A component's order also
+    /// places its column on a dock and a status control has no column; components
+    /// sit on Left, Right and Bottom docks while controls sit in Left, Middle and
+    /// Right bar zones, so one sequence per zone has no slot for a component on the
+    /// bottom dock. A component id named here is inert, as it is in
+    /// `item_locations`.
+    ///
+    /// Default: null
+    pub item_order: Option<Vec<String>>,
 }
 
 /// Where a status control sits in the bottom bar. `Hidden` is a placement value

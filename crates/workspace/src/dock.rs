@@ -1,6 +1,7 @@
 use crate::focus_follows_mouse::FocusFollowsMouse as _;
 use crate::persistence::WorkspaceDb;
 use crate::persistence::model::DockData;
+use crate::sequence_order::{LandsOn, order_after_joining, order_after_placing};
 use crate::status_bar::HideStatusItem;
 use crate::{
     DraggedDock, DraggedDockSeam, Event, FocusFollowsMouse, ModalLayer, Pane,
@@ -314,125 +315,6 @@ fn materialized_order(live: &[(String, u32)], order: &[String]) -> Vec<String> {
 
     ids.sort_by_key(|(id, priority)| icon_order(id, *priority, order));
     ids.into_iter().map(|(id, _)| id).collect()
-}
-
-/// The sequence after `moved` is placed where `target` currently sits on their
-/// shared strip.
-///
-/// **Only this dock's keys change places.** They occupy a fixed set of slots in the
-/// global sequence, and the rearrangement permutes which key sits in which slot —
-/// so a component on another side keeps its exact index even when it sits between
-/// the two that moved. Rewriting the sequence by index would not.
-///
-/// `strip` is the dock's keys **as drawn**, so a drop lands where the user aimed.
-/// `drawn_in_reverse` comes from [`Dock::strip_is_drawn_in_reverse`], the single
-/// owner of that fact.
-///
-/// `None` also when either key is off the strip, or when they are the same key —
-/// there is nothing to write that the file does not already say.
-fn order_after_placing(
-    full: &[String],
-    strip: &[String],
-    drawn_in_reverse: bool,
-    moved: &str,
-    target: &str,
-) -> Option<Vec<String>> {
-    if moved == target {
-        return None;
-    }
-    let from = strip.iter().position(|key| key == moved)?;
-    let to = strip.iter().position(|key| key == target)?;
-
-    let mut slots: Vec<usize> = strip
-        .iter()
-        .map(|key| full.iter().position(|id| id == key))
-        .collect::<Option<Vec<_>>>()?;
-
-    let mut rearranged = strip.to_vec();
-    let key = rearranged.remove(from);
-    rearranged.insert(to, key);
-    if drawn_in_reverse {
-        rearranged.reverse();
-    }
-
-    slots.sort_unstable();
-    let mut sequence = full.to_vec();
-    for (slot, key) in slots.into_iter().zip(rearranged) {
-        sequence[slot] = key;
-    }
-    Some(sequence)
-}
-
-/// The sequence after `moved` leaves its own strip and joins the one `target` is
-/// on, landing where `target` currently sits.
-///
-/// The bar is the placement surface, so dragging across a boundary re-places the
-/// component rather than being refused — the caller writes its new position too,
-/// and this decides where it lands once it is there.
-///
-/// Unlike [`order_after_placing`] this cannot permute fixed slots: the target
-/// strip gains a key and the source strip loses one, so the slot sets themselves
-/// change. It works on the global sequence directly instead — lift `moved` out,
-/// then set it down beside `target`. `drawn_in_reverse` is the **target** dock's,
-/// because display-left is sequence-later on the right and landing on the wrong
-/// side of the target is the whole failure mode here.
-/// Which side of the icon it was dropped on the component comes to rest, **as
-/// drawn**. Dropping onto an icon means taking its place, so it is `Before`; the
-/// end-of-strip zone is the only `After`, and the only way to name the slot past
-/// the last icon.
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum LandsOn {
-    Before,
-    After,
-}
-
-fn order_after_joining(
-    full: &[String],
-    drawn_in_reverse: bool,
-    moved: &str,
-    target: &str,
-    lands: LandsOn,
-) -> Option<Vec<String>> {
-    let mut sequence = full.to_vec();
-    let from = sequence.iter().position(|id| id == moved)?;
-    sequence.remove(from);
-    // A drop onto its own icon needs no guard: `moved` has just been lifted out,
-    // so the lookup below cannot find it and the whole call declines. The same
-    // guard *is* load-bearing in `order_after_placing`, where removing and
-    // reinserting at one index rebuilds the sequence it started from.
-    let at = sequence.iter().position(|id| id == target)?;
-    // Display-left is sequence-later on a reversed strip, so the side the user
-    // aimed at and the index to insert at agree exactly when the two disagree.
-    let after_in_sequence = (lands == LandsOn::After) != drawn_in_reverse;
-    sequence.insert(
-        if after_in_sequence { at + 1 } else { at },
-        moved.to_string(),
-    );
-    Some(sequence)
-}
-
-/// The sequence after moving `panel_key` one place along its own strip.
-///
-/// A nudge is a placement onto the icon next door, so it shares
-/// [`order_after_placing`] with the drag rather than reimplementing the rule that
-/// the other sides must not move.
-///
-/// `None` when the icon is already at that end of its strip. The caller disables
-/// the menu entry rather than writing back the sequence it already has.
-fn order_after_move(
-    full: &[String],
-    strip: &[String],
-    drawn_in_reverse: bool,
-    panel_key: &str,
-    later: bool,
-) -> Option<Vec<String>> {
-    let at = strip.iter().position(|key| key == panel_key)?;
-    let neighbour = if later {
-        strip.get(at + 1)?
-    } else {
-        strip.get(at.checked_sub(1)?)?
-    };
-    order_after_placing(full, strip, drawn_in_reverse, panel_key, neighbour)
 }
 
 /// Whether a drop on this dock would change anything, which is also whether it
@@ -3068,22 +2950,11 @@ impl Render for PanelButtons {
         let dock_entity = self.dock.clone();
         let workspace = dock.workspace.clone();
 
-        // What `Move Earlier` and `Move Later` operate on. `siblings` is the strip
-        // exactly as it renders, so the neighbour a user sees beside an icon is the
-        // one the move swaps with — the same two filters the button loop applies,
-        // because an entry that draws nothing is not a neighbour of anything.
-        let live_keys: Vec<(String, u32)> = dock
-            .panel_entries
-            .iter()
-            .map(|entry| {
-                (
-                    entry.panel.panel_key().to_string(),
-                    entry.panel.activation_priority(cx),
-                )
-            })
-            .collect();
+        // The strip exactly as it renders, so the icon a user sees beside another is
+        // the one a drop lands next to — the same two filters the button loop
+        // applies, because an entry that draws nothing is not a neighbour of
+        // anything.
         let siblings = dock.displayed_panel_keys(window, cx);
-        let strip_reversed = dock.strip_is_drawn_in_reverse();
 
         let mut buttons: Vec<_> = dock
             .panel_entries
@@ -3112,8 +2983,6 @@ impl Render for PanelButtons {
                 let currently_flexible = panel.has_flexible_size(window, cx);
                 let dock_for_menu = dock_entity.clone();
                 let workspace_for_menu = workspace.clone();
-                let live_for_menu = live_keys.clone();
-                let siblings_for_menu = siblings.clone();
                 let dock_for_click = dock_entity.clone();
                 let workspace_for_click = workspace.clone();
                 let dock_for_drop = dock_entity.clone();
@@ -3166,55 +3035,6 @@ impl Render for PanelButtons {
                                 if let Some(workspace) = workspace_for_menu.upgrade() {
                                     menu = menu.context(workspace.focus_handle(cx));
                                 }
-                                // Reordering comes first because it is the move
-                                // that keeps the component where it is. Labelled
-                                // "Earlier"/"Later" rather than a direction: the
-                                // same entry moves an icon left along the bottom
-                                // bar and up a side column, and "Left" already
-                                // means a dock in the section below.
-                                let full_order =
-                                    materialized_order(&live_for_menu, &component_order(cx));
-                                menu = menu.header("Position in Bar");
-                                for (label, later) in
-                                    [("Move Earlier", false), ("Move Later", true)]
-                                {
-                                    let moved = order_after_move(
-                                        &full_order,
-                                        &siblings_for_menu,
-                                        strip_reversed,
-                                        panel_key,
-                                        later,
-                                    );
-                                    // Already at that end of the strip. Shown
-                                    // disabled rather than dropped, so the menu
-                                    // keeps its shape as an icon moves along.
-                                    let at_the_end = moved.is_none();
-                                    let workspace_for_move = workspace_for_menu.clone();
-                                    menu = menu.toggleable_entry_disabled_when(
-                                        label,
-                                        false,
-                                        at_the_end,
-                                        IconPosition::Start,
-                                        None,
-                                        move |window, cx| {
-                                            let (Some(workspace), Some(moved)) =
-                                                (workspace_for_move.upgrade(), moved.clone())
-                                            else {
-                                                return;
-                                            };
-                                            let fs = workspace.read(cx).app_state().fs.clone();
-                                            set_component_order(
-                                                fs,
-                                                Some(moved),
-                                                placement_failure_message(panel_key, "move"),
-                                                window,
-                                                cx,
-                                            );
-                                        },
-                                    );
-                                }
-                                menu = menu.separator();
-
                                 let mut has_position_entries = false;
                                 if POSITIONS
                                     .iter()
@@ -4194,7 +4014,7 @@ mod component_position_tests {
 mod icon_order_tests {
     use super::{
         DockPosition, DraggedComponentIcon, LandsOn, drop_would_land, icon_order,
-        materialized_order, order_after_joining, order_after_move, order_after_placing,
+        materialized_order, order_after_joining, order_after_placing,
     };
     use crate::layout_registry::{SourceRank, get, ids};
 
@@ -4347,11 +4167,11 @@ mod icon_order_tests {
         let full = ids_of(&["a", "b", "c"]);
 
         assert_eq!(
-            order_after_move(&full, &full, false, "b", true),
+            order_after_placing(&full, &full, false, "b", "c"),
             Some(ids_of(&["a", "c", "b"]))
         );
         assert_eq!(
-            order_after_move(&full, &full, false, "b", false),
+            order_after_placing(&full, &full, false, "b", "a"),
             Some(ids_of(&["b", "a", "c"]))
         );
     }
@@ -4366,30 +4186,19 @@ mod icon_order_tests {
         let siblings = ids_of(&["a", "d"]);
 
         assert_eq!(
-            order_after_move(&full, &siblings, false, "a", true),
+            order_after_placing(&full, &siblings, false, "a", "d"),
             Some(ids_of(&["d", "b", "c", "a"])),
             "b and c hold indices 1 and 2 across the move"
         );
     }
 
-    /// The end of a strip is a real state, not an error — the menu entry is shown
-    /// disabled. Writing back the sequence it already has would be a settings
-    /// write, a file rewrite and a redraw for a gesture that changes nothing.
-    #[test]
-    fn an_icon_at_the_end_of_its_strip_has_nowhere_to_move() {
-        let full = ids_of(&["a", "b", "c"]);
-
-        assert_eq!(order_after_move(&full, &full, false, "a", false), None);
-        assert_eq!(order_after_move(&full, &full, false, "c", true), None);
-    }
-
     /// The exact case Tom dogfooded on 2026-09-06, kept as a witness because the
     /// screen agreed and the file is what proved *why*. Right dock drawn
-    /// `Outline · Git · Project`; `Move Later` on Git reads `Outline · Project ·
+    /// `Outline · Git · Project`; dropping Git onto Project reads `Outline · Project ·
     /// Git`. `TerminalPanel` sits between the two that swapped and is on the
     /// *bottom* dock — it must come through untouched.
     #[test]
-    fn the_dogfooded_right_dock_move_writes_the_sequence_it_wrote() {
+    fn the_dogfooded_right_dock_drop_writes_the_sequence_it_wrote() {
         let full = ids_of(&[
             ids::AGENT_PANEL,
             ids::PROJECT_PANEL,
@@ -4402,7 +4211,7 @@ mod icon_order_tests {
         let strip = ids_of(&[ids::OUTLINE_PANEL, ids::GIT_PANEL, ids::PROJECT_PANEL]);
 
         assert_eq!(
-            order_after_move(&full, &strip, true, ids::GIT_PANEL, true),
+            order_after_placing(&full, &strip, true, ids::GIT_PANEL, ids::PROJECT_PANEL),
             Some(ids_of(&[
                 ids::AGENT_PANEL,
                 ids::GIT_PANEL,
@@ -4589,9 +4398,9 @@ mod icon_order_tests {
         let full = ids_of(&["a", "b", "c"]);
         let siblings = ids_of(&["a", "b"]);
 
-        assert_eq!(order_after_move(&full, &siblings, false, "c", false), None);
+        assert_eq!(order_after_placing(&full, &siblings, false, "c", "a"), None);
         assert_eq!(
-            order_after_move(&full, &siblings, false, "b", true),
+            order_after_placing(&full, &siblings, false, "b", "c"),
             None,
             "and the strip's own last icon has no neighbour, whatever follows it globally"
         );

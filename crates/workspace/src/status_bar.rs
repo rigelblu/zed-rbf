@@ -163,6 +163,7 @@ impl StatusBarItem {
 fn zone_order(
     locations: &[StatusBarItemLocation],
     ids: &[Option<&'static str>],
+    order: &[String],
     zone: StatusBarItemLocation,
 ) -> Vec<usize> {
     let mut indices: Vec<usize> = locations
@@ -171,7 +172,7 @@ fn zone_order(
         .filter(|(_, location)| **location == zone && zone != StatusBarItemLocation::Hidden)
         .map(|(index, _)| index)
         .collect();
-    indices.sort_by_key(|index| zone_rank(ids.get(*index).copied().flatten(), *index));
+    indices.sort_by_key(|index| zone_rank(ids.get(*index).copied().flatten(), *index, order));
     if zone == StatusBarItemLocation::Right {
         indices.reverse();
     }
@@ -197,17 +198,40 @@ fn zone_order(
 /// of every registered control, because that is where it already sits — the dock
 /// button strips carry no adapter and are added in `Workspace::new`, before any
 /// status control exists.
-fn zone_rank(id: Option<&str>, registration_index: usize) -> (u8, u32) {
+///
+/// `order` is the user's sequence from `status_bar.item_order`, and it outranks the
+/// table. Four bands rather than three, because the strips have to stay in front of
+/// everything: strips first, then listed controls by their place in the list, then
+/// unlisted registered ones by `source_rank`, then anything else. So a partial list
+/// orders only what it names, and an empty list reproduces the table exactly.
+fn zone_rank(id: Option<&str>, registration_index: usize, order: &[String]) -> (u8, u32) {
     use crate::layout_registry::SourceRank;
 
-    match id
+    let rank = id
         .and_then(crate::layout_registry::get)
-        .map(|item| item.source_rank)
-    {
-        Some(SourceRank::StatusControl(rank)) => (1, rank as u32),
-        // A panel is not a status control. If the table ever says one is, sort it
-        // with the unregistered rather than give it a place in this sequence.
-        Some(SourceRank::Panel(_)) | None => (0, registration_index as u32),
+        .map(|item| item.source_rank);
+    // Band 0 is the dock button strips, which stay in front of every control. Only
+    // two things belong there: an item with no id at all, and a *component* id — a
+    // panel is not a status control, and listing one here is inert for the same
+    // reason it is inert in `item_locations`.
+    //
+    // An id the table simply does not know is **not** one of them. Putting the
+    // recognised-control check here instead sent an unknown id to band 0, so a typo
+    // in the user's list shoved itself ahead of every panel icon.
+    let Some(id) = id else {
+        return (0, registration_index as u32);
+    };
+    if matches!(rank, Some(SourceRank::Panel(_))) {
+        return (0, registration_index as u32);
+    }
+    if let Some(index) = order.iter().position(|listed| listed == id) {
+        return (1, index as u32);
+    }
+    match rank {
+        Some(SourceRank::StatusControl(rank)) => (2, rank as u32),
+        // Unknown and unlisted: behind everything the table places, which is where
+        // an extension's status item already sits.
+        _ => (3, registration_index as u32),
     }
 }
 
@@ -342,7 +366,10 @@ impl StatusBar {
             .iter()
             .map(|entry| entry.adapter.as_ref().map(|adapter| adapter.id))
             .collect();
-        zone_order(&locations, &ids, location)
+        let order = StatusBarSettings::get_global(cx).item_order.clone();
+        let strip = zone_control_strip(&locations, &ids, &order, location);
+        let full = materialized_control_order(&order);
+        zone_order(&locations, &ids, &order, location)
             .into_iter()
             .filter_map(|index| self.items.get(index).map(|entry| (index, entry)))
             .map(|(index, entry)| {
@@ -352,8 +379,18 @@ impl StatusBar {
                 // `location` is handed down rather than re-resolved: it is the
                 // zone that actually rendered this item, so a placement menu
                 // cannot mark a zone the item is not in.
-                render_status_bar_item(side, index, entry, location, &self.focus_handle, cx)
+                render_status_bar_item(
+                    side,
+                    index,
+                    entry,
+                    location,
+                    &strip,
+                    &full,
+                    &self.focus_handle,
+                    cx,
+                )
             })
+            .chain(zone_end_drop_target(location, &strip, &full))
             .collect()
     }
 
@@ -452,6 +489,8 @@ fn render_status_bar_item(
     index: usize,
     entry: &StatusBarItem,
     resolved_location: StatusBarItemLocation,
+    strip: &[String],
+    full: &[String],
     focus_handle: &FocusHandle,
     cx: &App,
 ) -> AnyElement {
@@ -461,7 +500,7 @@ fn render_status_bar_item(
     if let Some(adapter) = &entry.adapter {
         let item_id = adapter.id();
         let focus_handle = focus_handle.clone();
-        return right_click_menu(menu_id)
+        let menu = right_click_menu(menu_id)
             .trigger(move |_is_active, _window, _cx| view)
             .menu(move |window, cx| {
                 let focus_handle = focus_handle.clone();
@@ -473,6 +512,57 @@ fn render_status_bar_item(
                         focus_handle,
                     )
                 })
+            });
+
+        // Arranging a zone is the gesture a menu cannot carry: it closes after every
+        // move, so a three-place move is three right-clicks. Dogfooded on components
+        // 2026-09-06 and that is exactly what it cost, so the controls never shipped
+        // the menu version.
+        let Some(at) = strip.iter().position(|id| id == item_id) else {
+            return menu.into_any_element();
+        };
+        let registered = crate::layout_registry::get(item_id);
+        let strip = strip.to_vec();
+        let full = full.to_vec();
+        return div()
+            .id(("status-control", index))
+            .child(menu)
+            .on_drag(
+                DraggedStatusControl {
+                    item_id: item_id.into(),
+                    label: registered.map(|item| item.label).unwrap_or(item_id).into(),
+                    icon: registered.and_then(|item| item.icon),
+                    from: resolved_location,
+                    at,
+                },
+                |dragged, _, _, cx| cx.new(|_| dragged.clone()),
+            )
+            .drag_over::<DraggedStatusControl>(move |style, dragged, _, cx| {
+                if !control_drop_would_land(dragged, resolved_location, Some(item_id)) {
+                    return style;
+                }
+                let style = style
+                    .border_color(cx.theme().colors().drop_target_border)
+                    .border_0();
+                // Mark the edge the control would arrive from. One from another zone
+                // takes this one's place and pushes it along, which is the same as
+                // arriving from the left.
+                if dragged.from != resolved_location || at < dragged.at {
+                    style.border_l_2()
+                } else {
+                    style.border_r_2()
+                }
+            })
+            .on_drop(move |dragged: &DraggedStatusControl, window, cx| {
+                apply_control_drop(
+                    dragged,
+                    Some(item_id),
+                    resolved_location,
+                    &strip,
+                    &full,
+                    window,
+                    cx,
+                );
             })
             .into_any_element();
     }
@@ -586,6 +676,211 @@ pub fn set_status_control_location(
         },
     );
     crate::dock::report_layout_write(update, message, window, cx);
+}
+
+/// The one slot a drop cannot otherwise name.
+///
+/// Dropping onto a control means taking its place, so it always lands to that
+/// control's left, leaving the position past the last one unreachable from another
+/// zone. Found on the component side 2026-09-06 by Tom trying exactly that drop; a
+/// zone of N controls has N+1 slots and dropping-onto names only N.
+///
+/// Absent when the zone draws no controls: there is nothing to go after, and nothing
+/// drawn to aim at either.
+fn zone_end_drop_target(
+    zone: StatusBarItemLocation,
+    strip: &[String],
+    full: &[String],
+) -> Option<AnyElement> {
+    if strip.is_empty() {
+        return None;
+    }
+    let id: &'static str = match zone {
+        StatusBarItemLocation::Left => "status-zone-end-left",
+        StatusBarItemLocation::Middle => "status-zone-end-middle",
+        StatusBarItemLocation::Right => "status-zone-end-right",
+        StatusBarItemLocation::Hidden => return None,
+    };
+    let strip = strip.to_vec();
+    let full = full.to_vec();
+    Some(
+        div()
+            .id(id)
+            .w(px(12.))
+            .h(px(18.))
+            .border_0()
+            .drag_over::<DraggedStatusControl>(move |style, dragged, _, cx| {
+                if !control_drop_would_land(dragged, zone, None) {
+                    return style;
+                }
+                style
+                    .border_color(cx.theme().colors().drop_target_border)
+                    .border_l_2()
+            })
+            .on_drop(move |dragged: &DraggedStatusControl, window, cx| {
+                apply_control_drop(dragged, None, zone, &strip, &full, window, cx);
+            })
+            .into_any_element(),
+    )
+}
+
+/// A status control being dragged along its zone to a new place in the sequence.
+///
+/// Carries the zone it left so a drop can re-place it when it lands in another one,
+/// and its registry label so the drag preview reads as the item — a control renders
+/// as text as often as an icon, and the live view cannot be drawn twice.
+#[derive(Clone)]
+pub struct DraggedStatusControl {
+    item_id: SharedString,
+    label: SharedString,
+    icon: Option<IconName>,
+    from: StatusBarItemLocation,
+    at: usize,
+}
+
+impl Render for DraggedStatusControl {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .gap_1()
+            .px_1()
+            .rounded_sm()
+            .when_some(self.icon, |this, icon| {
+                this.child(Icon::new(icon).size(IconSize::Small))
+            })
+            .child(Label::new(self.label.clone()).size(LabelSize::Small))
+    }
+}
+
+/// Whether a drop on this zone would change anything, which is also whether it
+/// should promise to. `target` is the control under the pointer, or `None` for the
+/// end-of-zone zone, which always has somewhere to put a control that is not
+/// already last.
+///
+/// A panel icon is never a target: the strips share these zones and are always in
+/// front of the controls, so there is no slot on their side of the boundary.
+fn control_drop_would_land(
+    dragged: &DraggedStatusControl,
+    onto: StatusBarItemLocation,
+    target: Option<&str>,
+) -> bool {
+    if onto == StatusBarItemLocation::Hidden {
+        return false;
+    }
+    if dragged.from != onto {
+        return true;
+    }
+    match target {
+        Some(id) => id != dragged.item_id.as_ref(),
+        None => true,
+    }
+}
+
+/// Applies a dropped status control to this zone: the zone it joins, if it is
+/// joining, and where it lands once there.
+///
+/// Shared by the controls and the end-of-zone target because they differ in one
+/// thing — a control means *take this one's place*, the end means *go last*.
+fn apply_control_drop(
+    dragged: &DraggedStatusControl,
+    target: Option<&str>,
+    onto: StatusBarItemLocation,
+    strip: &[String],
+    full: &[String],
+    window: &mut Window,
+    cx: &mut App,
+) {
+    use crate::sequence_order::{LandsOn, order_after_joining, order_after_placing};
+
+    if !control_drop_would_land(dragged, onto, target) {
+        return;
+    }
+    let joining = dragged.from != onto;
+    let reversed = onto == StatusBarItemLocation::Right;
+
+    let (target, lands) = match target {
+        Some(id) => (id.to_string(), LandsOn::Before),
+        // An empty zone has no control to go after, and nothing drawn to aim at
+        // either — the placement entries cover it.
+        None => match strip.last() {
+            Some(last) => (last.clone(), LandsOn::After),
+            None => return,
+        },
+    };
+    let sequence = if joining {
+        order_after_joining(full, reversed, &dragged.item_id, &target, lands)
+    } else {
+        order_after_placing(full, strip, reversed, &dragged.item_id, &target)
+    };
+    let Some(sequence) = sequence else {
+        return;
+    };
+
+    // The zone first, then where it lands in it. Both ride the one serialized queue,
+    // so the order the control arrives in is the order written here.
+    if joining && let Some(id) = crate::layout_registry::get(&dragged.item_id).map(|item| item.id) {
+        set_status_control_location(id, onto, window, cx);
+    }
+    set_status_control_order(&dragged.item_id, sequence, window, cx);
+}
+
+/// Persists the whole status-control sequence, reporting a failure the same way
+/// every other placement write does.
+pub fn set_status_control_order(
+    item_id: &str,
+    order: Vec<String>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let fs = <dyn fs::Fs>::global(cx);
+    let message = crate::dock::placement_failure_message(item_id, "move");
+    let update = update_settings_file_with_completion(fs, cx, move |settings, _cx| {
+        settings.status_bar.get_or_insert_default().item_order = Some(order);
+    });
+    crate::dock::report_layout_write(update, message, window, cx);
+}
+
+/// Every registered status control, in the order the bar currently reads them.
+///
+/// The first move writes the whole sequence, for the reason the component list does:
+/// it makes every later move a plain list splice, and a control whose crate loads
+/// after the write cannot jump, because it is already named in the place the table
+/// gave it. Ids the user's list names that the table does not know are kept.
+fn materialized_control_order(order: &[String]) -> Vec<String> {
+    use crate::layout_registry::{LayoutItemKind, of_kind};
+
+    let mut ids: Vec<String> = of_kind(LayoutItemKind::StatusControl)
+        .map(|item| item.id.to_string())
+        .collect();
+    for id in order {
+        if !ids.iter().any(|known| known == id) {
+            ids.push(id.clone());
+        }
+    }
+    ids.sort_by_key(|id| zone_rank(Some(id), 0, order));
+    ids
+}
+
+/// The registered controls drawn in `zone`, in the order they are drawn.
+///
+/// Only controls: the dock button strips share these zones and are always in front
+/// of them, so they are not part of the sequence a nudge moves an item along.
+fn zone_control_strip(
+    locations: &[StatusBarItemLocation],
+    ids: &[Option<&'static str>],
+    order: &[String],
+    zone: StatusBarItemLocation,
+) -> Vec<String> {
+    zone_order(locations, ids, order, zone)
+        .into_iter()
+        .filter_map(|index| ids.get(index).copied().flatten())
+        .filter(|id| {
+            matches!(
+                crate::layout_registry::get(id).map(|item| item.kind),
+                Some(crate::layout_registry::LayoutItemKind::StatusControl)
+            )
+        })
+        .map(|id| id.to_string())
+        .collect()
 }
 
 /// Appends a "Hide Button" entry aligned with surrounding toggleable entries.
@@ -938,11 +1233,11 @@ mod zone_tests {
     fn a_zone_takes_only_its_own_items_and_keeps_their_order() {
         let locations = [Left, Right, Left, Middle, Left];
         assert_eq!(
-            zone_order(&locations, &unregistered(&locations), Left),
+            zone_order(&locations, &unregistered(&locations), &[], Left),
             vec![0, 2, 4]
         );
         assert_eq!(
-            zone_order(&locations, &unregistered(&locations), Middle),
+            zone_order(&locations, &unregistered(&locations), &[], Middle),
             vec![3]
         );
     }
@@ -954,11 +1249,11 @@ mod zone_tests {
         // list it has to be stated.
         let locations = [Right, Right, Right];
         assert_eq!(
-            zone_order(&locations, &unregistered(&locations), Right),
+            zone_order(&locations, &unregistered(&locations), &[], Right),
             vec![2, 1, 0]
         );
         assert_ne!(
-            zone_order(&locations, &unregistered(&locations), Right),
+            zone_order(&locations, &unregistered(&locations), &[], Right),
             vec![0, 1, 2],
             "source order and render order are indistinguishable here, so this \
              fixture cannot tell a reversal from its absence"
@@ -969,11 +1264,11 @@ mod zone_tests {
     fn only_the_right_zone_reverses() {
         let locations = [Left, Left, Middle, Middle];
         assert_eq!(
-            zone_order(&locations, &unregistered(&locations), Left),
+            zone_order(&locations, &unregistered(&locations), &[], Left),
             vec![0, 1]
         );
         assert_eq!(
-            zone_order(&locations, &unregistered(&locations), Middle),
+            zone_order(&locations, &unregistered(&locations), &[], Middle),
             vec![2, 3]
         );
     }
@@ -985,17 +1280,17 @@ mod zone_tests {
         let locations = [Hidden, Left, Hidden];
         for zone in ZONES {
             assert!(
-                !zone_order(&locations, &unregistered(&locations), zone).contains(&0),
+                !zone_order(&locations, &unregistered(&locations), &[], zone).contains(&0),
                 "a hidden item reached the {zone:?} zone"
             );
-            assert!(!zone_order(&locations, &unregistered(&locations), zone).contains(&2));
+            assert!(!zone_order(&locations, &unregistered(&locations), &[], zone).contains(&2));
         }
         assert!(
-            zone_order(&locations, &unregistered(&locations), Hidden).is_empty(),
+            zone_order(&locations, &unregistered(&locations), &[], Hidden).is_empty(),
             "asking for the Hidden zone returned items to render"
         );
         assert_eq!(
-            zone_order(&locations, &unregistered(&locations), Left),
+            zone_order(&locations, &unregistered(&locations), &[], Left),
             vec![1]
         );
     }
@@ -1011,7 +1306,7 @@ mod zone_tests {
             let appearances = ZONES
                 .iter()
                 .filter(|zone| {
-                    zone_order(&locations, &unregistered(&locations), **zone).contains(&index)
+                    zone_order(&locations, &unregistered(&locations), &[], **zone).contains(&index)
                 })
                 .count();
             let expected = if *location == Hidden { 0 } else { 1 };
@@ -1023,7 +1318,7 @@ mod zone_tests {
 
         let total: usize = ZONES
             .iter()
-            .map(|zone| zone_order(&locations, &unregistered(&locations), *zone).len())
+            .map(|zone| zone_order(&locations, &unregistered(&locations), &[], *zone).len())
             .sum();
         assert_eq!(
             total,
@@ -1046,13 +1341,13 @@ mod zone_tests {
             panic!("Cursor Position must be ranked as a status control");
         };
         assert_eq!(
-            super::zone_rank(Some(ids::CURSOR_POSITION), 999),
-            (1, cursor as u32),
+            super::zone_rank(Some(ids::CURSOR_POSITION), 999, &[]),
+            (2, cursor as u32),
             "a wildly wrong registration index changes nothing for a registered id"
         );
         assert!(
-            super::zone_rank(Some(ids::PROJECT_SEARCH), 999)
-                < super::zone_rank(Some(ids::CURSOR_POSITION), 0),
+            super::zone_rank(Some(ids::PROJECT_SEARCH), 999, &[])
+                < super::zone_rank(Some(ids::CURSOR_POSITION), 0, &[]),
             "and the table's order wins over the order they happened to be added in"
         );
     }
@@ -1066,10 +1361,150 @@ mod zone_tests {
     fn an_item_the_table_does_not_know_keeps_its_place_ahead_of_every_control() {
         use crate::layout_registry::ids;
 
-        assert_eq!(super::zone_rank(None, 7), (0, 7));
+        assert_eq!(super::zone_rank(None, 7, &[]), (0, 7));
         assert!(
-            super::zone_rank(None, 999) < super::zone_rank(Some(ids::PROJECT_SEARCH), 0),
+            super::zone_rank(None, 999, &[]) < super::zone_rank(Some(ids::PROJECT_SEARCH), 0, &[]),
             "a dock button strip stays ahead of the first-ranked control"
+        );
+    }
+
+    /// The empty list is every install's starting state and most installs' only
+    /// state, so it has to reproduce the table exactly rather than merely closely.
+    #[test]
+    fn an_empty_list_reproduces_the_control_table_exactly() {
+        use crate::layout_registry::{LayoutItemKind, of_kind};
+
+        let expected: Vec<String> = of_kind(LayoutItemKind::StatusControl)
+            .map(|item| item.id.to_string())
+            .collect();
+        assert_eq!(super::materialized_control_order(&[]), expected);
+        assert_eq!(expected.len(), 14, "the table's control count changed");
+    }
+
+    /// The first move writes the whole sequence, so a control whose crate loads
+    /// after the write cannot jump — it is already named, in the place the table
+    /// gave it. A stale or mistyped id is kept and obeyed rather than dropped,
+    /// which would quietly rewrite a user's file.
+    #[test]
+    fn the_written_sequence_leads_with_what_the_user_listed() {
+        use crate::layout_registry::ids;
+
+        let order = vec![ids::CURSOR_POSITION.to_string(), "Ghost".to_string()];
+        let sequence = super::materialized_control_order(&order);
+
+        assert_eq!(
+            sequence.first().map(String::as_str),
+            Some(ids::CURSOR_POSITION),
+            "the listed control leads, though the table ranks it near-last"
+        );
+        assert_eq!(sequence.get(1).map(String::as_str), Some("Ghost"));
+        assert_eq!(sequence.len(), 15, "and nothing was dropped to make room");
+    }
+
+    /// A nudge moves an item along the controls it can see, and the dock button
+    /// strips are not among them — they share the zone and always sit in front.
+    /// The strip also comes back **as drawn**, so the Right zone's reversal is
+    /// handled here rather than by every caller.
+    #[test]
+    fn the_zone_strip_is_the_controls_as_drawn_without_the_dock_strips() {
+        use crate::layout_registry::ids;
+        use StatusBarItemLocation::Right;
+
+        let locations = vec![Right, Right, Right];
+        let ids = vec![None, Some(ids::CURSOR_POSITION), Some(ids::VIM_MODE)];
+
+        assert_eq!(
+            super::zone_control_strip(&locations, &ids, &[], Right),
+            vec![ids::CURSOR_POSITION.to_string(), ids::VIM_MODE.to_string()],
+            "the strip drops the dock buttons and reads right-to-left like the zone"
+        );
+    }
+
+    /// A dock strip carries no id and drops out for free. A **panel** id does not:
+    /// `StatusControlAdapter::new` takes any `&'static str`, so a call site can
+    /// register a component id by mistake, and it would arrive here as `Some`.
+    /// `zone_rank` already sorts it with the strips; without the kind filter it
+    /// would still be a neighbour a nudge could move a control past.
+    #[test]
+    fn a_panel_id_registered_as_a_control_is_not_a_neighbour() {
+        use crate::layout_registry::ids;
+        use StatusBarItemLocation::Left;
+
+        let locations = vec![Left, Left];
+        let ids = vec![Some(ids::PROJECT_PANEL), Some(ids::CURSOR_POSITION)];
+
+        assert_eq!(
+            super::zone_control_strip(&locations, &ids, &[], Left),
+            vec![ids::CURSOR_POSITION.to_string()],
+            "only real status controls are in the sequence a nudge moves along"
+        );
+    }
+
+    /// The user's list is the top band among controls, so naming one moves it ahead
+    /// of every control the table ranks — including the one the table ranks first.
+    #[test]
+    fn a_listed_control_outranks_every_unlisted_one() {
+        use crate::layout_registry::ids;
+
+        let order = vec![ids::CURSOR_POSITION.to_string()];
+        assert_eq!(
+            super::zone_rank(Some(ids::CURSOR_POSITION), 0, &order),
+            (1, 0)
+        );
+        assert!(
+            super::zone_rank(Some(ids::CURSOR_POSITION), 0, &order)
+                < super::zone_rank(Some(ids::PROJECT_SEARCH), 0, &order),
+            "Cursor Position is ranked last in the table and first in the list; the \
+             list wins"
+        );
+    }
+
+    /// A partial list is meaningful on its own: naming two controls orders those two
+    /// and leaves every other one where the table had it.
+    #[test]
+    fn a_partial_list_disturbs_only_the_controls_it_names() {
+        use crate::layout_registry::ids;
+
+        let order = vec![ids::VIM_MODE.to_string(), ids::DIAGNOSTICS.to_string()];
+        assert!(
+            super::zone_rank(Some(ids::VIM_MODE), 0, &order)
+                < super::zone_rank(Some(ids::DIAGNOSTICS), 0, &order)
+        );
+        assert_eq!(
+            super::zone_rank(Some(ids::LSP_SERVERS), 0, &order)
+                < super::zone_rank(Some(ids::ACTIVE_FILE), 0, &order),
+            super::zone_rank(Some(ids::LSP_SERVERS), 0, &[])
+                < super::zone_rank(Some(ids::ACTIVE_FILE), 0, &[]),
+            "the unnamed controls keep the order they had between themselves"
+        );
+    }
+
+    /// The dock button strips must stay in front of the list as well as the table —
+    /// a user ordering their status controls has not asked for the panel icons to
+    /// move behind them.
+    #[test]
+    fn the_list_does_not_pull_a_control_ahead_of_the_dock_strips() {
+        use crate::layout_registry::ids;
+
+        let order = vec![ids::CURSOR_POSITION.to_string()];
+        assert!(
+            super::zone_rank(None, 999, &order)
+                < super::zone_rank(Some(ids::CURSOR_POSITION), 0, &order)
+        );
+    }
+
+    /// A component id is inert here for the same reason it is inert in
+    /// `item_locations`: the two sequences are deliberately separate, because a
+    /// component's order also places its column on a dock and a control has none.
+    #[test]
+    fn a_component_id_in_the_list_orders_nothing() {
+        use crate::layout_registry::ids;
+
+        let order = vec![ids::PROJECT_PANEL.to_string()];
+        assert_eq!(
+            super::zone_rank(Some(ids::PROJECT_PANEL), 7, &order),
+            (0, 7),
+            "listing a component neither moves it here nor gives it a control's place"
         );
     }
 
@@ -1085,7 +1520,7 @@ mod zone_tests {
             SourceRank::Panel(_)
         ));
         assert_eq!(
-            super::zone_rank(Some(ids::PROJECT_PANEL), 7),
+            super::zone_rank(Some(ids::PROJECT_PANEL), 7, &[]),
             (0, 7),
             "it sorts with the unregistered rather than among the controls"
         );

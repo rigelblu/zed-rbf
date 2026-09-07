@@ -241,6 +241,9 @@ pub struct StatusBarSettings {
     pub line_endings_button: bool,
     pub active_encoding_button: EncodingDisplayOptions,
     pub item_locations: HashMap<String, StatusBarItemLocation>,
+    /// The user's sequence for status controls inside their zone, ids first-to-last.
+    /// Empty until something writes one.
+    pub item_order: Vec<String>,
 }
 
 impl Settings for StatusBarSettings {
@@ -254,6 +257,7 @@ impl Settings for StatusBarSettings {
             line_endings_button: status_bar.line_endings_button.unwrap(),
             active_encoding_button: status_bar.active_encoding_button.unwrap(),
             item_locations: status_bar.item_locations.unwrap(),
+            item_order: status_bar.item_order.unwrap_or_default(),
         }
     }
 }
@@ -471,6 +475,7 @@ mod status_bar_settings_tests {
                 .iter()
                 .map(|(id, location)| (id.to_string(), *location))
                 .collect(),
+            item_order: Vec::new(),
         }
     }
 

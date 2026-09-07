@@ -1854,8 +1854,8 @@
     // order; anything unnamed keeps its registered order behind them. An id
     // nothing recognises is kept and ignored.
     //
-    // Set through each icon's right-click menu ("Move Earlier" / "Move Later"),
-    // which writes the whole sequence. Null means the registered order.
+    // Set by dragging an icon along its strip, which writes the whole sequence.
+    // Null means the registered order.
     "component_order": null
   },
   "status_bar": {
@@ -1885,6 +1885,14 @@
     // - active_language, active_toolchain, line_endings, vim_mode
     // - cursor_position, image_info
     "item_locations": {},
+    // The order status controls take inside their bar zone, by stable id. Ids named
+    // here come first in this order; anything unnamed keeps its registered order
+    // behind them, and the panel icon strips stay in front of both.
+    //
+    // Set by dragging a control along its zone. Null means the registered order. Component ids are inert here, as they are in
+    // "item_locations" above — components are ordered by
+    // "workspace_layout.component_order", which also places their columns.
+    "item_order": null
   },
   // Settings specific to the terminal
   "terminal": {

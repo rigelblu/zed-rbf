@@ -11,6 +11,7 @@ mod multi_workspace_tests;
 pub mod notifications;
 pub mod pane;
 pub mod pane_group;
+pub(crate) mod sequence_order;
 pub mod path_list {
     pub use util::path_list::{PathList, SerializedPathList};
 }

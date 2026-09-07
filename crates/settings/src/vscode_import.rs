@@ -813,6 +813,8 @@ impl VsCodeSettings {
             line_endings_button: None,
             active_encoding_button: None,
             item_locations: None,
+            // VS Code has no status-bar ordering to import.
+            item_order: None,
         })
     }
 
