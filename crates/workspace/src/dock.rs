@@ -439,6 +439,23 @@ pub fn set_component_order(
     report_layout_write(update, message, window, cx);
 }
 
+/// The share each component takes of a bottom row, one per state in order.
+///
+/// Split out of `Dock::effective_weights` only so the rule can be exercised without
+/// building a dock; the doc comment there is the explanation.
+fn effective_weights_of(states: &[PanelSizeState]) -> Vec<f32> {
+    let present: Vec<f32> = states.iter().filter_map(|state| state.weight).collect();
+    let default = if present.is_empty() {
+        1.0
+    } else {
+        present.iter().sum::<f32>() / present.len() as f32
+    };
+    states
+        .iter()
+        .map(|state| state.weight.unwrap_or(default).max(0.001))
+        .collect()
+}
+
 /// A component's effective side.
 ///
 /// `workspace_layout.component_positions` is authoritative when it names a
@@ -1360,10 +1377,10 @@ impl Dock {
     /// order, reversed on the right like `open_entry_indices` reverses the
     /// columns.
     ///
-    /// `Move Earlier` and `Move Later` mean earlier and later *as seen*, so the
-    /// neighbour they swap with has to come from here. Reading `panel_entries`
-    /// directly would send both entries the wrong way on the right dock, on the
-    /// one side where nobody would think to check.
+    /// A drop lands beside the icon a user aimed at, so the neighbour it lands
+    /// next to has to come from here. Reading `panel_entries` directly would put
+    /// the drop on the wrong side of its target on the right dock, on the one
+    /// side where nobody would think to check.
     ///
     /// Filtered exactly as the button loop filters, because an entry that draws
     /// no icon is not a neighbour of anything.
@@ -1380,6 +1397,23 @@ impl Dock {
             keys.reverse();
         }
         keys
+    }
+
+    /// Each open component's share of the bottom row, one per entry in order.
+    ///
+    /// **An absent weight is the mean of the weights that are present, not 1.0.**
+    /// `resize_row_seam` stores weights as fractions summing to 1, so a bare 1.0
+    /// arrives as large as every seamed peer put together: open a third component on
+    /// a row split 70/30 and it took half of it, leaving the others 35% and 15%.
+    ///
+    /// The mean *is* an equal share, which is why this is the fix rather than a
+    /// compromise. Peers summing to 1 have a mean of `1/n`, so the newcomer lands on
+    /// `1/(n+1)` of the row and the peers keep their ratio to each other. A row
+    /// nobody has seamed carries no weights at all, so the mean is 1.0 and every
+    /// component shares equally — exactly what it did before.
+    fn effective_weights(entries: &[&PanelEntry]) -> Vec<f32> {
+        let states: Vec<PanelSizeState> = entries.iter().map(|entry| entry.size_state).collect();
+        effective_weights_of(&states)
     }
 
     /// Whether this dock draws its strip against the sequence order.
@@ -1416,14 +1450,11 @@ impl Dock {
         // — `dock_total` is the row's width here, never its height.
         if self.position.axis() == Axis::Vertical {
             let entries = self.open_entries();
-            let total_weight: f32 = entries
-                .iter()
-                .map(|entry| entry.size_state.weight.unwrap_or(1.0).max(0.001))
-                .sum();
-            return entries
+            let weights = Self::effective_weights(&entries);
+            let total_weight: f32 = weights.iter().sum();
+            return weights
                 .into_iter()
-                .map(|entry| {
-                    let weight = entry.size_state.weight.unwrap_or(1.0).max(0.001);
+                .map(|weight| {
                     if total_weight > 0.0 {
                         dock_total * (weight / total_weight)
                     } else {
@@ -2802,11 +2833,9 @@ impl Render for Dock {
         // The bottom row's counterpart, normalised for the same reason: shares are
         // meaningful only against each other, and `flex_grow` summing under 1 leaves
         // the row's tail painted in `panel_background`. An absent weight is an equal
-        // share, so a row that never set one lays out exactly as it always did.
-        let total_weight: f32 = open_entries
-            .iter()
-            .map(|entry| entry.size_state.weight.unwrap_or(1.0).max(0.001))
-            .sum();
+        // share — see `effective_weights`, which is what makes that true.
+        let weights = Self::effective_weights(&open_entries);
+        let total_weight: f32 = weights.iter().sum();
 
         let columns: Vec<AnyElement> = open_entries
             .iter()
@@ -2863,7 +2892,7 @@ impl Render for Dock {
                         // let a narrow window squash them all to nothing — the
                         // sliver the registry floor exists to prevent, still live on
                         // this axis long after the sides were fixed.
-                        let weight = entry.size_state.weight.unwrap_or(1.0).max(0.001);
+                        let weight = weights.get(ix).copied().unwrap_or(1.0);
                         let style = column.style();
                         style.flex_grow = Some(if total_weight > 0. {
                             weight / total_weight
@@ -4007,6 +4036,65 @@ mod component_position_tests {
             "a status control resolved to a dock"
         );
         assert_eq!(registered_component_position("not_a_component"), None);
+    }
+}
+
+#[cfg(test)]
+mod weight_tests {
+    use super::{PanelSizeState, effective_weights_of as effective_weights};
+
+    fn entries(weights: &[Option<f32>]) -> Vec<PanelSizeState> {
+        weights
+            .iter()
+            .map(|weight| PanelSizeState {
+                weight: *weight,
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    fn shares(weights: &[Option<f32>]) -> Vec<f32> {
+        let effective = effective_weights(&entries(weights));
+        let total: f32 = effective.iter().sum();
+        effective.into_iter().map(|w| w / total).collect()
+    }
+
+    /// The case Tom hit in review. `resize_row_seam` stores weights as fractions
+    /// summing to 1, so a bare 1.0 arrived as large as every seamed peer put
+    /// together — a third component opening on a row split 70/30 took half of it.
+    #[test]
+    fn a_newcomer_to_a_seamed_row_takes_an_equal_share() {
+        let shares = shares(&[Some(0.7), Some(0.3), None]);
+
+        assert!(
+            (shares[2] - 1.0 / 3.0).abs() < 0.001,
+            "the newcomer takes a third, not a half: got {:?}",
+            shares[2]
+        );
+        assert!(
+            (shares[0] / shares[1] - 7.0 / 3.0).abs() < 0.001,
+            "and the peers keep their ratio to each other: {:?} vs {:?}",
+            shares[0],
+            shares[1]
+        );
+    }
+
+    /// A row nobody has ever seamed carries no weights at all, so the mean is 1.0
+    /// and everything shares equally — exactly what it did before.
+    #[test]
+    fn an_unseamed_row_lays_out_as_it_always_did() {
+        for share in shares(&[None, None, None]) {
+            assert!((share - 1.0 / 3.0).abs() < 0.001);
+        }
+    }
+
+    /// Weights that are all present are used as they are; the default never enters.
+    #[test]
+    fn a_fully_seamed_row_is_left_alone() {
+        assert_eq!(
+            effective_weights(&entries(&[Some(0.5), Some(0.25), Some(0.25)])),
+            vec![0.5, 0.25, 0.25]
+        );
     }
 }
 

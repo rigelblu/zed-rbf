@@ -291,16 +291,12 @@ fn confirm_then_restore_defaults(window: &mut Window, cx: &mut App) {
 }
 
 fn restore_defaults(window: &mut Window, cx: &mut App) {
-    // The icon sequence is part of "where it shipped". Leaving it standing would
-    // let the one action that promises the factory layout return every component
-    // to its registered side and still draw the strips in the user's order.
-    workspace::dock::set_component_order(
-        <dyn fs::Fs>::global(cx),
-        None,
-        "Failed to restore the icon order".into(),
-        window,
-        cx,
-    );
+    // Position, hidden and pinned reset; the icon order does not. The action is
+    // called *Positions*, and an order is not one — it is an arrangement, and the
+    // two are independent. Ruled 2026-09-07 after this briefly did clear
+    // `component_order`, reasoning from the prompt's "returns to where it shipped"
+    // rather than from the name. An action that wiped both would be
+    // `Restore Default Layout` and would have to clear `status_bar.item_order` too.
     for item in layout_registry::all() {
         match item.kind {
             LayoutItemKind::StatusControl => {
@@ -841,14 +837,14 @@ mod tests {
         });
     }
 
-    /// Same gap, one field later. `Restore Default Positions…` promises the
-    /// layout each item shipped with, and an icon sequence is part of where a
-    /// component sits — a reset that returned every component to its registered
-    /// side while the strips kept the user's order would be the factory layout in
-    /// name only. Written with the reset, not after it, because the pin above is
-    /// what this class of defect looks like when it is found late.
+    /// The reset leaves the icon order alone, and this is the witness that keeps it
+    /// that way. The action is called *Positions*; an order is an arrangement, and
+    /// the two are independent — someone restoring their sides has not asked for
+    /// their arrangement to be thrown away as well. This briefly did clear it,
+    /// reasoning from the prompt's "returns to where it shipped" rather than from
+    /// the name, which four lines of the brief already answered.
     #[gpui::test]
-    async fn test_restoring_defaults_clears_the_icon_order(cx: &mut TestAppContext) {
+    async fn test_restoring_defaults_leaves_the_icon_order_alone(cx: &mut TestAppContext) {
         let app_state = crate::zed::tests::init_test(cx);
         let window = cx.add_window(|_, _| gpui::Empty);
         let fs = app_state.fs.clone();
@@ -868,15 +864,6 @@ mod tests {
             })
             .unwrap();
         cx.run_until_parked();
-        cx.update(|cx| {
-            assert_eq!(
-                WorkspaceLayoutSettings::get_global(cx)
-                    .component_order
-                    .len(),
-                2,
-                "the fixture must actually set an order, or this witness proves nothing"
-            );
-        });
 
         window
             .update(cx, |_, window, cx| restore_defaults(window, cx))
@@ -884,11 +871,13 @@ mod tests {
         cx.run_until_parked();
 
         cx.update(|cx| {
-            assert!(
-                WorkspaceLayoutSettings::get_global(cx)
-                    .component_order
-                    .is_empty(),
-                "the reset hands every strip back to its registered order"
+            assert_eq!(
+                WorkspaceLayoutSettings::get_global(cx).component_order,
+                vec![
+                    workspace::layout_registry::ids::DEBUG_PANEL.to_string(),
+                    workspace::layout_registry::ids::AGENT_PANEL.to_string(),
+                ],
+                "the arrangement survives a reset of the positions"
             );
         });
     }

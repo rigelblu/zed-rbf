@@ -18945,18 +18945,32 @@ mod tests {
             let first = cx.new(|cx| TestPanel::new(DockPosition::Bottom, 100, cx));
             workspace.add_panel(first.clone(), window, cx);
             let second = cx.new(|cx| TestPanelB::new(DockPosition::Bottom, 101, cx));
-            workspace.add_panel(second, window, cx);
+            workspace.add_panel(second.clone(), window, cx);
             workspace.bottom_dock().update(cx, |dock, cx| {
                 dock.activate_panel(0, window, cx);
                 dock.activate_panel(1, window, cx);
                 dock.set_open(true, window, cx);
-                // Three parts to one: an equal-share row would draw them the same.
+                // Three parts to one, and both weights present — which is the
+                // only shape a seam produces: `resize_row_seam` writes fractions
+                // summing to 1 for *every* open entry. Leaving the second absent
+                // used to give it the old 1.0 default and made this a test of the
+                // default rather than of the saved weights, which is why the
+                // 2026-09-07 change to that default broke it.
                 dock.set_panel_size_state(
                     &first,
                     dock::PanelSizeState {
                         size: None,
                         flex: None,
-                        weight: Some(3.0),
+                        weight: Some(0.75),
+                    },
+                    cx,
+                );
+                dock.set_panel_size_state(
+                    &second,
+                    dock::PanelSizeState {
+                        size: None,
+                        flex: None,
+                        weight: Some(0.25),
                     },
                     cx,
                 );
@@ -18974,8 +18988,8 @@ mod tests {
             .expect("the unweighted segment renders");
         assert!(
             wide.size.width > narrow.size.width * 2.,
-            "a saved weight of 3 against a default 1 must draw wider than double; \
-             equal shares would draw them the same (got {:?} and {:?})",
+            "saved weights of 0.75 against 0.25 must draw wider than double; equal \
+             shares would draw them the same (got {:?} and {:?})",
             wide.size.width,
             narrow.size.width
         );
