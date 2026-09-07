@@ -6,6 +6,13 @@ title: "Zed RBF Changelog"
 
 ---
 
+# 🔵⋯ v0.64.0 (2026-09-07) — #zed-45
+- 2026-09-05 - feat (ux) | put status controls and actual workspace components where you want them — from each item's own right-click menu or the one `Customize Workspace Layout` surface — and have a component's position move the real component rather than only its bottom-bar icon; pin the ones that should stay visible side by side instead of each newly opened component replacing the last, and recover anything hidden instead of editing `settings.json` to get it back (#zed-45) [@zed-rbf]
+- 2026-09-07 - feat (ux) | drag any bottom-bar item to rearrange it — along its own strip or zone, or across a boundary, which also moves a component to that dock — and have open components follow the same order, instead of the sequence being fixed by each panel's own hardcoded priority (#zed-45) [@zed-rbf]
+- Note: `#zed-45`'s remaining slices are unshipped — Workspaces in the bottom bar (`v0.45.1`) and editor-buffer placement (`v0.45.3`). This release claims neither, nor Safari-style drag customization with spaces, nor a complete layout reset: `Restore Default Positions…` deliberately preserves the order you arranged.
+
+---
+
 # 🔵⋯ v0.63.0 (2026-08-31) — #zed-71; #zed-64.2/.3, #zed-65, #zed-66, #zed-66.2, #zed-66.3, and #zed-68 sit below it in the build, so their entries release here too
 - 2026-08-26 - feat (ux) | rename any saved workspace configuration without switching to it, so a growing saved list stays recognizable (#zed-64) [@zed-rbf]
 - 2026-08-26 - feat (ux) | delete an obsolete or broken saved workspace configuration without closing its open workspaces or losing their editor state, even when deleting the active configuration (#zed-64) [@zed-rbf]

@@ -119,6 +119,16 @@ The configured order is the display order. `~` and `$VAR` expand. Missing paths 
 - Grouped tab management and close controls directly on the tab strip
 - Save the current vertical-tab workspace set as a named configuration, then switch the same window between saved sets while restoring each workspace's latest editor and pane state
 
+## 🟠⋯ Workspace Layout
+- Place any status control or workspace component where you want it from the item's own right-click menu — a component's position moves the actual component and its bottom-bar icon together, not the icon alone
+- Pin the components that should stay visible side by side on one side; unpinned ones share a single slot per side, so opening a second one does not cost editor width by default
+- Hide anything you do not use, and get it back from `Customize Workspace Layout` instead of editing `settings.json`
+- Drag any bottom-bar item to rearrange it — along its own strip or zone, or across a boundary, which also moves a component to that dock. Open components follow the same order. Drag is the only reordering gesture, as it is for editor tabs
+- One `Customize Workspace Layout` surface lists workspace components and status controls separately, opens on the item you right-clicked, and offers `Restore Default Positions…` — which restores placement while preserving the order you arranged
+- Drag the divider between any two components on a side, or the side's outer edge to resize the whole side. Every axis carries a floor, so no side, segment, or the editor itself can be dragged down to a sliver you cannot grab back
+
+Placement lives in `workspace_layout.component_positions` and `status_bar.item_locations`; order lives in `workspace_layout.component_order` and `status_bar.item_order`. All four are plain lists you can hand-edit.
+
 ## 🟠⋯ File Tags
 - Mark important files with lightweight Zed-local color tags from the Project Panel file-row workflow, visible as markers on file rows
 - View and manage tagged files in a dedicated Tags section at the top of the Project Panel, grouped by color with path context and drag/keyboard support
