@@ -110,10 +110,17 @@ impl SidebarStatus {
         multi_workspace: &Option<WeakEntity<MultiWorkspace>>,
         cx: &App,
     ) -> Self {
+        // The *resolved* occupant, not the stored choice. With the agent off the
+        // stored choice can still be Threads while the slot shows Workspaces, and an
+        // icon that lights for a panel nobody can see is the same divergence the
+        // availability gate exists to close.
         let showing_this_occupant = multi_workspace
             .as_ref()
             .and_then(|mw| mw.upgrade())
-            .is_some_and(|mw| mw.read(cx).active_sidebar_id() == Some(id));
+            .is_some_and(|mw| {
+                let mw = mw.read(cx);
+                mw.resolved_active_sidebar_id(cx) == Some(id)
+            });
         let slot = Self::slot(multi_workspace, cx);
         Self {
             open: slot.open && showing_this_occupant,

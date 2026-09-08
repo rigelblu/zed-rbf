@@ -127,6 +127,16 @@ pub struct MultiWorkspaceState {
     /// storage is what stops switching occupants from handing one the other's.
     #[serde(default)]
     pub sidebar_states: std::collections::BTreeMap<String, String>,
+    /// Which occupant the slot was showing when the session ended.
+    ///
+    /// Without it a restart always shows whichever occupant registered first, so a
+    /// user who left the threads sidebar open came back to the workspace strip. The
+    /// slot's width and side were already restored; which content sat in it was not.
+    ///
+    /// Absent on a window saved before this field existed, and on one whose slot has
+    /// never been switched — both fall back to the first-registered default.
+    #[serde(default)]
+    pub active_sidebar_id: Option<String>,
     /// Which saved configuration this window was following when the session ended.
     ///
     /// Only an association. Reattached after an ordinary restore when the restored

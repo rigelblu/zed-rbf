@@ -1250,6 +1250,17 @@ async fn test_sidebar_disabled_when_disable_ai_is_enabled(cx: &mut TestAppContex
     let (multi_workspace, cx) =
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
 
+    // The agent's occupant has to be registered for this test to be about the agent.
+    // With an empty registry there is no slot for any reason at all, and every
+    // assertion below would hold whatever the agent setting said.
+    let threads = cx.new(|cx| SecondOccupant {
+        focus_handle: cx.focus_handle(),
+    });
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.register_sidebar(crate::layout_registry::ids::THREADS_SIDEBAR, threads, cx);
+    });
+    cx.run_until_parked();
+
     multi_workspace.read_with(cx, |mw, cx| {
         assert!(mw.retention_enabled(cx));
         assert!(mw.sidebar_ui_enabled(cx));
@@ -2330,10 +2341,19 @@ async fn test_the_slot_follows_the_side_of_the_occupant_it_shows(cx: &mut TestAp
     init_test(cx);
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    fs.insert_tree("/root_b", json!({ "file.txt": "" })).await;
     let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs.clone(), ["/root_b".as_ref()], cx).await;
 
     let (multi_workspace, cx) =
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    // Two workspaces, so the strip is genuinely the occupant the slot shows. With one,
+    // it has nothing to draw and the slot resolves to no occupant at all — and
+    // `sidebar_side` would answer `Left` from its fallback, passing the first
+    // assertion by luck and failing the second for the wrong reason.
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b, window, cx);
+    });
     cx.run_until_parked();
 
     let strip = cx.new_window_entity(|window, cx| {
@@ -2453,29 +2473,32 @@ async fn test_each_occupant_stores_its_own_state(cx: &mut TestAppContext) {
 
 /// The migration holds when the strip has nowhere to go.
 ///
-/// With the agent disabled the sidebar slot does not exist, so opening it is not a
-/// thing that can happen — and a migration that ignored that would try anyway. This
-/// is the deterministic half of the precondition: `workspace_tabs_visible` also
-/// answers yes on saved configurations, and the configuration store outlives a single
-/// test, so gating the check on workspace count passed alone and failed in the suite.
+/// **This test asserted the bug as correct until 2026-09-08.** Its precondition was
+/// "the agent is disabled, therefore there is no slot" — which was true of the code
+/// and wrong of the design: the strip worked without the agent as a rail, and losing
+/// it is a regression, not the missing feature the assertion made it.
 ///
-/// Deleting the `sidebar_slot_enabled` guard in `migrate_strip_into_the_slot_once`
-/// fails this.
+/// The state where there is genuinely no slot is the one where *neither* occupant has
+/// anything to show: the agent off, one workspace, and no saved configurations. The
+/// store outlives a single test, so it is reset here rather than assumed empty.
+///
+/// Deleting the `sidebar_available` guard in `migrate_strip_into_the_slot_once` fails
+/// this. **It does not die to the slot gate being reverted to the agent's** — that
+/// mutation makes this pass for the wrong reason, and
+/// `test_the_slot_stands_for_the_strip_with_the_agent_off` is the one that catches it.
+/// Stated because a test that cannot fail for the reason it names is the defect this
+/// whole block was rewritten over.
 #[gpui::test]
 async fn test_the_migration_holds_when_there_is_no_slot(cx: &mut TestAppContext) {
     init_test(cx);
+    reset_workspace_configuration_store(cx).await;
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
-    fs.insert_tree("/root_b", json!({ "file.txt": "" })).await;
     let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
-    let project_b = Project::test(fs.clone(), ["/root_b".as_ref()], cx).await;
     cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
 
     let (multi_workspace, cx) =
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
-    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
-        multi_workspace.test_add_workspace(project_b, window, cx);
-    });
     cx.run_until_parked();
 
     let occupant = cx.new_window_entity(|window, cx| {
@@ -2495,14 +2518,445 @@ async fn test_the_migration_holds_when_there_is_no_slot(cx: &mut TestAppContext)
 
     multi_workspace.update(cx, |multi_workspace, cx| {
         assert!(
+            !multi_workspace.workspace_tabs_visible(cx),
+            "precondition: one workspace and no saved configurations, so the strip has \
+             nothing to draw either",
+        );
+        assert!(
             !multi_workspace.sidebar_slot_enabled(cx),
-            "precondition: with the agent disabled there is no slot to open",
+            "precondition: no occupant has anything to show, so there is no slot to open",
         );
         assert!(
             !multi_workspace.migrate_strip_into_the_slot_once(cx),
             "the migration holds when there is no slot for the strip to move into",
         );
         assert!(!multi_workspace.sidebar_open());
+    });
+}
+
+/// Swapping occupants moves the focus handle pane navigation steers by.
+///
+/// `activate_sidebar` only set the id. The handle was written when the slot opened,
+/// when it closed, and when a workspace joined — never on a swap — so after clicking
+/// the other icon, `Workspace::activate_pane_in_direction` still targeted the occupant
+/// that had just been hidden.
+///
+/// Deleting the `sync_sidebar_focus_handles` call in `activate_sidebar` fails this.
+#[gpui::test]
+async fn test_swapping_occupants_moves_the_focus_handle(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    fs.insert_tree("/root_b", json!({ "file.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs.clone(), ["/root_b".as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b, window, cx);
+    });
+    cx.run_until_parked();
+
+    let strip = cx.new_window_entity(|window, cx| {
+        crate::workspace_tabs::WorkspacesSidebar::new(multi_workspace.clone(), window, cx)
+    });
+    let second = cx.new(|cx| SecondOccupant {
+        focus_handle: cx.focus_handle(),
+    });
+    let strip_handle = strip.read_with(cx, |strip, cx| gpui::Focusable::focus_handle(strip, cx));
+    let second_handle =
+        second.read_with(cx, |second, cx| gpui::Focusable::focus_handle(second, cx));
+    assert_ne!(
+        strip_handle, second_handle,
+        "fixture precondition: the two occupants have distinct handles, or this test \
+         cannot tell them apart",
+    );
+
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.register_sidebar(crate::layout_registry::ids::WORKSPACES, strip, cx);
+        multi_workspace.register_sidebar("test_second_occupant", second, cx);
+    });
+    cx.run_until_parked();
+
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.toggle_sidebar_occupant(
+            crate::layout_registry::ids::WORKSPACES,
+            window,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(
+            multi_workspace.test_sidebar_focus_handle(cx),
+            Some(strip_handle.clone()),
+            "the open slot points at the strip it is showing",
+        );
+    });
+
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.toggle_sidebar_occupant("test_second_occupant", window, cx);
+    });
+    cx.run_until_parked();
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(
+            multi_workspace.test_sidebar_focus_handle(cx),
+            Some(second_handle.clone()),
+            "and follows the swap, rather than steering into the hidden occupant",
+        );
+    });
+
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.toggle_sidebar_occupant("test_second_occupant", window, cx);
+    });
+    cx.run_until_parked();
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(
+            multi_workspace.test_sidebar_focus_handle(cx),
+            None,
+            "and clears when the slot closes",
+        );
+    });
+}
+
+/// A legacy `agent.sidebar_side: "right"` stops splitting the panel from its icon.
+///
+/// The panel reads the legacy key when there is no entry; the icon falls back to the
+/// registered side, Left. So the panel sat right and its icon sat left. Seeding the
+/// entry once puts both on the same door.
+///
+/// The state the defect needs is the two answers *disagreeing*, which is only true
+/// with the legacy key set to Right and no entry — assert the disagreement before the
+/// migration, or this passes against the bug.
+#[gpui::test]
+async fn test_a_legacy_right_sidebar_side_seeds_its_own_entry(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    cx.run_until_parked();
+
+    cx.update(|_window, cx| {
+        let mut agent = agent_settings::AgentSettings::get_global(cx).clone();
+        agent.sidebar_side = settings::SidebarDockPosition::Right;
+        agent_settings::AgentSettings::override_global(agent, cx);
+    });
+    cx.run_until_parked();
+
+    cx.update(|_window, cx| {
+        let layout = <crate::WorkspaceLayoutSettings as settings::Settings>::get_global(cx);
+        assert!(
+            !layout.has_component(crate::layout_registry::ids::THREADS_SIDEBAR),
+            "precondition: no entry, so the legacy key is still the panel's authority",
+        );
+        assert_eq!(
+            crate::multi_workspace::resolved_threads_sidebar_side(cx, SidebarSide::Right),
+            SidebarSide::Right,
+            "the panel follows the legacy key",
+        );
+        assert_eq!(
+            layout.resolved_component_zone(crate::layout_registry::ids::THREADS_SIDEBAR),
+            Some(settings::StatusBarItemLocation::Left),
+            "and the icon does not — this is the divergence, asserted before the fix \
+             so the test cannot pass against it",
+        );
+    });
+
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        assert!(
+            multi_workspace.migrate_threads_sidebar_side_once(cx),
+            "a legacy Right with no entry seeds one",
+        );
+    });
+    cx.run_until_parked();
+
+    cx.update(|_window, cx| {
+        let layout = <crate::WorkspaceLayoutSettings as settings::Settings>::get_global(cx);
+        assert_eq!(
+            layout.resolved_component_zone(crate::layout_registry::ids::THREADS_SIDEBAR),
+            Some(settings::StatusBarItemLocation::Right),
+            "the icon now reads the entry and lands beside its panel",
+        );
+        assert_eq!(
+            crate::multi_workspace::resolved_threads_sidebar_side(cx, SidebarSide::Left),
+            SidebarSide::Right,
+            "and the panel reads the entry too — passing a contradicting legacy key \
+             proves the key is out of the picture",
+        );
+    });
+
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        assert!(
+            !multi_workspace.migrate_threads_sidebar_side_once(cx),
+            "and it never runs again",
+        );
+    });
+}
+
+/// A legacy side that already matches the registered one writes nothing.
+///
+/// The icon and panel already agree there, so an entry would record a decision the
+/// user never made — in their settings file, where they will see it.
+#[gpui::test]
+async fn test_a_legacy_left_sidebar_side_seeds_nothing(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    cx.run_until_parked();
+
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        assert!(!multi_workspace.migrate_threads_sidebar_side_once(cx));
+    });
+    cx.run_until_parked();
+
+    cx.update(|_window, cx| {
+        assert!(
+            !<crate::WorkspaceLayoutSettings as settings::Settings>::get_global(cx)
+                .has_component(crate::layout_registry::ids::THREADS_SIDEBAR),
+            "no entry written for a user whose two answers already agree",
+        );
+    });
+}
+
+/// The migration leaves a slot the user already had open alone.
+///
+/// Its rationale is "the strip was showing before, so show it now" — and that only
+/// held for users whose sidebar was shut, because the old `workspace_tabs_visible` hid
+/// the strip whenever the agent sidebar was open. Taking the slot from someone who
+/// left the threads sidebar open would be the migration doing the opposite of what it
+/// claims. It still writes its marker, so it does not try again.
+///
+/// Deleting the `sidebar_open` early return in `migrate_strip_into_the_slot_once`
+/// fails this.
+#[gpui::test]
+async fn test_the_migration_leaves_an_already_open_slot_alone(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    fs.insert_tree("/root_b", json!({ "file.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs.clone(), ["/root_b".as_ref()], cx).await;
+    cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b, window, cx);
+    });
+    cx.run_until_parked();
+
+    let strip = cx.new_window_entity(|window, cx| {
+        crate::workspace_tabs::WorkspacesSidebar::new(multi_workspace.clone(), window, cx)
+    });
+    let threads = cx.new(|cx| SecondOccupant {
+        focus_handle: cx.focus_handle(),
+    });
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.register_sidebar(crate::layout_registry::ids::WORKSPACES, strip, cx);
+        multi_workspace.register_sidebar(crate::layout_registry::ids::THREADS_SIDEBAR, threads, cx);
+        // The upgrading user's session: threads showing, slot open.
+        multi_workspace.activate_sidebar(crate::layout_registry::ids::THREADS_SIDEBAR, cx);
+        multi_workspace.restore_open_sidebar(cx);
+    });
+    cx.run_until_parked();
+
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        assert!(
+            multi_workspace.migrate_strip_into_the_slot_once(cx),
+            "the migration runs, so it records that it has and never runs again",
+        );
+        assert_eq!(
+            multi_workspace.active_sidebar_id(),
+            Some(crate::layout_registry::ids::THREADS_SIDEBAR),
+            "but it does not take a slot the user already had open",
+        );
+        assert!(multi_workspace.sidebar_open());
+    });
+}
+
+/// A restart brings back the occupant you left showing, not the first registered.
+///
+/// Nothing persisted which occupant was active, and `register_sidebar` makes the first
+/// one registered active — so every restart showed Workspaces even for a user who left
+/// the threads sidebar open. `#zed-45`: "a restart restores which of the two was
+/// loaded, its side, and the slot's width."
+///
+/// The restored id arrives before its occupant registers, which is the order the app
+/// actually uses, so this covers the pending path rather than the easy one. Deleting
+/// the `pending_active_sidebar_id` claim in `register_sidebar` fails this.
+#[gpui::test]
+async fn test_a_restart_restores_the_occupant_that_was_showing(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    cx.run_until_parked();
+
+    // The restore runs first, before either occupant exists.
+    multi_workspace.update(cx, |multi_workspace, _cx| {
+        multi_workspace
+            .restore_active_sidebar_id(crate::layout_registry::ids::THREADS_SIDEBAR.to_string());
+    });
+
+    // Then registration, strip first — which is the order that used to decide this.
+    let strip = cx.new_window_entity(|window, cx| {
+        crate::workspace_tabs::WorkspacesSidebar::new(multi_workspace.clone(), window, cx)
+    });
+    let threads = cx.new(|cx| SecondOccupant {
+        focus_handle: cx.focus_handle(),
+    });
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.register_sidebar(crate::layout_registry::ids::WORKSPACES, strip, cx);
+        multi_workspace.register_sidebar(crate::layout_registry::ids::THREADS_SIDEBAR, threads, cx);
+    });
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(
+            multi_workspace.active_sidebar_id(),
+            Some(crate::layout_registry::ids::THREADS_SIDEBAR),
+            "the occupant the session left showing wins over the first registered",
+        );
+        assert_eq!(
+            multi_workspace.test_state(cx).active_sidebar_id.as_deref(),
+            Some(crate::layout_registry::ids::THREADS_SIDEBAR),
+            "and it is written back, so the next restart restores it too",
+        );
+    });
+}
+
+/// The strip's icon does not offer to open a column with nothing in it.
+///
+/// `WorkspacesSidebar::render` returns a bare `div()` when the strip has nothing to
+/// draw, and the icon's `available` closure read `|_cx| true`, so clicking it opened
+/// an empty column — something the rail it replaced never did. Both readers ask
+/// `sidebar_available` now, so the offer and the content cannot disagree.
+///
+/// Making `sidebar_available` return `true` for `WORKSPACES` fails this.
+#[gpui::test]
+async fn test_the_strip_offers_nothing_to_open_when_it_has_nothing_to_draw(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    reset_workspace_configuration_store(cx).await;
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    fs.insert_tree("/root_b", json!({ "file.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs.clone(), ["/root_b".as_ref()], cx).await;
+    cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    cx.run_until_parked();
+
+    let occupant = cx.new_window_entity(|window, cx| {
+        crate::workspace_tabs::WorkspacesSidebar::new(multi_workspace.clone(), window, cx)
+    });
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.register_sidebar(crate::layout_registry::ids::WORKSPACES, occupant, cx);
+    });
+    cx.run_until_parked();
+
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        assert!(
+            !multi_workspace.sidebar_available(crate::layout_registry::ids::WORKSPACES, cx),
+            "one workspace and no saved configurations: nothing to draw",
+        );
+        multi_workspace.toggle_sidebar_occupant(
+            crate::layout_registry::ids::WORKSPACES,
+            window,
+            cx,
+        );
+        assert!(
+            !multi_workspace.sidebar_open(),
+            "so the gesture opens nothing, rather than opening a blank column",
+        );
+    });
+
+    // A second workspace gives it rows, and the same gesture now works.
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b, window, cx);
+    });
+    cx.run_until_parked();
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        assert!(multi_workspace.sidebar_available(crate::layout_registry::ids::WORKSPACES, cx));
+        multi_workspace.toggle_sidebar_occupant(
+            crate::layout_registry::ids::WORKSPACES,
+            window,
+            cx,
+        );
+        assert!(
+            multi_workspace.sidebar_open(),
+            "with rows to draw the icon opens the slot as it always did",
+        );
+    });
+}
+
+/// With the agent off the slot stands for the strip alone.
+///
+/// The half `test_the_migration_holds_when_there_is_no_slot` used to deny. `#zed-45`'s
+/// `Flow 6` step 6: "with AI disabled there is no `Threads Sidebar` icon and the slot
+/// holds only `Workspaces`, rendering what the rail renders today."
+#[gpui::test]
+async fn test_the_slot_stands_for_the_strip_with_the_agent_off(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    fs.insert_tree("/root_b", json!({ "file.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs.clone(), ["/root_b".as_ref()], cx).await;
+    cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b, window, cx);
+    });
+    cx.run_until_parked();
+
+    let occupant = cx.new_window_entity(|window, cx| {
+        crate::workspace_tabs::WorkspacesSidebar::new(multi_workspace.clone(), window, cx)
+    });
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.register_sidebar(crate::layout_registry::ids::WORKSPACES, occupant, cx);
+    });
+    cx.update(|_window, cx| {
+        DisableAiSettings::override_global(DisableAiSettings { disable_ai: true }, cx);
+    });
+    cx.run_until_parked();
+
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        assert!(
+            !multi_workspace.sidebar_available(crate::layout_registry::ids::THREADS_SIDEBAR, cx),
+            "the agent's occupant has nothing to show",
+        );
+        assert!(
+            multi_workspace.sidebar_available(crate::layout_registry::ids::WORKSPACES, cx),
+            "the strip's does",
+        );
+        assert!(
+            multi_workspace.sidebar_slot_enabled(cx),
+            "so the slot stands — this is the regression the old test blessed",
+        );
+        assert!(
+            multi_workspace.migrate_strip_into_the_slot_once(cx),
+            "and the migration can move the strip into it",
+        );
+        assert!(multi_workspace.sidebar_open());
     });
 }
 
@@ -2697,10 +3151,18 @@ async fn test_an_occupants_icon_swaps_the_slot_rather_than_closing_it(cx: &mut T
     init_test(cx);
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
-    let project_a = Project::test(fs, ["/root_a".as_ref()], cx).await;
+    fs.insert_tree("/root_b", json!({ "file.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs, ["/root_b".as_ref()], cx).await;
 
     let (multi_workspace, cx) =
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    // Two workspaces so the strip has rows. An icon only offers to open an occupant
+    // that has something to show, and this test is about the swap, not availability.
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b, window, cx);
+    });
+    cx.run_until_parked();
 
     let workspaces = cx.new_window_entity(|window, cx| {
         crate::workspace_tabs::WorkspacesSidebar::new(multi_workspace.clone(), window, cx)
@@ -2757,6 +3219,16 @@ async fn test_an_occupants_icon_swaps_the_slot_rather_than_closing_it(cx: &mut T
     });
 }
 
+/// The strip survives the agent being turned off — through the real render path.
+///
+/// **This test drew the occupant directly until 2026-09-08, and passed while the
+/// product hid the strip.** `MultiWorkspace::render` gates the whole slot, so a test
+/// that hands the occupant straight to `cx.draw` never reaches the gate it exists to
+/// check. Drawing the `MultiWorkspace` is the whole point: with the slot keyed off
+/// `sidebar_ui_enabled` there was no slot at all with AI off, and the strip a user had
+/// as a rail simply vanished.
+///
+/// Making `sidebar_slot_enabled` return `self.sidebar_ui_enabled(cx)` again fails this.
 #[gpui::test]
 async fn test_workspace_tabs_stay_visible_when_ai_is_disabled(cx: &mut TestAppContext) {
     init_test(cx);
@@ -2777,16 +3249,31 @@ async fn test_workspace_tabs_stay_visible_when_ai_is_disabled(cx: &mut TestAppCo
         DisableAiSettings::override_global(DisableAiSettings { disable_ai: true }, cx);
     });
     cx.run_until_parked();
-    let occupant_view = show_workspace_strip(&multi_workspace, cx);
+    show_workspace_strip(&multi_workspace, cx);
 
-    cx.draw(
-        gpui::point(gpui::px(0.), gpui::px(0.)),
-        gpui::size(gpui::px(800.), gpui::px(600.)),
-        |_, _| occupant_view.clone().into_any_element(),
-    );
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert!(
+            multi_workspace.sidebar_slot_enabled(cx),
+            "the slot belongs to whichever occupant has something to show, and with AI \
+             off that is the strip",
+        );
+        assert_eq!(
+            multi_workspace.resolved_active_sidebar_id(cx),
+            Some(crate::layout_registry::ids::WORKSPACES),
+            "the strip is the occupant the slot shows, not merely the one stored",
+        );
+    });
+
+    // The window's own draw, not `cx.draw` on a detached element. `cx.draw` clears its
+    // element arena and `flush_effects` then redraws the root, which panics the moment
+    // the root registers a deferred draw — the strip's configuration popover does. The
+    // natural draw is both safer and closer to the product: `debug_bounds` reads
+    // `rendered_frame`, which every real draw fills.
+    cx.run_until_parked();
     assert!(
         cx.debug_bounds("WORKSPACE-TAB-0").is_some(),
-        "AI-off workspace tabs should stay visible because the agent sidebar is unavailable",
+        "AI-off workspace tabs should stay visible because the slot no longer belongs \
+         to the agent",
     );
 }
 
@@ -3616,6 +4103,7 @@ async fn test_restore_multiworkspace_state_restores_project_groups_when_ai_is_di
         sidebar_open: true,
         sidebar_state: None,
         sidebar_states: Default::default(),
+        active_sidebar_id: None,
         active_configuration_id: None,
     };
     let fs = app_state.fs.clone();
@@ -3629,7 +4117,11 @@ async fn test_restore_multiworkspace_state_restores_project_groups_when_ai_is_di
     window
         .read_with(cx, |mw, cx| {
             assert!(!mw.sidebar_ui_enabled(cx));
-            assert!(!mw.sidebar_open());
+            // The slot's openness is the slot's own state, restored whatever the agent
+            // is doing. It used to be dropped here, which is how a user with AI off who
+            // left the strip showing came back to it gone. What actually draws is the
+            // availability question, asked at render.
+            assert!(mw.sidebar_open());
             assert_eq!(
                 mw.project_group_keys(),
                 vec![
@@ -3679,6 +4171,7 @@ async fn test_restore_multiworkspace_state_restores_project_groups_when_agent_is
         sidebar_open: true,
         sidebar_state: None,
         sidebar_states: Default::default(),
+        active_sidebar_id: None,
         active_configuration_id: None,
     };
     let fs = app_state.fs.clone();
@@ -3692,7 +4185,8 @@ async fn test_restore_multiworkspace_state_restores_project_groups_when_agent_is
     window
         .read_with(cx, |mw, cx| {
             assert!(!mw.sidebar_ui_enabled(cx));
-            assert!(!mw.sidebar_open());
+            // Restored open, agent or no agent — see the sibling assertion above.
+            assert!(mw.sidebar_open());
             assert!(mw.retention_enabled(cx));
             assert_eq!(
                 mw.project_group_keys(),
@@ -3755,6 +4249,7 @@ async fn test_restore_multiworkspace_derives_missing_project_groups_for_restored
             sidebar_open: true,
             sidebar_state: None,
             sidebar_states: Default::default(),
+            active_sidebar_id: None,
             active_configuration_id: None,
         },
     };
@@ -3840,6 +4335,7 @@ async fn test_restore_multiworkspace_derives_project_groups_from_empty_state(
             sidebar_open: true,
             sidebar_state: None,
             sidebar_states: Default::default(),
+            active_sidebar_id: None,
             active_configuration_id: None,
         },
     };
@@ -3926,6 +4422,7 @@ async fn test_restore_multiworkspace_skips_inactive_remote_workspaces_without_li
             sidebar_open: true,
             sidebar_state: None,
             sidebar_states: Default::default(),
+            active_sidebar_id: None,
             active_configuration_id: None,
         },
     };
@@ -3982,6 +4479,7 @@ async fn test_restore_multiworkspace_state_restores_sidebar_when_ai_is_enabled(
         sidebar_open: true,
         sidebar_state: None,
         sidebar_states: Default::default(),
+        active_sidebar_id: None,
         active_configuration_id: None,
     };
     let fs = app_state.fs.clone();
@@ -4094,6 +4592,7 @@ async fn restore_inactive_workspaces_with_sidebar_ui_disabled(
             sidebar_open: true,
             sidebar_state: None,
             sidebar_states: Default::default(),
+            active_sidebar_id: None,
             active_configuration_id: None,
         },
     };
@@ -4113,7 +4612,10 @@ async fn restore_inactive_workspaces_with_sidebar_ui_disabled(
     restored_window
         .read_with(cx, |multi_workspace, cx| {
             assert!(!multi_workspace.sidebar_ui_enabled(cx));
-            assert!(!multi_workspace.sidebar_open());
+            // Restored open, agent or no agent. With two workspaces restored the strip
+            // has rows, so this is exactly the state where dropping the flag lost a
+            // user their tab strip on upgrade.
+            assert!(multi_workspace.sidebar_open());
             assert_eq!(multi_workspace.workspaces().count(), 2);
             assert_eq!(
                 multi_workspace.project_group_keys(),
@@ -7619,3 +8121,4 @@ async fn test_keep_project_removal_of_remote_workspace_reopens_local_neighbor(
         );
     });
 }
+

@@ -3913,7 +3913,7 @@ impl Sidebar {
                 .read(cx)
                 .ok()
                 .and_then(|multi_workspace| {
-                    multi_workspace.sidebar().map(|sidebar| sidebar.to_any())
+                    multi_workspace.sidebar(cx).map(|sidebar| sidebar.to_any())
                 })
                 .and_then(|sidebar| sidebar.downcast::<Self>().ok())
             {

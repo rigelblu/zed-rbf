@@ -5414,6 +5414,7 @@ mod tests {
                 sidebar_open: true,
                 sidebar_state: None,
                 sidebar_states: Default::default(),
+                active_sidebar_id: None,
                 active_configuration_id: None,
             },
         )
@@ -5428,6 +5429,7 @@ mod tests {
                 sidebar_open: false,
                 sidebar_state: None,
                 sidebar_states: Default::default(),
+                active_sidebar_id: None,
                 active_configuration_id: None,
             },
         )

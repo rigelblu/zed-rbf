@@ -817,7 +817,7 @@ async fn test_restore_serialized_archive_view_does_not_panic(cx: &mut TestAppCon
     .expect("serialization should succeed");
 
     multi_workspace.update_in(cx, |multi_workspace, window, cx| {
-        if let Some(sidebar) = multi_workspace.sidebar() {
+        if let Some(sidebar) = multi_workspace.sidebar(cx) {
             sidebar.restore_serialized_state(&serialized, window, cx);
         }
     });

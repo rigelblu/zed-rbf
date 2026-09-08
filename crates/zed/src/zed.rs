@@ -559,6 +559,10 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
                             sidebar,
                             cx,
                         );
+                        // Before the strip migration, so the threads sidebar's side is
+                        // settled by the time anything reads it. Pure settings work,
+                        // and a no-op on every launch after the first.
+                        multi_workspace.migrate_threads_sidebar_side_once(cx);
                         // After both are registered, so the migration can activate
                         // the strip and find it actually there. It is a no-op on
                         // every launch after the first.

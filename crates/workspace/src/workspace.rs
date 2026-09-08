@@ -1862,34 +1862,44 @@ impl Workspace {
             status_bar.add_left_item(left_dock_buttons, window, cx);
             status_bar.add_right_item(right_dock_buttons, window, cx);
             status_bar.add_right_item(bottom_dock_buttons, window, cx);
-            // The threads sidebar's icon is placed by the setting that moves the
-            // sidebar itself, so it goes in as a component-backed control rather
-            // than being appended beside a zone the way it was before `v0.45.1`.
-            // `available` carries the one thing its position cannot: the sidebar
-            // has a side whether or not the agent is enabled, and with the agent
-            // off there is nothing to open.
+            // Both icons are placed by the setting that moves the sidebar itself, so
+            // they go in as component-backed controls rather than being appended
+            // beside a zone the way the threads icon was before `v0.45.1`.
+            //
+            // `available` carries the one thing a position cannot: whether there is
+            // anything behind the icon to open. Both ask `MultiWorkspace` the same
+            // question the slot asks itself, so an icon can never offer to open a
+            // panel the slot will not show — which it did when this read
+            // `|_cx| true` for Workspaces.
+            let occupant_available = |id: &'static str| {
+                let multi_workspace = multi_workspace.clone();
+                move |cx: &App| {
+                    multi_workspace
+                        .as_ref()
+                        .and_then(|mw| mw.upgrade())
+                        .is_some_and(|mw| mw.read(cx).sidebar_available(id, cx))
+                }
+            };
+
             let threads_sidebar_button =
                 cx.new(|_| status_bar::ThreadsSidebarButton::new(multi_workspace.clone()));
             status_bar.add_status_control(
                 threads_sidebar_button,
                 status_bar::StatusControlAdapter::for_component(
                     crate::layout_registry::ids::THREADS_SIDEBAR,
-                    MultiWorkspace::sidebar_ui_enabled_from_settings,
+                    occupant_available(crate::layout_registry::ids::THREADS_SIDEBAR),
                 ),
                 window,
                 cx,
             );
 
-            // Always available, unlike the threads sidebar. That item is gated on
-            // the agent being enabled; workspaces exist either way, so there is no
-            // state in which this icon has nothing to open.
             let workspaces_button =
                 cx.new(|_| status_bar::WorkspacesButton::new(multi_workspace.clone()));
             status_bar.add_status_control(
                 workspaces_button,
                 status_bar::StatusControlAdapter::for_component(
                     crate::layout_registry::ids::WORKSPACES,
-                    |_cx| true,
+                    occupant_available(crate::layout_registry::ids::WORKSPACES),
                 ),
                 window,
                 cx,
@@ -10816,15 +10826,19 @@ pub async fn apply_restored_multiworkspace_state(
         project_groups,
         sidebar_state,
         sidebar_states,
+        active_sidebar_id,
         active_configuration_id,
         ..
     } = state;
     let restore_workspace_membership =
         cx.update(|cx| MultiWorkspace::retention_enabled_from_settings(cx));
-    // Slot-structural: this restores whether the slot was open, not whether the
-    // agent is enabled. It reads the agent setting only while the slot has one
-    // occupant; `sidebar_slot_enabled` is the instance-side twin.
-    let restore_sidebar_ui = cx.update(|cx| MultiWorkspace::sidebar_ui_enabled_from_settings(cx));
+    // Slot-structural: this restores whether the slot was **open**, which is the
+    // slot's own state and not the agent's. It read the agent setting while the slot
+    // had one occupant, and kept reading it after the strip joined — so a user with
+    // AI off who left the strip showing was restored closed. Whether anything draws
+    // is the availability question, and `MultiWorkspace::render` asks it at render
+    // time; a restored-open slot with nothing available simply draws nothing, and
+    // gains its column the moment an occupant has something to show.
 
     if restore_workspace_membership {
         // Resolve linked worktree paths to their main repo paths so
@@ -10872,10 +10886,21 @@ pub async fn apply_restored_multiworkspace_state(
             .ok();
     }
 
-    if restore_sidebar_ui && *sidebar_open {
+    if *sidebar_open {
         window_handle
             .update(cx, |multi_workspace, _, cx| {
                 multi_workspace.restore_open_sidebar(cx);
+            })
+            .ok();
+    }
+
+    // Before the migration below, so an upgrading user whose slot was already open
+    // keeps the occupant they had — the migration reads the slot's state to decide
+    // whether the strip is owed it.
+    if let Some(id) = active_sidebar_id {
+        window_handle
+            .update(cx, |multi_workspace, _, _cx| {
+                multi_workspace.restore_active_sidebar_id(id.clone());
             })
             .ok();
     }
@@ -10894,33 +10919,34 @@ pub async fn apply_restored_multiworkspace_state(
         })
         .ok();
 
-    if restore_sidebar_ui {
-        // Each occupant gets its own blob, reached by id rather than by whichever one
-        // the slot happens to be showing. A window saved before the slot could hold
-        // two carries one unkeyed blob instead; that belonged to the agent sidebar,
-        // since nothing else could have written it, and this is the only place that
-        // reads it. The next save writes keyed state and the legacy field goes empty.
-        let mut states = sidebar_states.clone();
-        if states.is_empty()
-            && let Some(legacy) = sidebar_state
-        {
-            states.insert(
-                crate::layout_registry::ids::THREADS_SIDEBAR.to_string(),
-                legacy.clone(),
-            );
-        }
-        if !states.is_empty() {
-            window_handle
-                .update(cx, |multi_workspace, window, cx| {
-                    for (id, state) in &states {
-                        if let Some(sidebar) = multi_workspace.sidebar_with_id(id) {
-                            sidebar.restore_serialized_state(state, window, cx);
-                        }
+    // Each occupant gets its own blob, reached by id rather than by whichever one the
+    // slot happens to be showing. A window saved before the slot could hold two
+    // carries one unkeyed blob instead; that belonged to the agent sidebar, since
+    // nothing else could have written it, and this is the only place that reads it.
+    // The next save writes keyed state and the legacy field goes empty.
+    //
+    // Not gated on the agent: the strip's width is stored the same way, and dropping
+    // it with AI off would restore a strip at its default width every launch.
+    let mut states = sidebar_states.clone();
+    if states.is_empty()
+        && let Some(legacy) = sidebar_state
+    {
+        states.insert(
+            crate::layout_registry::ids::THREADS_SIDEBAR.to_string(),
+            legacy.clone(),
+        );
+    }
+    if !states.is_empty() {
+        window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                for (id, state) in &states {
+                    if let Some(sidebar) = multi_workspace.sidebar_with_id(id) {
+                        sidebar.restore_serialized_state(state, window, cx);
                     }
-                    multi_workspace.serialize(cx);
-                })
-                .ok();
-        }
+                }
+                multi_workspace.serialize(cx);
+            })
+            .ok();
     }
 }
 
