@@ -1754,6 +1754,12 @@ impl MultiWorkspace {
         // has to move with it. Without this it kept naming the occupant that was just
         // swapped out, and `activate_pane_in_direction` walked into a hidden panel.
         self.sync_sidebar_focus_handles(cx);
+        // Which occupant is showing is persisted state, so changing it is a write.
+        // `apply_open_sidebar` used to be the only path that serialized, which meant a
+        // swap while the slot was **already open** never reached the store: the field
+        // changed, the screen changed, and the next launch restored the occupant from
+        // before the swap. Dogfood B-9 caught exactly that, against a green suite.
+        self.serialize(cx);
         cx.notify();
         true
     }
@@ -3371,9 +3377,21 @@ impl MultiWorkspace {
         self.workspace().read(cx).sidebar_focus_handle.clone()
     }
 
+    /// The state this window **would** serialize, recomputed from live fields.
+    ///
+    /// Not evidence that anything was written. For that use
+    /// [`Self::test_persisted_state`], which reads the store back — the difference is
+    /// what let dogfood B-9's missing `serialize` call survive a mutation test.
     #[cfg(any(test, feature = "test-support"))]
     pub fn test_state(&self, cx: &App) -> MultiWorkspaceState {
         self.multi_workspace_state(cx)
+    }
+
+    /// What this window has actually persisted. Await `run_until_parked` first —
+    /// `serialize` writes from a spawned task.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_persisted_state(&self, cx: &App) -> MultiWorkspaceState {
+        crate::persistence::test_read_persisted_multi_workspace_state(self.window_id, cx)
     }
 
     fn multi_workspace_state(&self, cx: &App) -> MultiWorkspaceState {

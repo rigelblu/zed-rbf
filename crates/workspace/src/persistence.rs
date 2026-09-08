@@ -311,6 +311,21 @@ impl From<WindowBoundsJson> for WindowBounds {
     }
 }
 
+/// Reads back what was actually **persisted** for `window_id`.
+///
+/// Exists because `MultiWorkspace::test_state` recomputes the state from live fields,
+/// so a test asserting persistence through it asserts nothing about persistence — it
+/// passes identically whether or not `serialize` ever ran. Dogfood B-9 was a missing
+/// `serialize` call, and a test built on `test_state` survived the mutation that
+/// removed it.
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_read_persisted_multi_workspace_state(
+    window_id: WindowId,
+    cx: &App,
+) -> model::MultiWorkspaceState {
+    read_multi_workspace_state(window_id, cx)
+}
+
 fn read_multi_workspace_state(window_id: WindowId, cx: &App) -> model::MultiWorkspaceState {
     let kvp = KeyValueStore::global(cx);
     kvp.scoped("multi_workspace_state")

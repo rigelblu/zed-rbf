@@ -151,7 +151,15 @@ pub struct StatusControlAdapter {
     /// Unavailable resolves to `Hidden` rather than to an empty element, because
     /// a zone item that renders nothing still takes its gap — the defect dogfood
     /// round B4-6 found.
-    available: Arc<dyn Fn(&App) -> bool + Send + Sync>,
+    ///
+    /// It is handed the bar's **live** `MultiWorkspace` handle rather than capturing
+    /// one, for the same reason `SidebarStatus::slot` takes it as a parameter: the
+    /// bar is built inside `Workspace::new`, which runs *before* the `MultiWorkspace`
+    /// exists as the window root, so a handle captured there is `None` for the life of
+    /// the window. `set_multi_workspace` fills the bar's field in a moment later; a
+    /// closure that captured the earlier value would answer "unavailable" forever, and
+    /// on a fresh single-workspace window that means no bar icons at all.
+    available: Arc<dyn Fn(&Option<WeakEntity<MultiWorkspace>>, &App) -> bool + Send + Sync>,
 }
 
 impl StatusControlAdapter {
@@ -162,7 +170,7 @@ impl StatusControlAdapter {
         Self {
             id,
             legacy_enabled: Arc::new(legacy_enabled),
-            available: Arc::new(|_| true),
+            available: Arc::new(|_, _| true),
         }
     }
 
@@ -170,7 +178,7 @@ impl StatusControlAdapter {
     /// like the component it opens, and present only while `available` says so.
     pub fn for_component(
         id: &'static str,
-        available: impl Fn(&App) -> bool + Send + Sync + 'static,
+        available: impl Fn(&Option<WeakEntity<MultiWorkspace>>, &App) -> bool + Send + Sync + 'static,
     ) -> Self {
         Self {
             id,
@@ -183,7 +191,11 @@ impl StatusControlAdapter {
         self.id
     }
 
-    fn effective_location(&self, cx: &App) -> Option<StatusBarItemLocation> {
+    fn effective_location(
+        &self,
+        multi_workspace: &Option<WeakEntity<MultiWorkspace>>,
+        cx: &App,
+    ) -> Option<StatusBarItemLocation> {
         // A component-backed item is placed by the setting that moves its
         // component, so its icon cannot end up in a zone its component is not on.
         // The status-control resolver declines these ids by design, and this is
@@ -191,7 +203,7 @@ impl StatusControlAdapter {
         // below is meaningless for an item that never had a legacy show/hide key.
         if let Some(zone) = WorkspaceLayoutSettings::get_global(cx).resolved_component_zone(self.id)
         {
-            return Some(if (self.available)(cx) {
+            return Some(if (self.available)(multi_workspace, cx) {
                 zone
             } else {
                 StatusBarItemLocation::Hidden
@@ -211,10 +223,14 @@ struct StatusBarItem {
 }
 
 impl StatusBarItem {
-    fn effective_location(&self, cx: &App) -> StatusBarItemLocation {
+    fn effective_location(
+        &self,
+        multi_workspace: &Option<WeakEntity<MultiWorkspace>>,
+        cx: &App,
+    ) -> StatusBarItemLocation {
         self.adapter
             .as_ref()
-            .and_then(|adapter| adapter.effective_location(cx))
+            .and_then(|adapter| adapter.effective_location(multi_workspace, cx))
             .unwrap_or(self.default_location)
     }
 }
@@ -420,7 +436,7 @@ impl StatusBar {
         let locations: Vec<_> = self
             .items
             .iter()
-            .map(|entry| entry.effective_location(cx))
+            .map(|entry| entry.effective_location(&self.multi_workspace, cx))
             .collect();
         let ids: Vec<Option<&'static str>> = self
             .items
@@ -1219,7 +1235,7 @@ impl StatusBar {
                     .as_ref()
                     .is_some_and(|adapter| adapter.id() == item_id)
             })
-            .map(|entry| entry.effective_location(cx))
+            .map(|entry| entry.effective_location(&self.multi_workspace, cx))
     }
 
     pub fn item_of_type<T: StatusItemView>(&self) -> Option<Entity<T>> {

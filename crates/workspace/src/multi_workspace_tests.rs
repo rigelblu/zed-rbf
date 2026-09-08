@@ -2534,6 +2534,70 @@ async fn test_the_migration_holds_when_there_is_no_slot(cx: &mut TestAppContext)
     });
 }
 
+/// A fresh window's bar icons resolve against a live `MultiWorkspace`, not a stale one.
+///
+/// The bar is assembled inside `Workspace::new`, which runs **before** the
+/// `MultiWorkspace` becomes the window root — so the handle in scope there is `None`,
+/// and `set_multi_workspace` fills the bar's field a moment later. An `available`
+/// closure that captured the construction-time value answered "unavailable" for the
+/// life of the window, which on a fresh single-workspace window means **no bar icons
+/// at all**: the exact state every user starts in.
+///
+/// Asserts the placement resolver rather than the icons' own render, because that is
+/// where `Hidden` is decided. Capturing `multi_workspace` in `occupant_available`
+/// instead of taking it as a parameter fails this.
+#[gpui::test]
+async fn test_a_fresh_windows_bar_icons_are_not_hidden_by_a_stale_handle(cx: &mut TestAppContext) {
+    init_test(cx);
+    reset_workspace_configuration_store(cx).await;
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    fs.insert_tree("/root_b", json!({ "file.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs.clone(), ["/root_b".as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    cx.run_until_parked();
+
+    let zone = |cx: &mut VisualTestContext, id: &'static str| {
+        let status_bar = multi_workspace.read_with(cx, |multi_workspace, cx| {
+            multi_workspace.workspace().read(cx).status_bar().clone()
+        });
+        status_bar.read_with(cx, |status_bar, cx| {
+            status_bar.effective_location_for(id, cx)
+        })
+    };
+
+    // One workspace, no saved configurations: the strip has nothing to draw, so its
+    // icon is correctly Hidden. The agent's is not, and that is the half a stale
+    // handle got wrong.
+    assert_eq!(
+        zone(cx, crate::layout_registry::ids::THREADS_SIDEBAR),
+        Some(settings::StatusBarItemLocation::Left),
+        "the agent's icon is on the bar of a fresh window, as it was before the slot \
+         learned about availability",
+    );
+    assert_eq!(
+        zone(cx, crate::layout_registry::ids::WORKSPACES),
+        Some(settings::StatusBarItemLocation::Hidden),
+        "and the strip's is hidden on its own merits — nothing to draw — rather than \
+         because the handle was dead",
+    );
+
+    // A second workspace gives the strip rows, and its icon appears. This is the
+    // assertion a stale handle cannot pass: it would stay Hidden forever.
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b, window, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        zone(cx, crate::layout_registry::ids::WORKSPACES),
+        Some(settings::StatusBarItemLocation::Left),
+        "the strip's icon joins the bar once it has rows",
+    );
+}
+
 /// Swapping occupants moves the focus handle pane navigation steers by.
 ///
 /// `activate_sidebar` only set the id. The handle was written when the slot opened,
@@ -2784,6 +2848,96 @@ async fn test_the_migration_leaves_an_already_open_slot_alone(cx: &mut TestAppCo
     });
 }
 
+/// Swapping the occupant of an **already-open** slot persists the swap.
+///
+/// **Dogfood B-9, 2026-09-08 — found on a binary, against a green suite.** The startup
+/// migration opens the slot showing Workspaces; clicking the Threads icon then swaps
+/// it. `toggle_sidebar_occupant` only reaches `open_sidebar` — and so only reaches
+/// `serialize` — when the slot was *closed*, so the swap changed the field and the
+/// screen and never touched the store. The next launch restored Workspaces.
+///
+/// `test_a_restart_restores_the_occupant_that_was_showing` passed against this the
+/// whole time, because it called `restore_active_sidebar_id` directly and never swapped
+/// anything. **The state the defect needs is a slot that is already open**, which is
+/// the state a real user is always in by the time they click the second icon.
+///
+/// Deleting the `serialize` call in `activate_sidebar` fails this.
+#[gpui::test]
+async fn test_swapping_an_already_open_slot_persists_which_occupant_shows(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    fs.insert_tree("/root_b", json!({ "file.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs.clone(), ["/root_b".as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b, window, cx);
+    });
+    cx.run_until_parked();
+
+    let strip = cx.new_window_entity(|window, cx| {
+        crate::workspace_tabs::WorkspacesSidebar::new(multi_workspace.clone(), window, cx)
+    });
+    let threads = cx.new(|cx| SecondOccupant {
+        focus_handle: cx.focus_handle(),
+    });
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.register_sidebar(crate::layout_registry::ids::WORKSPACES, strip, cx);
+        multi_workspace.register_sidebar(crate::layout_registry::ids::THREADS_SIDEBAR, threads, cx);
+    });
+    cx.run_until_parked();
+
+    // The state a user is actually in: the slot is already open, showing the strip.
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.toggle_sidebar_occupant(
+            crate::layout_registry::ids::WORKSPACES,
+            window,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert!(
+            multi_workspace.sidebar_open(),
+            "precondition: the slot is open"
+        );
+        assert_eq!(
+            multi_workspace
+                .test_persisted_state(cx)
+                .active_sidebar_id
+                .as_deref(),
+            Some(crate::layout_registry::ids::WORKSPACES),
+        );
+    });
+
+    // Now the second icon, with the slot still open — the path that never serialized.
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.toggle_sidebar_occupant(
+            crate::layout_registry::ids::THREADS_SIDEBAR,
+            window,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert!(
+            multi_workspace.sidebar_open(),
+            "the other icon swaps the occupant rather than closing the slot",
+        );
+        assert_eq!(
+            multi_workspace
+                .test_persisted_state(cx)
+                .active_sidebar_id
+                .as_deref(),
+            Some(crate::layout_registry::ids::THREADS_SIDEBAR),
+            "and the swap reaches the store, so the next launch restores what is showing",
+        );
+    });
+}
+
 /// A restart brings back the occupant you left showing, not the first registered.
 ///
 /// Nothing persisted which occupant was active, and `register_sidebar` makes the first
@@ -2833,7 +2987,9 @@ async fn test_a_restart_restores_the_occupant_that_was_showing(cx: &mut TestAppC
         assert_eq!(
             multi_workspace.test_state(cx).active_sidebar_id.as_deref(),
             Some(crate::layout_registry::ids::THREADS_SIDEBAR),
-            "and it is written back, so the next restart restores it too",
+            "and the state it would serialize names it. Whether a swap actually reaches the \
+             store is test_swapping_an_already_open_slot_persists_which_occupant_shows, \
+             which reads the KVP back — this one cannot tell",
         );
     });
 }
@@ -8121,4 +8277,3 @@ async fn test_keep_project_removal_of_remote_workspace_reopens_local_neighbor(
         );
     });
 }
-

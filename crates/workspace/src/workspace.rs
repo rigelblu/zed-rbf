@@ -1871,9 +1871,12 @@ impl Workspace {
             // question the slot asks itself, so an icon can never offer to open a
             // panel the slot will not show — which it did when this read
             // `|_cx| true` for Workspaces.
+            // Deliberately captures nothing: it is handed the bar's live handle. The
+            // one in scope here is `None` — this runs inside `Workspace::new`, before
+            // the `MultiWorkspace` is the window root — and capturing it would answer
+            // "unavailable" for the life of the window, hiding both icons.
             let occupant_available = |id: &'static str| {
-                let multi_workspace = multi_workspace.clone();
-                move |cx: &App| {
+                move |multi_workspace: &Option<WeakEntity<MultiWorkspace>>, cx: &App| {
                     multi_workspace
                         .as_ref()
                         .and_then(|mw| mw.upgrade())
