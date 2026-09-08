@@ -393,6 +393,45 @@ impl WorkspaceLayoutSettings {
             .copied()
             .unwrap_or_default()
     }
+
+    /// The bar zone a workspace component's icon renders in, or `None` when the
+    /// id does not name a workspace component.
+    ///
+    /// The icon's zone is *derived* from the component's position rather than
+    /// stored beside it, so the single write that moves the component is the same
+    /// write that moves its icon and a state where the two disagree cannot be
+    /// represented. That is why this reads `component_positions` and never
+    /// `status_bar.item_locations`, which is the status-control answer to the same
+    /// question and would be a second source for one fact.
+    ///
+    /// Ordering is the opposite case and stays separate: a slot-backed
+    /// component's icon orders on `status_bar.item_order` like any other zone
+    /// item, because its order places nothing.
+    pub fn resolved_component_zone(&self, item_id: &str) -> Option<StatusBarItemLocation> {
+        if !is_workspace_component(item_id) {
+            return None;
+        }
+        let entry = self.component(item_id);
+        if entry.hidden {
+            return Some(StatusBarItemLocation::Hidden);
+        }
+        entry
+            .position
+            .map(component_zone)
+            .or_else(|| registered_status_control_location(item_id))
+    }
+}
+
+/// Q1's mapping, in one place: Left and Right put the icon in the matching zone,
+/// Bottom puts it in the Middle. A component registering `SIDES` never reaches the
+/// Bottom arm, but writing it here keeps the rule whole rather than leaving the
+/// third case to the next caller to invent.
+fn component_zone(position: settings::DockPosition) -> StatusBarItemLocation {
+    match position {
+        settings::DockPosition::Left => StatusBarItemLocation::Left,
+        settings::DockPosition::Right => StatusBarItemLocation::Right,
+        settings::DockPosition::Bottom => StatusBarItemLocation::Middle,
+    }
 }
 
 /// Whether the registry says a component can take a position.
@@ -713,6 +752,114 @@ mod status_bar_settings_tests {
         assert_eq!(
             hidden.encoding_display_option("active_encoding"),
             EncodingDisplayOptions::Disabled
+        );
+    }
+
+    fn layout_with(entries: &[(&str, WorkspaceComponentPosition)]) -> WorkspaceLayoutSettings {
+        WorkspaceLayoutSettings {
+            component_positions: entries
+                .iter()
+                .map(|(id, entry)| ((*id).to_string(), *entry))
+                .collect(),
+            component_order: Vec::new(),
+        }
+    }
+
+    fn at(position: settings::DockPosition) -> WorkspaceComponentPosition {
+        WorkspaceComponentPosition {
+            position: Some(position),
+            hidden: false,
+            pinned: false,
+        }
+    }
+
+    #[test]
+    fn a_components_icon_zone_follows_the_position_that_moves_the_component() {
+        use crate::layout_registry::ids;
+        // The whole point of deriving rather than storing: one write moves both.
+        // If these ever disagree, the icon is offering to open something that is
+        // somewhere else, which is the icon-only model human Check 3 disproved.
+        let left = layout_with(&[(ids::GIT_PANEL, at(settings::DockPosition::Left))]);
+        let right = layout_with(&[(ids::GIT_PANEL, at(settings::DockPosition::Right))]);
+
+        assert_eq!(
+            left.resolved_component_zone(ids::GIT_PANEL),
+            Some(StatusBarItemLocation::Left)
+        );
+        assert_eq!(
+            right.resolved_component_zone(ids::GIT_PANEL),
+            Some(StatusBarItemLocation::Right),
+            "the icon stayed put while its component moved sides"
+        );
+    }
+
+    #[test]
+    fn a_component_with_no_entry_falls_back_to_its_registered_side() {
+        use crate::layout_registry::ids;
+        // Every install starts here and most stay here, so this is the common
+        // path rather than an edge: an empty settings file must still place the
+        // icon where the registry says the component lives.
+        let empty = layout_with(&[]);
+
+        assert_eq!(
+            empty.resolved_component_zone(ids::GIT_PANEL),
+            registered_status_control_location(ids::GIT_PANEL),
+            "an install with no entry invented a zone instead of using the registry"
+        );
+    }
+
+    #[test]
+    fn a_hidden_component_resolves_to_hidden_rather_than_to_a_zone() {
+        use crate::layout_registry::ids;
+        // Hiding takes the component and its icon together. Returning a zone here
+        // would draw an icon for something the user hid.
+        let hidden = layout_with(&[(
+            ids::GIT_PANEL,
+            WorkspaceComponentPosition {
+                position: Some(settings::DockPosition::Left),
+                hidden: true,
+                pinned: false,
+            },
+        )]);
+
+        assert_eq!(
+            hidden.resolved_component_zone(ids::GIT_PANEL),
+            Some(StatusBarItemLocation::Hidden),
+            "a hidden component still claimed a zone"
+        );
+    }
+
+    #[test]
+    fn a_status_control_is_not_answered_by_the_component_resolver() {
+        use crate::layout_registry::ids;
+        // The discriminating half. Both resolvers answer "which zone", and a
+        // status control must be answered by exactly one of them — the other
+        // returning `None` is what keeps `item_locations` from becoming a second
+        // source for a component's position.
+        let layout = layout_with(&[(ids::CURSOR_POSITION, at(settings::DockPosition::Left))]);
+
+        assert_eq!(
+            layout.resolved_component_zone(ids::CURSOR_POSITION),
+            None,
+            "a status control was placed by the component resolver"
+        );
+        assert_eq!(
+            layout.resolved_component_zone("no-such-item"),
+            None,
+            "an unregistered id was given an invented zone"
+        );
+    }
+
+    #[test]
+    fn a_bottom_component_puts_its_icon_in_the_middle_zone() {
+        use crate::layout_registry::ids;
+        // Q1's third case. The two sidebar-slot occupants register SIDES and never
+        // reach it, but a bottom-dock component does.
+        let bottom = layout_with(&[(ids::TERMINAL_PANEL, at(settings::DockPosition::Bottom))]);
+
+        assert_eq!(
+            bottom.resolved_component_zone(ids::TERMINAL_PANEL),
+            Some(StatusBarItemLocation::Middle)
         );
     }
 

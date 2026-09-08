@@ -1,6 +1,7 @@
 use crate::{
     ItemHandle, MultiWorkspace, Pane, SidebarSide, StatusBarItemLocation, StatusBarSettings,
-    ToggleWorkspaceSidebar, layout_registry::CustomizeWorkspaceLayout, sidebar_side_context_menu,
+    ToggleWorkspaceSidebar, WorkspaceLayoutSettings, layout_registry::CustomizeWorkspaceLayout,
+    sidebar_side_context_menu,
 };
 use gpui::{
     Anchor, AnyView, App, Context, Decorations, Entity, FocusHandle, Focusable, IntoElement,
@@ -10,7 +11,7 @@ use settings::Settings as _;
 use settings::{SettingsContent, update_settings_file, update_settings_file_with_completion};
 use std::{any::TypeId, sync::Arc};
 use theme::CLIENT_SIDE_DECORATION_ROUNDING;
-use ui::{ContextMenu, Divider, IconPosition, Indicator, Tooltip, prelude::*, right_click_menu};
+use ui::{ContextMenu, IconPosition, Indicator, Tooltip, prelude::*, right_click_menu};
 
 /// Describes how a status-bar item can be hidden by the user.
 ///
@@ -76,7 +77,6 @@ struct SidebarStatus {
     open: bool,
     side: SidebarSide,
     has_notifications: bool,
-    show_toggle: bool,
 }
 
 impl SidebarStatus {
@@ -86,12 +86,10 @@ impl SidebarStatus {
             .and_then(|mw| mw.upgrade())
             .map(|mw| {
                 let mw = mw.read(cx);
-                let enabled = mw.sidebar_ui_enabled(cx);
                 Self {
-                    open: mw.sidebar_open() && enabled,
+                    open: mw.sidebar_open() && mw.sidebar_slot_enabled(cx),
                     side: mw.sidebar_side(cx),
                     has_notifications: mw.sidebar_has_notifications(cx),
-                    show_toggle: enabled,
                 }
             })
             .unwrap_or_default()
@@ -110,6 +108,17 @@ impl SidebarStatus {
 pub struct StatusControlAdapter {
     id: &'static str,
     legacy_enabled: Arc<dyn Fn(&App) -> bool + Send + Sync>,
+    /// Whether the item exists to be placed at all, for items whose presence is
+    /// not a placement question. A component-backed item cannot answer this from
+    /// its position — the threads sidebar has a side whether or not the agent is
+    /// enabled — and it is deliberately *not* `legacy_enabled` wearing a second
+    /// hat: that closure answers "did the user's old show/hide key say yes",
+    /// which an item that never had one cannot be asked.
+    ///
+    /// Unavailable resolves to `Hidden` rather than to an empty element, because
+    /// a zone item that renders nothing still takes its gap — the defect dogfood
+    /// round B4-6 found.
+    available: Arc<dyn Fn(&App) -> bool + Send + Sync>,
 }
 
 impl StatusControlAdapter {
@@ -120,6 +129,20 @@ impl StatusControlAdapter {
         Self {
             id,
             legacy_enabled: Arc::new(legacy_enabled),
+            available: Arc::new(|_| true),
+        }
+    }
+
+    /// A component-backed bar item: placed by `workspace_layout.component_positions`
+    /// like the component it opens, and present only while `available` says so.
+    pub fn for_component(
+        id: &'static str,
+        available: impl Fn(&App) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            id,
+            legacy_enabled: Arc::new(|_| true),
+            available: Arc::new(available),
         }
     }
 
@@ -128,6 +151,19 @@ impl StatusControlAdapter {
     }
 
     fn effective_location(&self, cx: &App) -> Option<StatusBarItemLocation> {
+        // A component-backed item is placed by the setting that moves its
+        // component, so its icon cannot end up in a zone its component is not on.
+        // The status-control resolver declines these ids by design, and this is
+        // the sibling that answers them — asked first, because `legacy_enabled`
+        // below is meaningless for an item that never had a legacy show/hide key.
+        if let Some(zone) = WorkspaceLayoutSettings::get_global(cx).resolved_component_zone(self.id)
+        {
+            return Some(if (self.available)(cx) {
+                zone
+            } else {
+                StatusBarItemLocation::Hidden
+            });
+        }
         StatusBarSettings::get_global(cx)
             .resolved_status_control_location(self.id, (self.legacy_enabled)(cx))
     }
@@ -320,30 +356,22 @@ impl Render for StatusBar {
                     .border_b(px(1.0))
                     .border_color(cx.theme().colors().status_bar_background),
             })
-            .child(self.render_left_tools(&sidebar, cx))
+            .child(self.render_left_tools(cx))
             // The middle zone sits between the two groups rather than being pinned
             // to the window centre. True centring — independent of how wide the
             // left group happens to be — comes with the overflow work, and until
             // then a placed item is visible here rather than lost.
             .child(self.render_middle_tools(cx))
-            .child(self.render_right_tools(&sidebar, cx))
+            .child(self.render_right_tools(cx))
     }
 }
 
 impl StatusBar {
-    fn render_left_tools(
-        &self,
-        sidebar: &SidebarStatus,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render_left_tools(&self, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
             .gap_1()
             .min_w_0()
             .overflow_x_hidden()
-            .when(
-                sidebar.show_toggle && !sidebar.open && sidebar.side == SidebarSide::Left,
-                |this| this.child(self.render_sidebar_toggle(sidebar, cx)),
-            )
             .children(self.render_zone(StatusBarItemLocation::Left, "status-bar-left", cx))
     }
 
@@ -407,27 +435,53 @@ impl StatusBar {
             .children(self.render_zone(StatusBarItemLocation::Middle, "status-bar-middle", cx))
     }
 
-    fn render_right_tools(
-        &self,
-        sidebar: &SidebarStatus,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render_right_tools(&self, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
             .flex_shrink_0()
             .gap_1()
             .overflow_x_hidden()
             .children(self.render_zone(StatusBarItemLocation::Right, "status-bar-right", cx))
-            .when(
-                sidebar.show_toggle && !sidebar.open && sidebar.side == SidebarSide::Right,
-                |this| this.child(self.render_sidebar_toggle(sidebar, cx)),
-            )
+    }
+}
+
+/// The threads sidebar's bar item.
+///
+/// It renders inside its zone like every other placeable item rather than being
+/// appended beside one, so it takes the zone its component's position names and
+/// the order the user drags it into. It also no longer vanishes when the sidebar
+/// opens — it is a switch now, and a switch that disappears in one of its two
+/// states cannot be switched back.
+pub struct ThreadsSidebarButton {
+    multi_workspace: Option<WeakEntity<MultiWorkspace>>,
+}
+
+impl ThreadsSidebarButton {
+    pub fn new(multi_workspace: Option<WeakEntity<MultiWorkspace>>) -> Self {
+        Self { multi_workspace }
+    }
+}
+
+impl StatusItemView for ThreadsSidebarButton {
+    fn set_active_pane_item(
+        &mut self,
+        _active_pane_item: Option<&dyn ItemHandle>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
     }
 
-    fn render_sidebar_toggle(
-        &self,
-        sidebar: &SidebarStatus,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn hide_setting(&self, _cx: &App) -> Option<HideStatusItem> {
+        // Deliberately none. `HideStatusItem` writes a legacy per-item show/hide
+        // key, and this item never had one — it is hidden through its component's
+        // `hidden` flag, which the layout surface already offers and which
+        // `resolved_component_zone` already honours.
+        None
+    }
+}
+
+impl Render for ThreadsSidebarButton {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let sidebar = SidebarStatus::query(&self.multi_workspace, cx);
         let on_right = sidebar.side == SidebarSide::Right;
         let has_notifications = sidebar.has_notifications;
         let indicator_border = cx.theme().colors().status_bar_background;
@@ -446,21 +500,34 @@ impl StatusBar {
             .trigger(move |_is_active, _window, _cx| {
                 IconButton::new(
                     "toggle-workspace-sidebar",
-                    if on_right {
-                        IconName::ThreadsSidebarRightClosed
-                    } else {
-                        IconName::ThreadsSidebarLeftClosed
+                    match (on_right, sidebar.open) {
+                        (true, true) => IconName::ThreadsSidebarRightOpen,
+                        (true, false) => IconName::ThreadsSidebarRightClosed,
+                        (false, true) => IconName::ThreadsSidebarLeftOpen,
+                        (false, false) => IconName::ThreadsSidebarLeftClosed,
                     },
                 )
                 .icon_size(IconSize::Small)
                 .tab_index(0isize)
-                .aria_label("Open threads sidebar")
+                .aria_label(if sidebar.open {
+                    "Close threads sidebar"
+                } else {
+                    "Open threads sidebar"
+                })
                 .when(has_notifications, |this| {
                     this.indicator(Indicator::dot().color(Color::Accent))
                         .indicator_border_color(Some(indicator_border))
                 })
                 .tooltip(move |_, cx| {
-                    Tooltip::for_action("Open Threads Sidebar", &ToggleWorkspaceSidebar, cx)
+                    Tooltip::for_action(
+                        if sidebar.open {
+                            "Close Threads Sidebar"
+                        } else {
+                            "Open Threads Sidebar"
+                        },
+                        &ToggleWorkspaceSidebar,
+                        cx,
+                    )
                 })
                 .on_click(move |_, window, cx| {
                     if let Some(multi_workspace) = window.root::<MultiWorkspace>().flatten() {
@@ -471,15 +538,7 @@ impl StatusBar {
                 })
             });
 
-        h_flex()
-            .gap_0p5()
-            .when(on_right, |this| {
-                this.child(Divider::vertical().color(ui::DividerColor::Border))
-            })
-            .child(toggle)
-            .when(!on_right, |this| {
-                this.child(Divider::vertical().color(ui::DividerColor::Border))
-            })
+        h_flex().gap_0p5().child(toggle)
     }
 }
 

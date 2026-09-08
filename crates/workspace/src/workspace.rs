@@ -1861,6 +1861,23 @@ impl Workspace {
             status_bar.add_left_item(left_dock_buttons, window, cx);
             status_bar.add_right_item(right_dock_buttons, window, cx);
             status_bar.add_right_item(bottom_dock_buttons, window, cx);
+            // The threads sidebar's icon is placed by the setting that moves the
+            // sidebar itself, so it goes in as a component-backed control rather
+            // than being appended beside a zone the way it was before `v0.45.1`.
+            // `available` carries the one thing its position cannot: the sidebar
+            // has a side whether or not the agent is enabled, and with the agent
+            // off there is nothing to open.
+            let threads_sidebar_button =
+                cx.new(|_| status_bar::ThreadsSidebarButton::new(multi_workspace.clone()));
+            status_bar.add_status_control(
+                threads_sidebar_button,
+                status_bar::StatusControlAdapter::for_component(
+                    crate::layout_registry::ids::THREADS_SIDEBAR,
+                    MultiWorkspace::sidebar_ui_enabled_from_settings,
+                ),
+                window,
+                cx,
+            );
             status_bar
         });
 
@@ -10787,6 +10804,9 @@ pub async fn apply_restored_multiworkspace_state(
     } = state;
     let restore_workspace_membership =
         cx.update(|cx| MultiWorkspace::retention_enabled_from_settings(cx));
+    // Slot-structural: this restores whether the slot was open, not whether the
+    // agent is enabled. It reads the agent setting only while the slot has one
+    // occupant; `sidebar_slot_enabled` is the instance-side twin.
     let restore_sidebar_ui = cx.update(|cx| MultiWorkspace::sidebar_ui_enabled_from_settings(cx));
 
     if restore_workspace_membership {
@@ -11600,7 +11620,7 @@ pub fn open_paths(
                     open_options.requesting_window = Some(window);
                     window
                         .update(cx, |multi_workspace, _, cx| {
-                            if multi_workspace.sidebar_ui_enabled(cx) {
+                            if multi_workspace.sidebar_slot_enabled(cx) {
                                 multi_workspace.open_sidebar(cx);
                             }
                         })

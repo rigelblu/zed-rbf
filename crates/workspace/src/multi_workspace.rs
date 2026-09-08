@@ -86,11 +86,44 @@ pub struct SidebarRenderState {
     pub side: SidebarSide,
 }
 
+/// Which side the threads sidebar sits on, and which zone its bar icon takes —
+/// one answer, because they are one fact.
+///
+/// Split out of both callers because this is the half that can be wrong: the
+/// branch is on the *entry*, not on the position inside it. That is the rule
+/// `resolve_component_position` states for every other component — an entry
+/// existing at all ends `agent.sidebar_side`'s authority, and an entry created by
+/// hiding carries no position, so it falls to the registered side rather than back
+/// to the legacy key. Reading the legacy key after an entry exists is precisely how
+/// the panel and its icon come to disagree.
+fn resolved_sidebar_side(
+    entry: Option<crate::workspace_settings::WorkspaceComponentPosition>,
+    legacy: SidebarSide,
+) -> SidebarSide {
+    let Some(entry) = entry else {
+        return legacy;
+    };
+    match entry.position {
+        Some(settings::DockPosition::Right) => SidebarSide::Right,
+        // Left, Bottom (not a valid position for this component), and no position
+        // at all all take the registered side. None of them reach the legacy key.
+        _ => SidebarSide::Left,
+    }
+}
+
 pub fn sidebar_side_context_menu(
     id: impl Into<ElementId>,
     cx: &App,
 ) -> ui::RightClickMenu<ContextMenu> {
-    let current_position = AgentSettings::get_global(cx).sidebar_side;
+    // Read through the same resolver the sidebar renders from, so the tick sits
+    // beside the side actually in use rather than beside the legacy key.
+    let current_position = match resolved_sidebar_side(
+        threads_sidebar_entry(cx),
+        AgentSettings::get_global(cx).sidebar_side(),
+    ) {
+        SidebarSide::Right => SidebarDockPosition::Right,
+        SidebarSide::Left => SidebarDockPosition::Left,
+    };
     right_click_menu(id).menu(move |window, cx| {
         let fs = <dyn fs::Fs>::global(cx);
         ContextMenu::build(window, cx, move |mut menu, _, _cx| {
@@ -111,11 +144,22 @@ pub fn sidebar_side_context_menu(
                             SidebarDockPosition::Right => "right",
                         };
                         telemetry::event!("Sidebar Side Changed", side = side);
+                        // Writes `component_positions`, not `agent.sidebar_side`.
+                        // The legacy key is a one-way migration source: once an
+                        // entry exists nothing reads it again, so writing both
+                        // would leave two records of one fact free to diverge.
+                        let dock = match position {
+                            SidebarDockPosition::Left => settings::DockPosition::Left,
+                            SidebarDockPosition::Right => settings::DockPosition::Right,
+                        };
                         settings::update_settings_file(fs.clone(), cx, move |settings, _cx| {
                             settings
-                                .agent
+                                .workspace_layout
                                 .get_or_insert_default()
-                                .set_sidebar_side(position);
+                                .component_positions
+                                .entry(crate::layout_registry::ids::THREADS_SIDEBAR.to_string())
+                                .or_default()
+                                .position = Some(dock);
                         });
                     },
                 );
@@ -123,6 +167,90 @@ pub fn sidebar_side_context_menu(
             menu
         })
     })
+}
+
+/// The user's `component_positions` entry for the threads sidebar, or `None` when
+/// they have never placed it — which is the only state in which the legacy
+/// `agent.sidebar_side` key is still read.
+fn threads_sidebar_entry(
+    cx: &App,
+) -> Option<crate::workspace_settings::WorkspaceComponentPosition> {
+    let layout = crate::WorkspaceLayoutSettings::get_global(cx);
+    let id = crate::layout_registry::ids::THREADS_SIDEBAR;
+    layout.has_component(id).then(|| layout.component(id))
+}
+
+#[cfg(test)]
+mod sidebar_side_resolution_tests {
+    use super::*;
+    use crate::workspace_settings::WorkspaceComponentPosition;
+
+    fn at(position: settings::DockPosition) -> Option<WorkspaceComponentPosition> {
+        Some(WorkspaceComponentPosition {
+            position: Some(position),
+            hidden: false,
+            pinned: false,
+        })
+    }
+
+    #[test]
+    fn with_no_entry_the_legacy_key_still_decides() {
+        // Every existing install is here. Breaking this moves the sidebar out from
+        // under anyone who set `agent.sidebar_side` and never touched the new key.
+        assert_eq!(
+            resolved_sidebar_side(None, SidebarSide::Right),
+            SidebarSide::Right
+        );
+        assert_eq!(
+            resolved_sidebar_side(None, SidebarSide::Left),
+            SidebarSide::Left
+        );
+    }
+
+    #[test]
+    fn an_entry_ends_the_legacy_keys_authority() {
+        // The discriminating case: the legacy value is the *opposite* of the entry
+        // in both directions, so a resolver that still reads it fails here rather
+        // than passing by coincidence.
+        assert_eq!(
+            resolved_sidebar_side(at(settings::DockPosition::Right), SidebarSide::Left),
+            SidebarSide::Right,
+            "the legacy key overrode an explicit entry"
+        );
+        assert_eq!(
+            resolved_sidebar_side(at(settings::DockPosition::Left), SidebarSide::Right),
+            SidebarSide::Left,
+            "the legacy key overrode an explicit entry"
+        );
+    }
+
+    #[test]
+    fn an_entry_without_a_position_takes_the_registered_side_not_the_legacy_one() {
+        // Hiding creates an entry carrying no position. The entry still exists, so
+        // legacy authority is over — falling back to it here would resurrect a
+        // setting the entry was supposed to end.
+        let hide_created = Some(WorkspaceComponentPosition {
+            position: None,
+            hidden: true,
+            pinned: false,
+        });
+
+        assert_eq!(
+            resolved_sidebar_side(hide_created, SidebarSide::Right),
+            SidebarSide::Left,
+            "a hide-created entry fell back to the legacy key"
+        );
+    }
+
+    #[test]
+    fn a_bottom_entry_is_not_a_side_and_does_not_reach_the_legacy_key() {
+        // Bottom is not in this component's `valid_positions`. It resolves like any
+        // other unusable saved value: to the registered side, never to legacy.
+        assert_eq!(
+            resolved_sidebar_side(at(settings::DockPosition::Bottom), SidebarSide::Right),
+            SidebarSide::Left
+        );
+    }
 }
 
 pub enum MultiWorkspaceEvent {
@@ -411,7 +539,15 @@ pub struct MultiWorkspace {
     /// chrome ownership, as that might cause a double lease. Kept in sync with
     /// `active_workspace`.
     active_workspace_id: Rc<Cell<EntityId>>,
-    sidebar: Option<Box<dyn SidebarHandle>>,
+    /// The slot's occupants, in registration order, and which one it is showing.
+    ///
+    /// Two handles held at once rather than one replaced on each swap: swapping the
+    /// handle would drop the inactive occupant's state — the threads list's scroll,
+    /// selection and switcher — on every toggle, and `Sidebar::new` reads the
+    /// `MultiWorkspace`, which is why its construction is already deferred at
+    /// startup. Rebuilding it on a user gesture would invite that re-entrancy back.
+    sidebars: Vec<(&'static str, Box<dyn SidebarHandle>)>,
+    active_sidebar_id: Option<&'static str>,
     sidebar_open: bool,
     sidebar_overlay: Option<AnyView>,
     pub(crate) workspace_tabs_scroll_handle: ScrollHandle,
@@ -1372,14 +1508,14 @@ impl MultiWorkspace {
     }
 
     pub fn sidebar_side(&self, cx: &App) -> SidebarSide {
-        self.sidebar
-            .as_ref()
-            .map_or(SidebarSide::Left, |s| s.side(cx))
+        resolved_sidebar_side(threads_sidebar_entry(cx), {
+            self.sidebar().map_or(SidebarSide::Left, |s| s.side(cx))
+        })
     }
 
     pub fn sidebar_render_state(&self, cx: &App) -> SidebarRenderState {
         SidebarRenderState {
-            open: self.sidebar_open() && self.sidebar_ui_enabled(cx),
+            open: self.sidebar_open() && self.sidebar_slot_enabled(cx),
             side: self.sidebar_side(cx),
         }
     }
@@ -1432,7 +1568,8 @@ impl MultiWorkspace {
             }],
             project_groups: Vec::new(),
             active_workspace_id,
-            sidebar: None,
+            sidebars: Vec::new(),
+            active_sidebar_id: None,
             sidebar_open: false,
             sidebar_overlay: None,
             workspace_tabs_scroll_handle: ScrollHandle::new(),
@@ -1463,7 +1600,14 @@ impl MultiWorkspace {
         }
     }
 
-    pub fn register_sidebar<T: Sidebar>(&mut self, sidebar: Entity<T>, cx: &mut Context<Self>) {
+    /// Registers an occupant for the sidebar slot. The first one registered is the
+    /// one the slot shows until something activates another.
+    pub fn register_sidebar<T: Sidebar>(
+        &mut self,
+        id: &'static str,
+        sidebar: Entity<T>,
+        cx: &mut Context<Self>,
+    ) {
         self._subscriptions
             .push(cx.observe(&sidebar, |_this, _, cx| {
                 cx.notify();
@@ -1474,11 +1618,41 @@ impl MultiWorkspace {
                     this.serialize(cx);
                 }
             }));
-        self.sidebar = Some(Box::new(sidebar));
+        self.sidebars.retain(|(existing, _)| *existing != id);
+        self.sidebars.push((id, Box::new(sidebar)));
+        if self.active_sidebar_id.is_none() {
+            self.active_sidebar_id = Some(id);
+        }
     }
 
+    /// The occupant the slot is currently showing.
     pub fn sidebar(&self) -> Option<&dyn SidebarHandle> {
-        self.sidebar.as_deref()
+        let active = self.active_sidebar_id?;
+        self.sidebars
+            .iter()
+            .find(|(id, _)| *id == active)
+            .map(|(_, handle)| handle.as_ref())
+    }
+
+    pub fn active_sidebar_id(&self) -> Option<&'static str> {
+        self.active_sidebar_id
+    }
+
+    /// Shows `id` in the slot, replacing whichever occupant was there.
+    ///
+    /// Exclusivity is structural rather than enforced: one slot, one active id, so
+    /// there is nowhere for a second occupant to be. Returns whether the slot
+    /// changed, so a caller can skip a redundant notify.
+    pub fn activate_sidebar(&mut self, id: &'static str, cx: &mut Context<Self>) -> bool {
+        if self.active_sidebar_id == Some(id) {
+            return false;
+        }
+        if !self.sidebars.iter().any(|(existing, _)| *existing == id) {
+            return false;
+        }
+        self.active_sidebar_id = Some(id);
+        cx.notify();
+        true
     }
 
     pub fn set_sidebar_overlay(&mut self, overlay: Option<AnyView>, cx: &mut Context<Self>) {
@@ -1491,14 +1665,11 @@ impl MultiWorkspace {
     }
 
     pub fn sidebar_has_notifications(&self, cx: &App) -> bool {
-        self.sidebar
-            .as_ref()
-            .map_or(false, |s| s.has_notifications(cx))
+        self.sidebar().map_or(false, |s| s.has_notifications(cx))
     }
 
     pub fn is_threads_list_view_active(&self, cx: &App) -> bool {
-        self.sidebar
-            .as_ref()
+        self.sidebar()
             .map_or(false, |s| s.is_threads_list_view_active(cx))
     }
 
@@ -1518,8 +1689,25 @@ impl MultiWorkspace {
         Self::sidebar_ui_enabled_from_settings(cx)
     }
 
+    /// Whether the sidebar **slot** exists — a different question from whether the
+    /// agent's UI is enabled, and the two are separated here rather than at
+    /// `v0.45.1`'s end because getting the classification right is the work.
+    ///
+    /// Today the slot has exactly one occupant, the threads sidebar, so this
+    /// delegates and the split is a no-op **by construction rather than by an
+    /// unchanged suite** — the body is the same call. When Workspaces joins as a
+    /// second occupant it becomes "is any occupant available", and this one body
+    /// changes instead of ten call sites being re-read under time pressure.
+    ///
+    /// The rule for choosing between them: does the thing being gated belong to
+    /// the *slot* (open, close, focus, resize, render, restore) or to the *agent*
+    /// (thread actions, the threads icon's availability, closing on disable)?
+    pub fn sidebar_slot_enabled(&self, cx: &App) -> bool {
+        self.sidebar_ui_enabled(cx)
+    }
+
     pub fn toggle_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.sidebar_ui_enabled(cx) {
+        if !self.sidebar_slot_enabled(cx) {
             return;
         }
 
@@ -1528,7 +1716,7 @@ impl MultiWorkspace {
         } else {
             self.previous_focus_handle = window.focused(cx);
             self.open_sidebar(cx);
-            if let Some(sidebar) = &self.sidebar {
+            if let Some(sidebar) = self.sidebar() {
                 sidebar.prepare_for_focus(window, cx);
                 sidebar.focus(window, cx);
             }
@@ -1536,7 +1724,7 @@ impl MultiWorkspace {
     }
 
     pub fn close_sidebar_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.sidebar_ui_enabled(cx) {
+        if !self.sidebar_slot_enabled(cx) {
             return;
         }
 
@@ -1546,21 +1734,20 @@ impl MultiWorkspace {
     }
 
     pub fn focus_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.sidebar_ui_enabled(cx) {
+        if !self.sidebar_slot_enabled(cx) {
             return;
         }
 
         if self.sidebar_open() {
             let sidebar_is_focused = self
-                .sidebar
-                .as_ref()
+                .sidebar()
                 .is_some_and(|s| s.focus_handle(cx).contains_focused(window, cx));
 
             if sidebar_is_focused {
                 self.restore_previous_focus(false, window, cx);
             } else {
                 self.previous_focus_handle = window.focused(cx);
-                if let Some(sidebar) = &self.sidebar {
+                if let Some(sidebar) = self.sidebar() {
                     sidebar.prepare_for_focus(window, cx);
                     sidebar.focus(window, cx);
                 }
@@ -1568,7 +1755,7 @@ impl MultiWorkspace {
         } else {
             self.previous_focus_handle = window.focused(cx);
             self.open_sidebar(cx);
-            if let Some(sidebar) = &self.sidebar {
+            if let Some(sidebar) = self.sidebar() {
                 sidebar.prepare_for_focus(window, cx);
                 sidebar.focus(window, cx);
             }
@@ -1593,7 +1780,7 @@ impl MultiWorkspace {
     fn apply_open_sidebar(&mut self, cx: &mut Context<Self>) {
         self.sidebar_open = true;
         self.retain_active_workspace(cx);
-        let sidebar_focus_handle = self.sidebar.as_ref().map(|s| s.focus_handle(cx));
+        let sidebar_focus_handle = self.sidebar().map(|s| s.focus_handle(cx));
         for workspace in self.workspaces().cloned().collect::<Vec<_>>() {
             workspace.update(cx, |workspace, _cx| {
                 workspace.set_sidebar_focus_handle(sidebar_focus_handle.clone());
@@ -1616,8 +1803,7 @@ impl MultiWorkspace {
             });
         }
         let sidebar_has_focus = self
-            .sidebar
-            .as_ref()
+            .sidebar()
             .is_some_and(|s| s.focus_handle(cx).contains_focused(window, cx));
         if sidebar_has_focus {
             self.restore_previous_focus(true, window, cx);
@@ -2909,7 +3095,7 @@ impl MultiWorkspace {
 
     fn sync_sidebar_to_workspace(&self, workspace: &Entity<Workspace>, cx: &mut Context<Self>) {
         if self.sidebar_open() {
-            let sidebar_focus_handle = self.sidebar.as_ref().map(|s| s.focus_handle(cx));
+            let sidebar_focus_handle = self.sidebar().map(|s| s.focus_handle(cx));
             workspace.update(cx, |workspace, _| {
                 workspace.set_sidebar_focus_handle(sidebar_focus_handle);
             });
@@ -2930,7 +3116,7 @@ impl MultiWorkspace {
                 })
                 .collect::<Vec<_>>(),
             sidebar_open: self.sidebar_open,
-            sidebar_state: self.sidebar.as_ref().and_then(|s| s.serialized_state(cx)),
+            sidebar_state: self.sidebar().and_then(|s| s.serialized_state(cx)),
             active_configuration_id: self
                 .configuration_checkpoint_error
                 .is_none()
@@ -3729,12 +3915,12 @@ impl MultiWorkspace {
 
 impl Render for MultiWorkspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let sidebar_ui_enabled = self.sidebar_ui_enabled(cx);
+        let sidebar_slot_enabled = self.sidebar_slot_enabled(cx);
         let sidebar_side = self.sidebar_side(cx);
         let sidebar_on_right = sidebar_side == SidebarSide::Right;
 
-        let sidebar: Option<AnyElement> = if sidebar_ui_enabled && self.sidebar_open() {
-            self.sidebar.as_ref().map(|sidebar_handle| {
+        let sidebar: Option<AnyElement> = if sidebar_slot_enabled && self.sidebar_open() {
+            self.sidebar().map(|sidebar_handle| {
                 let weak = cx.weak_entity();
 
                 let sidebar_width = sidebar_handle.width(cx);
@@ -3762,7 +3948,7 @@ impl Render for MultiWorkspace {
                         .on_mouse_up(MouseButton::Left, move |event, _, cx| {
                             if event.click_count == 2 {
                                 weak.update(cx, |this, cx| {
-                                    if let Some(sidebar) = this.sidebar.as_mut() {
+                                    if let Some(sidebar) = this.sidebar() {
                                         sidebar.set_width(None, cx);
                                     }
                                     this.serialize(cx);
@@ -3853,7 +4039,11 @@ impl Render for MultiWorkspace {
                         }
                     },
                 ))
-                .when(self.sidebar_ui_enabled(cx), |this| {
+                // Slot actions: opening, closing and focusing the slot belong to
+                // the slot, not to the agent. They are split from the thread
+                // actions below so that a second occupant does not have to
+                // re-derive which of these six were which.
+                .when(self.sidebar_slot_enabled(cx), |this| {
                     this.on_action(cx.listener(
                         |this: &mut Self, _: &ToggleWorkspaceSidebar, window, cx| {
                             this.toggle_sidebar(window, cx);
@@ -3869,21 +4059,28 @@ impl Render for MultiWorkspace {
                             this.focus_sidebar(window, cx);
                         },
                     ))
-                    .on_action(cx.listener(
+                })
+                // Thread actions stay on the agent gate: they drive the threads
+                // sidebar's own contents, and with the agent disabled there are no
+                // threads to switch between whether or not the slot exists.
+                // `MoveProjectToNewWindow` sits here because the sidebar's project
+                // list is where it is reached from.
+                .when(self.sidebar_ui_enabled(cx), |this| {
+                    this.on_action(cx.listener(
                         |this: &mut Self, action: &ToggleThreadSwitcher, window, cx| {
-                            if let Some(sidebar) = &this.sidebar {
+                            if let Some(sidebar) = this.sidebar() {
                                 sidebar.toggle_thread_switcher(action.select_last, window, cx);
                             }
                         },
                     ))
                     .on_action(cx.listener(|this: &mut Self, _: &NextThread, window, cx| {
-                        if let Some(sidebar) = &this.sidebar {
+                        if let Some(sidebar) = this.sidebar() {
                             sidebar.cycle_thread(true, window, cx);
                         }
                     }))
                     .on_action(
                         cx.listener(|this: &mut Self, _: &PreviousThread, window, cx| {
-                            if let Some(sidebar) = &this.sidebar {
+                            if let Some(sidebar) = this.sidebar() {
                                 sidebar.cycle_thread(false, window, cx);
                             }
                         }),
@@ -3899,20 +4096,26 @@ impl Render for MultiWorkspace {
                         ))
                     })
                 })
-                .when(self.sidebar_open() && self.sidebar_ui_enabled(cx), |this| {
-                    this.on_drag_move(cx.listener(
-                        move |this: &mut Self, e: &DragMoveEvent<DraggedSidebar>, window, cx| {
-                            if let Some(sidebar) = &this.sidebar {
-                                let new_width = if sidebar_on_right {
-                                    window.bounds().size.width - e.event.position.x
-                                } else {
-                                    e.event.position.x
-                                };
-                                sidebar.set_width(Some(new_width), cx);
-                            }
-                        },
-                    ))
-                })
+                .when(
+                    self.sidebar_open() && self.sidebar_slot_enabled(cx),
+                    |this| {
+                        this.on_drag_move(cx.listener(
+                            move |this: &mut Self,
+                                  e: &DragMoveEvent<DraggedSidebar>,
+                                  window,
+                                  cx| {
+                                if let Some(sidebar) = this.sidebar() {
+                                    let new_width = if sidebar_on_right {
+                                        window.bounds().size.width - e.event.position.x
+                                    } else {
+                                        e.event.position.x
+                                    };
+                                    sidebar.set_width(Some(new_width), cx);
+                                }
+                            },
+                        ))
+                    },
+                )
                 // `#zed-37`: the tab strip sits above the sidebars and the workspace,
                 // so it spans the window and can extend the titlebar background.
                 .children(workspace_tabs)

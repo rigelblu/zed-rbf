@@ -304,6 +304,11 @@ fn materialized_order(live: &[(String, u32)], order: &[String]) -> Vec<String> {
     };
 
     for item in crate::layout_registry::of_kind(LayoutItemKind::WorkspaceComponent) {
+        // Dock-hosted only. A slot-hosted component has no icon in this strip, so
+        // naming it in the strip's sequence would order something that is not here.
+        if !item.dock_hosted {
+            continue;
+        }
         add(item.id.to_string(), 0, &mut ids);
     }
     for (key, priority) in live {

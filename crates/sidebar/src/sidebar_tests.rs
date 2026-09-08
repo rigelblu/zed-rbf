@@ -232,7 +232,11 @@ fn setup_sidebar_closed(
     let sidebar =
         cx.update(|window, cx| cx.new(|cx| Sidebar::new(multi_workspace.clone(), window, cx)));
     multi_workspace.update(cx, |mw, cx| {
-        mw.register_sidebar(sidebar.clone(), cx);
+        mw.register_sidebar(
+            workspace::layout_registry::ids::THREADS_SIDEBAR,
+            sidebar.clone(),
+            cx,
+        );
     });
     cx.run_until_parked();
     sidebar

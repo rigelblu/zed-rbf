@@ -92,6 +92,9 @@ pub const BOTTOM_DOCK_MIN_HEIGHT: Pixels = px(120.);
 /// indistinguishable from an item whose crate has not loaded.
 pub mod ids {
     pub const AGENT_PANEL: &str = "agent_panel";
+    /// The threads sidebar, which is not a `Panel` and so has no `panel_key()` to
+    /// transcribe — this literal is the id, and `v0.45.1` is where it acquires one.
+    pub const THREADS_SIDEBAR: &str = "threads_sidebar";
     pub const PROJECT_PANEL: &str = "ProjectPanel";
     pub const TERMINAL_PANEL: &str = "TerminalPanel";
     pub const GIT_PANEL: &str = "GitPanel";
@@ -158,6 +161,18 @@ pub struct LayoutItem {
     /// is PascalCase — so they are transcribed from the source, never derived.
     pub id: &'static str,
     pub kind: LayoutItemKind,
+    /// Whether the component's surface is a dock column, so `PanelButtons` draws
+    /// its icon and `component_order` sequences it.
+    ///
+    /// Not every workspace component is dock-hosted: Threads Sidebar occupies the
+    /// window-level sidebar slot, and its bar icon is a zone item ordered by
+    /// `status_bar.item_order` like any other. Putting it in the dock sequence
+    /// would list an id there that draws nothing in that strip.
+    ///
+    /// Meaningless for a status control, which hosts nothing — the same shape as
+    /// `default_pinned` and an empty `valid_positions`. `false` is honest for one
+    /// rather than a placeholder.
+    pub dock_hosted: bool,
     pub label: &'static str,
     /// Absent where the item renders as text and has no icon of its own. For the
     /// items whose live icon varies with state, this is the representative one the
@@ -198,6 +213,7 @@ const ITEMS: &[LayoutItem] = &[
     LayoutItem {
         id: ids::AGENT_PANEL,
         kind: LayoutItemKind::WorkspaceComponent,
+        dock_hosted: true,
         label: "Agent Panel",
         icon: Some(IconName::ZedAssistant),
         aliases: &["assistant", "ai", "chat"],
@@ -211,6 +227,7 @@ const ITEMS: &[LayoutItem] = &[
     LayoutItem {
         id: ids::PROJECT_PANEL,
         kind: LayoutItemKind::WorkspaceComponent,
+        dock_hosted: true,
         label: "Project Panel",
         icon: Some(IconName::FileTree),
         aliases: &["files", "file tree", "explorer", "sidebar"],
@@ -224,6 +241,7 @@ const ITEMS: &[LayoutItem] = &[
     LayoutItem {
         id: ids::TERMINAL_PANEL,
         kind: LayoutItemKind::WorkspaceComponent,
+        dock_hosted: true,
         label: "Terminal Panel",
         icon: Some(IconName::TerminalAlt),
         aliases: &["shell", "console"],
@@ -237,6 +255,7 @@ const ITEMS: &[LayoutItem] = &[
     LayoutItem {
         id: ids::GIT_PANEL,
         kind: LayoutItemKind::WorkspaceComponent,
+        dock_hosted: true,
         label: "Git Panel",
         icon: Some(IconName::GitBranch),
         aliases: &["source control", "version control", "vcs"],
@@ -250,6 +269,7 @@ const ITEMS: &[LayoutItem] = &[
     LayoutItem {
         id: ids::COLLABORATION_PANEL,
         kind: LayoutItemKind::WorkspaceComponent,
+        dock_hosted: true,
         label: "Collaboration Panel",
         icon: Some(IconName::UserGroup),
         aliases: &["collab", "contacts", "channels"],
@@ -263,6 +283,7 @@ const ITEMS: &[LayoutItem] = &[
     LayoutItem {
         id: ids::OUTLINE_PANEL,
         kind: LayoutItemKind::WorkspaceComponent,
+        dock_hosted: true,
         label: "Outline Panel",
         icon: Some(IconName::ListTree),
         aliases: &["symbols", "structure"],
@@ -276,6 +297,7 @@ const ITEMS: &[LayoutItem] = &[
     LayoutItem {
         id: ids::DEBUG_PANEL,
         kind: LayoutItemKind::WorkspaceComponent,
+        dock_hosted: true,
         label: "Debug Panel",
         icon: Some(IconName::Debug),
         aliases: &["debugger", "breakpoints"],
@@ -287,8 +309,30 @@ const ITEMS: &[LayoutItem] = &[
         valid_positions: SIDES_AND_BOTTOM,
     },
     LayoutItem {
+        id: ids::THREADS_SIDEBAR,
+        kind: LayoutItemKind::WorkspaceComponent,
+        dock_hosted: false,
+        label: "Threads Sidebar",
+        icon: Some(IconName::ThreadsSidebarLeftClosed),
+        aliases: &["threads", "agent", "ai", "conversations"],
+        clarification: None,
+        registered_position: LayoutPosition::Left,
+        default_hidden: false,
+        default_pinned: false,
+        // `Panel(8)` rather than a `StatusControl` rank: the variant encodes what
+        // an item *is*, not which render path draws it, and the table's own
+        // ordering law is components before controls. It takes 8 rather than the
+        // gap at 4 — that gap transcribes upstream's activation priorities and
+        // filling it would misreport them. `add_panel` sorts `panel_entries` by
+        // this and never sees this item, which lives in the window-level sidebar
+        // slot; the number is inert there and load-bearing only for the bar.
+        source_rank: SourceRank::Panel(8),
+        valid_positions: SIDES,
+    },
+    LayoutItem {
         id: ids::PROJECT_SEARCH,
         kind: LayoutItemKind::StatusControl,
+        dock_hosted: false,
         label: "Project Search",
         icon: Some(IconName::MagnifyingGlass),
         aliases: &["find", "search"],
@@ -302,6 +346,7 @@ const ITEMS: &[LayoutItem] = &[
     LayoutItem {
         id: ids::LSP_SERVERS,
         kind: LayoutItemKind::StatusControl,
+        dock_hosted: false,
         label: "Language Servers",
         icon: Some(IconName::BoltOutlined),
         aliases: &["lsp", "language server"],
@@ -315,6 +360,7 @@ const ITEMS: &[LayoutItem] = &[
     LayoutItem {
         id: ids::DIAGNOSTICS,
         kind: LayoutItemKind::StatusControl,
+        dock_hosted: false,
         label: "Diagnostics",
         icon: Some(IconName::Warning),
         aliases: &["errors", "warnings", "problems"],
@@ -328,6 +374,7 @@ const ITEMS: &[LayoutItem] = &[
     LayoutItem {
         id: ids::ACTIVE_FILE,
         kind: LayoutItemKind::StatusControl,
+        dock_hosted: false,
         label: "Active File Name",
         icon: None,
         aliases: &["filename", "current file", "breadcrumb"],
@@ -341,6 +388,7 @@ const ITEMS: &[LayoutItem] = &[
     LayoutItem {
         id: ids::GIT_BLAME,
         kind: LayoutItemKind::StatusControl,
+        dock_hosted: false,
         label: "Git Blame",
         icon: None,
         aliases: &["blame", "authorship"],
@@ -354,6 +402,7 @@ const ITEMS: &[LayoutItem] = &[
     LayoutItem {
         id: ids::MERGE_CONFLICTS,
         kind: LayoutItemKind::StatusControl,
+        dock_hosted: false,
         label: "Merge Conflicts",
         icon: Some(IconName::GitMergeConflict),
         aliases: &["conflicts", "merge"],
@@ -367,6 +416,7 @@ const ITEMS: &[LayoutItem] = &[
     LayoutItem {
         id: ids::ACTIVITY,
         kind: LayoutItemKind::StatusControl,
+        dock_hosted: false,
         label: "Activity",
         icon: None,
         aliases: &["progress", "indexing", "downloads"],
@@ -380,6 +430,7 @@ const ITEMS: &[LayoutItem] = &[
     LayoutItem {
         id: ids::EDIT_PREDICTION,
         kind: LayoutItemKind::StatusControl,
+        dock_hosted: false,
         label: "Edit Prediction",
         icon: None,
         aliases: &["copilot", "completion", "inline prediction"],
@@ -393,6 +444,7 @@ const ITEMS: &[LayoutItem] = &[
     LayoutItem {
         id: ids::ACTIVE_ENCODING,
         kind: LayoutItemKind::StatusControl,
+        dock_hosted: false,
         label: "Active Encoding",
         icon: None,
         aliases: &["charset", "utf-8", "encoding"],
@@ -406,6 +458,7 @@ const ITEMS: &[LayoutItem] = &[
     LayoutItem {
         id: ids::ACTIVE_LANGUAGE,
         kind: LayoutItemKind::StatusControl,
+        dock_hosted: false,
         label: "Active Language",
         icon: None,
         aliases: &["syntax", "language mode"],
@@ -419,6 +472,7 @@ const ITEMS: &[LayoutItem] = &[
     LayoutItem {
         id: ids::ACTIVE_TOOLCHAIN,
         kind: LayoutItemKind::StatusControl,
+        dock_hosted: false,
         label: "Active Toolchain",
         icon: None,
         aliases: &["interpreter", "sdk", "virtualenv"],
@@ -432,6 +486,7 @@ const ITEMS: &[LayoutItem] = &[
     LayoutItem {
         id: ids::VIM_MODE,
         kind: LayoutItemKind::StatusControl,
+        dock_hosted: false,
         label: "Vim Mode",
         icon: None,
         aliases: &["vim", "modal"],
@@ -445,6 +500,7 @@ const ITEMS: &[LayoutItem] = &[
     LayoutItem {
         id: ids::CURSOR_POSITION,
         kind: LayoutItemKind::StatusControl,
+        dock_hosted: false,
         label: "Cursor Position",
         icon: None,
         aliases: &["line", "column", "caret"],
@@ -458,6 +514,7 @@ const ITEMS: &[LayoutItem] = &[
     LayoutItem {
         id: ids::IMAGE_INFO,
         kind: LayoutItemKind::StatusControl,
+        dock_hosted: false,
         label: "Image Information",
         icon: None,
         aliases: &["dimensions", "image size"],
@@ -525,7 +582,7 @@ mod tests {
         // The whole reason this table is static: the layout surface has to render
         // a complete list before any panel has registered, or a hidden component
         // could never be recovered.
-        assert_eq!(all().len(), 21);
+        assert_eq!(all().len(), 22);
         for item in all() {
             assert!(!item.id.is_empty(), "{} has no id", item.label);
             assert!(!item.label.is_empty(), "{} has no label", item.id);
@@ -549,6 +606,30 @@ mod tests {
 
         let ranks: HashSet<_> = all().iter().map(|item| item.source_rank).collect();
         assert_eq!(ranks.len(), all().len(), "duplicate source rank");
+    }
+
+    #[test]
+    fn only_workspace_components_are_dock_hosted_and_the_slot_occupant_is_not() {
+        // The sequence at `materialized_order` orders dock icons. An id in it that
+        // `PanelButtons` never draws is the shape this feature has been bitten by
+        // more than once — a sequence and a strip disagreeing about what exists.
+        for item in all() {
+            if item.kind == LayoutItemKind::StatusControl {
+                assert!(!item.dock_hosted, "{} hosts nothing", item.id);
+            }
+        }
+        assert!(
+            !get(ids::THREADS_SIDEBAR)
+                .expect("threads sidebar has a row")
+                .dock_hosted,
+            "the sidebar-slot occupant claimed a dock column"
+        );
+        assert!(
+            get(ids::GIT_PANEL)
+                .expect("git panel has a row")
+                .dock_hosted,
+            "a dock panel stopped claiming its dock"
+        );
     }
 
     #[test]
@@ -644,6 +725,7 @@ mod tests {
             ids::COLLABORATION_PANEL,
             ids::OUTLINE_PANEL,
             ids::DEBUG_PANEL,
+            ids::THREADS_SIDEBAR,
             ids::PROJECT_SEARCH,
             ids::LSP_SERVERS,
             ids::DIAGNOSTICS,
