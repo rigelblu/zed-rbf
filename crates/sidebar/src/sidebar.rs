@@ -3913,7 +3913,12 @@ impl Sidebar {
                 .read(cx)
                 .ok()
                 .and_then(|multi_workspace| {
-                    multi_workspace.sidebar(cx).map(|sidebar| sidebar.to_any())
+                    // This id, not the showing occupant: the downcast below is to
+                    // `Self`, and it fails silently when the strip holds the slot —
+                    // leaving the target window's threads sidebar never told.
+                    multi_workspace
+                        .sidebar_with_id(workspace::layout_registry::ids::THREADS_SIDEBAR)
+                        .map(|sidebar| sidebar.to_any())
                 })
                 .and_then(|sidebar| sidebar.downcast::<Self>().ok())
             {
@@ -7318,7 +7323,14 @@ impl Sidebar {
     }
 
     fn render_sidebar_toggle_button(&self, _cx: &mut Context<Self>) -> impl IntoElement {
-        let on_right = AgentSettings::get_global(_cx).sidebar_side() == SidebarSide::Right;
+        // Through the resolver, the same way `Sidebar::side` answers. Reading the raw
+        // legacy key here made the header's glyph and menu anchor disagree with the
+        // panel's own side the moment a `component_positions` entry existed — the
+        // panel-and-icon divergence, in the one place still asking the old question.
+        let on_right = workspace::resolved_threads_sidebar_side(
+            _cx,
+            AgentSettings::get_global(_cx).sidebar_side(),
+        ) == SidebarSide::Right;
 
         sidebar_side_context_menu("sidebar-toggle-menu", _cx)
             .anchor(if on_right {

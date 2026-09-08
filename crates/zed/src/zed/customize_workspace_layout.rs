@@ -160,28 +160,40 @@ fn row_state(item: &LayoutItem, workspace: &Workspace, window: &Window, cx: &App
             let hidden = workspace::WorkspaceLayoutSettings::get_global(cx)
                 .component(item.id)
                 .hidden;
+            // A component without a live dock adapter still has a row here, and until
+            // 2026-09-08 it got neither a tick nor the unsupported message: both were
+            // derived from the adapter, and `component_adapter` searches the docks. The
+            // sidebar slot's two occupants are not dock panels and never have one, so
+            // both rows sat blank while Q11 says they list here.
+            //
+            // Without an adapter the settings entry and the registry answer the same two
+            // questions: which position is in use, and whether the saved one is usable.
+            let saved = workspace::WorkspaceLayoutSettings::get_global(cx)
+                .component(item.id)
+                .position
+                .map(DockPosition::from);
+            let accepts = |position: DockPosition| match adapter.as_ref() {
+                Some(adapter) => adapter.accepts(position, cx),
+                None => item.valid_positions.contains(&layout_position(position)),
+            };
+            let in_use = match adapter.as_ref() {
+                Some(adapter) => adapter.position(window, cx),
+                None => saved
+                    .filter(|position| accepts(*position))
+                    .or_else(|| dock_position(item.registered_position))
+                    .unwrap_or(DockPosition::Left),
+            };
             let current = if hidden {
                 choices
                     .iter()
                     .position(|choice| *choice == Placement::Hidden)
             } else {
-                adapter.as_ref().and_then(|adapter| {
-                    let position = layout_position(adapter.position(window, cx));
-                    choices
-                        .iter()
-                        .position(|choice| *choice == Placement::Zone(position))
-                })
+                let position = layout_position(in_use);
+                choices
+                    .iter()
+                    .position(|choice| *choice == Placement::Zone(position))
             };
-            let unsupported = adapter.as_ref().and_then(|adapter| {
-                unsupported_saved_position(
-                    workspace::WorkspaceLayoutSettings::get_global(cx)
-                        .component(item.id)
-                        .position
-                        .map(DockPosition::from),
-                    |position| adapter.accepts(position, cx),
-                    adapter.position(window, cx),
-                )
-            });
+            let unsupported = unsupported_saved_position(saved, accepts, in_use);
             RowState {
                 choices,
                 current,

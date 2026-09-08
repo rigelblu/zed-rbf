@@ -10116,6 +10116,7 @@ impl Render for Workspace {
                     .child(
                         div()
                             .id("workspace")
+                            .debug_selector(|| "WORKSPACE-CONTENT".to_string())
                             .bg(colors.background)
                             .relative()
                             .flex_1()
@@ -10902,8 +10903,8 @@ pub async fn apply_restored_multiworkspace_state(
     // whether the strip is owed it.
     if let Some(id) = active_sidebar_id {
         window_handle
-            .update(cx, |multi_workspace, _, _cx| {
-                multi_workspace.restore_active_sidebar_id(id.clone());
+            .update(cx, |multi_workspace, _, cx| {
+                multi_workspace.restore_active_sidebar_id(id.clone(), cx);
             })
             .ok();
     }

@@ -118,6 +118,10 @@ The configured order is the display order. `~` and `$VAR` expand. Missing paths 
 - Restores open workspace tabs, layout, and edit states stably across app restarts
 - Grouped tab management and close controls directly on the tab strip
 - Save the current vertical-tab workspace set as a named configuration, then switch the same window between saved sets while restoring each workspace's latest editor and pane state
+- The tab strip lives in the same window-level slot as the threads sidebar, with a bottom-bar icon each. Click one to load it, click it again to close the slot, click the other to swap. The two icons sit together at one end of the bar, separated from the rest
+- Both work with AI turned off: the slot holds the strip alone, and the threads icon does not render
+- The slot's width is drag-resizable and remembered per occupant; double-click the edge to reset. The strip never had this as a fixed 168px rail
+- A restart brings back whichever of the two you left showing, on the side you left it
 
 ## 🟠⋯ Workspace Layout
 - Place any status control or workspace component where you want it from the item's own right-click menu — a component's position moves the actual component and its bottom-bar icon together, not the icon alone
@@ -128,6 +132,8 @@ The configured order is the display order. `~` and `$VAR` expand. Missing paths 
 - Drag the divider between any two components on a side, or the side's outer edge to resize the whole side. Every axis carries a floor, so no side, segment, or the editor itself can be dragged down to a sliver you cannot grab back
 
 Placement lives in `workspace_layout.component_positions` and `status_bar.item_locations`; order lives in `workspace_layout.component_order` and `status_bar.item_order`. All four are plain lists you can hand-edit.
+
+`workspaces` and `threads_sidebar` are the exception to two of these rules: they share one slot, so they share one side and move together, and their icons are pinned to the end of their zone rather than dragged into place.
 
 ## 🟠⋯ File Tags
 - Mark important files with lightweight Zed-local color tags from the Project Panel file-row workflow, visible as markers on file rows

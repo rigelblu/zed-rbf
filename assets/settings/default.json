@@ -1848,6 +1848,13 @@
   "workspace_layout": {
     // Where each workspace component lives, whether it is hidden everywhere,
     // and whether it keeps its own column, keyed by the component's stable id.
+    //
+    // "workspaces" (the workspace tab strip) and "threads_sidebar" share one
+    // window-level slot and show one at a time, so they share one side: setting
+    // either one's position moves both, and both bottom-bar icons move with it.
+    // Neither is pinnable — the slot has one column. Setting "agent.sidebar_side"
+    // still works for an existing profile, and is read once to seed these entries;
+    // after that it is ignored.
     "component_positions": {},
     // The order component icons take in the bottom bar, and so the order their
     // columns take on a side, by stable id. Ids named here come first in this

@@ -1592,7 +1592,11 @@ async fn test_workspace_tabs_extend_title_bar_background(cx: &mut TestAppContext
             .debug_bounds("WORKSPACE-TAB-TITLE-BAR-FILL")
             .expect("workspace tab strip should extend the titlebar background");
         assert_eq!(fill_bounds.origin.y, gpui::px(0.));
-        assert_eq!(fill_bounds.size.height, expected_height);
+        // The title bar's height plus the 1px `colors.border` line the `#workspace` div
+        // draws under it with `border_t_1`. The band carries that line too, or the
+        // strip's content sits a pixel higher than the editor's — which it did until
+        // 2026-09-08, when Tom spotted it on a binary.
+        assert_eq!(fill_bounds.size.height, expected_height + gpui::px(1.));
 
         let heading_bounds = cx
             .debug_bounds("WORKSPACE-TABS-HEADING")
@@ -2332,8 +2336,10 @@ async fn workspace_configuration_ui_keeps_blocked_store_recovery_reachable(
 /// `sidebar_side` used to resolve the threads sidebar's entry no matter who was in
 /// the slot. With Workspaces showing and placed on the right, the bar icon moved and
 /// the panel did not — the panel-and-icon-disagree defect this feature has now
-/// produced three times. `Flow 6` step 4b: each item owns its own side and the two
-/// may differ.
+/// produced three times. `Flow 6` step 4b said each item owns its own side; **that was
+/// superseded on 2026-09-08** — the slot has one side and the pair moves together. The
+/// resolver still has to answer per occupant, because the two entries can disagree in a
+/// hand-edited settings file, which is the state this builds.
 ///
 /// Restoring the hardcoded `threads_sidebar_entry` lookup fails the second assertion.
 #[gpui::test]
@@ -2373,7 +2379,9 @@ async fn test_the_slot_follows_the_side_of_the_occupant_it_shows(cx: &mut TestAp
     });
 
     // The two items disagree: Workspaces on the right, threads on the left. This is the
-    // state the bug needed and the one `Flow 6` step 4b specifies. With only the
+    // state the bug needed. `Flow 6` step 4b specified it until 2026-09-08; it is now
+    // reachable only by hand-editing settings, which is why the resolver still has to
+    // answer per occupant. With only the
     // Workspaces entry set, the old hardcoded lookup fell through to the occupant's own
     // side and returned the right answer by luck — a test written that way passed
     // against the defect.
@@ -2684,6 +2692,662 @@ async fn test_swapping_occupants_moves_the_focus_handle(cx: &mut TestAppContext)
     });
 }
 
+/// An occupant that records what the restore hands it, so the keying can be checked.
+///
+/// `SecondOccupant` defaults `restore_serialized_state` away, which is why the restore
+/// path had no witness at all — every fixture set `sidebar_states: Default::default()`.
+struct RecordingOccupant {
+    focus_handle: FocusHandle,
+    restored: std::rc::Rc<std::cell::RefCell<Option<String>>>,
+}
+
+impl Focusable for RecordingOccupant {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl EventEmitter<crate::multi_workspace::SidebarEvent> for RecordingOccupant {}
+
+impl Render for RecordingOccupant {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
+impl crate::multi_workspace::Sidebar for RecordingOccupant {
+    fn width(&self, _cx: &App) -> Pixels {
+        px(200.)
+    }
+    fn set_width(&mut self, _width: Option<Pixels>, _cx: &mut Context<Self>) {}
+    fn has_notifications(&self, _cx: &App) -> bool {
+        false
+    }
+    fn side(&self, _cx: &App) -> SidebarSide {
+        SidebarSide::Left
+    }
+    fn restore_serialized_state(
+        &mut self,
+        state: &str,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        *self.restored.borrow_mut() = Some(state.to_string());
+    }
+}
+
+fn recording_occupants(
+    window: gpui::WindowHandle<MultiWorkspace>,
+    cx: &mut TestAppContext,
+) -> (
+    std::rc::Rc<std::cell::RefCell<Option<String>>>,
+    std::rc::Rc<std::cell::RefCell<Option<String>>>,
+) {
+    let strip_state = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let threads_state = std::rc::Rc::new(std::cell::RefCell::new(None));
+    window
+        .update(cx, |multi_workspace, _window, cx| {
+            let strip = cx.new(|cx| RecordingOccupant {
+                focus_handle: cx.focus_handle(),
+                restored: strip_state.clone(),
+            });
+            let threads = cx.new(|cx| RecordingOccupant {
+                focus_handle: cx.focus_handle(),
+                restored: threads_state.clone(),
+            });
+            multi_workspace.register_sidebar(crate::layout_registry::ids::WORKSPACES, strip, cx);
+            multi_workspace.register_sidebar(
+                crate::layout_registry::ids::THREADS_SIDEBAR,
+                threads,
+                cx,
+            );
+        })
+        .unwrap();
+    cx.run_until_parked();
+    (strip_state, threads_state)
+}
+
+/// Each occupant is restored its own blob, and the legacy one goes to the agent.
+///
+/// **Cold read 2026-09-08, C3.** The keyed-state restore and the one-way
+/// `sidebar_state` -> `threads_sidebar` migration had no witness: every fixture set
+/// `sidebar_states: Default::default()`, so the whole branch was unexecuted. `v0.45.1`'s
+/// reason for keying the state at all is that two occupants' widths are not
+/// interchangeable, and nothing checked that the right blob reached the right one.
+///
+/// Swapping the two ids in the restore loop fails this.
+#[gpui::test]
+async fn test_the_restore_hands_each_occupant_its_own_state(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let app_state = cx.update(AppState::test);
+    let fs = app_state.fs.as_fake();
+    fs.insert_tree(path!("/project_a"), json!({ "file.txt": "" }))
+        .await;
+    let project = Project::test(app_state.fs.clone(), [path!("/project_a").as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    cx.run_until_parked();
+    let (strip_state, threads_state) = recording_occupants(window, cx);
+
+    let mut sidebar_states = std::collections::BTreeMap::new();
+    sidebar_states.insert(
+        crate::layout_registry::ids::WORKSPACES.to_string(),
+        "the strip's own".to_string(),
+    );
+    sidebar_states.insert(
+        crate::layout_registry::ids::THREADS_SIDEBAR.to_string(),
+        "the agent's own".to_string(),
+    );
+    let state = crate::persistence::model::MultiWorkspaceState {
+        active_workspace_id: None,
+        project_groups: Vec::new(),
+        sidebar_open: true,
+        sidebar_state: None,
+        sidebar_states,
+        active_sidebar_id: None,
+        active_configuration_id: None,
+    };
+    let fs = app_state.fs.clone();
+    cx.update(|cx| {
+        cx.spawn(async move |mut cx| {
+            apply_restored_multiworkspace_state(window, &state, fs, &mut cx).await;
+        })
+    })
+    .await;
+    cx.run_until_parked();
+
+    assert_eq!(
+        strip_state.borrow().as_deref(),
+        Some("the strip's own"),
+        "each occupant is handed the blob stored under its own id",
+    );
+    assert_eq!(
+        threads_state.borrow().as_deref(),
+        Some("the agent's own"),
+        "and not the other's — which is the whole reason the state is keyed",
+    );
+}
+
+/// A window saved before the slot could hold two hands its blob to the agent.
+///
+/// The other half of C3: the legacy unkeyed `sidebar_state` belonged to the threads
+/// sidebar, because nothing else could have written it, and this is the only place that
+/// reads it. Deleting the legacy insert fails this.
+#[gpui::test]
+async fn test_the_legacy_sidebar_blob_restores_to_the_agent(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let app_state = cx.update(AppState::test);
+    let fs = app_state.fs.as_fake();
+    fs.insert_tree(path!("/project_a"), json!({ "file.txt": "" }))
+        .await;
+    let project = Project::test(app_state.fs.clone(), [path!("/project_a").as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    cx.run_until_parked();
+    let (strip_state, threads_state) = recording_occupants(window, cx);
+
+    let state = crate::persistence::model::MultiWorkspaceState {
+        active_workspace_id: None,
+        project_groups: Vec::new(),
+        sidebar_open: true,
+        sidebar_state: Some("the one blob the old slot kept".to_string()),
+        sidebar_states: Default::default(),
+        active_sidebar_id: None,
+        active_configuration_id: None,
+    };
+    let fs = app_state.fs.clone();
+    cx.update(|cx| {
+        cx.spawn(async move |mut cx| {
+            apply_restored_multiworkspace_state(window, &state, fs, &mut cx).await;
+        })
+    })
+    .await;
+    cx.run_until_parked();
+
+    assert_eq!(
+        threads_state.borrow().as_deref(),
+        Some("the one blob the old slot kept"),
+        "the legacy blob belonged to the agent, so that is where it lands",
+    );
+    assert_eq!(
+        strip_state.borrow().as_deref(),
+        None,
+        "and the strip is handed nothing — it never wrote that key",
+    );
+}
+
+/// A restart points pane navigation at the occupant it restored.
+///
+/// **Cold read 2026-09-08, R5 — R6's shape on the launch path.** `activate_sidebar`
+/// syncs the focus handle, but the restore path does not go through it:
+/// `restore_active_sidebar_id` and the pending claim in `register_sidebar` set the
+/// showing occupant directly. `restore_open_sidebar` runs before both and syncs against
+/// whichever occupant was active then — the first registered, not the restored one — so
+/// after a restart with Threads showing, `activate_pane_in_direction` steered into the
+/// strip's unrendered handle.
+///
+/// Covers the **pending** path: the id arrives before its occupant registers.
+///
+/// **Not the order the app uses** — this doc claimed it was until the second cold read
+/// checked. `zed.rs` registers both occupants inside a `cx.defer` at window init, while
+/// `apply_restored_multiworkspace_state` runs after an `.await`, so in the app the id
+/// arrives *last* and `restore_active_sidebar_id` takes its other branch.
+/// `test_a_restart_points_navigation_at_the_restored_occupant_when_it_is_registered`
+/// covers that one. Both branches sync; each test kills only its own call.
+///
+/// Deleting the pending claim's `sync_sidebar_focus_handles` fails this.
+#[gpui::test]
+async fn test_a_restart_points_navigation_at_the_restored_occupant(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    fs.insert_tree("/root_b", json!({ "file.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs.clone(), ["/root_b".as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b, window, cx);
+    });
+    cx.run_until_parked();
+
+    let strip = cx.new_window_entity(|window, cx| {
+        crate::workspace_tabs::WorkspacesSidebar::new(multi_workspace.clone(), window, cx)
+    });
+    let threads = cx.new(|cx| SecondOccupant {
+        focus_handle: cx.focus_handle(),
+    });
+    let threads_handle =
+        threads.read_with(cx, |threads, cx| gpui::Focusable::focus_handle(threads, cx));
+
+    // The launch order: the slot is restored open, the id arrives, then the occupants
+    // register — the strip first, so first-registered and restored disagree.
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.restore_open_sidebar(cx);
+        multi_workspace.restore_active_sidebar_id(
+            crate::layout_registry::ids::THREADS_SIDEBAR.to_string(),
+            cx,
+        );
+        multi_workspace.register_sidebar(crate::layout_registry::ids::WORKSPACES, strip, cx);
+        multi_workspace.register_sidebar(crate::layout_registry::ids::THREADS_SIDEBAR, threads, cx);
+    });
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(
+            multi_workspace.resolved_active_sidebar_id(cx),
+            Some(crate::layout_registry::ids::THREADS_SIDEBAR),
+            "precondition: the restored occupant is showing, not the first registered",
+        );
+        assert_eq!(
+            multi_workspace.test_sidebar_focus_handle(cx),
+            Some(threads_handle.clone()),
+            "and pane navigation steers at it rather than the occupant that is hidden",
+        );
+    });
+}
+
+/// Each icon's notification dot comes from its own occupant.
+///
+/// **Cold read 2026-09-08, R1 — a defect the earlier fixes introduced.** `sidebar()`
+/// changed meaning from "the threads sidebar" to "the showing occupant", and the rename
+/// went through nineteen call sites mechanically. `sidebar_has_notifications` was one of
+/// two that meant threads: with the strip showing — the default for every upgrading
+/// user, because the strip migration makes it the stored choice — the dot was answered
+/// by `WorkspacesSidebar::has_notifications`, hardcoded `false`.
+///
+/// The state the defect needs is the strip showing while the *other* occupant has
+/// notifications. Asking with threads showing passes against the bug.
+///
+/// Pointing `sidebar_has_notifications_for` at `sidebar()` instead of `sidebar_with_id`
+/// fails this.
+#[gpui::test]
+async fn test_each_icons_dot_comes_from_its_own_occupant(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    fs.insert_tree("/root_b", json!({ "file.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs.clone(), ["/root_b".as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b, window, cx);
+    });
+    cx.run_until_parked();
+
+    let strip = cx.new_window_entity(|window, cx| {
+        crate::workspace_tabs::WorkspacesSidebar::new(multi_workspace.clone(), window, cx)
+    });
+    let threads = cx.new(|cx| NotifyingOccupant {
+        focus_handle: cx.focus_handle(),
+    });
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.register_sidebar(crate::layout_registry::ids::WORKSPACES, strip, cx);
+        multi_workspace.register_sidebar(crate::layout_registry::ids::THREADS_SIDEBAR, threads, cx);
+    });
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(
+            multi_workspace.resolved_active_sidebar_id(cx),
+            Some(crate::layout_registry::ids::WORKSPACES),
+            "precondition: the strip holds the slot, which is the upgrading user's state",
+        );
+        assert!(
+            multi_workspace
+                .sidebar_has_notifications_for(crate::layout_registry::ids::THREADS_SIDEBAR, cx),
+            "the agent's dot is its own, and does not depend on the agent being on screen",
+        );
+        assert!(
+            !multi_workspace
+                .sidebar_has_notifications_for(crate::layout_registry::ids::WORKSPACES, cx),
+            "and the strip's icon does not borrow it",
+        );
+    });
+}
+
+/// An occupant that always reports notifications, so the dot can be traced to a source.
+struct NotifyingOccupant {
+    focus_handle: FocusHandle,
+}
+
+impl Focusable for NotifyingOccupant {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl EventEmitter<crate::multi_workspace::SidebarEvent> for NotifyingOccupant {}
+
+impl Render for NotifyingOccupant {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
+impl crate::multi_workspace::Sidebar for NotifyingOccupant {
+    fn width(&self, _cx: &App) -> Pixels {
+        px(200.)
+    }
+    fn set_width(&mut self, _width: Option<Pixels>, _cx: &mut Context<Self>) {}
+    fn has_notifications(&self, _cx: &App) -> bool {
+        true
+    }
+    fn side(&self, _cx: &App) -> SidebarSide {
+        SidebarSide::Left
+    }
+}
+
+/// The same, on the branch the app actually takes: occupants first, then the id.
+///
+/// **Cold read 2026-09-08, C2.** `zed.rs` registers both occupants in a `cx.defer` at
+/// window init; `apply_restored_multiworkspace_state` runs after an `.await`. So the id
+/// arrives *after* registration and `restore_active_sidebar_id` takes its non-pending
+/// branch — the branch the sibling test's doc wrongly claimed to cover, and whose sync
+/// call could be deleted without any test noticing.
+///
+/// Deleting the `sync_sidebar_focus_handles` call in `restore_active_sidebar_id` fails
+/// this.
+#[gpui::test]
+async fn test_a_restart_points_navigation_at_the_restored_occupant_when_it_is_registered(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    fs.insert_tree("/root_b", json!({ "file.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs.clone(), ["/root_b".as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b, window, cx);
+    });
+    cx.run_until_parked();
+
+    let strip = cx.new_window_entity(|window, cx| {
+        crate::workspace_tabs::WorkspacesSidebar::new(multi_workspace.clone(), window, cx)
+    });
+    let threads = cx.new(|cx| SecondOccupant {
+        focus_handle: cx.focus_handle(),
+    });
+    let threads_handle =
+        threads.read_with(cx, |threads, cx| gpui::Focusable::focus_handle(threads, cx));
+
+    // The app's order: both occupants register, the slot is restored open, and only
+    // then does the restored id arrive.
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.register_sidebar(crate::layout_registry::ids::WORKSPACES, strip, cx);
+        multi_workspace.register_sidebar(crate::layout_registry::ids::THREADS_SIDEBAR, threads, cx);
+        multi_workspace.restore_open_sidebar(cx);
+        multi_workspace.restore_active_sidebar_id(
+            crate::layout_registry::ids::THREADS_SIDEBAR.to_string(),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(
+            multi_workspace.resolved_active_sidebar_id(cx),
+            Some(crate::layout_registry::ids::THREADS_SIDEBAR),
+            "precondition: the restored occupant is showing",
+        );
+        assert_eq!(
+            multi_workspace.test_sidebar_focus_handle(cx),
+            Some(threads_handle.clone()),
+            "and navigation steers at it, on the branch the app actually reaches",
+        );
+    });
+}
+
+/// Turning the agent off swaps the slot, and navigation follows.
+///
+/// **Cold read 2026-09-08, C3 — the stale focus handle a third time.** The first was a
+/// swap by gesture, the second a restore at launch. This one needs neither: the slot
+/// resolves its occupant on read, so a settings change swaps what is drawn while
+/// nothing calls `sync_sidebar_focus_handles`, and `activate_pane_in_direction` keeps
+/// steering into the occupant that just went off screen.
+///
+/// The state the defect needs is the *agent's* occupant showing when the agent is
+/// turned off — starting from the strip proves nothing, because nothing changes.
+///
+/// Deleting the resync in the settings observer fails this.
+#[gpui::test]
+async fn test_turning_the_agent_off_moves_navigation_to_the_strip(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    fs.insert_tree("/root_b", json!({ "file.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs.clone(), ["/root_b".as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b, window, cx);
+    });
+    cx.run_until_parked();
+
+    let strip = cx.new_window_entity(|window, cx| {
+        crate::workspace_tabs::WorkspacesSidebar::new(multi_workspace.clone(), window, cx)
+    });
+    let threads = cx.new(|cx| SecondOccupant {
+        focus_handle: cx.focus_handle(),
+    });
+    let strip_handle = strip.read_with(cx, |strip, cx| gpui::Focusable::focus_handle(strip, cx));
+    let threads_handle =
+        threads.read_with(cx, |threads, cx| gpui::Focusable::focus_handle(threads, cx));
+
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.register_sidebar(crate::layout_registry::ids::WORKSPACES, strip, cx);
+        multi_workspace.register_sidebar(crate::layout_registry::ids::THREADS_SIDEBAR, threads, cx);
+    });
+    cx.run_until_parked();
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.toggle_sidebar_occupant(
+            crate::layout_registry::ids::THREADS_SIDEBAR,
+            window,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(
+            multi_workspace.test_sidebar_focus_handle(cx),
+            Some(threads_handle.clone()),
+            "precondition: the agent's occupant is showing and navigation points at it",
+        );
+    });
+
+    // No gesture — a settings change alone swaps what the slot draws.
+    cx.update(|_window, cx| {
+        DisableAiSettings::override_global(DisableAiSettings { disable_ai: true }, cx);
+    });
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(
+            multi_workspace.resolved_active_sidebar_id(cx),
+            Some(crate::layout_registry::ids::WORKSPACES),
+            "the slot falls to the strip, since the agent's occupant has nothing to show",
+        );
+        assert_eq!(
+            multi_workspace.test_sidebar_focus_handle(cx),
+            Some(strip_handle.clone()),
+            "and navigation follows it there rather than steering into the hidden one",
+        );
+    });
+}
+
+/// Hiding an occupant takes it out of the slot, not just off the bar.
+///
+/// **Cold read 2026-09-08, R3.** `sidebar_available` never read `hidden`, while
+/// `resolved_component_zone` did — so hiding Workspaces or Threads from `Customize
+/// Workspace Layout` removed the icon and left the slot showing the occupant, with
+/// `ToggleWorkspaceSidebar` still reopening it. Q5 and the 2026-08-31 Decision both say
+/// Hidden removes the component *and* its icon everywhere.
+///
+/// The state the defect needs is an occupant that would otherwise be available — two
+/// workspaces, so the strip has rows — or hiding proves nothing.
+///
+/// Deleting the `hidden` guard in `sidebar_available` fails this.
+#[gpui::test]
+async fn test_hiding_an_occupant_removes_it_from_the_slot(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    fs.insert_tree("/root_b", json!({ "file.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs.clone(), ["/root_b".as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b, window, cx);
+    });
+    cx.run_until_parked();
+
+    let strip = cx.new_window_entity(|window, cx| {
+        crate::workspace_tabs::WorkspacesSidebar::new(multi_workspace.clone(), window, cx)
+    });
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.register_sidebar(crate::layout_registry::ids::WORKSPACES, strip, cx);
+    });
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert!(
+            multi_workspace.sidebar_available(crate::layout_registry::ids::WORKSPACES, cx),
+            "precondition: two workspaces, so the strip has rows and would otherwise show",
+        );
+    });
+
+    cx.update(|_window, cx| {
+        let mut layout =
+            <crate::WorkspaceLayoutSettings as settings::Settings>::get_global(cx).clone();
+        layout.component_positions.insert(
+            crate::layout_registry::ids::WORKSPACES.to_string(),
+            crate::workspace_settings::WorkspaceComponentPosition {
+                position: None,
+                hidden: true,
+                pinned: false,
+            },
+        );
+        <crate::WorkspaceLayoutSettings as settings::Settings>::override_global(layout, cx);
+    });
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert!(
+            !multi_workspace.sidebar_available(crate::layout_registry::ids::WORKSPACES, cx),
+            "hidden takes the occupant out of the slot, not only off the bar",
+        );
+        assert_ne!(
+            multi_workspace.resolved_active_sidebar_id(cx),
+            Some(crate::layout_registry::ids::WORKSPACES),
+            "and the slot stops electing it",
+        );
+    });
+
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.toggle_sidebar_occupant(
+            crate::layout_registry::ids::WORKSPACES,
+            window,
+            cx,
+        );
+        assert!(
+            !multi_workspace.sidebar_open(),
+            "and the toggle no longer reopens it",
+        );
+    });
+}
+
+/// The legacy seed does not stop the strip migration from running.
+///
+/// **Cold read 2026-09-08, R2 — two fixes colliding.** The strip migration's "already
+/// ran" marker is the *existence* of a `workspaces` entry. The seed's earlier fix wrote
+/// that entry to keep the pair together, so a legacy-Right profile had its marker set by
+/// a migration it never ran: the strip vanished on upgrade and never came back.
+///
+/// The pair is shared on read now (`side_entry`), so the seed writes one entry and the
+/// marker means what it meant — the user has placed this component themselves.
+///
+/// **Runs both migrations in app order**, which is the gap the two existing witnesses
+/// left: each ran one alone.
+///
+/// Making the seed write every occupant again fails this.
+#[gpui::test]
+async fn test_the_legacy_seed_leaves_the_strip_migration_able_to_run(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    fs.insert_tree("/root_b", json!({ "file.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs.clone(), ["/root_b".as_ref()], cx).await;
+    cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b, window, cx);
+    });
+    cx.run_until_parked();
+
+    // The legacy profile: `agent.sidebar_side: "right"`, no placement entries.
+    cx.update(|_window, cx| {
+        let mut agent = agent_settings::AgentSettings::get_global(cx).clone();
+        agent.sidebar_side = settings::SidebarDockPosition::Right;
+        agent_settings::AgentSettings::override_global(agent, cx);
+    });
+    cx.run_until_parked();
+
+    let occupant = cx.new_window_entity(|window, cx| {
+        crate::workspace_tabs::WorkspacesSidebar::new(multi_workspace.clone(), window, cx)
+    });
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.register_sidebar(crate::layout_registry::ids::WORKSPACES, occupant, cx);
+    });
+    cx.run_until_parked();
+
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        assert!(
+            multi_workspace.migrate_threads_sidebar_side_once(cx),
+            "precondition: the legacy seed runs for a Right profile with no entry",
+        );
+    });
+    cx.run_until_parked();
+
+    cx.update(|_window, cx| {
+        let layout = <crate::WorkspaceLayoutSettings as settings::Settings>::get_global(cx);
+        assert!(
+            !layout.has_component(crate::layout_registry::ids::WORKSPACES),
+            "the seed writes one entry, so the strip migration's marker is still unset",
+        );
+        assert_eq!(
+            layout
+                .side_entry(crate::layout_registry::ids::WORKSPACES)
+                .and_then(|entry| entry.position),
+            Some(settings::DockPosition::Right),
+            "and the strip still shares the side, by reading its sibling rather than a \
+             line of its own",
+        );
+    });
+
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        assert!(
+            multi_workspace.migrate_strip_into_the_slot_once(cx),
+            "so the strip migration still runs — a legacy user keeps their strip",
+        );
+        assert!(multi_workspace.sidebar_open());
+    });
+}
+
 /// A legacy `agent.sidebar_side: "right"` stops splitting the panel from its icon.
 ///
 /// The panel reads the legacy key when there is no entry; the icon falls back to the
@@ -2745,6 +3409,15 @@ async fn test_a_legacy_right_sidebar_side_seeds_its_own_entry(cx: &mut TestAppCo
             layout.resolved_component_zone(crate::layout_registry::ids::THREADS_SIDEBAR),
             Some(settings::StatusBarItemLocation::Right),
             "the icon now reads the entry and lands beside its panel",
+        );
+        // The whole pair, not just the agent's occupant. The slot has one side and the
+        // two move together (2026-09-08); this migration predates that rule, and seeding
+        // the threads entry alone would land a legacy user with the two icons split
+        // across the bar.
+        assert_eq!(
+            layout.resolved_component_zone(crate::layout_registry::ids::WORKSPACES),
+            Some(settings::StatusBarItemLocation::Right),
+            "and the strip goes with it, because the pair shares one side",
         );
         assert_eq!(
             crate::multi_workspace::resolved_threads_sidebar_side(cx, SidebarSide::Left),
@@ -2938,6 +3611,229 @@ async fn test_swapping_an_already_open_slot_persists_which_occupant_shows(cx: &m
     });
 }
 
+/// The strip's chrome meets the workspace's chrome, measured in one frame.
+///
+/// **The check that was missing while four builds went by.** Every other test here
+/// compares the strip's bands to a *number*; this compares them to the chrome actually
+/// drawn beside them. The band and the bars are rendered by different entities, so
+/// nothing put them in the same frame, and every defect had to be found by eye:
+///
+/// - the foot band 3.25px short, from a wrong `status_bar_height` derivation
+/// - the seam gone, because `sidebar-container` drew no border and the strip's comment
+///   claimed the slot owned one
+/// - a pixel added at the foot that belongs only at the top
+///
+/// All three are failures of *this* assertion, and none of them could fail any other.
+#[gpui::test]
+async fn test_the_strips_chrome_meets_the_workspaces_chrome(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    fs.insert_tree("/root_b", json!({ "file.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs.clone(), ["/root_b".as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b, window, cx);
+    });
+    cx.run_until_parked();
+    show_workspace_strip(&multi_workspace, cx);
+    cx.run_until_parked();
+
+    let mut bounds = |name: &'static str| {
+        cx.debug_bounds(name)
+            .unwrap_or_else(|| panic!("{name} should render in the same frame as the rest"))
+    };
+    let status_bar = bounds("STATUS-BAR");
+    let content = bounds("WORKSPACE-CONTENT");
+    let foot = bounds("WORKSPACE-TAB-STATUS-BAR-FILL");
+    let strip = bounds("WORKSPACE-TAB-STRIP");
+
+    // The reason the bands exist: the slot runs the window's full height while the
+    // workspace's chrome stops at the slot's edge, so the grey breaks unless the
+    // occupant paints its own.
+    assert!(
+        strip.origin.y + strip.size.height > content.origin.y + content.size.height,
+        "precondition: the slot outruns the workspace content vertically",
+    );
+
+    assert_eq!(
+        foot.origin.y, status_bar.origin.y,
+        "the foot band starts where the status bar starts",
+    );
+    assert_eq!(
+        foot.size.height, status_bar.size.height,
+        "and is the same height — this is the assertion a derived constant cannot make \
+         about itself, and the one that was 3.25px wrong",
+    );
+    assert_eq!(
+        foot.origin.y + foot.size.height,
+        status_bar.origin.y + status_bar.size.height,
+        "so both reach the window's foot together",
+    );
+
+    // The seam. `sidebar-container` draws a 1px border on its editor-facing edge, so
+    // the strip ends one pixel before the workspace content begins.
+    assert_eq!(
+        strip.origin.x + strip.size.width + gpui::px(1.),
+        content.origin.x,
+        "a 1px seam separates the slot from the workspace content",
+    );
+}
+
+/// `status_bar_height` equals the status bar the workspace actually renders.
+///
+/// **The constant is derived, and I derived it wrong.** The first version read
+/// `IconSize::Small.square` and returned 22.75px against a bar that renders 26px — a
+/// 3.25px gap Tom saw immediately on a binary as a band that did not line up. Nothing
+/// in the suite could have caught it, because the only other reader of the constant was
+/// the band being checked against it.
+///
+/// This is the check that makes the constant honest: it renders the real status bar and
+/// compares. Change either the bar's padding or its tallest control and this fails,
+/// which is the point — the band cannot silently drift out of alignment again.
+///
+/// Within a device pixel, not exactly: GPUI snaps a laid-out height to the display grid.
+#[gpui::test]
+async fn test_status_bar_height_matches_the_bar_the_workspace_renders(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    cx.run_until_parked();
+    let _ = &multi_workspace;
+
+    let computed = cx.update(|window, cx| ui::utils::status_bar_height(window, cx));
+    let rendered = cx
+        .debug_bounds("STATUS-BAR")
+        .expect("the workspace renders a status bar")
+        .size
+        .height;
+
+    assert!(
+        (computed - rendered).abs() < gpui::px(1.),
+        "the strip's footer band is sized from `status_bar_height`, so it has to equal \
+         the bar it sits beside: computed {computed} vs rendered {rendered}",
+    );
+}
+
+/// The strip paints the chrome's top and bottom bands, on whichever side it is on.
+///
+/// **Tom, 2026-09-08, on a binary.** The sidebar slot spans the full window height
+/// while the title bar and status bar live inside `Workspace` and stop at the slot's
+/// edge, so the grey ran up to the panel and stopped — at the top and at the foot.
+///
+/// The top band used to be left-only, because its original job was clearing the macOS
+/// traffic lights and there are none on the right. Keeping the chrome unbroken is a
+/// different job and it applies to both sides, which is why this asserts the Right
+/// case: it is the one the old condition got wrong.
+///
+/// The foot band is new, and its height comes from `ui::utils::status_bar_height` —
+/// the same call `StatusBar::render` sizes itself with, so the band and the bar cannot
+/// drift.
+///
+/// Restoring the `side == Left` condition on the fill fails this.
+#[gpui::test]
+async fn test_the_strip_paints_the_chrome_bands_on_either_side(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    fs.insert_tree("/root_b", json!({ "file.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs.clone(), ["/root_b".as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b, window, cx);
+    });
+    cx.run_until_parked();
+
+    // The side the old condition skipped.
+    cx.update(|_window, cx| {
+        let mut layout =
+            <crate::WorkspaceLayoutSettings as settings::Settings>::get_global(cx).clone();
+        layout.component_positions.insert(
+            crate::layout_registry::ids::WORKSPACES.to_string(),
+            crate::workspace_settings::WorkspaceComponentPosition {
+                position: Some(settings::DockPosition::Right),
+                hidden: false,
+                pinned: false,
+            },
+        );
+        <crate::WorkspaceLayoutSettings as settings::Settings>::override_global(layout, cx);
+    });
+    cx.run_until_parked();
+
+    let title_bar_height = cx.update(|window, _cx| platform_title_bar_height(window));
+    let status_bar_height = cx.update(|window, cx| ui::utils::status_bar_height(window, cx));
+    let occupant_view = show_workspace_strip(&multi_workspace, cx);
+
+    let height = gpui::px(600.);
+    cx.draw(
+        gpui::point(gpui::px(0.), gpui::px(0.)),
+        gpui::size(gpui::px(800.), height),
+        |_, _| occupant_view.clone().into_any_element(),
+    );
+
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(
+            multi_workspace.sidebar_side(cx),
+            SidebarSide::Right,
+            "precondition: the slot is on the side the old condition skipped",
+        );
+    });
+
+    // One pixel taller than the bar it matches, and deliberately: the `#workspace` div
+    // beside it carries `border_t_1`/`border_b_1`, so a 1px line in `colors.border` sits
+    // under the title bar and above the status bar. Without it the strip's content
+    // starts a pixel higher than the editor's — reported on a binary, invisible to every
+    // other check here.
+    let chrome_border = gpui::px(1.);
+    let top = cx
+        .debug_bounds("WORKSPACE-TAB-TITLE-BAR-FILL")
+        .expect("the strip paints the title bar band on the right too");
+    assert_eq!(top.origin.y, gpui::px(0.));
+    assert_eq!(top.size.height, title_bar_height + chrome_border);
+
+    let foot = cx
+        .debug_bounds("WORKSPACE-TAB-STATUS-BAR-FILL")
+        .expect("the strip paints a status bar band at its foot");
+    // Within a device pixel, not exactly: GPUI snaps a laid-out height to the display
+    // grid, so the drawn band is 22.5px where the computed value is 22.75px. Asserting
+    // equality would pin the snapping rather than the thing being claimed, which is
+    // that the band takes its size from `status_bar_height` and not from a number
+    // copied out of the status bar.
+    // The bar's height exactly — no chrome line at this end. The status bar is a child
+    // of `#workspace`, so that div's `border_b_1` is drawn below it at the window edge,
+    // not between it and the content. The top end is the one that gains a pixel.
+    assert!(
+        (foot.size.height - status_bar_height).abs() < gpui::px(1.),
+        "sized from the same call the status bar sizes itself with: band {} vs {}",
+        foot.size.height,
+        status_bar_height,
+    );
+    // Against the strip's own box, not the draw space: `h_full()` resolves against the
+    // window, so the element is taller than the size handed to `cx.draw`. Asserting on
+    // the draw size checked the wrong box and passed for the wrong reason.
+    let strip = cx
+        .debug_bounds("WORKSPACE-TAB-STRIP")
+        .expect("the strip renders");
+    assert!(
+        (foot.origin.y + foot.size.height - (strip.origin.y + strip.size.height)).abs()
+            < gpui::px(1.),
+        "the band sits flush with the strip's foot, where the status bar's grey stops",
+    );
+    assert!(
+        foot.origin.y > top.origin.y + top.size.height,
+        "and the two bands do not overlap",
+    );
+}
+
 /// A restart brings back the occupant you left showing, not the first registered.
 ///
 /// Nothing persisted which occupant was active, and `register_sidebar` makes the first
@@ -2960,9 +3856,11 @@ async fn test_a_restart_restores_the_occupant_that_was_showing(cx: &mut TestAppC
     cx.run_until_parked();
 
     // The restore runs first, before either occupant exists.
-    multi_workspace.update(cx, |multi_workspace, _cx| {
-        multi_workspace
-            .restore_active_sidebar_id(crate::layout_registry::ids::THREADS_SIDEBAR.to_string());
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.restore_active_sidebar_id(
+            crate::layout_registry::ids::THREADS_SIDEBAR.to_string(),
+            cx,
+        );
     });
 
     // Then registration, strip first — which is the order that used to decide this.

@@ -1,11 +1,10 @@
 use crate::{
     ItemHandle, MultiWorkspace, Pane, SidebarSide, StatusBarItemLocation, StatusBarSettings,
     ToggleWorkspaceSidebar, WorkspaceLayoutSettings, layout_registry::CustomizeWorkspaceLayout,
-    sidebar_side_context_menu,
 };
 use gpui::{
-    Anchor, AnyView, App, Context, Decorations, Entity, FocusHandle, Focusable, IntoElement,
-    ParentElement, Render, Role, SharedString, Styled, Subscription, WeakEntity, Window,
+    AnyView, App, Context, Decorations, Entity, FocusHandle, Focusable, IntoElement, ParentElement,
+    Render, Role, SharedString, Styled, Subscription, WeakEntity, Window,
 };
 use settings::Settings as _;
 use settings::{SettingsContent, update_settings_file, update_settings_file_with_completion};
@@ -122,8 +121,16 @@ impl SidebarStatus {
                 mw.resolved_active_sidebar_id(cx) == Some(id)
             });
         let slot = Self::slot(multi_workspace, cx);
+        // The dot belongs to this icon's occupant, not to whoever is showing. `slot`
+        // answers from the showing one, which meant the strip — hardcoded no
+        // notifications — swallowed the agent's dot whenever it held the slot.
+        let has_notifications = multi_workspace
+            .as_ref()
+            .and_then(|mw| mw.upgrade())
+            .is_some_and(|mw| mw.read(cx).sidebar_has_notifications_for(id, cx));
         Self {
             open: slot.open && showing_this_occupant,
+            has_notifications,
             ..slot
         }
     }
@@ -304,19 +311,26 @@ fn zone_rank(id: Option<&str>, registration_index: usize, order: &[String]) -> (
     // recognised-control check here instead sent an unknown id to band 0, so a typo
     // in the user's list shoved itself ahead of every panel icon.
     let Some(id) = id else {
-        return (0, registration_index as u32);
+        return (1, registration_index as u32);
     };
-    if matches!(rank, Some(SourceRank::Panel(_))) {
+    // Band 0 is the sidebar slot's pair, and only ever that pair: they sit at the
+    // outer edge of whichever zone they are in, ahead of even the dock button strips.
+    // `zone_order` reverses the Right zone, so "first" here reads as the window edge
+    // on either side — which is what makes them findable at a glance (Tom, 2026-09-08).
+    if crate::layout_registry::is_sidebar_slot_occupant(id) {
         return (0, registration_index as u32);
+    }
+    if matches!(rank, Some(SourceRank::Panel(_))) {
+        return (1, registration_index as u32);
     }
     if let Some(index) = order.iter().position(|listed| listed == id) {
-        return (1, index as u32);
+        return (2, index as u32);
     }
     match rank {
-        Some(SourceRank::StatusControl(rank)) => (2, rank as u32),
+        Some(SourceRank::StatusControl(rank)) => (3, rank as u32),
         // Unknown and unlisted: behind everything the table places, which is where
         // an extension's status item already sits.
-        _ => (3, registration_index as u32),
+        _ => (4, registration_index as u32),
     }
 }
 
@@ -372,6 +386,7 @@ impl Render for StatusBar {
                 }),
             )
             .w_full()
+            .debug_selector(|| "STATUS-BAR".to_string())
             .justify_between()
             .gap(DynamicSpacing::Base08.rems(cx))
             .p(DynamicSpacing::Base04.rems(cx))
@@ -448,6 +463,28 @@ impl StatusBar {
         let full = materialized_control_order(&order);
         let zone_indices = zone_order(&locations, &ids, &order, location);
         let last_control = zone_end_target_follows(&zone_indices, &ids);
+        // The boundary between the sidebar slot's pair and the rest of the zone, as a
+        // draw-order position — one divider for the pair, not one per icon.
+        //
+        // Found as "the first place the group changes" rather than "after the pair",
+        // because `zone_order` reverses the Right zone: the pair draws first on the
+        // left and last on the right, and after-the-pair would put the divider at the
+        // window edge on the right instead of between the groups. This rule reads the
+        // same on both sides.
+        //
+        // `None` when the zone is all pair or no pair — a divider with nothing on the
+        // far side of it separates nothing.
+        let is_pair = |index: &usize| {
+            ids.get(*index)
+                .copied()
+                .flatten()
+                .is_some_and(crate::layout_registry::is_sidebar_slot_occupant)
+        };
+        let divider_after = zone_indices
+            .windows(2)
+            .position(|pair| is_pair(&pair[0]) != is_pair(&pair[1]))
+            .map(|position| zone_indices[position]);
+
         zone_indices
             .into_iter()
             .filter_map(|index| self.items.get(index).map(|entry| (index, entry)))
@@ -471,7 +508,19 @@ impl StatusBar {
                 let end = (Some(index) == last_control)
                     .then(|| zone_end_drop_target(location, &strip, &full))
                     .flatten();
-                std::iter::once(item).chain(end)
+                // Sits between the pair and everything else, so the two read as their
+                // own group rather than as two more status icons (Tom, 2026-09-08).
+                // Suppressed when the pair is the whole zone — a divider with nothing
+                // on the far side of it separates nothing.
+                let divider = (Some(index) == divider_after).then(|| {
+                    div()
+                        .w(px(1.))
+                        .h(px(14.))
+                        .mx_1()
+                        .bg(cx.theme().colors().border_variant)
+                        .into_any_element()
+                });
+                std::iter::once(item).chain(divider).chain(end)
             })
             .collect()
     }
@@ -539,67 +588,60 @@ impl Render for ThreadsSidebarButton {
         let has_notifications = sidebar.has_notifications;
         let indicator_border = cx.theme().colors().status_bar_background;
 
-        let toggle = sidebar_side_context_menu("sidebar-status-toggle-menu", cx)
-            .anchor(if on_right {
-                Anchor::BottomRight
-            } else {
-                Anchor::BottomLeft
-            })
-            .attach(if on_right {
-                Anchor::TopRight
-            } else {
-                Anchor::TopLeft
-            })
-            .trigger(move |_is_active, _window, _cx| {
-                IconButton::new(
-                    "toggle-workspace-sidebar",
-                    match (on_right, sidebar.open) {
-                        (true, true) => IconName::ThreadsSidebarRightOpen,
-                        (true, false) => IconName::ThreadsSidebarRightClosed,
-                        (false, true) => IconName::ThreadsSidebarLeftOpen,
-                        (false, false) => IconName::ThreadsSidebarLeftClosed,
-                    },
-                )
-                .icon_size(IconSize::Small)
-                .tab_index(0isize)
-                // The glyph already swaps open/closed, but that reads as a different
-                // picture rather than a state. Now that this and Workspaces are a
-                // matched pair of exclusive on/off switches, they have to highlight
-                // the same way every other bar item does, or only one of the two
-                // looks like it is on.
-                .toggle_state(sidebar.open)
-                .aria_label(if sidebar.open {
-                    "Close threads sidebar"
+        // No inner right-click menu. This icon carried its own threads-only side
+        // menu, which wrote the threads entry alone — splitting the pair the moment
+        // anyone used it — and, being nested inside the bar item's own menu, fired
+        // first and made the `Workspace Position` menu unreachable here. The outer
+        // menu offers Left and Right for both occupants and writes through
+        // `set_component_position`, so this icon needs nothing of its own.
+        let toggle = IconButton::new(
+            "toggle-workspace-sidebar",
+            match (on_right, sidebar.open) {
+                (true, true) => IconName::ThreadsSidebarRightOpen,
+                (true, false) => IconName::ThreadsSidebarRightClosed,
+                (false, true) => IconName::ThreadsSidebarLeftOpen,
+                (false, false) => IconName::ThreadsSidebarLeftClosed,
+            },
+        )
+        .icon_size(IconSize::Small)
+        .tab_index(0isize)
+        // The glyph already swaps open/closed, but that reads as a different
+        // picture rather than a state. Now that this and Workspaces are a
+        // matched pair of exclusive on/off switches, they have to highlight
+        // the same way every other bar item does, or only one of the two
+        // looks like it is on.
+        .toggle_state(sidebar.open)
+        .aria_label(if sidebar.open {
+            "Close threads sidebar"
+        } else {
+            "Open threads sidebar"
+        })
+        .when(has_notifications, |this| {
+            this.indicator(Indicator::dot().color(Color::Accent))
+                .indicator_border_color(Some(indicator_border))
+        })
+        .tooltip(move |_, cx| {
+            Tooltip::for_action(
+                if sidebar.open {
+                    "Close Threads Sidebar"
                 } else {
-                    "Open threads sidebar"
-                })
-                .when(has_notifications, |this| {
-                    this.indicator(Indicator::dot().color(Color::Accent))
-                        .indicator_border_color(Some(indicator_border))
-                })
-                .tooltip(move |_, cx| {
-                    Tooltip::for_action(
-                        if sidebar.open {
-                            "Close Threads Sidebar"
-                        } else {
-                            "Open Threads Sidebar"
-                        },
-                        &ToggleWorkspaceSidebar,
+                    "Open Threads Sidebar"
+                },
+                &ToggleWorkspaceSidebar,
+                cx,
+            )
+        })
+        .on_click(move |_, window, cx| {
+            if let Some(multi_workspace) = window.root::<MultiWorkspace>().flatten() {
+                multi_workspace.update(cx, |multi_workspace, cx| {
+                    multi_workspace.toggle_sidebar_occupant(
+                        crate::layout_registry::ids::THREADS_SIDEBAR,
+                        window,
                         cx,
-                    )
-                })
-                .on_click(move |_, window, cx| {
-                    if let Some(multi_workspace) = window.root::<MultiWorkspace>().flatten() {
-                        multi_workspace.update(cx, |multi_workspace, cx| {
-                            multi_workspace.toggle_sidebar_occupant(
-                                crate::layout_registry::ids::THREADS_SIDEBAR,
-                                window,
-                                cx,
-                            );
-                        });
-                    }
-                })
-            });
+                    );
+                });
+            }
+        });
 
         h_flex().gap_0p5().child(toggle)
     }
@@ -705,17 +747,26 @@ fn render_status_bar_item(
     if let Some(adapter) = &entry.adapter {
         let item_id = adapter.id();
         let focus_handle = focus_handle.clone();
+        // Which menu an item gets follows which key actually places it. A
+        // component-backed id is placed by `component_positions`, and the
+        // status-control menu writes `item_locations` — a key nothing reads for these
+        // ids, so that menu is a working-looking no-op on them (dogfood B-4).
+        let is_component = crate::workspace_settings::is_workspace_component(item_id);
         let menu = right_click_menu(menu_id)
             .trigger(move |_is_active, _window, _cx| view)
             .menu(move |window, cx| {
                 let focus_handle = focus_handle.clone();
-                ContextMenu::build(window, cx, move |menu, _window, _cx| {
-                    add_status_control_placement_entries(
-                        menu,
-                        item_id,
-                        resolved_location,
-                        focus_handle,
-                    )
+                ContextMenu::build(window, cx, move |menu, _window, cx| {
+                    if is_component {
+                        add_component_placement_entries(menu, item_id, focus_handle, cx)
+                    } else {
+                        add_status_control_placement_entries(
+                            menu,
+                            item_id,
+                            resolved_location,
+                            focus_handle,
+                        )
+                    }
                 })
             });
 
@@ -831,6 +882,124 @@ fn add_status_control_placement_entries(
         }),
     );
     menu
+}
+
+/// The placement menu for a **component-backed** bar item.
+///
+/// `Workspace Position`, not `Bottom Bar Placement`, and it writes
+/// `workspace_layout.component_positions` rather than `status_bar.item_locations`.
+/// The distinction is not cosmetic: `StatusControlAdapter::effective_location` answers
+/// a component-backed id from `resolved_component_zone` and returns before it ever
+/// reads the status-control key, so the control menu's writes are **inert** for these
+/// ids. Dogfood B-4 found exactly that — the menu opened, looked like every other
+/// placement menu, wrote `status_bar.item_locations.workspaces: "hidden"`, and nothing
+/// on screen moved.
+///
+/// Positions come from the registry's `valid_positions`, so a `SIDES` component offers
+/// Left and Right and never Middle — Q11's rule that a component's icon lives in the
+/// zone matching its panel's side, and there is no middle side.
+fn add_component_placement_entries(
+    mut menu: ContextMenu,
+    item_id: &'static str,
+    focus_handle: FocusHandle,
+    cx: &App,
+) -> ContextMenu {
+    use crate::layout_registry::LayoutPosition;
+
+    menu = menu.context(focus_handle);
+
+    let registered = crate::layout_registry::get(item_id);
+    // Two things this asks that a raw `component(id).position` does not.
+    //
+    // `side_entry`: a slot occupant with no entry of its own ticks the side its sibling
+    // names, because the pair shares one side.
+    //
+    // The registry filter: a saved position the component cannot take is not the one in
+    // use. Without it a hand-edited `Bottom` left both sides unticked here while
+    // `resolved_component_zone` and the Customize row both said Left — the same fix
+    // landing on one of three readers.
+    //
+    // And an entry with no position at all takes the registered side, or every
+    // component the user has never placed shows no tick.
+    let effective = crate::WorkspaceLayoutSettings::get_global(cx)
+        .side_entry(item_id)
+        .and_then(|entry| entry.position)
+        .filter(|position| {
+            registered.is_some_and(|item| {
+                item.valid_positions.contains(&match position {
+                    settings::DockPosition::Right => LayoutPosition::Right,
+                    settings::DockPosition::Bottom => LayoutPosition::Bottom,
+                    settings::DockPosition::Left => LayoutPosition::Left,
+                })
+            })
+        })
+        .unwrap_or(match registered.map(|item| item.registered_position) {
+            Some(LayoutPosition::Right) => settings::DockPosition::Right,
+            _ => settings::DockPosition::Left,
+        });
+
+    let sides = [
+        (LayoutPosition::Left, settings::DockPosition::Left, "Left"),
+        (
+            LayoutPosition::Right,
+            settings::DockPosition::Right,
+            "Right",
+        ),
+    ];
+    let mut offered_any = false;
+    for (layout_position, dock_position, label) in sides {
+        if !registered.is_some_and(|item| item.valid_positions.contains(&layout_position)) {
+            continue;
+        }
+        if !offered_any {
+            menu = menu.header("Workspace Position");
+            offered_any = true;
+        }
+        let is_current = dock_position == effective;
+        menu = menu.toggleable_entry(
+            label,
+            is_current,
+            IconPosition::Start,
+            None,
+            move |window, cx| {
+                if is_current {
+                    return;
+                }
+                // The global, not a workspace's own handle: this menu opens from a bar
+                // icon, and `StatusControlHide::apply` beside it already reaches the fs
+                // this way. Threading a `Workspace` down here would buy nothing.
+                let fs = <dyn fs::Fs>::global(cx);
+                crate::dock::set_component_position(
+                    fs,
+                    item_id.to_string(),
+                    dock_position,
+                    window,
+                    cx,
+                );
+            },
+        );
+    }
+
+    // Hidden, the same as the dock-panel icon menu offers. The 2026-08-31 Decision
+    // says `Workspace Position` carries every supported position **plus Hidden**, and
+    // this menu omitted it — recoverable through `Customize Workspace Layout`, but a
+    // stated rule broken silently.
+    //
+    // Position first, for the reason the dock menu records: hiding creates the entry,
+    // so the side in use has to be written before it, or it is lost.
+    let hide_position = effective;
+    menu = menu.separator().entry("Hidden", None, move |window, cx| {
+        let fs = <dyn fs::Fs>::global(cx);
+        crate::dock::seed_component_position(fs.clone(), item_id.to_string(), hide_position, cx);
+        crate::dock::set_component_hidden(fs, item_id.to_string(), true, window, cx);
+    });
+
+    menu.action(
+        "Customize Workspace Layout…",
+        Box::new(CustomizeWorkspaceLayout {
+            item_id: Some(item_id.to_string()),
+        }),
+    )
 }
 
 /// The whole settings mutation a placement makes.
@@ -1570,7 +1739,7 @@ mod zone_tests {
         };
         assert_eq!(
             super::zone_rank(Some(ids::CURSOR_POSITION), 999, &[]),
-            (2, cursor as u32),
+            (3, cursor as u32),
             "a wildly wrong registration index changes nothing for a registered id"
         );
         assert!(
@@ -1589,10 +1758,39 @@ mod zone_tests {
     fn an_item_the_table_does_not_know_keeps_its_place_ahead_of_every_control() {
         use crate::layout_registry::ids;
 
-        assert_eq!(super::zone_rank(None, 7, &[]), (0, 7));
+        assert_eq!(super::zone_rank(None, 7, &[]), (1, 7));
         assert!(
             super::zone_rank(None, 999, &[]) < super::zone_rank(Some(ids::PROJECT_SEARCH), 0, &[]),
             "a dock button strip stays ahead of the first-ranked control"
+        );
+    }
+
+    /// The sidebar slot's pair draws at the outer edge, ahead of the dock strips.
+    ///
+    /// Tom, 2026-09-08, dogfooding: the two icons have to be findable at a glance, so
+    /// they take the window edge rather than sitting mid-bar among the status icons.
+    /// Band 0 exists for them and holds nothing else — moving them into the band the
+    /// dock strips occupy would sort them by registration order, and
+    /// `Workspace::new` registers the strips first, which is exactly the layout he
+    /// reported as wrong.
+    #[test]
+    fn the_sidebar_slot_pair_sorts_outside_even_the_dock_strips() {
+        use crate::layout_registry::ids;
+
+        for id in [ids::WORKSPACES, ids::THREADS_SIDEBAR] {
+            assert_eq!(
+                super::zone_rank(Some(id), 4, &[]).0,
+                0,
+                "{id} takes the outer band",
+            );
+            assert!(
+                super::zone_rank(Some(id), 999, &[]) < super::zone_rank(None, 0, &[]),
+                "{id} draws outside the dock button strips even registered last",
+            );
+        }
+        assert!(
+            super::zone_rank(Some(ids::GIT_PANEL), 0, &[]).0 > 0,
+            "a dock-hosted component is not in the pair's band",
         );
     }
 
@@ -1730,7 +1928,7 @@ mod zone_tests {
         let order = vec![ids::CURSOR_POSITION.to_string()];
         assert_eq!(
             super::zone_rank(Some(ids::CURSOR_POSITION), 0, &order),
-            (1, 0)
+            (2, 0)
         );
         assert!(
             super::zone_rank(Some(ids::CURSOR_POSITION), 0, &order)
@@ -1784,7 +1982,7 @@ mod zone_tests {
         let order = vec![ids::PROJECT_PANEL.to_string()];
         assert_eq!(
             super::zone_rank(Some(ids::PROJECT_PANEL), 7, &order),
-            (0, 7),
+            super::zone_rank(Some(ids::PROJECT_PANEL), 7, &[]),
             "listing a component neither moves it here nor gives it a control's place"
         );
     }
@@ -1802,7 +2000,7 @@ mod zone_tests {
         ));
         assert_eq!(
             super::zone_rank(Some(ids::PROJECT_PANEL), 7, &[]),
-            (0, 7),
+            super::zone_rank(None, 7, &[]),
             "it sorts with the unregistered rather than among the controls"
         );
     }

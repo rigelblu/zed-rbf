@@ -120,9 +120,13 @@ impl Sidebar for WorkspacesSidebar {
     /// back to either — the rail was always on the left.
     fn side(&self, cx: &App) -> SidebarSide {
         let layout = <crate::WorkspaceLayoutSettings as settings::Settings>::get_global(cx);
-        let id = crate::layout_registry::ids::WORKSPACES;
-        if layout.has_component(id)
-            && layout.component(id).position == Some(settings::DockPosition::Right)
+        // Through `side_entry`, so the strip follows the slot's side even with no entry
+        // of its own — the pair shares one side, and reading it here is what makes that
+        // true without every writer having to remember.
+        if layout
+            .side_entry(crate::layout_registry::ids::WORKSPACES)
+            .and_then(|entry| entry.position)
+            == Some(settings::DockPosition::Right)
         {
             SidebarSide::Right
         } else {
@@ -233,22 +237,37 @@ impl Render for WorkspacesSidebar {
             self.last_scrolled_index.set(Some(active_workspace_index));
         }
 
-        // The traffic lights sit over this occupant's top-left, and the slot does
-        // NOT pad for them: `render_sidebar_header` belongs to the agent's own
-        // `Sidebar::render`, not to the slot, which only does
-        // `.child(sidebar_handle.to_any())`. So the band the rail painted has to be
-        // painted here too, or the first tab renders under the window controls.
-        // Only on the left — on the right there are no traffic lights to clear, a
-        // question the fixed-left rail never had to ask.
-        let title_bar_fill_height = if cfg!(target_os = "macos")
-            && !window.is_fullscreen()
-            && self.side(cx) == SidebarSide::Left
-        {
-            Some(platform_title_bar_height(window))
-        } else {
-            None
-        };
-        let top_padding = title_bar_fill_height.unwrap_or(px(4.));
+        // The slot spans the full window height while the title bar and status bar both
+        // live inside `Workspace` and stop at the slot's edge — so the chrome breaks
+        // where this occupant starts unless the occupant paints the two bands itself.
+        // The slot cannot do it: it only does `.child(sidebar_handle.to_any())`.
+        //
+        // **Painted on both sides now** (Tom, 2026-09-08, on a binary). It used to be
+        // left-only, because the band's original job was clearing the macOS traffic
+        // lights and there are none on the right. Continuity of the chrome is a
+        // different job and it applies to both sides — with the slot on the right the
+        // grey ran up to the panel and stopped, which is what he reported.
+        // The two ends are not symmetric, and assuming they were is what made the foot
+        // a pixel too tall.
+        //
+        // **Top:** `#workspace` carries `border_t_1`, and that line sits between the
+        // title bar and the content. The band carries it too, so its box is one pixel
+        // taller than the title bar it matches — without it the strip's first row
+        // starts a pixel above the editor's.
+        //
+        // **Foot:** the status bar is a *sibling* of `#workspace`, not a child — measured,
+        // after two wrong readings of the nesting. `#workspace` ends exactly where the
+        // status bar begins (1054px / 1054px in a 1080px window), so its `border_b_1`
+        // draws a line immediately above the bar. That line is invisible in a light
+        // theme and plain to see in a dark one, which is how it survived a round of
+        // this looking right.
+        //
+        // The band carries the line **inside** its height rather than on top of it:
+        // Tom confirmed the 26px box lines up, so the line takes a pixel from the grey
+        // instead of adding one to the box.
+        let title_bar_fill_height = platform_title_bar_height(window) + px(1.);
+        let status_bar_fill_height = ui::utils::status_bar_height(window, cx);
+        let top_padding = title_bar_fill_height;
         let this_handle = self.multi_workspace.clone();
         let path_detail_map = workspace_tab_path_detail_map(&workspace_paths);
         let overflow_edges = workspace_tab_overflow_edges(&self.scroll_handle);
@@ -262,13 +281,13 @@ impl Render for WorkspacesSidebar {
         // over its header all along without it. Dated ruling 2026-09-07.
         div()
             .id("workspace-tab-strip")
+            .debug_selector(|| "WORKSPACE-TAB-STRIP".to_string())
             .relative()
             .h_full()
             .w_full()
             .bg(cx.theme().colors().panel_background)
             .vertical_scrollbar_for(&self.scroll_handle, window, cx)
-            .when_some(title_bar_fill_height, |this, title_bar_fill_height| {
-                this.child(
+            .child(
                     div()
                         .id("workspace-tab-title-bar-fill")
                         .debug_selector(|| "WORKSPACE-TAB-TITLE-BAR-FILL".to_string())
@@ -278,6 +297,8 @@ impl Render for WorkspacesSidebar {
                         .right_0()
                         .h(title_bar_fill_height)
                         .bg(cx.theme().colors().title_bar_background)
+                        .border_b_1()
+                        .border_color(cx.theme().colors().border)
                         .window_control_area(WindowControlArea::Drag)
                         .on_mouse_down(
                             MouseButton::Left,
@@ -304,14 +325,30 @@ impl Render for WorkspacesSidebar {
                             }
                         })),
                 )
-            })
+            // The foot of the slot, matching the status bar the workspace area shows
+            // beside it. Absolute and painted over the scrolling list, the same way the
+            // title-bar band is at the top, so the list keeps the full height and
+            // scrolls under both — its `pb` below clears this one.
+            .child(
+                div()
+                    .id("workspace-tab-status-bar-fill")
+                    .debug_selector(|| "WORKSPACE-TAB-STATUS-BAR-FILL".to_string())
+                    .absolute()
+                    .bottom_0()
+                    .left_0()
+                    .right_0()
+                    .h(status_bar_fill_height)
+                    .bg(cx.theme().colors().status_bar_background)
+                    .border_t_1()
+                    .border_color(cx.theme().colors().border),
+            )
             .child(
                 v_flex()
                     .id("workspace-tab-strip-scroll")
                     .h_full()
                     .w_full()
                     .pt(top_padding)
-                    .pb_1()
+                    .pb(status_bar_fill_height)
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll_handle)
                     .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))

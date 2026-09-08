@@ -553,8 +553,59 @@ pub fn all() -> &'static [LayoutItem] {
     ITEMS
 }
 
+#[cfg(test)]
+mod sidebar_slot_pair_tests {
+    use super::*;
+
+    /// The pair is found structurally, so a third occupant joins it for free.
+    ///
+    /// Tom, 2026-09-08: the two icons move as one and sit together at one end of the
+    /// bar. Everything that implements that — the paired position write, the outer
+    /// band in `zone_rank`, the divider — keys off this one predicate, so an id list
+    /// that drifted from the registry would break all three at once.
+    #[test]
+    fn the_slot_pair_is_exactly_the_two_non_dock_hosted_components() {
+        let occupants: Vec<&str> = sidebar_slot_occupants().collect();
+        assert_eq!(occupants, vec![ids::THREADS_SIDEBAR, ids::WORKSPACES]);
+
+        assert!(is_sidebar_slot_occupant(ids::WORKSPACES));
+        assert!(is_sidebar_slot_occupant(ids::THREADS_SIDEBAR));
+        assert!(
+            !is_sidebar_slot_occupant(ids::GIT_PANEL),
+            "a dock-hosted component has its own column and is not in the slot",
+        );
+        assert!(
+            !is_sidebar_slot_occupant(ids::PROJECT_SEARCH),
+            "a status control is not a component at all",
+        );
+    }
+}
+
 pub fn get(id: &str) -> Option<&'static LayoutItem> {
     ITEMS.iter().find(|item| item.id == id)
+}
+
+/// The ids sharing the sidebar slot, in registry order.
+///
+/// Identified structurally rather than by name: they are the only rows that are a
+/// `WorkspaceComponent` and **not** `dock_hosted` — a component with no dock column of
+/// its own, because it lives in the window-level slot instead. A third occupant added
+/// to that slot is picked up here for free.
+///
+/// **They move as one.** Tom, 2026-09-08, after using it: the slot has one side, both
+/// icons sit together at that end of the bar, and setting either one's position moves
+/// the pair. This reverses `Flow 6` step 4b, which specified a side per occupant — the
+/// cost 4b named (one item's placement rewriting the other's entry) is real and is now
+/// the intended behaviour, written in one settings update so it cannot half-apply.
+pub fn sidebar_slot_occupants() -> impl Iterator<Item = &'static str> {
+    ITEMS
+        .iter()
+        .filter(|item| item.kind == LayoutItemKind::WorkspaceComponent && !item.dock_hosted)
+        .map(|item| item.id)
+}
+
+pub fn is_sidebar_slot_occupant(item_id: &str) -> bool {
+    sidebar_slot_occupants().any(|id| id == item_id)
 }
 
 pub fn of_kind(kind: LayoutItemKind) -> impl Iterator<Item = &'static LayoutItem> {

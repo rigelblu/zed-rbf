@@ -138,7 +138,7 @@ pub fn sidebar_side_context_menu(
                     position == current_position,
                     IconPosition::Start,
                     None,
-                    move |_window, cx| {
+                    move |window, cx| {
                         let side = match position {
                             SidebarDockPosition::Left => "left",
                             SidebarDockPosition::Right => "right",
@@ -152,15 +152,19 @@ pub fn sidebar_side_context_menu(
                             SidebarDockPosition::Left => settings::DockPosition::Left,
                             SidebarDockPosition::Right => settings::DockPosition::Right,
                         };
-                        settings::update_settings_file(fs.clone(), cx, move |settings, _cx| {
-                            settings
-                                .workspace_layout
-                                .get_or_insert_default()
-                                .component_positions
-                                .entry(crate::layout_registry::ids::THREADS_SIDEBAR.to_string())
-                                .or_default()
-                                .position = Some(dock);
-                        });
+                        // Through `set_component_position`, not a raw settings write.
+                        // This menu predates the slot having two occupants and wrote the
+                        // threads entry alone, which since 2026-09-08 splits the pair —
+                        // one right-click undoing the decision that the slot has one
+                        // side. `carried_along_by` lives behind this call, as does the
+                        // failed-write report Q13 requires.
+                        crate::dock::set_component_position(
+                            fs.clone(),
+                            crate::layout_registry::ids::THREADS_SIDEBAR.to_string(),
+                            dock,
+                            window,
+                            cx,
+                        );
                     },
                 );
             }
@@ -184,9 +188,8 @@ pub fn resolved_threads_sidebar_side(cx: &App, legacy: SidebarSide) -> SidebarSi
 fn threads_sidebar_entry(
     cx: &App,
 ) -> Option<crate::workspace_settings::WorkspaceComponentPosition> {
-    let layout = crate::WorkspaceLayoutSettings::get_global(cx);
-    let id = crate::layout_registry::ids::THREADS_SIDEBAR;
-    layout.has_component(id).then(|| layout.component(id))
+    crate::WorkspaceLayoutSettings::get_global(cx)
+        .side_entry(crate::layout_registry::ids::THREADS_SIDEBAR)
 }
 
 #[cfg(test)]
@@ -1522,10 +1525,14 @@ impl MultiWorkspace {
     ///
     /// It used to resolve the threads sidebar's entry no matter who was in the slot,
     /// which made placing Workspaces on the right move its bar icon and leave the
-    /// panel where it was. Each item owns its own side and the two may differ
-    /// (`Flow 6`), so the only occupant whose side can answer this is the one on
-    /// screen — every occupant resolves its own, including the legacy key where it
-    /// still applies.
+    /// panel where it was.
+    ///
+    /// Since 2026-09-08 the slot has **one** side and every writer moves the pair, so
+    /// the two entries agree by construction. This still asks the showing occupant
+    /// rather than picking one: the entries can disagree in a hand-edited settings
+    /// file, and the occupant on screen is the only one whose side can be right about
+    /// what is drawn. `Flow 6` step 4b, which made differing sides the design, is
+    /// superseded — see the dated Decision.
     pub fn sidebar_side(&self, cx: &App) -> SidebarSide {
         self.sidebar(cx).map_or(SidebarSide::Left, |s| s.side(cx))
     }
@@ -1556,6 +1563,7 @@ impl MultiWorkspace {
         let settings_subscription = cx.observe_global_in::<settings::SettingsStore>(window, {
             let mut previous_retention_enabled = Self::retention_enabled_from_settings(cx);
             let mut previous_sidebar_ui_enabled = Self::sidebar_ui_enabled_from_settings(cx);
+            let mut previous_showing: Option<&'static str> = None;
             move |this, window, cx| {
                 let retention_enabled = this.retention_enabled(cx);
                 if previous_retention_enabled && !retention_enabled {
@@ -1563,11 +1571,35 @@ impl MultiWorkspace {
                 }
                 previous_retention_enabled = retention_enabled;
 
+                // Close on disable only when **nothing** is left to show. This rule
+                // predates the slot having two occupants: it closed the slot because
+                // the agent owned it, so turning the agent off while the threads
+                // sidebar was showing took the strip down with it, rather than falling
+                // to the strip as `Flow 6` step 6 specifies. The eighth gate that had
+                // to split, found by a test for the focus handle rather than by the
+                // seven-gate sweep — the sweep looked at `sidebar_ui_enabled` call
+                // sites, and this one reads it through a local.
                 let sidebar_ui_enabled = this.sidebar_ui_enabled(cx);
-                if previous_sidebar_ui_enabled && !sidebar_ui_enabled && this.sidebar_open() {
+                if previous_sidebar_ui_enabled
+                    && !sidebar_ui_enabled
+                    && this.sidebar_open()
+                    && !this.sidebar_slot_enabled(cx)
+                {
                     this.close_sidebar(window, cx);
                 }
                 previous_sidebar_ui_enabled = sidebar_ui_enabled;
+
+                // The showing occupant can change without any gesture: the slot resolves
+                // it on read, so toggling the agent or hiding a component swaps what is
+                // drawn while nothing calls `sync_sidebar_focus_handles`. Pane
+                // navigation then steered into the occupant that had just gone off
+                // screen — the third place this shape has appeared, after the swap and
+                // the restore. Settings are where the other two cannot reach.
+                let showing = this.resolved_active_sidebar_id(cx);
+                if previous_showing != showing {
+                    previous_showing = showing;
+                    this.sync_sidebar_focus_handles(cx);
+                }
             }
         });
         Self::subscribe_to_workspace(&workspace, window, cx);
@@ -1641,6 +1673,9 @@ impl MultiWorkspace {
         if self.pending_active_sidebar_id.as_deref() == Some(id) {
             self.pending_active_sidebar_id = None;
             self.active_sidebar_id = Some(id);
+            // Same reason as `restore_active_sidebar_id`: this is the other half of the
+            // launch path, where the restored id waits for its occupant to register.
+            self.sync_sidebar_focus_handles(cx);
         } else if self.active_sidebar_id.is_none() {
             self.active_sidebar_id = Some(id);
         }
@@ -1651,7 +1686,7 @@ impl MultiWorkspace {
     /// Takes effect when that occupant registers — see `pending_active_sidebar_id`.
     /// An id nothing ever registers under simply never applies, which is the right
     /// answer for a window saved by a build that had an occupant this one does not.
-    pub fn restore_active_sidebar_id(&mut self, id: String) {
+    pub fn restore_active_sidebar_id(&mut self, id: String, cx: &mut Context<Self>) {
         if self.sidebars.iter().any(|(existing, _)| *existing == id) {
             self.pending_active_sidebar_id = None;
             self.active_sidebar_id = self
@@ -1659,6 +1694,12 @@ impl MultiWorkspace {
                 .iter()
                 .find(|(existing, _)| *existing == id)
                 .map(|(existing, _)| *existing);
+            // The showing occupant changed, so the handle pane navigation steers by has
+            // to move with it — R6's shape on the launch path. `restore_open_sidebar`
+            // runs before this and syncs against whichever occupant was active then,
+            // which after a restart is the first registered rather than the restored
+            // one.
+            self.sync_sidebar_focus_handles(cx);
         } else {
             self.pending_active_sidebar_id = Some(id);
         }
@@ -1697,6 +1738,17 @@ impl MultiWorkspace {
     /// An occupant with no arm here is always available, which is what a test
     /// occupant wants.
     pub fn sidebar_available(&self, id: &str, cx: &App) -> bool {
+        // Hidden first, and for every occupant. `resolved_component_zone` already
+        // answers `Hidden` for the icon, so leaving it out here removed the icon while
+        // the slot kept showing the occupant and `ToggleWorkspaceSidebar` reopened it —
+        // against Q5 and the 2026-08-31 Decision, which say Hidden removes the
+        // component *and* its icon everywhere.
+        if crate::WorkspaceLayoutSettings::get_global(cx)
+            .component(id)
+            .hidden
+        {
+            return false;
+        }
         match id {
             crate::layout_registry::ids::THREADS_SIDEBAR => {
                 Self::sidebar_ui_enabled_from_settings(cx)
@@ -1775,6 +1827,21 @@ impl MultiWorkspace {
 
     pub fn sidebar_has_notifications(&self, cx: &App) -> bool {
         self.sidebar(cx).map_or(false, |s| s.has_notifications(cx))
+    }
+
+    /// Whether `id`'s occupant has notifications — asked of that occupant, not of
+    /// whichever one the slot is showing.
+    ///
+    /// **Cold read 2026-09-08.** `sidebar()` used to mean "the threads sidebar" and now
+    /// means "the showing occupant"; the rename went through nineteen call sites
+    /// mechanically without asking what each one meant by it. This is one of the two
+    /// that meant threads: with the strip showing, the dot was answered by
+    /// `WorkspacesSidebar::has_notifications`, which is hardcoded `false`, so a thread
+    /// finishing raised nothing on the bar. The strip migration makes the strip the
+    /// stored choice for every upgrading user, so that was the default state.
+    pub fn sidebar_has_notifications_for(&self, id: &str, cx: &App) -> bool {
+        self.sidebar_with_id(id)
+            .map_or(false, |sidebar| sidebar.has_notifications(cx))
     }
 
     pub fn is_threads_list_view_active(&self, cx: &App) -> bool {
@@ -2005,7 +2072,6 @@ impl MultiWorkspace {
     ///
     /// Returns whether it wrote, so a caller can tell a no-op from a migration.
     pub fn migrate_threads_sidebar_side_once(&mut self, cx: &mut Context<Self>) -> bool {
-        let id = crate::layout_registry::ids::THREADS_SIDEBAR;
         if threads_sidebar_entry(cx).is_some() {
             return false;
         }
@@ -2016,12 +2082,17 @@ impl MultiWorkspace {
         let Some(fs) = <dyn fs::Fs>::try_global(cx) else {
             return false;
         };
+        // One entry, the agent's — the pair shares a side on *read* now
+        // (`side_entry`), so the strip follows without a line of its own. Writing both
+        // was the earlier fix, and it broke the strip migration: that migration's
+        // "already ran" marker is the existence of a `workspaces` entry, so seeding one
+        // here made a legacy-Right profile skip the migration and lose its strip.
         settings::update_settings_file(fs, cx, move |settings, _cx| {
             settings
                 .workspace_layout
                 .get_or_insert_default()
                 .component_positions
-                .entry(id.to_string())
+                .entry(crate::layout_registry::ids::THREADS_SIDEBAR.to_string())
                 .or_default()
                 .position = Some(settings::DockPosition::Right);
         });
@@ -4276,6 +4347,16 @@ impl Render for MultiWorkspace {
                     .h_full()
                     .w(sidebar_width)
                     .flex_shrink_0()
+                    // The seam between the slot and the editor area. The rail drew this
+                    // as its own `border_r_1` and it was lost in the move — the strip's
+                    // comment says "no right border: the slot owns it", and the slot did
+                    // not. Drawn on the editor-facing edge, so it follows the side.
+                    .when(sidebar_on_right, |el| {
+                        el.border_l_1().border_color(cx.theme().colors().border)
+                    })
+                    .when(!sidebar_on_right, |el| {
+                        el.border_r_1().border_color(cx.theme().colors().border)
+                    })
                     .child(sidebar_handle.to_any())
                     .child(resize_handle)
                     .into_any_element()

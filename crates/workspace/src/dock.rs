@@ -126,6 +126,33 @@ impl Global for LayoutWritePromptOpen {}
 /// Split from the reporting because the two need different contexts: the write
 /// must go through whether or not the window that asked is still there, and only
 /// the report needs a window.
+/// The other ids a write to `panel_key` must carry along.
+///
+/// The sidebar slot's occupants share one side, so a position set on either moves the
+/// pair — one slot, one side, both icons together at that end of the bar (Tom,
+/// 2026-09-08, after using it). Applied inside the single update closure below rather
+/// than as a second write, so the two can never half-apply.
+///
+/// Position only. `hidden` and `pinned` stay per-item: hiding one occupant's icon says
+/// nothing about the other's, and neither is pinnable anyway (`Flow 6` step 7).
+///
+/// Split out **because the write itself needs a window to test**, and a test that
+/// reimplements this decision locally passes against any mutation of it — which is
+/// exactly what the first version of the pair test did. This is the decision; the
+/// closure below only applies it.
+fn carried_along_by(panel_key: &str, setting: &ComponentSetting) -> Vec<String> {
+    if !matches!(setting, ComponentSetting::Position(_)) {
+        return Vec::new();
+    }
+    if !crate::layout_registry::is_sidebar_slot_occupant(panel_key) {
+        return Vec::new();
+    }
+    crate::layout_registry::sidebar_slot_occupants()
+        .filter(|id| *id != panel_key)
+        .map(str::to_string)
+        .collect()
+}
+
 fn queue_component_setting(
     fs: Arc<dyn Fs>,
     panel_key: String,
@@ -134,19 +161,39 @@ fn queue_component_setting(
 ) -> (oneshot::Receiver<anyhow::Result<()>>, SharedString) {
     let message = setting.failure_message(&panel_key);
     let update = settings::update_settings_file_with_completion(fs, cx, move |settings, _| {
-        let entry = settings
-            .workspace_layout
-            .get_or_insert_default()
-            .component_positions
-            .entry(panel_key)
-            .or_default();
-        match setting {
-            ComponentSetting::Position(position) => entry.position = Some(position),
-            ComponentSetting::Hidden(hidden) => entry.hidden = Some(hidden),
-            ComponentSetting::Pinned(pinned) => entry.pinned = Some(pinned),
-        }
+        apply_component_setting(settings, &panel_key, setting);
     });
     (update, message)
+}
+
+/// The whole mutation a component-setting write makes, as one testable function.
+///
+/// The pair loop used to live inline in the closure above, where nothing could reach
+/// it: `queue_component_setting` needs a window, so the only test of the pairing called
+/// `carried_along_by` and re-applied the result itself. Deleting the loop survived the
+/// suite — the cold read's C2, and the third time in one day a test held a copy of the
+/// code it was checking.
+fn apply_component_setting(
+    settings: &mut settings::SettingsContent,
+    panel_key: &str,
+    setting: ComponentSetting,
+) {
+    let also_write = carried_along_by(panel_key, &setting);
+    let positions = &mut settings
+        .workspace_layout
+        .get_or_insert_default()
+        .component_positions;
+    let entry = positions.entry(panel_key.to_string()).or_default();
+    match setting {
+        ComponentSetting::Position(position) => entry.position = Some(position),
+        ComponentSetting::Hidden(hidden) => entry.hidden = Some(hidden),
+        ComponentSetting::Pinned(pinned) => entry.pinned = Some(pinned),
+    }
+    if let ComponentSetting::Position(position) = setting {
+        for id in also_write {
+            positions.entry(id).or_default().position = Some(position);
+        }
+    }
 }
 
 /// Persists one component setting, reporting a failure rather than swallowing it.
@@ -3901,6 +3948,97 @@ mod component_position_tests {
                 sides_only,
             ),
             DockPosition::Left
+        );
+    }
+
+    /// Every writer of an occupant's side carries the pair — not just the one menu.
+    ///
+    /// **Cold read 2026-09-08, R1.** `sidebar_side_context_menu` predates the slot
+    /// having two occupants and wrote `component_positions.threads_sidebar` with a raw
+    /// `update_settings_file`, never touching `set_component_position` and so never
+    /// running `carried_along_by`. Two live callers — the Threads bar icon and the
+    /// threads header — so one right-click undid the same-day decision that the slot
+    /// has one side.
+    ///
+    /// The state the defect needs is the two entries **disagreeing**, which is what a
+    /// threads-only write produces. Asserting only that the threads entry moved passes
+    /// against the bug, because the bug moves it correctly.
+    ///
+    /// This pins the invariant rather than one call site: whatever writes a slot
+    /// occupant's position must leave both entries equal.
+    #[test]
+    fn a_slot_occupants_side_write_never_leaves_the_pair_disagreeing() {
+        use crate::layout_registry::{ids, sidebar_slot_occupants};
+        use settings::{DockPosition, SettingsContent};
+
+        for writer in [ids::THREADS_SIDEBAR, ids::WORKSPACES] {
+            let mut settings = SettingsContent::default();
+            // The real write, not a copy of it — `apply_component_setting` is what the
+            // settings closure calls, so deleting its pair loop fails this.
+            super::apply_component_setting(
+                &mut settings,
+                writer,
+                super::ComponentSetting::Position(DockPosition::Right),
+            );
+            let positions = &settings
+                .workspace_layout
+                .as_ref()
+                .expect("the write creates the block")
+                .component_positions;
+
+            let sides: Vec<Option<DockPosition>> = sidebar_slot_occupants()
+                .map(|id| positions.get(id).and_then(|entry| entry.position))
+                .collect();
+            assert!(
+                sides.iter().all(|side| *side == Some(DockPosition::Right)),
+                "writing {writer} left the pair disagreeing: {sides:?}",
+            );
+        }
+    }
+
+    /// Setting one slot occupant's side carries the other along.
+    ///
+    /// Tom, 2026-09-08, after using it: the slot has one side and the two icons move as
+    /// a pair. **This reverses `Flow 6` step 4b**, which gave each occupant its own
+    /// side; 4b named the cost — one item's placement rewriting the other's entry —
+    /// and that cost is now the intended behaviour.
+    ///
+    /// **Calls `carried_along_by`, the real decision.** The first version of this test
+    /// reimplemented the pairing inside its own closure and asserted on that, so it
+    /// passed with the production branch deleted. A test holding a copy of the code
+    /// under test cannot fail for the reason it names.
+    ///
+    /// Deleting either guard in `carried_along_by` fails this.
+    #[test]
+    fn setting_one_slot_occupants_side_carries_the_pair() {
+        use crate::layout_registry::ids;
+        use settings::DockPosition;
+
+        let position = super::ComponentSetting::Position(DockPosition::Right);
+
+        assert_eq!(
+            super::carried_along_by(ids::WORKSPACES, &position),
+            vec![ids::THREADS_SIDEBAR.to_string()],
+            "moving the strip moves the threads sidebar with it",
+        );
+        assert_eq!(
+            super::carried_along_by(ids::THREADS_SIDEBAR, &position),
+            vec![ids::WORKSPACES.to_string()],
+            "and the other way round — neither is the master",
+        );
+        assert!(
+            super::carried_along_by(ids::GIT_PANEL, &position).is_empty(),
+            "a dock-hosted component has its own column and carries nothing",
+        );
+        assert!(
+            super::carried_along_by(ids::WORKSPACES, &super::ComponentSetting::Hidden(true))
+                .is_empty(),
+            "hiding one icon says nothing about the other's visibility",
+        );
+        assert!(
+            super::carried_along_by(ids::WORKSPACES, &super::ComponentSetting::Pinned(true))
+                .is_empty(),
+            "and neither of the pair is pinnable at all (Flow 6 step 7)",
         );
     }
 

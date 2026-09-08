@@ -563,10 +563,14 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
                         // settled by the time anything reads it. Pure settings work,
                         // and a no-op on every launch after the first.
                         multi_workspace.migrate_threads_sidebar_side_once(cx);
-                        // After both are registered, so the migration can activate
-                        // the strip and find it actually there. It is a no-op on
-                        // every launch after the first.
-                        multi_workspace.migrate_strip_into_the_slot_once(cx);
+                        // The strip migration is deliberately **not** called here.
+                        // It belongs at startup after the session restore and nowhere
+                        // else — the brief says so, and this second call site was
+                        // running before the restore, where the slot's open flag is
+                        // still false. With saved configurations that made it take a
+                        // slot the user had left showing threads, which is the defect
+                        // its `sidebar_open` guard was added to prevent. Its one call
+                        // is in `apply_restored_multiworkspace_state`.
                     });
                 })
                 .ok();

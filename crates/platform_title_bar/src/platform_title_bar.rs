@@ -194,6 +194,7 @@ impl Render for PlatformTitleBar {
             .window_control_area(WindowControlArea::Drag)
             .w_full()
             .h(height)
+            .debug_selector(|| "PLATFORM-TITLE-BAR".to_string())
             .map(|this| {
                 this.on_mouse_down_out(cx.listener(move |this, _ev, _window, _cx| {
                     this.should_move = false;

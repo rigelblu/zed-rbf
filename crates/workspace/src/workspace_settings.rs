@@ -338,7 +338,7 @@ impl StatusBarSettings {
     }
 }
 
-fn is_workspace_component(item_id: &str) -> bool {
+pub(crate) fn is_workspace_component(item_id: &str) -> bool {
     crate::layout_registry::get(item_id)
         .is_some_and(|item| item.kind == crate::layout_registry::LayoutItemKind::WorkspaceComponent)
 }
@@ -394,6 +394,35 @@ impl WorkspaceLayoutSettings {
             .unwrap_or_default()
     }
 
+    /// The entry that decides a sidebar-slot occupant's **side**: its own, or its
+    /// sibling's when it has none of its own.
+    ///
+    /// The slot has one side and its two occupants share it (Decision 2026-09-08). That
+    /// was enforced only on write — every writer had to remember to move the pair — and
+    /// two writers forgot on the same day: the legacy `agent.sidebar_side` seed, and
+    /// `sidebar_side_context_menu`. Worse, the seed's fix made it write the `workspaces`
+    /// entry, whose *existence* is the strip migration's "already ran" marker, so a
+    /// legacy-Right profile silently lost its strip on upgrade.
+    ///
+    /// Reading the sibling makes one-slot-one-side a property of the model instead of a
+    /// rule each writer must observe, and leaves the marker meaning what it meant: the
+    /// user has placed this component themselves.
+    ///
+    /// Side only. `hidden` and `pinned` stay per item — hiding one occupant's icon says
+    /// nothing about the other's.
+    pub fn side_entry(&self, item_id: &str) -> Option<WorkspaceComponentPosition> {
+        if self.has_component(item_id) {
+            return Some(self.component(item_id));
+        }
+        if !crate::layout_registry::is_sidebar_slot_occupant(item_id) {
+            return None;
+        }
+        crate::layout_registry::sidebar_slot_occupants()
+            .filter(|id| *id != item_id)
+            .find(|id| self.has_component(id))
+            .map(|id| self.component(id))
+    }
+
     /// The bar zone a workspace component's icon renders in, or `None` when the
     /// id does not name a workspace component.
     ///
@@ -411,21 +440,31 @@ impl WorkspaceLayoutSettings {
         if !is_workspace_component(item_id) {
             return None;
         }
-        let entry = self.component(item_id);
-        if entry.hidden {
+        if self.component(item_id).hidden {
             return Some(StatusBarItemLocation::Hidden);
         }
+        // Side from the pairing-aware entry, hidden from this item's own above.
+        let entry = self.side_entry(item_id).unwrap_or_default();
+        // Through the registry's own validity check, not straight to `component_zone`.
+        // A `SIDES` component with a hand-edited `Bottom` reached the Bottom arm and
+        // landed in the Middle zone, while both side resolvers sent the same `Bottom`
+        // to Left — the icon in one place and the panel in another. The brief's
+        // invalid-saved-position line says fall back to the registered side, which is
+        // what the side resolvers already do.
         entry
             .position
+            .filter(|position| registry_accepts_position(item_id, *position))
             .map(component_zone)
             .or_else(|| registered_status_control_location(item_id))
     }
 }
 
 /// Q1's mapping, in one place: Left and Right put the icon in the matching zone,
-/// Bottom puts it in the Middle. A component registering `SIDES` never reaches the
-/// Bottom arm, but writing it here keeps the rule whole rather than leaving the
-/// third case to the next caller to invent.
+/// Bottom puts it in the Middle. A component registering `SIDES` reaches the Bottom
+/// arm only if its caller failed to check `registry_accepts_position` first — which
+/// `resolved_component_zone` did until 2026-09-08, sending a hand-edited `Bottom` to
+/// the Middle zone while the panel went Left. The arm stays because a
+/// `SIDES_AND_BOTTOM` component needs it.
 fn component_zone(position: settings::DockPosition) -> StatusBarItemLocation {
     match position {
         settings::DockPosition::Left => StatusBarItemLocation::Left,
@@ -790,6 +829,73 @@ mod status_bar_settings_tests {
             right.resolved_component_zone(ids::GIT_PANEL),
             Some(StatusBarItemLocation::Right),
             "the icon stayed put while its component moved sides"
+        );
+    }
+
+    /// A component-backed id is deaf to `status_bar.item_locations`, which is why it
+    /// must not be offered the status-control placement menu.
+    ///
+    /// **Dogfood B-4, 2026-09-08.** Right-clicking the Workspaces icon opened
+    /// `Bottom Bar Placement`, and choosing a zone wrote
+    /// `status_bar.item_locations.workspaces`. Nothing moved, because
+    /// `StatusControlAdapter::effective_location` answers a component id from
+    /// `resolved_component_zone` and returns before reading that key. Three inert
+    /// entries had accumulated in the reporter's settings file before anyone noticed.
+    ///
+    /// This pins the deafness as *correct* — the component key is the one source for
+    /// where a component's icon goes (Q11) — so the defect is the menu, not the
+    /// resolver. `render_status_bar_item` now branches on `is_workspace_component`.
+    #[test]
+    fn a_component_ignores_the_status_control_location_key() {
+        use crate::layout_registry::ids;
+
+        assert!(
+            is_workspace_component(ids::WORKSPACES),
+            "the branch that picks the menu keys off this",
+        );
+        assert!(is_workspace_component(ids::THREADS_SIDEBAR));
+
+        // The reporter's actual settings state: the control menu had written Hidden.
+        let layout = layout_with(&[(ids::WORKSPACES, at(settings::DockPosition::Right))]);
+        assert_eq!(
+            layout.resolved_component_zone(ids::WORKSPACES),
+            Some(StatusBarItemLocation::Right),
+            "the component key decides, whatever `item_locations` says — so a menu \
+             writing `item_locations` for this id is a working-looking no-op",
+        );
+    }
+
+    /// A saved position the component cannot take does not move its icon.
+    ///
+    /// **Cold read 2026-09-08, R2.** `resolved_component_zone` mapped `entry.position`
+    /// straight through `component_zone`, so a hand-edited `Bottom` for a `SIDES`
+    /// component put the icon in the Middle zone — while both side resolvers sent the
+    /// same `Bottom` to Left. Icon in one place, panel in another. The brief's
+    /// invalid-saved-position line says fall back to the registered side.
+    ///
+    /// `registry_accepts_position` already existed; the resolver just never asked it.
+    #[test]
+    fn a_bottom_saved_for_a_sides_component_does_not_reach_the_middle_zone() {
+        use crate::layout_registry::ids;
+
+        for id in [ids::WORKSPACES, ids::THREADS_SIDEBAR] {
+            let layout = layout_with(&[(id, at(settings::DockPosition::Bottom))]);
+            assert_eq!(
+                layout.resolved_component_zone(id),
+                Some(StatusBarItemLocation::Left),
+                "{id} registers SIDES, so a saved Bottom falls back to its registered \
+                 side rather than landing in the Middle",
+            );
+        }
+
+        // A component that genuinely takes Bottom is untouched by the filter — the
+        // arm exists for these, and `PROJECT_PANEL` is not one of them (it registers
+        // SIDES, so it would have passed this for the wrong reason).
+        assert_eq!(
+            layout_with(&[(ids::TERMINAL_PANEL, at(settings::DockPosition::Bottom))])
+                .resolved_component_zone(ids::TERMINAL_PANEL),
+            Some(StatusBarItemLocation::Middle),
+            "a SIDES_AND_BOTTOM component still reaches the Bottom arm",
         );
     }
 
