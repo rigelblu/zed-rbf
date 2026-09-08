@@ -80,7 +80,11 @@ struct SidebarStatus {
 }
 
 impl SidebarStatus {
-    fn query(multi_workspace: &Option<WeakEntity<MultiWorkspace>>, cx: &App) -> Self {
+    /// The slot's own state: whether it is open at all, and on which side.
+    ///
+    /// This is the question the bar's rounded corners ask — a corner is square when
+    /// the slot covers it, whichever occupant happens to be showing.
+    fn slot(multi_workspace: &Option<WeakEntity<MultiWorkspace>>, cx: &App) -> Self {
         multi_workspace
             .as_ref()
             .and_then(|mw| mw.upgrade())
@@ -93,6 +97,28 @@ impl SidebarStatus {
                 }
             })
             .unwrap_or_default()
+    }
+
+    /// The slot's state as `id`'s own icon should read it.
+    ///
+    /// `open` here is narrower than the slot's flag: the slot holds one occupant at
+    /// a time, so an icon reads open only when the slot is open *and* showing that
+    /// occupant. Using the slot's flag would light both icons at once, which is the
+    /// opposite of the exclusive on/off switch the two are specified to be.
+    fn query(
+        id: &'static str,
+        multi_workspace: &Option<WeakEntity<MultiWorkspace>>,
+        cx: &App,
+    ) -> Self {
+        let showing_this_occupant = multi_workspace
+            .as_ref()
+            .and_then(|mw| mw.upgrade())
+            .is_some_and(|mw| mw.read(cx).active_sidebar_id() == Some(id));
+        let slot = Self::slot(multi_workspace, cx);
+        Self {
+            open: slot.open && showing_this_occupant,
+            ..slot
+        }
     }
 }
 
@@ -289,7 +315,7 @@ impl Focusable for StatusBar {
 
 impl Render for StatusBar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let sidebar = SidebarStatus::query(&self.multi_workspace, cx);
+        let sidebar = SidebarStatus::slot(&self.multi_workspace, cx);
 
         h_flex()
             .id("status-bar")
@@ -481,7 +507,11 @@ impl StatusItemView for ThreadsSidebarButton {
 
 impl Render for ThreadsSidebarButton {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let sidebar = SidebarStatus::query(&self.multi_workspace, cx);
+        let sidebar = SidebarStatus::query(
+            crate::layout_registry::ids::THREADS_SIDEBAR,
+            &self.multi_workspace,
+            cx,
+        );
         let on_right = sidebar.side == SidebarSide::Right;
         let has_notifications = sidebar.has_notifications;
         let indicator_border = cx.theme().colors().status_bar_background;
@@ -509,6 +539,12 @@ impl Render for ThreadsSidebarButton {
                 )
                 .icon_size(IconSize::Small)
                 .tab_index(0isize)
+                // The glyph already swaps open/closed, but that reads as a different
+                // picture rather than a state. Now that this and Workspaces are a
+                // matched pair of exclusive on/off switches, they have to highlight
+                // the same way every other bar item does, or only one of the two
+                // looks like it is on.
+                .toggle_state(sidebar.open)
                 .aria_label(if sidebar.open {
                     "Close threads sidebar"
                 } else {
@@ -532,13 +568,95 @@ impl Render for ThreadsSidebarButton {
                 .on_click(move |_, window, cx| {
                     if let Some(multi_workspace) = window.root::<MultiWorkspace>().flatten() {
                         multi_workspace.update(cx, |multi_workspace, cx| {
-                            multi_workspace.toggle_sidebar(window, cx);
+                            multi_workspace.toggle_sidebar_occupant(
+                                crate::layout_registry::ids::THREADS_SIDEBAR,
+                                window,
+                                cx,
+                            );
                         });
                     }
                 })
             });
 
         h_flex().gap_0p5().child(toggle)
+    }
+}
+
+/// The bottom-bar icon for the workspace tab strip, the sidebar slot's other
+/// occupant.
+///
+/// It mirrors `ThreadsSidebarButton` rather than sharing a body with it: the two
+/// differ in icon set, label, and the side each one reads, and folding them into
+/// one parameterised button would trade four small differences for a type that
+/// answers "which occupant am I" at every line.
+pub struct WorkspacesButton {
+    multi_workspace: Option<WeakEntity<MultiWorkspace>>,
+}
+
+impl WorkspacesButton {
+    pub fn new(multi_workspace: Option<WeakEntity<MultiWorkspace>>) -> Self {
+        Self { multi_workspace }
+    }
+}
+
+impl StatusItemView for WorkspacesButton {
+    fn set_active_pane_item(
+        &mut self,
+        _active_pane_item: Option<&dyn ItemHandle>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
+
+    fn hide_setting(&self, _cx: &App) -> Option<HideStatusItem> {
+        // None, for the same reason the threads sidebar has none: this item never
+        // had a legacy per-item show/hide key, so there is nothing for
+        // `HideStatusItem` to write. It hides through its component's `hidden` flag.
+        None
+    }
+}
+
+impl Render for WorkspacesButton {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let sidebar = SidebarStatus::query(
+            crate::layout_registry::ids::WORKSPACES,
+            &self.multi_workspace,
+            cx,
+        );
+        let open = sidebar.open;
+
+        h_flex().gap_0p5().child(
+            IconButton::new("toggle-workspaces-sidebar", IconName::ThisWindow)
+                .icon_size(IconSize::Small)
+                .tab_index(0isize)
+                .toggle_state(open)
+                .aria_label(if open {
+                    "Close workspaces"
+                } else {
+                    "Open workspaces"
+                })
+                .tooltip(move |_, cx| {
+                    Tooltip::simple(
+                        if open {
+                            "Close Workspaces"
+                        } else {
+                            "Open Workspaces"
+                        },
+                        cx,
+                    )
+                })
+                .on_click(move |_, window, cx| {
+                    if let Some(multi_workspace) = window.root::<MultiWorkspace>().flatten() {
+                        multi_workspace.update(cx, |multi_workspace, cx| {
+                            multi_workspace.toggle_sidebar_occupant(
+                                crate::layout_registry::ids::WORKSPACES,
+                                window,
+                                cx,
+                            );
+                        });
+                    }
+                }),
+        )
     }
 }
 

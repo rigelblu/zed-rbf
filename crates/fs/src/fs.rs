@@ -260,6 +260,16 @@ impl dyn Fs {
         GlobalFs::global(cx).0.clone()
     }
 
+    /// Returns the global [`Fs`] if one has been set.
+    ///
+    /// `global` panics when it has not, which is right for code that cannot proceed
+    /// without a filesystem. Startup-time work that merely *prefers* to write should
+    /// use this instead: most tests never set the global, so reaching for it
+    /// unconditionally turns an optional write into a crash.
+    pub fn try_global(cx: &App) -> Option<Arc<Self>> {
+        cx.try_global::<GlobalFs>().map(|global| global.0.clone())
+    }
+
     /// Sets the global [`Fs`].
     pub fn set_global(fs: Arc<Self>, cx: &mut App) {
         cx.set_global(GlobalFs(fs));

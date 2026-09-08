@@ -537,12 +537,32 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
                 .update(cx, |_, window, cx| {
                     let sidebar =
                         cx.new(|cx| Sidebar::new(multi_workspace_handle.clone(), window, cx));
+                    // Registered before the threads sidebar so it wins the
+                    // first-registration default in `register_sidebar`. The strip was
+                    // always on screen before this slice, so an upgrading user finds
+                    // it where they left it rather than having to discover an icon.
+                    let workspaces = cx.new(|cx| {
+                        workspace::workspace_tabs::WorkspacesSidebar::new(
+                            multi_workspace_handle.clone(),
+                            window,
+                            cx,
+                        )
+                    });
                     multi_workspace_handle.update(cx, |multi_workspace, cx| {
+                        multi_workspace.register_sidebar(
+                            workspace::layout_registry::ids::WORKSPACES,
+                            workspaces,
+                            cx,
+                        );
                         multi_workspace.register_sidebar(
                             workspace::layout_registry::ids::THREADS_SIDEBAR,
                             sidebar,
                             cx,
                         );
+                        // After both are registered, so the migration can activate
+                        // the strip and find it actually there. It is a no-op on
+                        // every launch after the first.
+                        multi_workspace.migrate_strip_into_the_slot_once(cx);
                     });
                 })
                 .ok();

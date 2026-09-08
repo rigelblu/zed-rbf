@@ -4,8 +4,8 @@ use fs::Fs;
 
 use gpui::{
     AnyView, App, AsyncApp, Context, DragMoveEvent, Entity, EntityId, EventEmitter, FocusHandle,
-    Focusable, ManagedView, MouseButton, Pixels, Render, ScrollHandle, Subscription, Task, TaskExt,
-    WeakEntity, Window, WindowId, actions, deferred, px,
+    Focusable, ManagedView, MouseButton, Pixels, Render, Subscription, Task, TaskExt, WeakEntity,
+    Window, WindowId, actions, deferred, px,
 };
 pub use project::ProjectGroupKey;
 use project::{DisableAiSettings, Project};
@@ -172,6 +172,15 @@ pub fn sidebar_side_context_menu(
 /// The user's `component_positions` entry for the threads sidebar, or `None` when
 /// they have never placed it — which is the only state in which the legacy
 /// `agent.sidebar_side` key is still read.
+/// The side the threads sidebar sits on, resolved the way everything else reads it.
+///
+/// Public because the occupant itself has to answer this: the slot asks whichever
+/// occupant is showing for its own side, so an occupant that returned a raw legacy
+/// key would place the slot by a value nothing else agrees with.
+pub fn resolved_threads_sidebar_side(cx: &App, legacy: SidebarSide) -> SidebarSide {
+    resolved_sidebar_side(threads_sidebar_entry(cx), legacy)
+}
+
 fn threads_sidebar_entry(
     cx: &App,
 ) -> Option<crate::workspace_settings::WorkspaceComponentPosition> {
@@ -550,12 +559,6 @@ pub struct MultiWorkspace {
     active_sidebar_id: Option<&'static str>,
     sidebar_open: bool,
     sidebar_overlay: Option<AnyView>,
-    pub(crate) workspace_tabs_scroll_handle: ScrollHandle,
-    pub(crate) workspace_tabs_last_scrolled_workspace_id: Cell<Option<EntityId>>,
-    pub(crate) workspace_tabs_last_scrolled_index: Cell<Option<usize>>,
-    /// Armed on mouse-down in the tab strip's title-bar band, spent on the first
-    /// mouse-move. See `workspace_tabs.rs` for why the move can't start on the down.
-    pub(crate) workspace_tabs_title_bar_drag_armed: bool,
     pub(crate) workspace_configuration_menu_handle: PopoverMenuHandle<ContextMenu>,
     /// The workspace being held across an await purely to keep the window alive, if any.
     ///
@@ -1507,10 +1510,16 @@ impl MultiWorkspace {
         })
     }
 
+    /// Which side the slot draws on: the side of whichever occupant it is showing.
+    ///
+    /// It used to resolve the threads sidebar's entry no matter who was in the slot,
+    /// which made placing Workspaces on the right move its bar icon and leave the
+    /// panel where it was. Each item owns its own side and the two may differ
+    /// (`Flow 6`), so the only occupant whose side can answer this is the one on
+    /// screen — every occupant resolves its own, including the legacy key where it
+    /// still applies.
     pub fn sidebar_side(&self, cx: &App) -> SidebarSide {
-        resolved_sidebar_side(threads_sidebar_entry(cx), {
-            self.sidebar().map_or(SidebarSide::Left, |s| s.side(cx))
-        })
+        self.sidebar().map_or(SidebarSide::Left, |s| s.side(cx))
     }
 
     pub fn sidebar_render_state(&self, cx: &App) -> SidebarRenderState {
@@ -1572,10 +1581,6 @@ impl MultiWorkspace {
             active_sidebar_id: None,
             sidebar_open: false,
             sidebar_overlay: None,
-            workspace_tabs_scroll_handle: ScrollHandle::new(),
-            workspace_tabs_last_scrolled_workspace_id: Cell::new(None),
-            workspace_tabs_last_scrolled_index: Cell::new(None),
-            workspace_tabs_title_bar_drag_armed: false,
             workspace_configuration_menu_handle: PopoverMenuHandle::default(),
             placeholder_in_flight: None,
             pending_removal_tasks: Vec::new(),
@@ -1636,6 +1641,18 @@ impl MultiWorkspace {
 
     pub fn active_sidebar_id(&self) -> Option<&'static str> {
         self.active_sidebar_id
+    }
+
+    /// The occupant registered under `id`, whether or not it is the one showing.
+    ///
+    /// Restoring state has to reach the occupant that owns it, not the one currently
+    /// in the slot — otherwise the first restore hands every blob to whichever
+    /// occupant happened to register first.
+    pub fn sidebar_with_id(&self, id: &str) -> Option<&dyn SidebarHandle> {
+        self.sidebars
+            .iter()
+            .find(|(existing, _)| *existing == id)
+            .map(|(_, handle)| handle.as_ref())
     }
 
     /// Shows `id` in the slot, replacing whichever occupant was there.
@@ -1723,6 +1740,39 @@ impl MultiWorkspace {
         }
     }
 
+    /// Toggles the slot from one occupant's own icon.
+    ///
+    /// The two icons are exclusive on/off switches, so what a click means depends
+    /// on which occupant is showing, not just on whether the slot is open:
+    /// clicking the icon that is already on closes the slot, and clicking the other
+    /// one swaps the occupant and leaves the slot open. Routing both through
+    /// `toggle_sidebar` would make the second case close the slot instead.
+    pub fn toggle_sidebar_occupant(
+        &mut self,
+        id: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.sidebar_slot_enabled(cx) {
+            return;
+        }
+
+        if self.sidebar_open() && self.active_sidebar_id == Some(id) {
+            self.close_sidebar(window, cx);
+            return;
+        }
+
+        self.activate_sidebar(id, cx);
+        if !self.sidebar_open() {
+            self.previous_focus_handle = window.focused(cx);
+            self.open_sidebar(cx);
+        }
+        if let Some(sidebar) = self.sidebar() {
+            sidebar.prepare_for_focus(window, cx);
+            sidebar.focus(window, cx);
+        }
+    }
+
     pub fn close_sidebar_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.sidebar_slot_enabled(cx) {
             return;
@@ -1769,6 +1819,52 @@ impl MultiWorkspace {
         };
         telemetry::event!("Sidebar Toggled", action = "open", side = side);
         self.apply_open_sidebar(cx);
+    }
+
+    /// One-time migration: show the workspace strip the first time this build runs.
+    ///
+    /// Before this slice the strip was always on screen when it had rows, whatever
+    /// the sidebar was doing. It is now an occupant of the sidebar slot, and that
+    /// slot's open flag is persisted per window and defaults to closed — so an
+    /// upgrading user who never opened the agent sidebar would find their strip
+    /// simply gone, with an icon they have no reason to look for.
+    ///
+    /// The marker is the absence of a `component_positions` entry for this item,
+    /// the same shape the `agent.sidebar_side` migration in this change uses: no
+    /// entry means the user has never expressed an opinion about where this thing
+    /// lives. Writing the entry is what makes the migration one-time — after it,
+    /// closing the slot is a choice the user made and this leaves it alone.
+    ///
+    /// Returns whether it fired, so a caller can skip a redundant serialize.
+    pub fn migrate_strip_into_the_slot_once(&mut self, cx: &mut Context<Self>) -> bool {
+        let id = crate::layout_registry::ids::WORKSPACES;
+        let layout = <crate::WorkspaceLayoutSettings as settings::Settings>::get_global(cx);
+        if layout.has_component(id) {
+            return false;
+        }
+        if !self.sidebar_slot_enabled(cx) || !self.workspace_tabs_visible(cx) {
+            return false;
+        }
+
+        self.activate_sidebar(id, cx);
+        if !self.sidebar_open() {
+            self.restore_open_sidebar(cx);
+        }
+        // Optional by design: with no filesystem there is nothing to write the marker
+        // to, and the slot has already been put right for this session. The next
+        // launch simply tries again.
+        let Some(fs) = <dyn fs::Fs>::try_global(cx) else {
+            return true;
+        };
+        settings::update_settings_file(fs, cx, move |settings, _cx| {
+            settings
+                .workspace_layout
+                .get_or_insert_default()
+                .component_positions
+                .entry(id.to_string())
+                .or_default();
+        });
+        true
     }
 
     /// Restores the sidebar to open state from persisted session data without
@@ -3102,6 +3198,11 @@ impl MultiWorkspace {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_state(&self, cx: &App) -> MultiWorkspaceState {
+        self.multi_workspace_state(cx)
+    }
+
     fn multi_workspace_state(&self, cx: &App) -> MultiWorkspaceState {
         MultiWorkspaceState {
             active_workspace_id: self.workspace().read(cx).database_id(),
@@ -3116,7 +3217,16 @@ impl MultiWorkspace {
                 })
                 .collect::<Vec<_>>(),
             sidebar_open: self.sidebar_open,
-            sidebar_state: self.sidebar().and_then(|s| s.serialized_state(cx)),
+            // Never written again — see the field's own note. Keeping it `None` is
+            // what makes the migration one-way: once a window has saved keyed state,
+            // the legacy blob is gone and cannot resurrect one occupant's width under
+            // the other.
+            sidebar_state: None,
+            sidebar_states: self
+                .sidebars
+                .iter()
+                .filter_map(|(id, handle)| handle.serialized_state(cx).map(|s| (id.to_string(), s)))
+                .collect(),
             active_configuration_id: self
                 .configuration_checkpoint_error
                 .is_none()
@@ -3987,7 +4097,6 @@ impl Render for MultiWorkspace {
 
         let ui_font = theme_settings::setup_ui_font(window, cx);
         let text_color = cx.theme().colors().text;
-        let workspace_tabs = self.render_workspace_tabs(window, cx);
 
         let workspace = self.workspace().clone();
         let workspace_key_context = workspace.update(cx, |workspace, cx| workspace.key_context(cx));
@@ -4116,9 +4225,9 @@ impl Render for MultiWorkspace {
                         ))
                     },
                 )
-                // `#zed-37`: the tab strip sits above the sidebars and the workspace,
-                // so it spans the window and can extend the titlebar background.
-                .children(workspace_tabs)
+                // `#zed-37`'s tab strip is no longer a root-level sibling here: it is
+                // one of the two occupants the sidebar slot can hold, so it draws
+                // through `left_sidebar`/`right_sidebar` like any other occupant.
                 .children(left_sidebar)
                 .child(
                     div()

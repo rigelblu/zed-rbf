@@ -5413,6 +5413,7 @@ mod tests {
                 project_groups: vec![],
                 sidebar_open: true,
                 sidebar_state: None,
+                sidebar_states: Default::default(),
                 active_configuration_id: None,
             },
         )
@@ -5426,6 +5427,7 @@ mod tests {
                 project_groups: vec![],
                 sidebar_open: false,
                 sidebar_state: None,
+                sidebar_states: Default::default(),
                 active_configuration_id: None,
             },
         )

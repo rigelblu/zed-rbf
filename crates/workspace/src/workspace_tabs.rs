@@ -1,13 +1,14 @@
 use std::{
     borrow::Cow,
+    cell::Cell,
     collections::HashMap,
     path::{Path, PathBuf},
 };
 
 use gpui::{
-    Action, Anchor, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
-    MouseButton, Pixels, PromptLevel, ScrollHandle, SharedString, TaskExt, WeakEntity, Window,
-    WindowControlArea, px, rems,
+    Action, Anchor, App, Context, DismissEvent, Entity, EntityId, EventEmitter, FocusHandle,
+    Focusable, MouseButton, MouseUpEvent, Pixels, PromptLevel, ScrollHandle, SharedString, TaskExt,
+    WeakEntity, Window, WindowControlArea, px, rems,
 };
 use project::ProjectGroupKey;
 use ui::{
@@ -21,7 +22,7 @@ use crate::{
     ModalView, MultiWorkspace, SaveWorkspaceConfigurationAs, Workspace,
     multi_workspace::{
         ManageWorkspaceConfigurations, SelectNextWorkspaceConfiguration,
-        SelectPreviousWorkspaceConfiguration,
+        SelectPreviousWorkspaceConfiguration, Sidebar, SidebarEvent, SidebarSide,
     },
     persistence::{
         StoreBlock, WorkspaceConfigurationMutation, WorkspaceConfigurationStore,
@@ -37,187 +38,296 @@ struct DraggedWorkspaceTab {
     is_active: bool,
 }
 
-impl MultiWorkspace {
-    pub(crate) fn cycle_workspace_tab(
+/// The width the rail was hardcoded to, kept as the slot default so an existing
+/// user's strip is the same width it was the day before the move.
+const WORKSPACES_DEFAULT_WIDTH: Pixels = px(168.);
+const WORKSPACES_MIN_WIDTH: Pixels = px(120.);
+const WORKSPACES_MAX_WIDTH: Pixels = px(400.);
+
+/// The workspace tab strip as a sidebar-slot occupant.
+///
+/// The strip's own state lives here rather than on `MultiWorkspace` because an
+/// occupant renders under `Context<WorkspacesSidebar>`: reaching back through
+/// `mw.update(..)` during render would re-enter `MultiWorkspace::render`, which is
+/// the panic `visual_test_runner.rs` already carries a comment about. Reads of the
+/// workspace list go through `mw.read(cx)`, which is safe; every write happens in a
+/// listener body, at event time, when `MultiWorkspace::render` is off the stack.
+pub struct WorkspacesSidebar {
+    multi_workspace: WeakEntity<MultiWorkspace>,
+    focus_handle: FocusHandle,
+    width: Pixels,
+    pub(crate) scroll_handle: ScrollHandle,
+    pub(crate) last_scrolled_workspace_id: Cell<Option<EntityId>>,
+    pub(crate) last_scrolled_index: Cell<Option<usize>>,
+    /// Armed on mouse-down in the header, spent on the first mouse-move.
+    ///
+    /// The move cannot start on the mouse-down: that would swallow the
+    /// double-click bound to the same band. `window_control_area` is a
+    /// Windows-only hit-test hint — `gpui_macos` ignores it — so macOS needs this
+    /// armed gesture, the same one `PlatformTitleBar` uses.
+    pub(crate) title_bar_drag_armed: bool,
+}
+
+impl WorkspacesSidebar {
+    pub fn new(
+        multi_workspace: Entity<MultiWorkspace>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self {
+            multi_workspace: multi_workspace.downgrade(),
+            focus_handle: cx.focus_handle(),
+            width: WORKSPACES_DEFAULT_WIDTH,
+            scroll_handle: ScrollHandle::new(),
+            last_scrolled_workspace_id: Cell::new(None),
+            last_scrolled_index: Cell::new(None),
+            title_bar_drag_armed: false,
+        }
+    }
+}
+
+impl Focusable for WorkspacesSidebar {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl EventEmitter<SidebarEvent> for WorkspacesSidebar {}
+
+impl Sidebar for WorkspacesSidebar {
+    fn width(&self, _cx: &App) -> Pixels {
+        self.width
+    }
+
+    fn set_width(&mut self, width: Option<Pixels>, cx: &mut Context<Self>) {
+        self.width = width
+            .unwrap_or(WORKSPACES_DEFAULT_WIDTH)
+            .clamp(WORKSPACES_MIN_WIDTH, WORKSPACES_MAX_WIDTH);
+        cx.notify();
+    }
+
+    fn has_notifications(&self, _cx: &App) -> bool {
+        false
+    }
+
+    /// Resolved from this item's own `component_positions` entry, and never by
+    /// asking `MultiWorkspace`.
+    ///
+    /// `MultiWorkspace::sidebar_side` answers by reading the active occupant's
+    /// handle, so an occupant calling it during its own render re-enters itself:
+    /// `cannot read WorkspacesSidebar while it is already being updated`. Reading
+    /// settings directly has no such round trip. There is no legacy key to fall
+    /// back to either — the rail was always on the left.
+    fn side(&self, cx: &App) -> SidebarSide {
+        let layout = <crate::WorkspaceLayoutSettings as settings::Settings>::get_global(cx);
+        let id = crate::layout_registry::ids::WORKSPACES;
+        if layout.has_component(id)
+            && layout.component(id).position == Some(settings::DockPosition::Right)
+        {
+            SidebarSide::Right
+        } else {
+            SidebarSide::Left
+        }
+    }
+
+    /// The strip's width, so a resize survives a restart.
+    ///
+    /// Stored under this occupant's own key rather than in the slot's single blob:
+    /// both occupants have a width and they are not the same width, so one shared
+    /// field means switching occupants hands one the other's size.
+    fn serialized_state(&self, _cx: &App) -> Option<String> {
+        Some(f32::from(self.width).to_string())
+    }
+
+    fn restore_serialized_state(
         &mut self,
-        forward: bool,
-        window: &mut Window,
+        state: &str,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // `#zed-66.2`: cycling must not land on a row the strip is not drawing.
-        let workspaces = self.ordered_workspace_tabs(cx);
-        if workspaces.len() < 2 {
-            return;
+        // A blob written by another occupant, or by a build that stored something
+        // else here, parses to nothing — so fall back to the default rather than
+        // failing the whole restore over a width.
+        if let Ok(width) = state.parse::<f32>() {
+            self.set_width(Some(px(width)), cx);
         }
+    }
 
-        let active_index = workspaces
-            .iter()
-            .position(|workspace| workspace == self.workspace())
-            .unwrap_or(0);
-        let next_index = if forward {
-            (active_index + 1) % workspaces.len()
-        } else if active_index == 0 {
-            workspaces.len() - 1
-        } else {
-            active_index - 1
+    /// `NextProject` / `PreviousProject` are bound twice today: `MultiWorkspace`
+    /// cycles the rail's list and the agent sidebar cycles its own. Piece 9 retires
+    /// the rail's binding, so without this the action would silently do nothing
+    /// whenever Workspaces is the active occupant.
+    fn cycle_project(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.multi_workspace
+            .update(cx, |multi_workspace, cx| {
+                multi_workspace.cycle_workspace_tab(forward, window, cx);
+            })
+            .log_err();
+    }
+}
+
+impl Render for WorkspacesSidebar {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(multi_workspace) = self.multi_workspace.upgrade() else {
+            return div().into_any_element();
         };
 
-        self.activate(workspaces[next_index].clone(), None, window, cx);
-    }
+        // Everything read from `MultiWorkspace` is gathered here, before a single
+        // element is built. `mw.read(cx)` holds an immutable borrow of `cx`, and
+        // `cx.listener` below needs it mutably — so the borrow has to be finished
+        // with, not merely finished reading. This block is also the whole of the
+        // re-entrancy story: reads happen here, at render time, and every write
+        // happens inside a listener, at event time, when `MultiWorkspace::render`
+        // is no longer on the stack.
+        let (
+            visible,
+            workspaces,
+            active_workspace,
+            workspace_paths,
+            workspace_has_unsaved_changes,
+            project_group_keys,
+            heading,
+        ) = {
+            let mw = multi_workspace.read(cx);
+            let workspaces = mw.ordered_workspace_tabs(cx);
+            let active_workspace = mw.workspace().clone();
+            let workspace_paths = workspaces
+                .iter()
+                .map(|workspace| workspace_tab_paths(workspace.read(cx), cx))
+                .collect::<Vec<_>>();
+            let workspace_has_unsaved_changes = workspaces
+                .iter()
+                .map(|workspace| workspace_has_unsaved_changes(workspace.read(cx), cx))
+                .collect::<Vec<_>>();
+            let project_group_keys = workspaces
+                .iter()
+                .map(|workspace| mw.project_group_key_for_workspace(workspace, cx))
+                .collect::<Vec<_>>();
+            let heading = mw.workspace_tab_heading(self.multi_workspace.clone(), cx);
+            (
+                mw.workspace_tabs_visible(cx),
+                workspaces,
+                active_workspace,
+                workspace_paths,
+                workspace_has_unsaved_changes,
+                project_group_keys,
+                heading,
+            )
+        };
 
-    /// Whether the workspace tab strip renders, and so occupies the window's left edge.
-    ///
-    /// `#zed-65`: the platform title bar asks this to decide whether it still has to
-    /// reserve room for the macOS traffic lights, which sit over the strip when there
-    /// is one. Keep it and `render_workspace_tabs` answering the same question.
-    pub fn workspace_tabs_visible(&self, cx: &App) -> bool {
-        if !self.retention_enabled(cx) {
-            return false;
+        if !visible {
+            return div().into_any_element();
         }
-        if self.sidebar_ui_enabled(cx) && self.sidebar_open() {
-            return false;
-        }
 
-        let store_requires_recovery = WorkspaceConfigurationStore::try_global(cx)
-            .is_some_and(|store| store.blocked().is_some());
-        let has_saved_configurations = WorkspaceConfigurationStore::try_global(cx)
-            .is_some_and(|store| !store.configurations().is_empty());
-
-        // `#zed-66.2`: count drawable rows, not held workspaces. A placeholder held
-        // across an open would otherwise push the count to 2 for the frames between the
-        // new workspace activating and the placeholder detaching — making the whole
-        // strip appear and vanish for a user who has no saved configurations, rather
-        // than just gaining and losing a row.
-        self.workspace_tab_count() >= 2 || has_saved_configurations || store_requires_recovery
-    }
-
-    pub(crate) fn render_workspace_tabs(
-        &self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        if !self.workspace_tabs_visible(cx) {
-            return None;
-        }
-
-        let workspaces = self.ordered_workspace_tabs(cx);
-        let active_workspace = self.workspace().clone();
         let active_workspace_index = workspaces
             .iter()
             .position(|workspace| workspace == &active_workspace)
             .unwrap_or(0);
         let active_workspace_id = active_workspace.entity_id();
-        if self.workspace_tabs_last_scrolled_workspace_id.get() != Some(active_workspace_id)
-            || self.workspace_tabs_last_scrolled_index.get() != Some(active_workspace_index)
+        if self.last_scrolled_workspace_id.get() != Some(active_workspace_id)
+            || self.last_scrolled_index.get() != Some(active_workspace_index)
         {
-            self.workspace_tabs_scroll_handle
-                .scroll_to_item(active_workspace_index);
-            self.workspace_tabs_last_scrolled_workspace_id
+            self.scroll_handle.scroll_to_item(active_workspace_index);
+            self.last_scrolled_workspace_id
                 .set(Some(active_workspace_id));
-            self.workspace_tabs_last_scrolled_index
-                .set(Some(active_workspace_index));
+            self.last_scrolled_index.set(Some(active_workspace_index));
         }
 
-        let workspace_paths = workspaces
-            .iter()
-            .map(|workspace| workspace_tab_paths(workspace.read(cx), cx))
-            .collect::<Vec<_>>();
-        let workspace_has_unsaved_changes = workspaces
-            .iter()
-            .map(|workspace| workspace_has_unsaved_changes(workspace.read(cx), cx))
-            .collect::<Vec<_>>();
-        let path_detail_map = workspace_tab_path_detail_map(&workspace_paths);
-        let title_bar_fill_height = if cfg!(target_os = "macos") && !window.is_fullscreen() {
+        // The traffic lights sit over this occupant's top-left, and the slot does
+        // NOT pad for them: `render_sidebar_header` belongs to the agent's own
+        // `Sidebar::render`, not to the slot, which only does
+        // `.child(sidebar_handle.to_any())`. So the band the rail painted has to be
+        // painted here too, or the first tab renders under the window controls.
+        // Only on the left — on the right there are no traffic lights to clear, a
+        // question the fixed-left rail never had to ask.
+        let title_bar_fill_height = if cfg!(target_os = "macos")
+            && !window.is_fullscreen()
+            && self.side(cx) == SidebarSide::Left
+        {
             Some(platform_title_bar_height(window))
         } else {
             None
         };
-        let top_padding = if let Some(title_bar_fill_height) = title_bar_fill_height {
-            title_bar_fill_height
-        } else {
-            px(4.)
-        };
-        let overflow_edges = workspace_tab_overflow_edges(&self.workspace_tabs_scroll_handle);
+        let top_padding = title_bar_fill_height.unwrap_or(px(4.));
+        let this_handle = self.multi_workspace.clone();
+        let path_detail_map = workspace_tab_path_detail_map(&workspace_paths);
+        let overflow_edges = workspace_tab_overflow_edges(&self.scroll_handle);
 
-        Some(
-            div()
-                .id("workspace-tab-strip")
-                .relative()
-                .h_full()
-                .w(px(168.))
-                .flex_shrink_0()
-                .bg(cx.theme().colors().panel_background)
-                .border_r_1()
-                .border_color(cx.theme().colors().border)
-                .vertical_scrollbar_for(&self.workspace_tabs_scroll_handle, window, cx)
-                .when_some(title_bar_fill_height, |this, title_bar_fill_height| {
-                    this.child(
-                        div()
-                            .id("workspace-tab-title-bar-fill")
-                            .debug_selector(|| "WORKSPACE-TAB-TITLE-BAR-FILL".to_string())
-                            .absolute()
-                            .top_0()
-                            .left_0()
-                            .right_0()
-                            .h(title_bar_fill_height)
-                            .bg(cx.theme().colors().title_bar_background)
-                            // `window_control_area` is a Windows-only hit-test hint —
-                            // `gpui_macos`'s `on_hit_test_window_control` ignores it — so
-                            // macOS needs the same armed gesture `PlatformTitleBar` uses:
-                            // arm on mouse-down, move on the first mouse-move. Starting the
-                            // move on the down would swallow the double-click below.
-                            .window_control_area(WindowControlArea::Drag)
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _event, _window, _cx| {
-                                    this.workspace_tabs_title_bar_drag_armed = true;
-                                }),
-                            )
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(|this, _event, _window, _cx| {
-                                    this.workspace_tabs_title_bar_drag_armed = false;
-                                }),
-                            )
-                            .on_mouse_down_out(cx.listener(|this, _event, _window, _cx| {
-                                this.workspace_tabs_title_bar_drag_armed = false;
-                            }))
-                            .on_mouse_move(cx.listener(|this, _event, window, _cx| {
-                                if this.workspace_tabs_title_bar_drag_armed {
-                                    this.workspace_tabs_title_bar_drag_armed = false;
-                                    window.start_window_move();
-                                }
-                            }))
-                            .on_click(|event, window, _| {
-                                if event.click_count() == 2 {
+        // No width, no right border and no title-bar fill: the slot owns all three.
+        // The fill is gone rather than moved — it existed to paint the rail's top
+        // like the title bar and to let a drag there move the window, and the slot's
+        // header already does the painting. The window-move gesture is deliberately
+        // not rebuilt here: dragging a sidebar header does not move the window
+        // today, and the agent sidebar has sat on the left with the traffic lights
+        // over its header all along without it. Dated ruling 2026-09-07.
+        div()
+            .id("workspace-tab-strip")
+            .relative()
+            .h_full()
+            .w_full()
+            .bg(cx.theme().colors().panel_background)
+            .vertical_scrollbar_for(&self.scroll_handle, window, cx)
+            .when_some(title_bar_fill_height, |this, title_bar_fill_height| {
+                this.child(
+                    div()
+                        .id("workspace-tab-title-bar-fill")
+                        .debug_selector(|| "WORKSPACE-TAB-TITLE-BAR-FILL".to_string())
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .h(title_bar_fill_height)
+                        .bg(cx.theme().colors().title_bar_background)
+                        .window_control_area(WindowControlArea::Drag)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _event, _window, _cx| {
+                                this.title_bar_drag_armed = true;
+                            }),
+                        )
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, event: &MouseUpEvent, window, _cx| {
+                                this.title_bar_drag_armed = false;
+                                if event.click_count == 2 {
                                     window.titlebar_double_click();
                                 }
                             }),
-                    )
-                })
-                .child(
-                    v_flex()
-                        .id("workspace-tab-strip-scroll")
-                        .h_full()
-                        .w_full()
-                        .pt(top_padding)
-                        .pb_1()
-                        .overflow_y_scroll()
-                        .track_scroll(&self.workspace_tabs_scroll_handle)
-                        .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
-                        .child(self.workspace_tab_heading(cx))
-                        .children(
-                            workspaces
-                                .into_iter()
-                                .zip(workspace_paths)
-                                .zip(workspace_has_unsaved_changes)
-                                .enumerate()
-                                .map(|(ix, ((workspace, paths), has_unsaved_changes))| {
+                        )
+                        .on_mouse_down_out(cx.listener(|this, _event, _window, _cx| {
+                            this.title_bar_drag_armed = false;
+                        }))
+                        .on_mouse_move(cx.listener(|this, _event, window, _cx| {
+                            if this.title_bar_drag_armed {
+                                this.title_bar_drag_armed = false;
+                                window.start_window_move();
+                            }
+                        })),
+                )
+            })
+            .child(
+                v_flex()
+                    .id("workspace-tab-strip-scroll")
+                    .h_full()
+                    .w_full()
+                    .pt(top_padding)
+                    .pb_1()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll_handle)
+                    .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
+                    .child(heading)
+                    .children(
+                        workspaces
+                            .into_iter()
+                            .zip(workspace_paths)
+                            .zip(workspace_has_unsaved_changes)
+                            .zip(project_group_keys)
+                            .enumerate()
+                            .map(
+                                |(ix, (((workspace, paths), has_unsaved_changes), project_group_key))| {
                                     let label = workspace_tab_label(&paths, &path_detail_map);
                                     let tooltip = workspace_tab_tooltip(&paths);
                                     let is_active = workspace == active_workspace;
-                                    let project_group_key =
-                                        self.project_group_key_for_workspace(&workspace, cx);
                                     let dragged_tab = DraggedWorkspaceTab {
                                         ix,
                                         workspace: workspace.clone(),
@@ -276,16 +386,24 @@ impl MultiWorkspace {
                                             let tab_ix = ix;
                                             cx.listener(
                                                 move |this, dragged_tab: &DraggedWorkspaceTab, _, cx| {
-                                                    this.move_workspace_tab_to_index(
-                                                        &dragged_tab.workspace,
-                                                        tab_ix,
-                                                        cx,
-                                                    );
+                                                    let workspace = dragged_tab.workspace.clone();
+                                                    this.multi_workspace
+                                                        .update(cx, |mw, cx| {
+                                                            mw.move_workspace_tab_to_index(
+                                                                &workspace, tab_ix, cx,
+                                                            );
+                                                        })
+                                                        .log_err();
                                                 },
                                             )
                                         })
                                         .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.activate(workspace.clone(), None, window, cx);
+                                            let workspace = workspace.clone();
+                                            this.multi_workspace
+                                                .update(cx, |mw, cx| {
+                                                    mw.activate(workspace, None, window, cx);
+                                                })
+                                                .log_err();
                                         }))
                                         .child(
                                             Label::new(label)
@@ -312,7 +430,7 @@ impl MultiWorkspace {
                                         .child(workspace_tab_actions_menu(
                                             ix,
                                             project_group_key,
-                                            cx,
+                                            this_handle.clone(),
                                         ))
                                         .child(
                                             div()
@@ -333,40 +451,109 @@ impl MultiWorkspace {
                                                         move |this, _, window, cx| {
                                                             cx.stop_propagation();
                                                             window.prevent_default();
-                                                            this.close_workspace(
-                                                                &close_workspace,
-                                                                window,
-                                                                cx,
-                                                            )
-                                                            .detach_and_log_err(cx);
+                                                            let workspace =
+                                                                close_workspace.clone();
+                                                            this.multi_workspace
+                                                                .update(cx, |mw, cx| {
+                                                                    mw.close_workspace(
+                                                                        &workspace, window, cx,
+                                                                    )
+                                                                    .detach_and_log_err(cx);
+                                                                })
+                                                                .log_err();
                                                         },
                                                     )),
                                                 ),
                                         )
                                         .into_any_element()
-                                }),
-                        ),
-                )
-                .when(overflow_edges.above, |this| {
-                    this.child(workspace_tab_overflow_cue(
-                        "workspace-tab-overflow-above",
-                        IconName::ChevronUp,
-                        "More Workspace Tabs Above",
-                        Some(top_padding),
-                        cx,
-                    ))
-                })
-                .when(overflow_edges.below, |this| {
-                    this.child(workspace_tab_overflow_cue(
-                        "workspace-tab-overflow-below",
-                        IconName::ChevronDown,
-                        "More Workspace Tabs Below",
-                        None,
-                        cx,
-                    ))
-                })
-                .into_any_element(),
-        )
+                                },
+                            ),
+                    ),
+            )
+            .when(overflow_edges.above, |this| {
+                this.child(workspace_tab_overflow_cue(
+                    "workspace-tab-overflow-above",
+                    IconName::ChevronUp,
+                    "More Workspace Tabs Above",
+                    Some(top_padding),
+                    cx,
+                ))
+            })
+            .when(overflow_edges.below, |this| {
+                this.child(workspace_tab_overflow_cue(
+                    "workspace-tab-overflow-below",
+                    IconName::ChevronDown,
+                    "More Workspace Tabs Below",
+                    None,
+                    cx,
+                ))
+            })
+            .into_any_element()
+    }
+}
+
+impl MultiWorkspace {
+    pub(crate) fn cycle_workspace_tab(
+        &mut self,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // `#zed-66.2`: cycling must not land on a row the strip is not drawing.
+        let workspaces = self.ordered_workspace_tabs(cx);
+        if workspaces.len() < 2 {
+            return;
+        }
+
+        let active_index = workspaces
+            .iter()
+            .position(|workspace| workspace == self.workspace())
+            .unwrap_or(0);
+        let next_index = if forward {
+            (active_index + 1) % workspaces.len()
+        } else if active_index == 0 {
+            workspaces.len() - 1
+        } else {
+            active_index - 1
+        };
+
+        self.activate(workspaces[next_index].clone(), None, window, cx);
+    }
+
+    /// Whether the workspace tab strip has anything to draw.
+    ///
+    /// **The platform title bar no longer asks this.** It used to, to decide whether
+    /// to reserve room for the macOS traffic lights when the rail already covered the
+    /// window's left edge. The strip is an occupant of the sidebar slot now, so
+    /// "is the sidebar open on the left" is the same question and the title bar asks
+    /// only that one. `workspace_tabs_cover_left_edge` went with the coupling.
+    ///
+    /// What remains is the strip's own gate, and it has two readers that must agree:
+    /// `WorkspacesSidebar::render` and `migrate_strip_into_the_slot_once`.
+    ///
+    /// **This no longer asks whether the agent sidebar is open**, and the clause that
+    /// did was removed rather than adjusted. It encoded the rail's rule — a root-level
+    /// strip beside the sidebar had to yield when the sidebar appeared — and the strip
+    /// is now an occupant of that same sidebar slot. Kept as-is it inverted: the strip
+    /// would hide in exactly the state where it is the thing being shown. Exclusivity
+    /// with the threads sidebar is structural now, not a visibility rule: one slot,
+    /// one active occupant, so there is nowhere for the second to be.
+    pub fn workspace_tabs_visible(&self, cx: &App) -> bool {
+        if !self.retention_enabled(cx) {
+            return false;
+        }
+
+        let store_requires_recovery = WorkspaceConfigurationStore::try_global(cx)
+            .is_some_and(|store| store.blocked().is_some());
+        let has_saved_configurations = WorkspaceConfigurationStore::try_global(cx)
+            .is_some_and(|store| !store.configurations().is_empty());
+
+        // `#zed-66.2`: count drawable rows, not held workspaces. A placeholder held
+        // across an open would otherwise push the count to 2 for the frames between the
+        // new workspace activating and the placeholder detaching — making the whole
+        // strip appear and vanish for a user who has no saved configurations, rather
+        // than just gaining and losing a row.
+        self.workspace_tab_count() >= 2 || has_saved_configurations || store_requires_recovery
     }
 }
 
@@ -499,7 +686,14 @@ impl MultiWorkspace {
 }
 
 impl MultiWorkspace {
-    fn workspace_tab_heading(&self, cx: &Context<Self>) -> AnyElement {
+    /// Takes the handle rather than reaching for `cx.weak_entity()` so it can be
+    /// called from the occupant's render, where `cx` is `Context<WorkspacesSidebar>`
+    /// and the only `MultiWorkspace` handle in scope is the one the occupant holds.
+    fn workspace_tab_heading(
+        &self,
+        multi_workspace: WeakEntity<MultiWorkspace>,
+        cx: &App,
+    ) -> AnyElement {
         let active_name = self
             .active_configuration_id()
             .and_then(|configuration_id| {
@@ -523,8 +717,6 @@ impl MultiWorkspace {
         } else {
             "Workspace Configurations"
         };
-        let multi_workspace = cx.weak_entity();
-
         h_flex()
             .debug_selector(|| "WORKSPACE-TABS-HEADING".to_string())
             .h(px(24.))
@@ -1751,13 +1943,16 @@ impl Render for WorkspaceConfigurationManagementModal {
     }
 }
 
+/// Takes the handle rather than `cx.weak_entity()` for the same reason
+/// `workspace_tab_heading` does: its caller now renders under
+/// `Context<WorkspacesSidebar>`, where `weak_entity()` would hand back the wrong
+/// entity type entirely.
 fn workspace_tab_actions_menu(
     ix: usize,
     project_group_key: ProjectGroupKey,
-    cx: &Context<MultiWorkspace>,
+    multi_workspace: WeakEntity<MultiWorkspace>,
 ) -> AnyElement {
     let open_in_new_window_enabled = project_group_key.host().is_none();
-    let multi_workspace = cx.weak_entity();
 
     div()
         .id(("workspace-tab-menu", ix))

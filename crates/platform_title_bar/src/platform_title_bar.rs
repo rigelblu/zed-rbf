@@ -110,17 +110,6 @@ impl PlatformTitleBar {
     pub fn is_workspace_sidebar_enabled(cx: &App) -> bool {
         MultiWorkspace::sidebar_ui_enabled_from_settings(cx)
     }
-
-    /// `#zed-65`: the macOS traffic lights are positioned in window coordinates, so they
-    /// land over whatever occupies the window's left edge. When the workspace tab strip
-    /// does, reserving `TRAFFIC_LIGHT_PADDING` in the title bar as well leaves that much
-    /// dead space before the project name.
-    fn workspace_tabs_cover_left_edge(&self, cx: &App) -> bool {
-        self.multi_workspace
-            .as_ref()
-            .and_then(|mw| mw.upgrade())
-            .is_some_and(|mw| mw.read(cx).workspace_tabs_visible(cx))
-    }
 }
 
 /// Renders the platform-appropriate left-side window controls (e.g. Ubuntu/GNOME close button).
@@ -200,7 +189,6 @@ impl Render for PlatformTitleBar {
 
         let button_layout = self.effective_button_layout(&decorations, cx);
         let sidebar = self.sidebar_render_state(cx);
-        let workspace_tabs_cover_left_edge = self.workspace_tabs_cover_left_edge(cx);
 
         let title_bar = h_flex()
             .window_control_area(WindowControlArea::Drag)
@@ -253,9 +241,15 @@ impl Render for PlatformTitleBar {
                     )
             })
             .map(|this| {
+                // `#zed-65`: the macOS traffic lights sit in window coordinates, so
+                // they land over whatever holds the window's left edge, and reserving
+                // room for them here as well would leave dead space before the project
+                // name. That used to need a second question — whether the workspace
+                // tab strip covered the edge — because the strip was its own root-level
+                // column. It is an occupant of the sidebar slot now, so the sidebar
+                // check below is the same question, asked once.
                 let show_left_controls = !(sidebar.open && sidebar.side == SidebarSide::Left);
-                let reserve_traffic_light_room =
-                    show_left_controls && !workspace_tabs_cover_left_edge;
+                let reserve_traffic_light_room = show_left_controls;
 
                 if window.is_fullscreen() {
                     this.pl_2()

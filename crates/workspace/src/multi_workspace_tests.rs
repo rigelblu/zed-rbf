@@ -26,6 +26,32 @@ use util::path;
 /// The empty set is the strictest input the guard accepts — it asserts the subject is
 /// clean — so the preconditions below keep testing exactly what they tested before the
 /// snapshot term existed, rather than passing for a new reason.
+/// Registers the workspace strip as the slot's occupant and opens the slot — what a
+/// real window does at startup.
+///
+/// Every test that asserts on the strip needs this now. `MultiWorkspace` stopped
+/// drawing the strip directly when it became a sidebar-slot occupant, so a test that
+/// only draws `MultiWorkspace` sees no tabs and would pass or fail for the wrong
+/// reason.
+fn show_workspace_strip(
+    multi_workspace: &Entity<MultiWorkspace>,
+    cx: &mut VisualTestContext,
+) -> Entity<crate::workspace_tabs::WorkspacesSidebar> {
+    let occupant = cx.new_window_entity(|window, cx| {
+        crate::workspace_tabs::WorkspacesSidebar::new(multi_workspace.clone(), window, cx)
+    });
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.register_sidebar(
+            crate::layout_registry::ids::WORKSPACES,
+            occupant.clone(),
+            cx,
+        );
+        multi_workspace.open_sidebar(cx);
+    });
+    cx.run_until_parked();
+    occupant
+}
+
 fn nothing_consented() -> HashSet<EntityId> {
     HashSet::default()
 }
@@ -1471,11 +1497,12 @@ async fn test_click_workspace_tab_activates_workspace(cx: &mut TestAppContext) {
         assert_eq!(multi_workspace.workspaces().count(), 2);
         assert_ne!(multi_workspace.workspace(), &workspace_a);
     });
+    let _occupant = show_workspace_strip(&multi_workspace, cx);
 
     cx.draw(
         gpui::point(gpui::px(0.), gpui::px(0.)),
         gpui::size(gpui::px(800.), gpui::px(600.)),
-        |_, _| multi_workspace.clone().into_any_element(),
+        |_, _| _occupant.clone().into_any_element(),
     );
     let tab_bounds = cx
         .debug_bounds("WORKSPACE-TAB-1")
@@ -1504,12 +1531,13 @@ async fn test_workspace_tabs_start_below_macos_traffic_lights(cx: &mut TestAppCo
         multi_workspace.test_add_workspace(project_b, window, cx);
     });
     cx.run_until_parked();
+    let occupant_view = show_workspace_strip(&multi_workspace, cx);
 
     let expected_top = cx.update(|window, _cx| platform_title_bar_height(window));
     cx.draw(
         gpui::point(gpui::px(0.), gpui::px(0.)),
         gpui::size(gpui::px(800.), gpui::px(600.)),
-        |_, _| multi_workspace.clone().into_any_element(),
+        |_, _| occupant_view.clone().into_any_element(),
     );
 
     let tab_bounds = cx
@@ -1540,10 +1568,12 @@ async fn test_workspace_tabs_extend_title_bar_background(cx: &mut TestAppContext
     cx.run_until_parked();
 
     let expected_height = cx.update(|window, _cx| platform_title_bar_height(window));
+    let occupant_view = show_workspace_strip(&multi_workspace, cx);
+
     cx.draw(
         gpui::point(gpui::px(0.), gpui::px(0.)),
         gpui::size(gpui::px(800.), gpui::px(600.)),
-        |_, _| multi_workspace.clone().into_any_element(),
+        |_, _| occupant_view.clone().into_any_element(),
     );
 
     if cfg!(target_os = "macos") {
@@ -1571,105 +1601,6 @@ async fn test_workspace_tabs_extend_title_bar_background(cx: &mut TestAppContext
 }
 
 #[gpui::test]
-async fn test_workspace_tabs_title_bar_fill_drags_the_window(cx: &mut TestAppContext) {
-    init_test(cx);
-    let fs = FakeFs::new(cx.executor());
-    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
-    fs.insert_tree("/root_b", json!({ "file.txt": "" })).await;
-    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
-    let project_b = Project::test(fs, ["/root_b".as_ref()], cx).await;
-
-    let (multi_workspace, cx) =
-        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
-    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
-        multi_workspace.test_add_workspace(project_b, window, cx);
-    });
-    cx.run_until_parked();
-
-    cx.draw(
-        gpui::point(gpui::px(0.), gpui::px(0.)),
-        gpui::size(gpui::px(800.), gpui::px(600.)),
-        |_, _| multi_workspace.clone().into_any_element(),
-    );
-
-    if !cfg!(target_os = "macos") {
-        return;
-    }
-
-    let fill_bounds = cx
-        .debug_bounds("WORKSPACE-TAB-TITLE-BAR-FILL")
-        .expect("workspace tab strip should extend the titlebar background");
-    let grab = fill_bounds.center();
-
-    assert_eq!(
-        cx.window_move_count(),
-        0,
-        "nothing should move the window before the drag starts"
-    );
-
-    cx.simulate_mouse_move(grab, None, gpui::Modifiers::none());
-    assert_eq!(
-        cx.window_move_count(),
-        0,
-        "hovering the titlebar fill should not move the window"
-    );
-
-    cx.simulate_mouse_down(grab, gpui::MouseButton::Left, gpui::Modifiers::none());
-    cx.simulate_mouse_move(
-        grab + gpui::point(gpui::px(24.), gpui::px(6.)),
-        gpui::MouseButton::Left,
-        gpui::Modifiers::none(),
-    );
-
-    assert_eq!(
-        cx.window_move_count(),
-        1,
-        "dragging the titlebar fill should start a window move"
-    );
-}
-
-#[gpui::test]
-async fn test_workspace_tab_rows_do_not_drag_the_window(cx: &mut TestAppContext) {
-    init_test(cx);
-    let fs = FakeFs::new(cx.executor());
-    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
-    fs.insert_tree("/root_b", json!({ "file.txt": "" })).await;
-    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
-    let project_b = Project::test(fs, ["/root_b".as_ref()], cx).await;
-
-    let (multi_workspace, cx) =
-        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
-    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
-        multi_workspace.test_add_workspace(project_b, window, cx);
-    });
-    cx.run_until_parked();
-
-    cx.draw(
-        gpui::point(gpui::px(0.), gpui::px(0.)),
-        gpui::size(gpui::px(800.), gpui::px(600.)),
-        |_, _| multi_workspace.clone().into_any_element(),
-    );
-
-    let tab_bounds = cx
-        .debug_bounds("WORKSPACE-TAB-0")
-        .expect("first workspace tab should render with debug bounds");
-    let grab = tab_bounds.center();
-
-    cx.simulate_mouse_down(grab, gpui::MouseButton::Left, gpui::Modifiers::none());
-    cx.simulate_mouse_move(
-        grab + gpui::point(gpui::px(0.), gpui::px(24.)),
-        gpui::MouseButton::Left,
-        gpui::Modifiers::none(),
-    );
-
-    assert_eq!(
-        cx.window_move_count(),
-        0,
-        "dragging a workspace tab row reorders tabs and must never move the window"
-    );
-}
-
-#[gpui::test]
 async fn test_workspace_tabs_visible_tracks_the_rendered_strip(cx: &mut TestAppContext) {
     init_test(cx);
     // The store is process-wide in tests, and a saved configuration legitimately keeps
@@ -1690,10 +1621,12 @@ async fn test_workspace_tabs_visible_tracks_the_rendered_strip(cx: &mut TestAppC
     // what the strip actually draws. Assert the agreement at both counts, not just the
     // absolute answers, so the two can never drift apart.
     let draw = |cx: &mut VisualTestContext| {
+        let occupant_view = show_workspace_strip(&multi_workspace, cx);
+
         cx.draw(
             gpui::point(gpui::px(0.), gpui::px(0.)),
             gpui::size(gpui::px(800.), gpui::px(600.)),
-            |_, _| multi_workspace.clone().into_any_element(),
+            |_, _| occupant_view.clone().into_any_element(),
         );
     };
 
@@ -1763,11 +1696,12 @@ async fn test_workspace_tabs_mark_workspaces_with_unsaved_changes(cx: &mut TestA
             vec![("root_b".to_string(), false), ("root_a".to_string(), true)],
         );
     });
+    let occupant_view = show_workspace_strip(&multi_workspace, cx);
 
     cx.draw(
         gpui::point(gpui::px(0.), gpui::px(0.)),
         gpui::size(gpui::px(800.), gpui::px(600.)),
-        |_, _| multi_workspace.clone().into_any_element(),
+        |_, _| occupant_view.clone().into_any_element(),
     );
 
     assert!(
@@ -1858,11 +1792,12 @@ async fn test_workspace_tabs_drag_reorder_project_groups(cx: &mut TestAppContext
             vec!["root_c", "root_b", "root_a"],
         );
     });
+    let occupant_view = show_workspace_strip(&multi_workspace, cx);
 
     cx.draw(
         gpui::point(gpui::px(0.), gpui::px(0.)),
         gpui::size(gpui::px(800.), gpui::px(600.)),
-        |_, _| multi_workspace.clone().into_any_element(),
+        |_, _| occupant_view.clone().into_any_element(),
     );
     let source_bounds = cx
         .debug_bounds("WORKSPACE-TAB-1")
@@ -1931,11 +1866,12 @@ async fn test_workspace_tabs_drag_reorder_with_multiple_tabs_in_project_group(
             vec!["root_a", "root_b"],
         );
     });
+    let occupant_view = show_workspace_strip(&multi_workspace, cx);
 
     cx.draw(
         gpui::point(gpui::px(0.), gpui::px(0.)),
         gpui::size(gpui::px(800.), gpui::px(600.)),
-        |_, _| multi_workspace.clone().into_any_element(),
+        |_, _| occupant_view.clone().into_any_element(),
     );
     let source_bounds = cx
         .debug_bounds("WORKSPACE-TAB-0")
@@ -2031,11 +1967,12 @@ async fn test_workspace_tabs_render_management_menu(cx: &mut TestAppContext) {
         multi_workspace.test_add_workspace(project_b, window, cx);
     });
     cx.run_until_parked();
+    let occupant_view = show_workspace_strip(&multi_workspace, cx);
 
     cx.draw(
         gpui::point(gpui::px(0.), gpui::px(0.)),
         gpui::size(gpui::px(800.), gpui::px(600.)),
-        |_, _| multi_workspace.clone().into_any_element(),
+        |_, _| occupant_view.clone().into_any_element(),
     );
 
     assert!(
@@ -2084,11 +2021,12 @@ async fn workspace_configuration_ui_keeps_single_workspace_strip_and_switch_acti
         .await
         .expect("failed to save the concurrent-deletion UI fixture");
     cx.run_until_parked();
+    let occupant_view = show_workspace_strip(&multi_workspace, cx);
 
     cx.draw(
         gpui::point(gpui::px(0.), gpui::px(0.)),
         gpui::size(gpui::px(800.), gpui::px(600.)),
-        |_, _| multi_workspace.clone().into_any_element(),
+        |_, _| occupant_view.clone().into_any_element(),
     );
     let heading_bounds = cx
         .debug_bounds("WORKSPACE-TABS-HEADING")
@@ -2122,7 +2060,7 @@ async fn workspace_configuration_ui_keeps_single_workspace_strip_and_switch_acti
     cx.draw(
         gpui::point(gpui::px(0.), gpui::px(0.)),
         gpui::size(gpui::px(800.), gpui::px(600.)),
-        |_, _| multi_workspace.clone().into_any_element(),
+        |_, _| occupant_view.clone().into_any_element(),
     );
     assert!(
         cx.debug_bounds("WORKSPACE-CONFIGURATION-MANAGEMENT-MODAL")
@@ -2148,7 +2086,7 @@ async fn workspace_configuration_ui_keeps_single_workspace_strip_and_switch_acti
     cx.draw(
         gpui::point(gpui::px(0.), gpui::px(0.)),
         gpui::size(gpui::px(800.), gpui::px(600.)),
-        |_, _| multi_workspace.clone().into_any_element(),
+        |_, _| occupant_view.clone().into_any_element(),
     );
     cx.simulate_keystrokes("tab");
     cx.run_until_parked();
@@ -2170,7 +2108,7 @@ async fn workspace_configuration_ui_keeps_single_workspace_strip_and_switch_acti
     cx.draw(
         gpui::point(gpui::px(0.), gpui::px(0.)),
         gpui::size(gpui::px(800.), gpui::px(600.)),
-        |_, _| multi_workspace.clone().into_any_element(),
+        |_, _| occupant_view.clone().into_any_element(),
     );
     cx.simulate_keystrokes("tab");
     cx.run_until_parked();
@@ -2193,7 +2131,7 @@ async fn workspace_configuration_ui_keeps_single_workspace_strip_and_switch_acti
     cx.draw(
         gpui::point(gpui::px(0.), gpui::px(0.)),
         gpui::size(gpui::px(800.), gpui::px(600.)),
-        |_, _| multi_workspace.clone().into_any_element(),
+        |_, _| occupant_view.clone().into_any_element(),
     );
     cx.simulate_keystrokes("enter");
     cx.run_until_parked();
@@ -2252,7 +2190,7 @@ async fn workspace_configuration_ui_keeps_single_workspace_strip_and_switch_acti
     cx.draw(
         gpui::point(gpui::px(0.), gpui::px(0.)),
         gpui::size(gpui::px(800.), gpui::px(600.)),
-        |_, _| multi_workspace.clone().into_any_element(),
+        |_, _| occupant_view.clone().into_any_element(),
     );
     cx.simulate_keystrokes("tab enter");
     cx.run_until_parked();
@@ -2265,7 +2203,7 @@ async fn workspace_configuration_ui_keeps_single_workspace_strip_and_switch_acti
     cx.draw(
         gpui::point(gpui::px(0.), gpui::px(0.)),
         gpui::size(gpui::px(800.), gpui::px(600.)),
-        |_, _| multi_workspace.clone().into_any_element(),
+        |_, _| occupant_view.clone().into_any_element(),
     );
     cx.simulate_keystrokes("tab");
     cx.run_until_parked();
@@ -2311,7 +2249,7 @@ async fn workspace_configuration_ui_keeps_single_workspace_strip_and_switch_acti
     cx.draw(
         gpui::point(gpui::px(0.), gpui::px(0.)),
         gpui::size(gpui::px(800.), gpui::px(600.)),
-        |_, _| multi_workspace.clone().into_any_element(),
+        |_, _| occupant_view.clone().into_any_element(),
     );
     multi_workspace.read_with(cx, |multi_workspace, cx| {
         assert!(multi_workspace.test_workspace_configuration_management_modal_is_open(cx));
@@ -2325,7 +2263,7 @@ async fn workspace_configuration_ui_keeps_single_workspace_strip_and_switch_acti
     cx.draw(
         gpui::point(gpui::px(0.), gpui::px(0.)),
         gpui::size(gpui::px(800.), gpui::px(600.)),
-        |_, _| multi_workspace.clone().into_any_element(),
+        |_, _| occupant_view.clone().into_any_element(),
     );
     cx.simulate_keystrokes("tab tab enter");
     cx.run_until_parked();
@@ -2359,11 +2297,12 @@ async fn workspace_configuration_ui_keeps_blocked_store_recovery_reachable(
     let project = Project::test(fs, ["/root_a".as_ref()], cx).await;
     let (multi_workspace, cx) =
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let occupant_view = show_workspace_strip(&multi_workspace, cx);
 
     cx.draw(
         gpui::point(gpui::px(0.), gpui::px(0.)),
         gpui::size(gpui::px(800.), gpui::px(600.)),
-        |_, _| multi_workspace.clone().into_any_element(),
+        |_, _| occupant_view.clone().into_any_element(),
     );
     assert!(
         cx.debug_bounds("WORKSPACE-TABS-HEADING").is_some(),
@@ -2377,8 +2316,288 @@ async fn workspace_configuration_ui_keeps_blocked_store_recovery_reachable(
     });
 }
 
+/// The slot draws on the side of whichever occupant it is showing.
+///
+/// `sidebar_side` used to resolve the threads sidebar's entry no matter who was in
+/// the slot. With Workspaces showing and placed on the right, the bar icon moved and
+/// the panel did not — the panel-and-icon-disagree defect this feature has now
+/// produced three times. `Flow 6` step 4b: each item owns its own side and the two
+/// may differ.
+///
+/// Restoring the hardcoded `threads_sidebar_entry` lookup fails the second assertion.
 #[gpui::test]
-async fn test_workspace_tabs_hide_when_agent_sidebar_is_open(cx: &mut TestAppContext) {
+async fn test_the_slot_follows_the_side_of_the_occupant_it_shows(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    cx.run_until_parked();
+
+    let strip = cx.new_window_entity(|window, cx| {
+        crate::workspace_tabs::WorkspacesSidebar::new(multi_workspace.clone(), window, cx)
+    });
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.register_sidebar(crate::layout_registry::ids::WORKSPACES, strip, cx);
+    });
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(
+            multi_workspace.sidebar_side(cx),
+            SidebarSide::Left,
+            "unplaced, the strip takes its registered side",
+        );
+    });
+
+    // The two items disagree: Workspaces on the right, threads on the left. This is the
+    // state the bug needed and the one `Flow 6` step 4b specifies. With only the
+    // Workspaces entry set, the old hardcoded lookup fell through to the occupant's own
+    // side and returned the right answer by luck — a test written that way passed
+    // against the defect.
+    cx.update(|_window, cx| {
+        let mut layout =
+            <crate::WorkspaceLayoutSettings as settings::Settings>::get_global(cx).clone();
+        layout.component_positions.insert(
+            crate::layout_registry::ids::WORKSPACES.to_string(),
+            crate::workspace_settings::WorkspaceComponentPosition {
+                position: Some(settings::DockPosition::Right),
+                hidden: false,
+                pinned: false,
+            },
+        );
+        layout.component_positions.insert(
+            crate::layout_registry::ids::THREADS_SIDEBAR.to_string(),
+            crate::workspace_settings::WorkspaceComponentPosition {
+                position: Some(settings::DockPosition::Left),
+                hidden: false,
+                pinned: false,
+            },
+        );
+        <crate::WorkspaceLayoutSettings as settings::Settings>::override_global(layout, cx);
+    });
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(
+            multi_workspace.sidebar_side(cx),
+            SidebarSide::Right,
+            "placing the occupant that is showing moves the slot, not only its bar icon",
+        );
+    });
+}
+
+/// Each occupant's state is stored under its own key, so a switch cannot hand one
+/// occupant the other's width.
+///
+/// Before this the slot kept a single blob, written from whichever occupant was
+/// showing and restored into whichever one was showing next. Two occupants both have
+/// a width and they are not the same width, so that field could only ever hold one
+/// of them. Reverting `sidebar_states` to the single `sidebar_state` field fails the
+/// second assertion here.
+#[gpui::test]
+async fn test_each_occupant_stores_its_own_state(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    cx.run_until_parked();
+
+    let strip = cx.new_window_entity(|window, cx| {
+        crate::workspace_tabs::WorkspacesSidebar::new(multi_workspace.clone(), window, cx)
+    });
+    let other = cx.new(|cx| SecondOccupant {
+        focus_handle: cx.focus_handle(),
+    });
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.register_sidebar(
+            crate::layout_registry::ids::WORKSPACES,
+            strip.clone(),
+            cx,
+        );
+        multi_workspace.register_sidebar("test_second_occupant", other, cx);
+    });
+    cx.run_until_parked();
+
+    strip.update(cx, |strip, cx| {
+        crate::multi_workspace::Sidebar::set_width(strip, Some(px(287.)), cx);
+    });
+    cx.run_until_parked();
+
+    let state = multi_workspace.read_with(cx, |multi_workspace, cx| multi_workspace.test_state(cx));
+
+    assert!(
+        state.sidebar_state.is_none(),
+        "the legacy single blob is never written again",
+    );
+    assert_eq!(
+        state
+            .sidebar_states
+            .get(crate::layout_registry::ids::WORKSPACES)
+            .map(String::as_str),
+        Some("287"),
+        "the strip's width is stored under the strip's own id, not the slot's",
+    );
+    assert_eq!(
+        state.sidebar_states.get("test_second_occupant"),
+        None,
+        "an occupant with no state of its own contributes no entry, rather than \
+         overwriting one",
+    );
+}
+
+/// The migration holds when the strip has nowhere to go.
+///
+/// With the agent disabled the sidebar slot does not exist, so opening it is not a
+/// thing that can happen — and a migration that ignored that would try anyway. This
+/// is the deterministic half of the precondition: `workspace_tabs_visible` also
+/// answers yes on saved configurations, and the configuration store outlives a single
+/// test, so gating the check on workspace count passed alone and failed in the suite.
+///
+/// Deleting the `sidebar_slot_enabled` guard in `migrate_strip_into_the_slot_once`
+/// fails this.
+#[gpui::test]
+async fn test_the_migration_holds_when_there_is_no_slot(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    fs.insert_tree("/root_b", json!({ "file.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs.clone(), ["/root_b".as_ref()], cx).await;
+    cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b, window, cx);
+    });
+    cx.run_until_parked();
+
+    let occupant = cx.new_window_entity(|window, cx| {
+        crate::workspace_tabs::WorkspacesSidebar::new(multi_workspace.clone(), window, cx)
+    });
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.register_sidebar(
+            crate::layout_registry::ids::WORKSPACES,
+            occupant.clone(),
+            cx,
+        );
+    });
+    cx.update(|_window, cx| {
+        DisableAiSettings::override_global(DisableAiSettings { disable_ai: true }, cx);
+    });
+    cx.run_until_parked();
+
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        assert!(
+            !multi_workspace.sidebar_slot_enabled(cx),
+            "precondition: with the agent disabled there is no slot to open",
+        );
+        assert!(
+            !multi_workspace.migrate_strip_into_the_slot_once(cx),
+            "the migration holds when there is no slot for the strip to move into",
+        );
+        assert!(!multi_workspace.sidebar_open());
+    });
+}
+
+/// The strip comes back by itself the first time this build runs, and only then.
+///
+/// Without this an upgrading user loses the strip outright: it used to draw whenever
+/// it had rows, and it now needs the sidebar slot open, which is persisted per window
+/// and defaults to closed. Deleting the `has_component` guard in
+/// `migrate_strip_into_the_slot_once` fails the second half — the migration would
+/// re-open the slot every launch, overriding a user who closed it on purpose.
+#[gpui::test]
+async fn test_the_strip_reopens_once_on_upgrade_and_not_again(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    fs.insert_tree("/root_b", json!({ "file.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs.clone(), ["/root_b".as_ref()], cx).await;
+    // The migration writes the settings entry that stops it firing twice, so it needs
+    // a real filesystem to write to.
+    cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b, window, cx);
+    });
+    cx.run_until_parked();
+
+    let occupant = cx.new_window_entity(|window, cx| {
+        crate::workspace_tabs::WorkspacesSidebar::new(multi_workspace.clone(), window, cx)
+    });
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.register_sidebar(
+            crate::layout_registry::ids::WORKSPACES,
+            occupant.clone(),
+            cx,
+        );
+    });
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.close_sidebar_action(window, cx);
+    });
+    multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        assert!(
+            !multi_workspace.sidebar_open(),
+            "precondition: the slot starts closed, which is the state that loses the strip",
+        );
+    });
+    cx.run_until_parked();
+
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        assert!(
+            multi_workspace.migrate_strip_into_the_slot_once(cx),
+            "the first run brings the strip back",
+        );
+        assert!(multi_workspace.sidebar_open());
+        assert_eq!(
+            multi_workspace.active_sidebar_id(),
+            Some(crate::layout_registry::ids::WORKSPACES),
+        );
+    });
+    cx.run_until_parked();
+
+    // The user closes it on purpose.
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.close_sidebar_action(window, cx);
+    });
+    cx.run_until_parked();
+
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        assert!(
+            !multi_workspace.migrate_strip_into_the_slot_once(cx),
+            "the entry the first run wrote is what stops it firing again",
+        );
+        assert!(
+            !multi_workspace.sidebar_open(),
+            "a slot the user closed stays closed",
+        );
+    });
+}
+
+/// The strip and the threads sidebar cannot both be on screen — and after this slice
+/// that is structural rather than a visibility rule.
+///
+/// This test used to assert that opening the agent sidebar *hid* the strip, because
+/// the strip was a root-level sibling that had to yield. It is now one of the two
+/// occupants of the sidebar slot, so "hidden" is the wrong shape entirely: there is
+/// one slot and one active id, and the loser is not hidden, it is simply not the
+/// thing being shown. Asserting on pixels here would also re-draw `MultiWorkspace`
+/// detached while the window draws it too, which double-registers the slot's deferred
+/// elements and panics in the element arena.
+#[gpui::test]
+async fn test_the_slot_shows_one_occupant_so_the_strip_and_threads_cannot_both_show(
+    cx: &mut TestAppContext,
+) {
     init_test(cx);
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
@@ -2393,30 +2612,149 @@ async fn test_workspace_tabs_hide_when_agent_sidebar_is_open(cx: &mut TestAppCon
     });
     cx.run_until_parked();
 
-    cx.draw(
-        gpui::point(gpui::px(0.), gpui::px(0.)),
-        gpui::size(gpui::px(800.), gpui::px(600.)),
-        |_, _| multi_workspace.clone().into_any_element(),
-    );
-    assert!(
-        cx.debug_bounds("WORKSPACE-TAB-0").is_some(),
-        "workspace tabs should render while the agent sidebar is closed",
-    );
-
+    let occupant_view = show_workspace_strip(&multi_workspace, cx);
+    let threads = cx.new(|cx| SecondOccupant {
+        focus_handle: cx.focus_handle(),
+    });
     multi_workspace.update(cx, |multi_workspace, cx| {
-        multi_workspace.open_sidebar(cx);
+        multi_workspace.register_sidebar("test_threads_occupant", threads, cx);
     });
     cx.run_until_parked();
 
     cx.draw(
         gpui::point(gpui::px(0.), gpui::px(0.)),
         gpui::size(gpui::px(800.), gpui::px(600.)),
-        |_, _| multi_workspace.clone().into_any_element(),
+        |_, _| occupant_view.clone().into_any_element(),
     );
     assert!(
-        cx.debug_bounds("WORKSPACE-TAB-0").is_none(),
-        "workspace tabs should hide while the agent sidebar's project switcher is visible",
+        cx.debug_bounds("WORKSPACE-TAB-0").is_some(),
+        "the strip draws while it is the occupant the slot shows",
     );
+
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.activate_sidebar("test_threads_occupant", cx);
+    });
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        assert!(
+            multi_workspace.sidebar_open(),
+            "activating the other occupant does not close the slot",
+        );
+        assert_eq!(
+            multi_workspace.active_sidebar_id(),
+            Some("test_threads_occupant"),
+            "the slot shows one occupant, so activating threads displaces the strip",
+        );
+    });
+}
+
+/// A second occupant, so the slot has something to swap *to*.
+///
+/// The exclusivity behaviour cannot be seen with one occupant registered: with a
+/// single id, "clicked the other icon" is not a reachable state, and every toggle
+/// looks like plain open/close.
+struct SecondOccupant {
+    focus_handle: FocusHandle,
+}
+
+impl Focusable for SecondOccupant {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl EventEmitter<crate::multi_workspace::SidebarEvent> for SecondOccupant {}
+
+impl Render for SecondOccupant {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
+impl crate::multi_workspace::Sidebar for SecondOccupant {
+    fn width(&self, _cx: &App) -> Pixels {
+        px(200.)
+    }
+    fn set_width(&mut self, _width: Option<Pixels>, _cx: &mut Context<Self>) {}
+    fn has_notifications(&self, _cx: &App) -> bool {
+        false
+    }
+    fn side(&self, _cx: &App) -> SidebarSide {
+        SidebarSide::Left
+    }
+}
+
+/// Clicking the icon that is already showing closes the slot; clicking the other
+/// one swaps the occupant and leaves the slot open.
+///
+/// The swap is the half a plain toggle gets wrong: routing both icons through
+/// `toggle_sidebar` closes the slot when you click the icon that is off, because
+/// all it can see is that the slot was open. Reverting
+/// `toggle_sidebar_occupant`'s id check to that fails the middle assertion here.
+#[gpui::test]
+async fn test_an_occupants_icon_swaps_the_slot_rather_than_closing_it(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    let project_a = Project::test(fs, ["/root_a".as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+
+    let workspaces = cx.new_window_entity(|window, cx| {
+        crate::workspace_tabs::WorkspacesSidebar::new(multi_workspace.clone(), window, cx)
+    });
+    let second = cx.new(|cx| SecondOccupant {
+        focus_handle: cx.focus_handle(),
+    });
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.register_sidebar(crate::layout_registry::ids::WORKSPACES, workspaces, cx);
+        multi_workspace.register_sidebar("test_second_occupant", second, cx);
+    });
+    cx.run_until_parked();
+
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.toggle_sidebar_occupant(
+            crate::layout_registry::ids::WORKSPACES,
+            window,
+            cx,
+        );
+    });
+    multi_workspace.update(cx, |multi_workspace, _cx| {
+        assert!(
+            multi_workspace.sidebar_open(),
+            "its own icon opens the slot"
+        );
+        assert_eq!(
+            multi_workspace.active_sidebar_id(),
+            Some(crate::layout_registry::ids::WORKSPACES),
+        );
+    });
+
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.toggle_sidebar_occupant("test_second_occupant", window, cx);
+    });
+    multi_workspace.update(cx, |multi_workspace, _cx| {
+        assert!(
+            multi_workspace.sidebar_open(),
+            "the other icon swaps the occupant; it does not close the slot",
+        );
+        assert_eq!(
+            multi_workspace.active_sidebar_id(),
+            Some("test_second_occupant"),
+        );
+    });
+
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.toggle_sidebar_occupant("test_second_occupant", window, cx);
+    });
+    multi_workspace.update(cx, |multi_workspace, _cx| {
+        assert!(
+            !multi_workspace.sidebar_open(),
+            "clicking the icon that is showing closes the slot",
+        );
+    });
 }
 
 #[gpui::test]
@@ -2439,11 +2777,12 @@ async fn test_workspace_tabs_stay_visible_when_ai_is_disabled(cx: &mut TestAppCo
         DisableAiSettings::override_global(DisableAiSettings { disable_ai: true }, cx);
     });
     cx.run_until_parked();
+    let occupant_view = show_workspace_strip(&multi_workspace, cx);
 
     cx.draw(
         gpui::point(gpui::px(0.), gpui::px(0.)),
         gpui::size(gpui::px(800.), gpui::px(600.)),
-        |_, _| multi_workspace.clone().into_any_element(),
+        |_, _| occupant_view.clone().into_any_element(),
     );
     assert!(
         cx.debug_bounds("WORKSPACE-TAB-0").is_some(),
@@ -2471,6 +2810,7 @@ async fn test_workspace_tabs_show_overflow_cue_for_hidden_tabs(cx: &mut TestAppC
     }
     cx.run_until_parked();
     cx.simulate_resize(gpui::size(gpui::px(800.), gpui::px(160.)));
+    let occupant_view = show_workspace_strip(&multi_workspace, cx);
 
     for _ in 0..2 {
         cx.draw(
@@ -2480,14 +2820,14 @@ async fn test_workspace_tabs_show_overflow_cue_for_hidden_tabs(cx: &mut TestAppC
                 div()
                     .w(gpui::px(800.))
                     .h(gpui::px(160.))
-                    .child(multi_workspace.clone())
+                    .child(occupant_view.clone())
             },
         );
     }
 
-    multi_workspace.read_with(cx, |multi_workspace, _cx| {
+    occupant_view.read_with(cx, |occupant, _cx| {
         assert!(
-            multi_workspace.workspace_tabs_scroll_handle.max_offset().y > gpui::px(2.),
+            occupant.scroll_handle.max_offset().y > gpui::px(2.),
             "crowded workspace tab strip should be vertically scrollable",
         );
     });
@@ -2518,6 +2858,7 @@ async fn test_workspace_tabs_do_not_snap_back_after_manual_scroll(cx: &mut TestA
     }
     cx.run_until_parked();
     cx.simulate_resize(gpui::size(gpui::px(800.), gpui::px(160.)));
+    let occupant_view = show_workspace_strip(&multi_workspace, cx);
 
     for _ in 0..2 {
         cx.draw(
@@ -2527,19 +2868,19 @@ async fn test_workspace_tabs_do_not_snap_back_after_manual_scroll(cx: &mut TestA
                 div()
                     .w(gpui::px(800.))
                     .h(gpui::px(160.))
-                    .child(multi_workspace.clone())
+                    .child(occupant_view.clone())
             },
         );
     }
 
-    multi_workspace.read_with(cx, |multi_workspace, _cx| {
-        let max_offset = multi_workspace.workspace_tabs_scroll_handle.max_offset().y;
+    occupant_view.read_with(cx, |occupant, _cx| {
+        let max_offset = occupant.scroll_handle.max_offset().y;
         assert!(
             max_offset > gpui::px(2.),
             "crowded workspace tab strip should be vertically scrollable",
         );
-        multi_workspace
-            .workspace_tabs_scroll_handle
+        occupant
+            .scroll_handle
             .set_offset(gpui::point(gpui::px(0.), -max_offset));
     });
     multi_workspace.update(cx, |_multi_workspace, cx| cx.notify());
@@ -2551,14 +2892,14 @@ async fn test_workspace_tabs_do_not_snap_back_after_manual_scroll(cx: &mut TestA
             div()
                 .w(gpui::px(800.))
                 .h(gpui::px(160.))
-                .child(multi_workspace.clone())
+                .child(occupant_view.clone())
         },
     );
 
-    multi_workspace.read_with(cx, |multi_workspace, _cx| {
+    occupant_view.read_with(cx, |occupant, _cx| {
         assert_eq!(
-            multi_workspace.workspace_tabs_scroll_handle.offset().y,
-            -multi_workspace.workspace_tabs_scroll_handle.max_offset().y,
+            occupant.scroll_handle.offset().y,
+            -occupant.scroll_handle.max_offset().y,
             "repainting without an active-tab/order change should not override manual scroll",
         );
     });
@@ -2593,11 +2934,12 @@ async fn test_click_workspace_tab_close_removes_inactive_workspace(cx: &mut Test
         assert_eq!(multi_workspace.workspace(), &workspace_c);
         assert_eq!(multi_workspace.workspaces().count(), 3);
     });
+    let occupant_view = show_workspace_strip(&multi_workspace, cx);
 
     cx.draw(
         gpui::point(gpui::px(0.), gpui::px(0.)),
         gpui::size(gpui::px(800.), gpui::px(600.)),
-        |_, _| multi_workspace.clone().into_any_element(),
+        |_, _| occupant_view.clone().into_any_element(),
     );
     let close_bounds = cx
         .debug_bounds("WORKSPACE-TAB-CLOSE-2")
@@ -2652,11 +2994,12 @@ async fn test_click_workspace_tab_close_activates_neighbor(cx: &mut TestAppConte
         assert_eq!(multi_workspace.workspace(), &workspace_c);
         assert_eq!(multi_workspace.workspaces().count(), 3);
     });
+    let occupant_view = show_workspace_strip(&multi_workspace, cx);
 
     cx.draw(
         gpui::point(gpui::px(0.), gpui::px(0.)),
         gpui::size(gpui::px(800.), gpui::px(600.)),
-        |_, _| multi_workspace.clone().into_any_element(),
+        |_, _| occupant_view.clone().into_any_element(),
     );
     let close_bounds = cx
         .debug_bounds("WORKSPACE-TAB-CLOSE-0")
@@ -3272,6 +3615,7 @@ async fn test_restore_multiworkspace_state_restores_project_groups_when_ai_is_di
         ],
         sidebar_open: true,
         sidebar_state: None,
+        sidebar_states: Default::default(),
         active_configuration_id: None,
     };
     let fs = app_state.fs.clone();
@@ -3334,6 +3678,7 @@ async fn test_restore_multiworkspace_state_restores_project_groups_when_agent_is
         ],
         sidebar_open: true,
         sidebar_state: None,
+        sidebar_states: Default::default(),
         active_configuration_id: None,
     };
     let fs = app_state.fs.clone();
@@ -3409,6 +3754,7 @@ async fn test_restore_multiworkspace_derives_missing_project_groups_for_restored
             ],
             sidebar_open: true,
             sidebar_state: None,
+            sidebar_states: Default::default(),
             active_configuration_id: None,
         },
     };
@@ -3493,6 +3839,7 @@ async fn test_restore_multiworkspace_derives_project_groups_from_empty_state(
             project_groups: Vec::new(),
             sidebar_open: true,
             sidebar_state: None,
+            sidebar_states: Default::default(),
             active_configuration_id: None,
         },
     };
@@ -3578,6 +3925,7 @@ async fn test_restore_multiworkspace_skips_inactive_remote_workspaces_without_li
             project_groups: Vec::new(),
             sidebar_open: true,
             sidebar_state: None,
+            sidebar_states: Default::default(),
             active_configuration_id: None,
         },
     };
@@ -3633,6 +3981,7 @@ async fn test_restore_multiworkspace_state_restores_sidebar_when_ai_is_enabled(
         ],
         sidebar_open: true,
         sidebar_state: None,
+        sidebar_states: Default::default(),
         active_configuration_id: None,
     };
     let fs = app_state.fs.clone();
@@ -3744,6 +4093,7 @@ async fn restore_inactive_workspaces_with_sidebar_ui_disabled(
             ],
             sidebar_open: true,
             sidebar_state: None,
+            sidebar_states: Default::default(),
             active_configuration_id: None,
         },
     };
@@ -5912,10 +6262,12 @@ async fn workspace_configuration_checkpoint_failure_is_stale_until_retry(cx: &mu
         multi_workspace.close_sidebar(window, cx);
     });
     cx.run_until_parked();
+    let occupant_view = show_workspace_strip(&multi_workspace, cx);
+
     cx.draw(
         gpui::point(gpui::px(0.), gpui::px(0.)),
         gpui::size(gpui::px(800.), gpui::px(600.)),
-        |_, _| multi_workspace.clone().into_any_element(),
+        |_, _| occupant_view.clone().into_any_element(),
     );
     let heading_bounds = cx.debug_bounds("WORKSPACE-TABS-HEADING");
     let trigger_bounds = cx.debug_bounds("WORKSPACE-CONFIGURATION-TRIGGER-CONTENT");

@@ -112,8 +112,21 @@ pub struct MultiWorkspaceState {
     pub sidebar_open: bool,
     #[serde(alias = "project_group_keys")]
     pub project_groups: Vec<SerializedProjectGroup>,
+    /// The single opaque blob the sidebar slot stored when it could hold only one
+    /// occupant. Read once and migrated into `sidebar_states`; never written again.
+    ///
+    /// It belonged to the agent sidebar by construction — there was nothing else it
+    /// could have come from — so that is the key it migrates to.
     #[serde(default)]
     pub sidebar_state: Option<String>,
+    /// Each occupant's own serialized state, keyed by its registry id.
+    ///
+    /// One blob per occupant, because two of them now share the slot and their state
+    /// is not interchangeable: a width, a scroll position and a selection all mean
+    /// different things to the workspace strip than to the threads sidebar. Keyed
+    /// storage is what stops switching occupants from handing one the other's.
+    #[serde(default)]
+    pub sidebar_states: std::collections::BTreeMap<String, String>,
     /// Which saved configuration this window was following when the session ended.
     ///
     /// Only an association. Reattached after an ordinary restore when the restored

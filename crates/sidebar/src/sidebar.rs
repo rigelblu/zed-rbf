@@ -29,9 +29,9 @@ use feature_flags::{
 };
 use gpui::{
     Action as _, AnyElement, App, ClickEvent, Context, Decorations, DismissEvent, Entity, EntityId,
-    FocusHandle, Focusable, KeyContext, ListState, Modifiers, Pixels, Render, SharedString, Task,
-    TaskExt, WeakEntity, Window, WindowBackgroundAppearance, WindowHandle, linear_color_stop,
-    linear_gradient, list, prelude::*, px,
+    FocusHandle, Focusable, KeyContext, ListState, Modifiers, MouseButton, MouseUpEvent, Pixels,
+    Render, SharedString, Task, TaskExt, WeakEntity, Window, WindowBackgroundAppearance,
+    WindowControlArea, WindowHandle, linear_color_stop, linear_gradient, list, prelude::*, px,
 };
 use itertools::Itertools;
 use language_model::LanguageModelRegistry;
@@ -734,6 +734,13 @@ fn create_worktree_in_workspace(
 pub struct Sidebar {
     multi_workspace: WeakEntity<MultiWorkspace>,
     width: Pixels,
+    /// Armed on mouse-down in the header, spent on the first mouse-move.
+    ///
+    /// The traffic lights sit on this header when the sidebar is on the left, so it
+    /// reads as title bar and has to behave like one. The move cannot start on the
+    /// mouse-down or it swallows the double-click. Mirrors the same gesture in
+    /// `WorkspacesSidebar`, the slot's other occupant.
+    title_bar_drag_armed: bool,
     focus_handle: FocusHandle,
     filter_editor: Entity<Editor>,
     thread_rename_editor: Entity<Editor>,
@@ -889,6 +896,7 @@ impl Sidebar {
         Self {
             multi_workspace: multi_workspace.downgrade(),
             width: DEFAULT_WIDTH,
+            title_bar_drag_armed: false,
             focus_handle,
             filter_editor,
             thread_rename_editor,
@@ -7210,6 +7218,31 @@ impl Sidebar {
 
         h_flex()
             .h(header_height)
+            .window_control_area(WindowControlArea::Drag)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event, _window, _cx| {
+                    this.title_bar_drag_armed = true;
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseUpEvent, window, _cx| {
+                    this.title_bar_drag_armed = false;
+                    if event.click_count == 2 {
+                        window.titlebar_double_click();
+                    }
+                }),
+            )
+            .on_mouse_down_out(cx.listener(|this, _event, _window, _cx| {
+                this.title_bar_drag_armed = false;
+            }))
+            .on_mouse_move(cx.listener(|this, _event, window, _cx| {
+                if this.title_bar_drag_armed {
+                    this.title_bar_drag_armed = false;
+                    window.start_window_move();
+                }
+            }))
             .map(|header| match window.window_decorations() {
                 Decorations::Client { .. } => header.mt(px(-1.)),
                 Decorations::Server => header.mt_px().pb_px(),
@@ -7685,8 +7718,14 @@ impl WorkspaceSidebar for Sidebar {
         matches!(self.view, SidebarView::ThreadList)
     }
 
+    /// Resolved through the shared resolver, not straight off the legacy key.
+    ///
+    /// The slot places itself by asking whichever occupant is showing for its side,
+    /// so returning the raw `agent.sidebar_side` here would put the panel on a side
+    /// the icon, the menu tick and `component_positions` all disagree with — the
+    /// exact divergence `resolved_sidebar_side`'s own doc comment warns about.
     fn side(&self, cx: &App) -> SidebarSide {
-        AgentSettings::get_global(cx).sidebar_side()
+        workspace::resolved_threads_sidebar_side(cx, AgentSettings::get_global(cx).sidebar_side())
     }
 
     fn prepare_for_focus(&mut self, _window: &mut Window, cx: &mut Context<Self>) {

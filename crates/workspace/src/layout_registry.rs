@@ -95,6 +95,9 @@ pub mod ids {
     /// The threads sidebar, which is not a `Panel` and so has no `panel_key()` to
     /// transcribe — this literal is the id, and `v0.45.1` is where it acquires one.
     pub const THREADS_SIDEBAR: &str = "threads_sidebar";
+    /// The workspace tab strip, the sidebar slot's second occupant. Like the
+    /// threads sidebar it is not a `Panel`, so this literal is the id.
+    pub const WORKSPACES: &str = "workspaces";
     pub const PROJECT_PANEL: &str = "ProjectPanel";
     pub const TERMINAL_PANEL: &str = "TerminalPanel";
     pub const GIT_PANEL: &str = "GitPanel";
@@ -327,6 +330,24 @@ const ITEMS: &[LayoutItem] = &[
         // this and never sees this item, which lives in the window-level sidebar
         // slot; the number is inert there and load-bearing only for the bar.
         source_rank: SourceRank::Panel(8),
+        valid_positions: SIDES,
+    },
+    LayoutItem {
+        id: ids::WORKSPACES,
+        kind: LayoutItemKind::WorkspaceComponent,
+        dock_hosted: false,
+        label: "Workspaces",
+        icon: Some(IconName::ThisWindow),
+        aliases: &["workspace", "tabs", "projects", "strip"],
+        clarification: None,
+        registered_position: LayoutPosition::Left,
+        default_hidden: false,
+        default_pinned: false,
+        // `Panel(9)` for the same reason `THREADS_SIDEBAR` takes 8: the variant
+        // encodes what an item is, not which render path draws it, and the gap at
+        // 4 transcribes upstream's activation priorities. 9 is the next free rank
+        // after the threads sidebar, which is the occupant it shares a slot with.
+        source_rank: SourceRank::Panel(9),
         valid_positions: SIDES,
     },
     LayoutItem {
@@ -582,7 +603,7 @@ mod tests {
         // The whole reason this table is static: the layout surface has to render
         // a complete list before any panel has registered, or a hidden component
         // could never be recovered.
-        assert_eq!(all().len(), 22);
+        assert_eq!(all().len(), 23);
         for item in all() {
             assert!(!item.id.is_empty(), "{} has no id", item.label);
             assert!(!item.label.is_empty(), "{} has no label", item.id);
@@ -726,6 +747,7 @@ mod tests {
             ids::OUTLINE_PANEL,
             ids::DEBUG_PANEL,
             ids::THREADS_SIDEBAR,
+            ids::WORKSPACES,
             ids::PROJECT_SEARCH,
             ids::LSP_SERVERS,
             ids::DIAGNOSTICS,

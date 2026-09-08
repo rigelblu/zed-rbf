@@ -30,7 +30,7 @@ mod toolbar;
 pub mod welcome;
 pub mod workspace_error;
 mod workspace_settings;
-mod workspace_tabs;
+pub mod workspace_tabs;
 
 pub use dock::{ComponentAdapter, Panel};
 pub use multi_workspace::{
@@ -38,7 +38,8 @@ pub use multi_workspace::{
     MultiWorkspace, MultiWorkspaceEvent, NewThread, NextProject, NextThread, PreviousProject,
     PreviousThread, ProjectGroup, ProjectGroupKey, RemovalIntent, SaveWorkspaceConfigurationAs,
     SerializedProjectGroupState, Sidebar, SidebarEvent, SidebarHandle, SidebarRenderState,
-    SidebarSide, SwitchWorkspaceConfiguration, ToggleWorkspaceSidebar, sidebar_side_context_menu,
+    SidebarSide, SwitchWorkspaceConfiguration, ToggleWorkspaceSidebar,
+    resolved_threads_sidebar_side, sidebar_side_context_menu,
 };
 pub use path_list::{PathList, SerializedPathList};
 pub use remote::{
@@ -1874,6 +1875,21 @@ impl Workspace {
                 status_bar::StatusControlAdapter::for_component(
                     crate::layout_registry::ids::THREADS_SIDEBAR,
                     MultiWorkspace::sidebar_ui_enabled_from_settings,
+                ),
+                window,
+                cx,
+            );
+
+            // Always available, unlike the threads sidebar. That item is gated on
+            // the agent being enabled; workspaces exist either way, so there is no
+            // state in which this icon has nothing to open.
+            let workspaces_button =
+                cx.new(|_| status_bar::WorkspacesButton::new(multi_workspace.clone()));
+            status_bar.add_status_control(
+                workspaces_button,
+                status_bar::StatusControlAdapter::for_component(
+                    crate::layout_registry::ids::WORKSPACES,
+                    |_cx| true,
                 ),
                 window,
                 cx,
@@ -10799,6 +10815,7 @@ pub async fn apply_restored_multiworkspace_state(
         sidebar_open,
         project_groups,
         sidebar_state,
+        sidebar_states,
         active_configuration_id,
         ..
     } = state;
@@ -10863,12 +10880,42 @@ pub async fn apply_restored_multiworkspace_state(
             .ok();
     }
 
+    // Startup, and only startup. The workspaces this session restores have landed by
+    // now, so the strip can finally answer whether it is owed a place — which it
+    // cannot at window init, when there is one workspace and the answer is always no.
+    //
+    // It deliberately does not hang off `add` or `activate`. Those fire on user
+    // actions too, and opening the sidebar in the middle of one is a surprise: it
+    // broke `test_open_directory_in_empty_workspace_does_not_open_sidebar`, which is
+    // a rule about what a blank project may do to the window, not about this slice.
+    window_handle
+        .update(cx, |multi_workspace, _, cx| {
+            multi_workspace.migrate_strip_into_the_slot_once(cx);
+        })
+        .ok();
+
     if restore_sidebar_ui {
-        if let Some(sidebar_state) = sidebar_state {
+        // Each occupant gets its own blob, reached by id rather than by whichever one
+        // the slot happens to be showing. A window saved before the slot could hold
+        // two carries one unkeyed blob instead; that belonged to the agent sidebar,
+        // since nothing else could have written it, and this is the only place that
+        // reads it. The next save writes keyed state and the legacy field goes empty.
+        let mut states = sidebar_states.clone();
+        if states.is_empty()
+            && let Some(legacy) = sidebar_state
+        {
+            states.insert(
+                crate::layout_registry::ids::THREADS_SIDEBAR.to_string(),
+                legacy.clone(),
+            );
+        }
+        if !states.is_empty() {
             window_handle
                 .update(cx, |multi_workspace, window, cx| {
-                    if let Some(sidebar) = multi_workspace.sidebar() {
-                        sidebar.restore_serialized_state(sidebar_state, window, cx);
+                    for (id, state) in &states {
+                        if let Some(sidebar) = multi_workspace.sidebar_with_id(id) {
+                            sidebar.restore_serialized_state(state, window, cx);
+                        }
                     }
                     multi_workspace.serialize(cx);
                 })
