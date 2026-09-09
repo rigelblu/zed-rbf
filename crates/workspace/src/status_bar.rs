@@ -12,6 +12,29 @@ use std::{any::TypeId, sync::Arc};
 use theme::CLIENT_SIDE_DECORATION_ROUNDING;
 use ui::{ContextMenu, IconPosition, Indicator, Tooltip, prelude::*, right_click_menu};
 
+/// The bottom edge the status bar paints, and the one thing a band standing in for
+/// it beside the workspace area has to copy.
+///
+/// With client-side decorations the bar's grey reaches one pixel past its own layout
+/// box, so it meets the window edge with no transparent seam. A band that sets the
+/// same height but omits this stops a pixel short, and the two greys disagree exactly
+/// where they meet — which is what the workspace strip's foot did until 2026-09-09.
+///
+/// It is one body because the strip's foot was a hand-matched replica and drifted:
+/// same nominal height, different edges. `border_color` in GPUI colors every side at
+/// once, so a caller cannot keep a differently-coloured top border and this bottom
+/// edge at the same time — the bottom edge wins, since the bar it mirrors has no top
+/// border at all.
+pub(crate) fn status_bar_bottom_edge<E: Styled>(element: E, window: &Window, cx: &App) -> E {
+    match window.window_decorations() {
+        Decorations::Server => element,
+        Decorations::Client { .. } => element
+            .mb(px(-1.))
+            .border_b(px(1.0))
+            .border_color(cx.theme().colors().status_bar_background),
+    }
+}
+
 /// Describes how a status-bar item can be hidden by the user.
 ///
 /// Every [`StatusItemView`] must either provide this (so that the user gets a
@@ -405,7 +428,6 @@ impl Render for StatusBar {
                         |el| el.rounded_bl(CLIENT_SIDE_DECORATION_ROUNDING),
                     )
                     // This border is to avoid a transparent gap in the rounded corners
-                    .mb(px(-1.))
                     .mt({
                         #[cfg(target_os = "linux")]
                         let needs_gap_fix = {
@@ -417,8 +439,7 @@ impl Render for StatusBar {
                         let needs_gap_fix = false;
                         if needs_gap_fix { px(-1.) } else { px(0.) }
                     })
-                    .border_b(px(1.0))
-                    .border_color(cx.theme().colors().status_bar_background),
+                    .map(|el| status_bar_bottom_edge(el, window, cx)),
             })
             .child(self.render_left_tools(cx))
             // The middle zone sits between the two groups rather than being pinned

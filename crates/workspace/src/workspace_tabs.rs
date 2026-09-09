@@ -339,18 +339,26 @@ impl Render for WorkspacesSidebar {
             // beside it. Absolute and painted over the scrolling list, the same way the
             // title-bar band is at the top, so the list keeps the full height and
             // scrolls under both — its `pb` below clears this one.
+            //
+            // The edges come from `status_bar_bottom_edge` rather than being restated
+            // here: matching only the height left the two greys ending at different
+            // pixels, visible as a seam wherever the foot meets the bar. The separator
+            // line this used to carry is gone with it — the bar beside it has no top
+            // border, so the line stopped dead at the seam.
             .child(
-                div()
-                    .id("workspace-tab-status-bar-fill")
-                    .debug_selector(|| "WORKSPACE-TAB-STATUS-BAR-FILL".to_string())
-                    .absolute()
-                    .bottom_0()
-                    .left_0()
-                    .right_0()
-                    .h(status_bar_fill_height)
-                    .bg(cx.theme().colors().status_bar_background)
-                    .border_t_1()
-                    .border_color(cx.theme().colors().border),
+                crate::status_bar::status_bar_bottom_edge(
+                    div()
+                        .id("workspace-tab-status-bar-fill")
+                        .debug_selector(|| "WORKSPACE-TAB-STATUS-BAR-FILL".to_string())
+                        .absolute()
+                        .bottom_0()
+                        .left_0()
+                        .right_0()
+                        .h(status_bar_fill_height)
+                        .bg(cx.theme().colors().status_bar_background),
+                    window,
+                    cx,
+                ),
             )
             .child(
                 v_flex()
