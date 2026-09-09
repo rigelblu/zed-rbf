@@ -167,6 +167,17 @@ impl Sidebar for WorkspacesSidebar {
             })
             .log_err();
     }
+
+    /// This occupant is a list of workspaces. It holds no threads list, ever.
+    ///
+    /// The trait used to default this to `true` and the strip inherited it, so with the
+    /// strip showing, `conversation_view.rs` and `agent_panel.rs` both concluded the
+    /// threads list was on screen and suppressed the notification they would otherwise
+    /// raise — a finished thread in another workspace produced no pop-up and no sound.
+    /// The default is gone; this is the answer that replaces it.
+    fn is_threads_list_view_active(&self) -> bool {
+        false
+    }
 }
 
 impl Render for WorkspacesSidebar {

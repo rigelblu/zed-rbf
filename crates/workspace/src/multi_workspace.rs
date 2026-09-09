@@ -323,9 +323,18 @@ pub trait Sidebar: Focusable + Render + EventEmitter<SidebarEvent> + Sized {
     fn has_notifications(&self, cx: &App) -> bool;
     fn side(&self, _cx: &App) -> SidebarSide;
 
-    fn is_threads_list_view_active(&self) -> bool {
-        true
-    }
+    /// Whether the threads *list* is the view on screen in this occupant.
+    ///
+    /// **No default, deliberately.** It defaulted to `true` while the threads sidebar was
+    /// the slot's only occupant, where the default was merely redundant. The workspace
+    /// tab strip then inherited it and answered `true` about a threads list it does not
+    /// contain, and three consumers believe that answer: agent-done notifications, the
+    /// agent terminal's waiting notification, and the title bar's menu choice. A thread
+    /// finishing while the strip was open raised nothing at all. Every occupant answers
+    /// for itself now, so the next one cannot inherit a claim about someone else's view.
+    /// Fifth cold read, 2026-09-09.
+    fn is_threads_list_view_active(&self) -> bool;
+
     /// Makes focus reset back to the search editor upon toggling the sidebar from outside
     fn prepare_for_focus(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
     /// Opens or cycles the thread switcher popup.
@@ -1827,6 +1836,20 @@ impl MultiWorkspace {
             .iter()
             .find(|(existing, _)| *existing == id)
             .map(|(_, handle)| handle.as_ref())
+    }
+
+    /// The threads sidebar, whether or not it is the occupant on screen.
+    ///
+    /// A named door for the callers that mean *threads* rather than *whatever is
+    /// showing*. `sidebar()` used to mean both, because there was one occupant; the
+    /// rename to "the showing occupant" went through nineteen call sites, compiled at
+    /// every one, and was wrong at six. Two were found by the second cold read, four more
+    /// by the fifth — thread cycling, the thread switcher, and the threads-list-active
+    /// question behind three notification gates. **The compiler cannot see this class of
+    /// mistake**; the only defence is that asking for threads looks different at the call
+    /// site from asking for the slot.
+    pub fn threads_sidebar(&self) -> Option<&dyn SidebarHandle> {
+        self.sidebar_with_id(crate::layout_registry::ids::THREADS_SIDEBAR)
     }
 
     /// Shows `id` in the slot, replacing whichever occupant was there.
@@ -4491,21 +4514,36 @@ impl Render for MultiWorkspace {
                 // `MoveProjectToNewWindow` sits here because the sidebar's project
                 // list is where it is reached from.
                 .when(self.sidebar_ui_enabled(cx), |this| {
+                    // These three are *thread* actions, so they go to the threads sidebar
+                    // by id rather than to whichever occupant is showing.
+                    //
+                    // `sidebar()` meant "the threads sidebar" before this slice and now
+                    // means "the showing occupant", and these routed through it. With the
+                    // strip active — which is what the migration leaves every upgrading
+                    // user with — they reached `WorkspacesSidebar`, whose `cycle_thread`
+                    // and `toggle_thread_switcher` are the trait's no-ops, so the
+                    // keybindings did nothing and said nothing. They worked with the slot
+                    // *closed* before, because there was only ever one occupant to find.
+                    //
+                    // Routing by id is enough: the switcher is an overlay `MultiWorkspace`
+                    // draws itself, and `toggle_thread_switcher_impl` needs no render, so
+                    // the threads sidebar does not have to be on screen to answer.
+                    // Fifth cold read, 2026-09-09.
                     this.on_action(cx.listener(
                         |this: &mut Self, action: &ToggleThreadSwitcher, window, cx| {
-                            if let Some(sidebar) = this.sidebar(cx) {
+                            if let Some(sidebar) = this.threads_sidebar() {
                                 sidebar.toggle_thread_switcher(action.select_last, window, cx);
                             }
                         },
                     ))
                     .on_action(cx.listener(|this: &mut Self, _: &NextThread, window, cx| {
-                        if let Some(sidebar) = this.sidebar(cx) {
+                        if let Some(sidebar) = this.threads_sidebar() {
                             sidebar.cycle_thread(true, window, cx);
                         }
                     }))
                     .on_action(
                         cx.listener(|this: &mut Self, _: &PreviousThread, window, cx| {
-                            if let Some(sidebar) = this.sidebar(cx) {
+                            if let Some(sidebar) = this.threads_sidebar() {
                                 sidebar.cycle_thread(false, window, cx);
                             }
                         }),

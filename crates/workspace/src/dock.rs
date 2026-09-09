@@ -121,11 +121,6 @@ struct LayoutWritePromptOpen(collections::HashSet<gpui::WindowId>);
 
 impl Global for LayoutWritePromptOpen {}
 
-/// Queues one component setting and hands back the write's completion.
-///
-/// Split from the reporting because the two need different contexts: the write
-/// must go through whether or not the window that asked is still there, and only
-/// the report needs a window.
 /// The line between two groups of icons in the status bar.
 ///
 /// The divider carries `mx_1`, so the gap across a boundary is visibly wider than the
@@ -175,6 +170,11 @@ fn carried_along_by(panel_key: &str, setting: &ComponentSetting) -> Vec<String> 
         .collect()
 }
 
+/// Queues one component setting and hands back the write's completion.
+///
+/// Split from the reporting because the two need different contexts: the write
+/// must go through whether or not the window that asked is still there, and only
+/// the report needs a window.
 fn queue_component_setting(
     fs: Arc<dyn Fs>,
     panel_key: String,

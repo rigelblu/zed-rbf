@@ -2720,6 +2720,11 @@ impl crate::multi_workspace::Sidebar for RecordingOccupant {
         px(200.)
     }
     fn set_width(&mut self, _width: Option<Pixels>, _cx: &mut Context<Self>) {}
+    // The trait has no default for this any more, so a stand-in occupant has to say what
+    // it is. None of these hold a threads list.
+    fn is_threads_list_view_active(&self) -> bool {
+        false
+    }
     fn has_notifications(&self, _cx: &App) -> bool {
         false
     }
@@ -3009,6 +3014,166 @@ async fn test_each_icons_dot_comes_from_its_own_occupant(cx: &mut TestAppContext
     });
 }
 
+/// With the strip in the slot, the app must not believe a threads list is on screen.
+///
+/// **Three notification gates read this**, none of them in this crate:
+/// `conversation_view.rs`'s `is_visible` (agent-done pop-up and sound),
+/// `agent_panel.rs`'s `terminal_status_visible` (the agent terminal's waiting
+/// notification), and the title bar's menu choice. All three suppress themselves when
+/// the threads list is showing, on the reasoning that you can already see it.
+///
+/// The `Sidebar` trait defaulted this to `true` — harmless while the threads sidebar was
+/// the slot's only occupant, and a lie the moment the strip could hold it. **The state is
+/// the migration's target state**: strip in the slot, agent on, slot open. A thread
+/// finishing in another workspace raised nothing at all.
+///
+/// Found by the fifth cold read, in consumers no read had been pointed at. The default is
+/// gone now, so this cannot recur by omission — but the assertion is what proves the
+/// strip's answer, and the default's absence only proves someone had to type one.
+#[gpui::test]
+async fn test_the_strip_does_not_claim_the_threads_list_is_showing(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    fs.insert_tree("/root_b", json!({ "file.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs.clone(), ["/root_b".as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b, window, cx);
+    });
+    cx.run_until_parked();
+    show_workspace_strip(&multi_workspace, cx);
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert!(
+            multi_workspace.sidebar_open(),
+            "precondition: the slot is open, or the consumers' other gate hides this",
+        );
+        assert_eq!(
+            multi_workspace.resolved_active_sidebar_id(cx),
+            Some(crate::layout_registry::ids::WORKSPACES),
+            "precondition: the strip holds the slot — the upgrading user's state",
+        );
+        assert!(
+            !multi_workspace.is_threads_list_view_active(cx),
+            "the strip claimed a threads list was on screen, and three notification \
+             gates believe it",
+        );
+    });
+}
+
+/// An occupant that records every `cycle_thread`, so a thread action can be traced to
+/// the occupant it actually reached.
+struct ThreadCyclingOccupant {
+    focus_handle: FocusHandle,
+    cycled: std::rc::Rc<std::cell::RefCell<Vec<bool>>>,
+}
+
+impl Focusable for ThreadCyclingOccupant {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl EventEmitter<crate::multi_workspace::SidebarEvent> for ThreadCyclingOccupant {}
+
+impl Render for ThreadCyclingOccupant {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
+impl crate::multi_workspace::Sidebar for ThreadCyclingOccupant {
+    fn width(&self, _cx: &App) -> Pixels {
+        px(200.)
+    }
+    fn set_width(&mut self, _width: Option<Pixels>, _cx: &mut Context<Self>) {}
+    fn is_threads_list_view_active(&self) -> bool {
+        true
+    }
+    fn has_notifications(&self, _cx: &App) -> bool {
+        false
+    }
+    fn side(&self, _cx: &App) -> SidebarSide {
+        SidebarSide::Left
+    }
+    fn cycle_thread(&mut self, forward: bool, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.cycled.borrow_mut().push(forward);
+    }
+}
+
+/// `NextThread` reaches the threads sidebar even when the strip holds the slot.
+///
+/// **The state is the migration's target state**, and the one the first-registered
+/// default also produces: the strip is the active occupant. The three thread actions
+/// routed through `sidebar()`, which used to mean "the threads sidebar" and now means
+/// "the showing occupant" — so they arrived at `WorkspacesSidebar` and fell into the
+/// trait's no-op `cycle_thread`. The keybinding did nothing and reported nothing. It
+/// worked before this slice with the slot *closed*, because there was only ever one
+/// occupant to find.
+///
+/// **This dispatches the real action rather than calling the router**, because the defect
+/// is the handler's choice of door. A test asserting `threads_sidebar()` returns the
+/// threads occupant passes against the bug — the handler would still be asking
+/// `sidebar()`.
+#[gpui::test]
+async fn test_next_thread_reaches_the_threads_sidebar_while_the_strip_holds_the_slot(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    fs.insert_tree("/root_b", json!({ "file.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs.clone(), ["/root_b".as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b, window, cx);
+    });
+    cx.run_until_parked();
+
+    let cycled = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let threads = cx.new(|cx| ThreadCyclingOccupant {
+        focus_handle: cx.focus_handle(),
+        cycled: cycled.clone(),
+    });
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.register_sidebar(crate::layout_registry::ids::THREADS_SIDEBAR, threads, cx);
+    });
+    cx.run_until_parked();
+    show_workspace_strip(&multi_workspace, cx);
+    // Threads registered first, so it claimed the slot. Hand it to the strip — the state
+    // a user reaches by clicking the Workspaces icon, and the one the migration leaves
+    // them in.
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.activate_sidebar(crate::layout_registry::ids::WORKSPACES, cx);
+    });
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(
+            multi_workspace.resolved_active_sidebar_id(cx),
+            Some(crate::layout_registry::ids::WORKSPACES),
+            "precondition: the strip is the active occupant, or this tests nothing",
+        );
+    });
+
+    cx.dispatch_action(crate::NextThread);
+    cx.run_until_parked();
+
+    assert_eq!(
+        cycled.borrow().as_slice(),
+        &[true],
+        "NextThread never reached the threads sidebar while the strip held the slot",
+    );
+}
+
 /// An occupant that always reports notifications, so the dot can be traced to a source.
 struct NotifyingOccupant {
     focus_handle: FocusHandle,
@@ -3033,6 +3198,11 @@ impl crate::multi_workspace::Sidebar for NotifyingOccupant {
         px(200.)
     }
     fn set_width(&mut self, _width: Option<Pixels>, _cx: &mut Context<Self>) {}
+    // The trait has no default for this any more, so a stand-in occupant has to say what
+    // it is. None of these hold a threads list.
+    fn is_threads_list_view_active(&self) -> bool {
+        false
+    }
     fn has_notifications(&self, _cx: &App) -> bool {
         true
     }
@@ -4215,6 +4385,11 @@ impl crate::multi_workspace::Sidebar for SecondOccupant {
         px(200.)
     }
     fn set_width(&mut self, _width: Option<Pixels>, _cx: &mut Context<Self>) {}
+    // The trait has no default for this any more, so a stand-in occupant has to say what
+    // it is. None of these hold a threads list.
+    fn is_threads_list_view_active(&self) -> bool {
+        false
+    }
     fn has_notifications(&self, _cx: &App) -> bool {
         false
     }
