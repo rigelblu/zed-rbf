@@ -6,10 +6,17 @@ title: "Zed RBF Changelog"
 
 ---
 
+# 🔵⋯ v0.64.1 (2026-09-09) — #zed-45
+- 2026-09-09 - feat (ux) | choose whether the side panel shows your workspaces or your threads, and which side of the window it sits on — the workspace tab strip is no longer a fixed 168px rail welded to the left edge, but one of two things the side panel can hold, switched by two bottom-bar icons that show you which is loaded without opening anything; right-click either icon to move the panel and both icons to the other side together, or hide it, and the app remembers which one you had open across a restart (#zed-45) [@zed-rbf]
+- Note: turning the agent off leaves the tab strip in place — the side panel is no longer the agent's. `agent.sidebar_side` still seeds a profile that has never placed the panel, and is ignored after that; the Settings row that wrote it is gone, because an entry in `workspace_layout.component_positions` overrides it and the row had become a control that silently did nothing.
+- Known limit: on a profile the strip has never migrated into the panel, opening a second workspace, opening the panel and then closing it can show the strip once on the next launch before the app records that the move has happened. One time only.
+
+---
+
 # 🔵⋯ v0.64.0 (2026-09-07) — #zed-45
 - 2026-09-05 - feat (ux) | put status controls and actual workspace components where you want them — from each item's own right-click menu or the one `Customize Workspace Layout` surface — and have a component's position move the real component rather than only its bottom-bar icon; pin the ones that should stay visible side by side instead of each newly opened component replacing the last, and recover anything hidden instead of editing `settings.json` to get it back (#zed-45) [@zed-rbf]
 - 2026-09-07 - feat (ux) | drag any bottom-bar item to rearrange it — along its own strip or zone, or across a boundary, which also moves a component to that dock — and have open components follow the same order, instead of the sequence being fixed by each panel's own hardcoded priority (#zed-45) [@zed-rbf]
-- Note: `#zed-45`'s remaining slices are unshipped — Workspaces in the bottom bar (`v0.45.1`) and editor-buffer placement (`v0.45.3`). This release claims neither, nor Safari-style drag customization with spaces, nor a complete layout reset: `Restore Default Positions…` deliberately preserves the order you arranged.
+- Note: `#zed-45`'s remaining slices are unshipped — Workspaces in the bottom bar (`v0.45.1`, since released in `v0.64.1`) and editor-buffer placement (`v0.45.3`). This release claims neither, nor Safari-style drag customization with spaces, nor a complete layout reset: `Restore Default Positions…` deliberately preserves the order you arranged.
 
 ---
 

@@ -122,6 +122,7 @@ The configured order is the display order. `~` and `$VAR` expand. Missing paths 
 - Both work with AI turned off: the slot holds the strip alone, and the threads icon does not render
 - The slot's width is drag-resizable and remembered per occupant; double-click the edge to reset. The strip never had this as a fixed 168px rail
 - A restart brings back whichever of the two you left showing, on the side you left it
+- Right-click either icon for `Workspace Position` — `Left`, `Right` or `Hidden`. The slot has one side, so choosing one moves the panel and both icons together, from a single settings write
 
 ## 🟠⋯ Workspace Layout
 - Place any status control or workspace component where you want it from the item's own right-click menu — a component's position moves the actual component and its bottom-bar icon together, not the icon alone
@@ -134,6 +135,8 @@ The configured order is the display order. `~` and `$VAR` expand. Missing paths 
 Placement lives in `workspace_layout.component_positions` and `status_bar.item_locations`; order lives in `workspace_layout.component_order` and `status_bar.item_order`. All four are plain lists you can hand-edit.
 
 `workspaces` and `threads_sidebar` are the exception to two of these rules: they share one slot, so they share one side and move together, and their icons are pinned to the end of their zone rather than dragged into place.
+
+The legacy `agent.sidebar_side` seeds a profile that has never placed the slot, and is ignored once `component_positions` holds an entry. Its Settings row was removed in `v0.64.1`: the row could not carry the pair, and on any profile that had placed the slot it wrote a value nothing read.
 
 ## 🟠⋯ File Tags
 - Mark important files with lightweight Zed-local color tags from the Project Panel file-row workflow, visible as markers on file rows
