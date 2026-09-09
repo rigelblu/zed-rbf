@@ -40,7 +40,7 @@ use util::ResultExt;
 use util::paths::PathExt;
 use workspace::{
     CloseWindow, ModalView, PathList, RecentWorkspace, SerializedWorkspaceLocation, Workspace,
-    WorkspaceDb, WorkspaceId,
+    WorkspaceDb, WorkspaceId, resolved_threads_sidebar_side,
 };
 
 use zed_actions::agents_sidebar::FocusSidebarFilter;
@@ -852,8 +852,17 @@ impl ThreadsArchiveView {
 
     fn render_header(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let has_query = !self.filter_editor.read(cx).text(cx).is_empty();
+        // Resolved, not the raw legacy key. This header is the archive view's own — the
+        // container draws `render_sidebar_header` for `ThreadList` only — and it decides
+        // traffic-light padding and which edge the window controls take. Read straight,
+        // `agent.sidebar_side` says Left for anyone who has since placed the slot Right
+        // through the bar menu, so the header padded for traffic lights on the side that
+        // has none, and the filter field sat under them in the mirror case. The resolver
+        // is the one `sidebar.rs` already uses; this was the reader nobody had moved onto
+        // it, because it lives outside that file. Found by the fourth cold read,
+        // 2026-09-09.
         let sidebar_on_left = matches!(
-            AgentSettings::get_global(cx).sidebar_side(),
+            resolved_threads_sidebar_side(cx, AgentSettings::get_global(cx).sidebar_side()),
             settings::SidebarSide::Left
         );
         let sidebar_on_right = !sidebar_on_left;

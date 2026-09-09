@@ -3346,6 +3346,36 @@ async fn test_the_legacy_seed_leaves_the_strip_migration_able_to_run(cx: &mut Te
         );
         assert!(multi_workspace.sidebar_open());
     });
+    cx.run_until_parked();
+
+    // The assertion this test used to stop one short of, and the whole upgrade path in
+    // one line: the migration has now dropped its marker on `workspaces`, and the pair
+    // must *still* share the side the seed named. Before 2026-09-09 the marker — an
+    // entry with no position — outranked the sibling that named one, so the strip fell
+    // to the registered side while the threads panel stayed Right. Observed on a binary
+    // as `"workspaces": {}`; the earlier stopping point could not see it, because it
+    // read the state before the marker existed.
+    cx.update(|_window, cx| {
+        let layout = <crate::WorkspaceLayoutSettings as settings::Settings>::get_global(cx);
+        assert!(
+            layout.has_component(crate::layout_registry::ids::WORKSPACES),
+            "precondition: the migration wrote its marker, so the next launch skips it",
+        );
+        assert_eq!(
+            layout
+                .component(crate::layout_registry::ids::WORKSPACES)
+                .position,
+            None,
+            "precondition: the marker names no side — that is what made it dangerous",
+        );
+        assert_eq!(
+            layout
+                .side_entry(crate::layout_registry::ids::WORKSPACES)
+                .and_then(|entry| entry.position),
+            Some(settings::DockPosition::Right),
+            "the marker outranked the sibling and split the pair on upgrade",
+        );
+    });
 }
 
 /// A legacy `agent.sidebar_side: "right"` stops splitting the panel from its icon.

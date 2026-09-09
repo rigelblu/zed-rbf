@@ -563,6 +563,30 @@ mod sidebar_slot_pair_tests {
     /// bar. Everything that implements that — the paired position write, the outer
     /// band in `zone_rank`, the divider — keys off this one predicate, so an id list
     /// that drifted from the registry would break all three at once.
+    /// The slot has one side, so its occupants cannot register different ones.
+    ///
+    /// `sidebar_slot_registered_position` takes the first occupant's, which is right
+    /// only while they agree — a third occupant registering Right would be overruled
+    /// with no error anywhere. The table is a static constant, so this is a total check
+    /// over it rather than a sample of it, and it is the only thing holding the
+    /// invariant that function's `.next()` assumes.
+    #[test]
+    fn the_slot_occupants_agree_on_a_registered_side() {
+        let sides: Vec<(&str, LayoutPosition)> = sidebar_slot_occupants()
+            .filter_map(|id| get(id).map(|item| (id, item.registered_position)))
+            .collect();
+
+        assert!(!sides.is_empty(), "the slot has no occupants at all");
+        let expected = sidebar_slot_registered_position();
+        for (id, position) in sides {
+            assert_eq!(
+                position, expected,
+                "{id} registers {position:?} while the slot resolves to {expected:?}; \
+                 one slot has one side, so the table must not disagree with itself",
+            );
+        }
+    }
+
     #[test]
     fn the_slot_pair_is_exactly_the_two_non_dock_hosted_components() {
         let occupants: Vec<&str> = sidebar_slot_occupants().collect();
@@ -606,6 +630,28 @@ pub fn sidebar_slot_occupants() -> impl Iterator<Item = &'static str> {
 
 pub fn is_sidebar_slot_occupant(item_id: &str) -> bool {
     sidebar_slot_occupants().any(|id| id == item_id)
+}
+
+/// The side the sidebar slot sits on before anything has chosen one.
+///
+/// The slot has one side and both occupants share it, so one occupant's
+/// `registered_position` answers for the slot. Read here rather than restated at each
+/// caller: two resolvers in `multi_workspace.rs` wrote `SidebarSide::Left` inline while
+/// their comments called it "the registered side", which is true only for as long as
+/// nobody edits the table. A restated constant is what drifted the status bar's group
+/// divider on 2026-09-09, in the same crate, on the same day this was raised.
+///
+/// **Taking the first occupant is sound only because they all register the same side,
+/// and `the_slot_occupants_agree_on_a_registered_side` is what holds that.** A third
+/// occupant registering Right would otherwise be overruled here in silence. The table
+/// is a static constant, so a test over it is a total check rather than a sample — this
+/// is the enforcement point, not a comment hoping someone reads it.
+pub fn sidebar_slot_registered_position() -> LayoutPosition {
+    sidebar_slot_occupants()
+        .filter_map(get)
+        .map(|item| item.registered_position)
+        .next()
+        .unwrap_or(LayoutPosition::Left)
 }
 
 pub fn of_kind(kind: LayoutItemKind) -> impl Iterator<Item = &'static LayoutItem> {

@@ -96,7 +96,7 @@ pub struct SidebarRenderState {
 /// hiding carries no position, so it falls to the registered side rather than back
 /// to the legacy key. Reading the legacy key after an entry exists is precisely how
 /// the panel and its icon come to disagree.
-fn resolved_sidebar_side(
+pub(crate) fn resolved_sidebar_side(
     entry: Option<crate::workspace_settings::WorkspaceComponentPosition>,
     legacy: SidebarSide,
 ) -> SidebarSide {
@@ -104,10 +104,31 @@ fn resolved_sidebar_side(
         return legacy;
     };
     match entry.position {
+        // An explicit position names a side outright, and is not the registry's to
+        // answer. Lumping this in with the arm below made a stored `Left` follow the
+        // registered side — caught by mutating the registry to Right, which is the
+        // only way the two can be told apart while they agree.
         Some(settings::DockPosition::Right) => SidebarSide::Right,
-        // Left, Bottom (not a valid position for this component), and no position
-        // at all all take the registered side. None of them reach the legacy key.
-        _ => SidebarSide::Left,
+        Some(settings::DockPosition::Left) => SidebarSide::Left,
+        // Bottom is not a valid position for a slot occupant, and an entry created by
+        // hiding carries no position at all. Neither names a side, so both take the
+        // registered one — and neither reaches the legacy key.
+        Some(settings::DockPosition::Bottom) | None => registered_sidebar_side(),
+    }
+}
+
+/// The slot's side when nothing has chosen one, read from the registry.
+///
+/// It was written inline as `SidebarSide::Left` at both call sites, under comments
+/// calling it the registered side — the registry agreed, so it was right by
+/// coincidence rather than by construction.
+pub(crate) fn registered_sidebar_side() -> SidebarSide {
+    match crate::layout_registry::sidebar_slot_registered_position() {
+        crate::layout_registry::LayoutPosition::Right => SidebarSide::Right,
+        // A slot occupant cannot register Middle or Bottom; a sidebar has two sides.
+        crate::layout_registry::LayoutPosition::Left
+        | crate::layout_registry::LayoutPosition::Middle
+        | crate::layout_registry::LayoutPosition::Bottom => SidebarSide::Left,
     }
 }
 
@@ -249,9 +270,27 @@ mod sidebar_side_resolution_tests {
 
         assert_eq!(
             resolved_sidebar_side(hide_created, SidebarSide::Right),
-            SidebarSide::Left,
+            registered_sidebar_side(),
             "a hide-created entry fell back to the legacy key"
         );
+    }
+
+    #[test]
+    fn the_registered_side_is_currently_left() {
+        // The tests above compare two expressions; this is what pins the value, so they
+        // cannot pass by both sides being wrong together. Change the registry and this
+        // is the line that has to change with it.
+        //
+        // **It cannot tell a read from a copy** — it passes just as well against a
+        // `registered_sidebar_side` that returns a hardcoded `Left`, which is what its
+        // first name ("...and_not_a_second_copy_of_it") claimed and could not do. Only
+        // mutating the registry separates those, and that is a thing a person does, not
+        // a thing this file asserts. Named for what it holds.
+        assert_eq!(
+            crate::layout_registry::sidebar_slot_registered_position(),
+            crate::layout_registry::LayoutPosition::Left
+        );
+        assert_eq!(registered_sidebar_side(), SidebarSide::Left);
     }
 
     #[test]
@@ -260,7 +299,7 @@ mod sidebar_side_resolution_tests {
         // other unusable saved value: to the registered side, never to legacy.
         assert_eq!(
             resolved_sidebar_side(at(settings::DockPosition::Bottom), SidebarSide::Right),
-            SidebarSide::Left
+            registered_sidebar_side()
         );
     }
 }
@@ -1534,7 +1573,8 @@ impl MultiWorkspace {
     /// what is drawn. `Flow 6` step 4b, which made differing sides the design, is
     /// superseded — see the dated Decision.
     pub fn sidebar_side(&self, cx: &App) -> SidebarSide {
-        self.sidebar(cx).map_or(SidebarSide::Left, |s| s.side(cx))
+        self.sidebar(cx)
+            .map_or_else(registered_sidebar_side, |s| s.side(cx))
     }
 
     pub fn sidebar_render_state(&self, cx: &App) -> SidebarRenderState {

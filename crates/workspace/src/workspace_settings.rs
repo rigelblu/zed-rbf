@@ -408,19 +408,50 @@ impl WorkspaceLayoutSettings {
     /// rule each writer must observe, and leaves the marker meaning what it meant: the
     /// user has placed this component themselves.
     ///
+    /// **It is an entry that names a side that wins, not merely an entry that exists** —
+    /// corrected 2026-09-09 after a cold read, and observed on a binary. The marker is
+    /// written as `.entry(id).or_default()`, so it lands in the file as `"workspaces":
+    /// {}`: an entry with no position. Preferring any own entry handed that empty object
+    /// the answer, and the legacy-Right upgrade path — the one this whole function exists
+    /// for — split the pair again: strip Left on the registered side, threads panel
+    /// Right. It also killed `agent.sidebar_side` outright, because the seed's "has this
+    /// an entry yet" gate reads through here and the marker answered yes on the threads
+    /// sidebar's behalf.
+    ///
+    /// So the order is: own entry with a position, then a sibling's with a position, then
+    /// the own entry whatever it holds (a hide-created entry still ends the legacy key's
+    /// authority), then nothing.
+    ///
     /// Side only. `hidden` and `pinned` stay per item — hiding one occupant's icon says
-    /// nothing about the other's.
+    /// nothing about the other's. Every caller reads `.position` from what comes back;
+    /// `resolved_component_zone` takes `hidden` from the item's own entry instead.
     pub fn side_entry(&self, item_id: &str) -> Option<WorkspaceComponentPosition> {
-        if self.has_component(item_id) {
-            return Some(self.component(item_id));
-        }
-        if !crate::layout_registry::is_sidebar_slot_occupant(item_id) {
-            return None;
+        // "Names a side" means a position the registry accepts, not merely one that is
+        // present. `from_settings` keeps an unusable value and warns rather than
+        // dropping it, so a hand-edited `"bottom"` sits in the file looking like a
+        // placement; every other reader already filters it through
+        // `registry_accepts_position` and falls back to the registered side. Treating it
+        // as a side here split the pair the same way the marker did — strip Left on the
+        // registered side, threads Right — with each half self-consistent. Found by the
+        // fourth cold read, 2026-09-09.
+        let names_a_side = |id: &str, entry: &WorkspaceComponentPosition| {
+            entry
+                .position
+                .is_some_and(|position| registry_accepts_position(id, position))
+        };
+        let own = self.has_component(item_id).then(|| self.component(item_id));
+        if own.is_some_and(|entry| names_a_side(item_id, &entry))
+            || !crate::layout_registry::is_sidebar_slot_occupant(item_id)
+        {
+            return own;
         }
         crate::layout_registry::sidebar_slot_occupants()
             .filter(|id| *id != item_id)
-            .find(|id| self.has_component(id))
-            .map(|id| self.component(id))
+            .filter(|id| self.has_component(id))
+            .map(|id| (id, self.component(id)))
+            .find(|(id, entry)| names_a_side(id, entry))
+            .map(|(_, entry)| entry)
+            .or(own)
     }
 
     /// The bar zone a workspace component's icon renders in, or `None` when the
@@ -480,7 +511,7 @@ fn component_zone(position: settings::DockPosition) -> StatusBarItemLocation {
 /// open, which is where a settings-load warning has to be decided — and it is
 /// deliberately permissive about ids it does not recognise, since an unregistered
 /// key is a different complaint from an unusable position.
-fn registry_accepts_position(panel_key: &str, position: settings::DockPosition) -> bool {
+pub(crate) fn registry_accepts_position(panel_key: &str, position: settings::DockPosition) -> bool {
     use crate::layout_registry::{LayoutItemKind, LayoutPosition};
 
     let Some(item) = crate::layout_registry::get(panel_key) else {
@@ -810,6 +841,104 @@ mod status_bar_settings_tests {
             hidden: false,
             pinned: false,
         }
+    }
+
+    /// What `write_strip_migration_marker` actually leaves in the file: an entry that
+    /// exists and names nothing. Observed on a binary 2026-09-09 as `"workspaces": {}`.
+    fn marker() -> WorkspaceComponentPosition {
+        WorkspaceComponentPosition {
+            position: None,
+            hidden: false,
+            pinned: false,
+        }
+    }
+
+    #[test]
+    fn a_position_less_entry_does_not_outrank_a_sibling_that_names_a_side() {
+        use crate::layout_registry::ids;
+        // The legacy-Right upgrade, exactly: the seed writes the threads side, then the
+        // strip migration drops its marker on `workspaces`. Preferring any own entry let
+        // the marker answer, so the strip took the registered side while the threads
+        // panel stayed Right — the pair split on the one path this pairing exists for.
+        let layout = layout_with(&[
+            (ids::WORKSPACES, marker()),
+            (ids::THREADS_SIDEBAR, at(settings::DockPosition::Right)),
+        ]);
+
+        assert_eq!(
+            layout
+                .side_entry(ids::WORKSPACES)
+                .and_then(|entry| entry.position),
+            Some(settings::DockPosition::Right),
+            "the marker outranked the sibling that actually names a side",
+        );
+        assert_eq!(
+            layout.resolved_component_zone(ids::WORKSPACES),
+            Some(StatusBarItemLocation::Right),
+            "the icon and the panel must land on the same side",
+        );
+    }
+
+    #[test]
+    fn a_siblings_marker_does_not_answer_for_an_item_that_has_no_entry() {
+        use crate::layout_registry::ids;
+        // The other half of the same defect. `migrate_threads_sidebar_side_once` gates on
+        // "does the threads sidebar have an entry yet", read through here — so a marker
+        // on `workspaces` answered yes on the threads sidebar's behalf and the seed never
+        // fired. `agent.sidebar_side` went dead for every profile the strip migration had
+        // touched, including the Settings UI control that writes it.
+        let layout = layout_with(&[(ids::WORKSPACES, marker())]);
+
+        assert_eq!(
+            layout.side_entry(ids::THREADS_SIDEBAR),
+            None,
+            "a sibling entry naming no side ended the legacy key's authority",
+        );
+    }
+
+    #[test]
+    fn an_unusable_own_position_does_not_outrank_a_sibling_that_names_a_real_side() {
+        use crate::layout_registry::ids;
+        // A hand-edited `"bottom"` is kept in the file rather than dropped, so it looks
+        // like a placement to anything that only checks `position.is_some()`. Every
+        // other reader filters it through the registry; this one did not, and the pair
+        // split with each half self-consistent — the hardest kind to spot by looking.
+        let layout = layout_with(&[
+            (ids::WORKSPACES, at(settings::DockPosition::Bottom)),
+            (ids::THREADS_SIDEBAR, at(settings::DockPosition::Right)),
+        ]);
+
+        assert_eq!(
+            layout
+                .side_entry(ids::WORKSPACES)
+                .and_then(|entry| entry.position),
+            Some(settings::DockPosition::Right),
+            "an unusable own position outranked a sibling naming a side the slot can take",
+        );
+        assert_eq!(
+            layout.resolved_component_zone(ids::WORKSPACES),
+            Some(StatusBarItemLocation::Right),
+            "and the icon must follow the panel, as always",
+        );
+    }
+
+    #[test]
+    fn an_items_own_entry_still_ends_the_legacy_keys_authority_without_a_position() {
+        use crate::layout_registry::ids;
+        // The case the two above must not break: hiding creates an entry with no
+        // position, and that entry existing is what ends `agent.sidebar_side`. It ranks
+        // below a sibling that names a side, but above nothing at all.
+        let hidden = WorkspaceComponentPosition {
+            position: None,
+            hidden: true,
+            pinned: false,
+        };
+
+        assert_eq!(
+            layout_with(&[(ids::THREADS_SIDEBAR, hidden)]).side_entry(ids::THREADS_SIDEBAR),
+            Some(hidden),
+            "a hide-created entry stopped ending the legacy key's authority",
+        );
     }
 
     #[test]

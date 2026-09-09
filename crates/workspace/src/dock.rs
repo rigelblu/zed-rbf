@@ -126,6 +126,28 @@ impl Global for LayoutWritePromptOpen {}
 /// Split from the reporting because the two need different contexts: the write
 /// must go through whether or not the window that asked is still there, and only
 /// the report needs a window.
+/// The line between two groups of icons in the status bar.
+///
+/// The divider carries `mx_1`, so the gap across a boundary is visibly wider than the
+/// `gap_1` between icons inside a strip. The line alone did not read: every gap in the
+/// row was 4px, so seven icons from three different docks looked like one strip.
+/// Dogfooded 2026-09-06 — Tom hit the boundary by having a drag refused there, which is
+/// finding it the hard way, and now a drop on either side of it means two different
+/// things.
+///
+/// One body, two callers: the dock strips below, and the sidebar slot's pair in
+/// `status_bar.rs`. They were two copies for a day and drifted — the pair's copy was
+/// `border_variant` at 14px against this one's `Border` at 18px, and next to a grey line
+/// the lighter token reads as white. The bar draws both, inches apart, so a difference
+/// nobody chose is visible immediately. Dogfooded 2026-09-09 — Tom: *"the verticle line
+/// is white instead of grey"*.
+pub(crate) fn group_boundary_divider() -> Divider {
+    Divider::vertical()
+        .color(DividerColor::Border)
+        .mx_1()
+        .h(px(18.))
+}
+
 /// The other ids a write to `panel_key` must carry along.
 ///
 /// The sidebar slot's occupants share one side, so a position set on either moves the
@@ -3448,18 +3470,7 @@ impl Render for PanelButtons {
 
         let has_buttons = !buttons.is_empty();
 
-        // The divider carries `mx_1`, so the gap across a boundary is visibly wider
-        // than the `gap_1` between icons inside a strip. The line alone did not
-        // read: every gap in the row was 4px, so seven icons from three different
-        // docks looked like one strip. Dogfooded 2026-09-06 — Tom hit the boundary
-        // by having a drag refused there, which is finding it the hard way, and
-        // now a drop on either side of it means two different things.
-        let boundary = || {
-            Divider::vertical()
-                .color(DividerColor::Border)
-                .mx_1()
-                .h(px(18.))
-        };
+        let boundary = group_boundary_divider;
 
         // The one slot a drop cannot otherwise name. Dropping onto an icon means
         // taking its place, so it always lands to that icon's left, leaving the

@@ -168,9 +168,14 @@ fn row_state(item: &LayoutItem, workspace: &Workspace, window: &Window, cx: &App
             //
             // Without an adapter the settings entry and the registry answer the same two
             // questions: which position is in use, and whether the saved one is usable.
+            // Through `side_entry`, not this item's own entry: a slot occupant with no
+            // position of its own takes its sibling's, so reading the raw entry ticked
+            // Left on the Workspaces row while its bar icon and its panel sat Right.
+            // Third reader of the same fact, and the third to be fixed separately —
+            // found by the 2026-09-09 cold read, after the bar menu (C5) and the strip.
             let saved = workspace::WorkspaceLayoutSettings::get_global(cx)
-                .component(item.id)
-                .position
+                .side_entry(item.id)
+                .and_then(|entry| entry.position)
                 .map(DockPosition::from);
             let accepts = |position: DockPosition| match adapter.as_ref() {
                 Some(adapter) => adapter.accepts(position, cx),

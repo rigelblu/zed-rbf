@@ -512,14 +512,11 @@ impl StatusBar {
                 // own group rather than as two more status icons (Tom, 2026-09-08).
                 // Suppressed when the pair is the whole zone — a divider with nothing
                 // on the far side of it separates nothing.
-                let divider = (Some(index) == divider_after).then(|| {
-                    div()
-                        .w(px(1.))
-                        .h(px(14.))
-                        .mx_1()
-                        .bg(cx.theme().colors().border_variant)
-                        .into_any_element()
-                });
+                //
+                // The same body the dock strips' boundary draws — see
+                // `group_boundary_divider`, which says why it is not a second copy.
+                let divider = (Some(index) == divider_after)
+                    .then(|| crate::dock::group_boundary_divider().into_any_element());
                 std::iter::once(item).chain(divider).chain(end)
             })
             .collect()
@@ -921,22 +918,27 @@ fn add_component_placement_entries(
     //
     // And an entry with no position at all takes the registered side, or every
     // component the user has never placed shows no tick.
+    // The filter is `registry_accepts_position` itself, not a transcription of it. The
+    // copy that stood here until 2026-09-09 had already drifted from it — `false` for an
+    // unknown id where the rule says `true`, and no exemption for status controls —
+    // though neither divergence could be reached from here, since this menu is built
+    // only for `is_workspace_component` ids. What it cost was the *next* edit: two
+    // bodies for one rule, and no way to tell which one a reader was looking at.
     let effective = crate::WorkspaceLayoutSettings::get_global(cx)
         .side_entry(item_id)
         .and_then(|entry| entry.position)
-        .filter(|position| {
-            registered.is_some_and(|item| {
-                item.valid_positions.contains(&match position {
-                    settings::DockPosition::Right => LayoutPosition::Right,
-                    settings::DockPosition::Bottom => LayoutPosition::Bottom,
-                    settings::DockPosition::Left => LayoutPosition::Left,
-                })
+        .filter(|position| crate::workspace_settings::registry_accepts_position(item_id, *position))
+        // The registered fallback, written out rather than folded into a `_ => Left`:
+        // that arm sent a Bottom-registered component's tick to Left.
+        .or_else(|| {
+            registered.and_then(|item| match item.registered_position {
+                LayoutPosition::Left => Some(settings::DockPosition::Left),
+                LayoutPosition::Right => Some(settings::DockPosition::Right),
+                LayoutPosition::Bottom => Some(settings::DockPosition::Bottom),
+                LayoutPosition::Middle => None,
             })
         })
-        .unwrap_or(match registered.map(|item| item.registered_position) {
-            Some(LayoutPosition::Right) => settings::DockPosition::Right,
-            _ => settings::DockPosition::Left,
-        });
+        .unwrap_or(settings::DockPosition::Left);
 
     let sides = [
         (LayoutPosition::Left, settings::DockPosition::Left, "Left"),

@@ -123,15 +123,14 @@ impl Sidebar for WorkspacesSidebar {
         // Through `side_entry`, so the strip follows the slot's side even with no entry
         // of its own — the pair shares one side, and reading it here is what makes that
         // true without every writer having to remember.
-        if layout
-            .side_entry(crate::layout_registry::ids::WORKSPACES)
-            .and_then(|entry| entry.position)
-            == Some(settings::DockPosition::Right)
-        {
-            SidebarSide::Right
-        } else {
-            SidebarSide::Left
-        }
+        // The same body the threads sidebar resolves through, with the registered side
+        // standing in for the legacy key this occupant does not have. It restated
+        // `SidebarSide::Left` inline until 2026-09-09 — the third side resolver, and the
+        // one the first pass at that Nit missed.
+        crate::multi_workspace::resolved_sidebar_side(
+            layout.side_entry(crate::layout_registry::ids::WORKSPACES),
+            crate::multi_workspace::registered_sidebar_side(),
+        )
     }
 
     /// The strip's width, so a resize survives a restart.

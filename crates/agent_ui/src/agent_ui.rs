@@ -203,8 +203,16 @@ impl AgentThreadSource {
     }
 }
 
+/// The side the threads sidebar is actually on, for telemetry.
+///
+/// Resolved rather than raw: `agent.sidebar_side` is legacy, and an entry in
+/// `workspace_layout.component_positions` ends its authority — so once a user places
+/// the slot from the bar menu, this logged `left` for a sidebar showing on the right.
+/// No behaviour depended on it, which is exactly why nobody would have found it in use.
+/// Fourth cold read, 2026-09-09.
 pub(crate) fn agent_sidebar_side(cx: &App) -> &'static str {
-    match AgentSettings::get_global(cx).sidebar_side() {
+    match workspace::resolved_threads_sidebar_side(cx, AgentSettings::get_global(cx).sidebar_side())
+    {
         SidebarSide::Left => "left",
         SidebarSide::Right => "right",
     }

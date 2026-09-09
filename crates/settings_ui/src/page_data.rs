@@ -8204,7 +8204,7 @@ fn collaboration_page() -> SettingsPage {
 }
 
 fn ai_page(cx: &App) -> SettingsPage {
-    fn general_section() -> [SettingsPageItem; 6] {
+    fn general_section() -> [SettingsPageItem; 5] {
         [
             SettingsPageItem::SectionHeader("General"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -8221,20 +8221,27 @@ fn ai_page(cx: &App) -> SettingsPage {
                 metadata: None,
                 files: USER | PROJECT,
             }),
-            SettingsPageItem::SettingItem(SettingItem {
-                title: "Threads Sidebar Side",
-                description: "Which side of the window the threads sidebar appears on.",
-                field: Box::new(SettingField {
-                    organization_override: None,
-                    json_path: Some("agent.sidebar_side"),
-                    pick: |settings_content| settings_content.agent.as_ref()?.sidebar_side.as_ref(),
-                    write: |settings_content, value, _| {
-                        settings_content.agent.get_or_insert_default().sidebar_side = value;
-                    },
-                }),
-                metadata: None,
-                files: USER,
-            }),
+            // `Threads Sidebar Side` was here, writing `agent.sidebar_side`, and it was
+            // removed in `v0.45.1` because it had become a control that silently did
+            // nothing. The threads sidebar is one of two occupants of the window's
+            // sidebar slot now, and the slot's side lives in
+            // `workspace_layout.component_positions`. An entry there ends the legacy
+            // key's authority by design — so on any profile that had ever placed the
+            // slot, or that the strip migration had touched, setting this row wrote a
+            // value nothing read, and the UI went on displaying it as though it had
+            // taken. Dogfooded 2026-09-09 — Tom set it and told me *"it doesn't move"*.
+            //
+            // It cannot simply be rewired: `pick` must return a reference into
+            // `SettingsContent`, the stored position is a `DockPosition` (whose `Bottom`
+            // is not a side a sidebar has), and a write must carry the slot's other
+            // occupant with it. Any of those bought as a second stored copy of the side
+            // is the defect this slice spent the week removing.
+            //
+            // Two controls place the slot and both do it correctly: the bar icons'
+            // right-click `Workspace Position` menu, and the Workspaces and Threads
+            // Sidebar rows in `Customize Workspace Layout`. `agent.sidebar_side` is
+            // still read for a profile that has no entry, which is what
+            // `assets/settings/default.json` promises a hand-editor.
             SettingsPageItem::SubPageLink(SubPageLink {
                 title: "LLM Providers".into(),
                 r#type: Default::default(),

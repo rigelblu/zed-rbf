@@ -1081,6 +1081,13 @@
     // Default: true
     "flexible": true,
     // Where to position the threads sidebar. Can be 'left' or 'right'.
+    //
+    // Legacy, and read only until the sidebar slot has been placed. The threads
+    // sidebar shares one window-level slot with the workspace tab strip, and that
+    // slot's side lives in "workspace_layout.component_positions" — an entry there
+    // ends this key's authority. Place the slot by right-clicking either bottom-bar
+    // icon ("Workspace Position") or from "Customize Workspace Layout"; both move
+    // the pair together, which this key cannot do.
     "sidebar_side": "left",
     // Default width when the agent panel is docked to the left or right.
     "default_width": 640,

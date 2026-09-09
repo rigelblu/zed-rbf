@@ -367,9 +367,13 @@ impl AgentSettingsContent {
         self.dock = Some(dock);
     }
 
-    pub fn set_sidebar_side(&mut self, position: SidebarDockPosition) {
-        self.sidebar_side = Some(position);
-    }
+    // `set_sidebar_side` was here and is gone as of `v0.45.1`. The threads sidebar is one
+    // of two occupants of the window's sidebar slot now, and the slot's side lives in
+    // `workspace_layout.component_positions` — an entry there ends `agent.sidebar_side`'s
+    // authority, and a write has to carry the slot's other occupant with it, which this
+    // setter cannot do. It had no callers left, and a setter for a key nothing writes is
+    // what the next person reaches for. Place the slot through
+    // `workspace::dock::set_component_position`.
 
     pub fn set_flexible_size(&mut self, flexible: bool) {
         self.flexible = Some(flexible);

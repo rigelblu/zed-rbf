@@ -7187,7 +7187,13 @@ impl Sidebar {
             KeyBinding::for_action(&workspace::Open::default(), cx),
         )
         .on_open_project(|_, window, cx| {
-            let side = match AgentSettings::get_global(cx).sidebar_side() {
+            // Resolved, like the rest of this file's side reads — the raw legacy key
+            // reports the wrong side once the slot has been placed. Fourth cold read,
+            // 2026-09-09.
+            let side = match workspace::resolved_threads_sidebar_side(
+                cx,
+                AgentSettings::get_global(cx).sidebar_side(),
+            ) {
                 SidebarSide::Left => "left",
                 SidebarSide::Right => "right",
             };
