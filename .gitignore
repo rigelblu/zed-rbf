@@ -63,3 +63,5 @@ crates/docs_preprocessor/actions.json
 
 # rb
 rb-drive*
+.rb-drive-remote
+.rb-drive-public-share
