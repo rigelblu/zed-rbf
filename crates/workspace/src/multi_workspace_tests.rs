@@ -3921,6 +3921,51 @@ async fn test_status_bar_height_matches_the_bar_the_workspace_renders(cx: &mut T
     );
 }
 
+/// `status_bar_height` must answer from the window's rem size alone.
+///
+/// **Tom, 2026-09-09, on a binary, on an external monitor.** The padding term read
+/// `DynamicSpacing::Base04.px(cx)`, which scales by the *global* `ui_font_size` and is
+/// handed no window, so it cannot see a display profile. The bar lays its own padding
+/// out in rems against the window's rem size, which `setup_ui_font` sets from
+/// `ui_font_size_for(window, cx)` — profile-resolved. On a display whose profile
+/// overrides the font size the two disagreed and the foot band came out wrong by twice
+/// the difference.
+///
+/// `test_status_bar_height_matches_the_bar_the_workspace_renders` cannot catch this and
+/// stayed green throughout: at default settings the window's rem size and the global
+/// font size are the same number, which is the single case where the two accessors
+/// agree. Pinning the rem size while moving the global is what separates them.
+#[gpui::test]
+async fn test_status_bar_height_ignores_the_global_font_size(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    cx.run_until_parked();
+    let _ = &multi_workspace;
+
+    let pinned_rem_size = gpui::px(16.);
+    let before = cx.update(|window, cx| {
+        window.set_rem_size(pinned_rem_size);
+        ui::utils::status_bar_height(window, cx)
+    });
+
+    cx.update(|_, cx| theme_settings::adjust_ui_font_size(cx, |size| size + gpui::px(6.)));
+
+    let after = cx.update(|window, cx| {
+        window.set_rem_size(pinned_rem_size);
+        ui::utils::status_bar_height(window, cx)
+    });
+
+    assert_eq!(
+        before, after,
+        "the bar lays its padding out in rems, so a height derived for it has to move \
+         with the window's rem size and not with the global font size",
+    );
+}
+
 /// The strip paints the chrome's top and bottom bands, on whichever side it is on.
 ///
 /// **Tom, 2026-09-08, on a binary.** The sidebar slot spans the full window height

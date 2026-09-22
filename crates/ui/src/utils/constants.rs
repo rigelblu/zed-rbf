@@ -43,6 +43,16 @@ pub fn platform_title_bar_height(_window: &Window) -> Pixels {
 /// and compares. Without it a wrong derivation is invisible, because the only other
 /// reader is the band being checked against it — which is how the first version shipped
 /// 3.25px short.
+/// **Both terms resolve through `window.rem_size()`, and that is the whole point.**
+/// This read `DynamicSpacing::Base04.px(cx)` for the padding until 2026-09-09, which
+/// scales by the *global* `ui_font_size` — no window, so no display profile. The bar
+/// itself lays its padding out in rems, against the window's rem size, which
+/// `setup_ui_font` sets from `ui_font_size_for(window, cx)`. On any display whose
+/// profile overrides the font size the two disagreed, and the band came out wrong by
+/// twice that difference — visible on an external monitor and nearly invisible on the
+/// built-in one, which is why it read as intermittent.
 pub fn status_bar_height(window: &mut Window, cx: &mut App) -> Pixels {
-    ButtonSize::Default.rems().to_pixels(window.rem_size()) + DynamicSpacing::Base04.px(cx) * 2.
+    let rem_size = window.rem_size();
+    ButtonSize::Default.rems().to_pixels(rem_size)
+        + DynamicSpacing::Base04.rems(cx).to_pixels(rem_size) * 2.
 }
