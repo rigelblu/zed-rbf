@@ -7,8 +7,8 @@ use std::{
 
 use gpui::{
     Action, Anchor, App, Context, DismissEvent, Entity, EntityId, EventEmitter, FocusHandle,
-    Focusable, MouseButton, MouseUpEvent, Pixels, PromptLevel, ScrollHandle, SharedString, TaskExt,
-    WeakEntity, Window, WindowControlArea, px, rems,
+    Focusable, MouseButton, MouseUpEvent, Pixels, PromptLevel, ScrollHandle, SharedString, Task,
+    TaskExt, WeakEntity, Window, WindowControlArea, px, rems,
 };
 use project::ProjectGroupKey;
 use ui::{
@@ -19,13 +19,13 @@ use ui_input::InputField;
 use util::ResultExt as _;
 
 use crate::{
-    ModalView, MultiWorkspace, SaveWorkspaceConfigurationAs, Workspace,
+    ModalView, MultiWorkspace, SaveWorkspaceConfigurationAs, Workspace, WorkspaceId,
     multi_workspace::{
         ManageWorkspaceConfigurations, SelectNextWorkspaceConfiguration,
         SelectPreviousWorkspaceConfiguration, Sidebar, SidebarEvent, SidebarSide,
     },
     persistence::{
-        StoreBlock, WorkspaceConfigurationMutation, WorkspaceConfigurationStore,
+        StoreBlock, WorkspaceConfigurationMutation, WorkspaceConfigurationStore, WorkspaceDb,
         model::WorkspaceConfigurationId,
     },
 };
@@ -738,6 +738,95 @@ impl MultiWorkspace {
             None
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_workspace_configuration_management_has_unavailable_badge(
+        &self,
+        configuration_id: WorkspaceConfigurationId,
+        cx: &App,
+    ) -> bool {
+        self.active_modal::<WorkspaceConfigurationManagementModal>(cx)
+            .is_some_and(|modal| {
+                modal
+                    .read(cx)
+                    .unavailable_members
+                    .contains_key(&configuration_id)
+            })
+    }
+}
+
+#[cfg(test)]
+pub(crate) trait MultiWorkspaceTestExt {
+    fn test_locate_member(
+        &self,
+        configuration_id: WorkspaceConfigurationId,
+        old_root: &Path,
+        new_root: PathBuf,
+        cx: &mut gpui::VisualTestContext,
+    ) -> bool;
+
+    /// Starts `Locate…` the way the button does, through the folder picker, so
+    /// tests exercise what happens between the picker and the relocate.
+    fn test_start_locate_member(
+        &self,
+        configuration_id: WorkspaceConfigurationId,
+        old_root: &Path,
+        cx: &mut gpui::VisualTestContext,
+    ) -> bool;
+}
+
+#[cfg(test)]
+impl MultiWorkspaceTestExt for Entity<MultiWorkspace> {
+    fn test_locate_member(
+        &self,
+        configuration_id: WorkspaceConfigurationId,
+        old_root: &Path,
+        new_root: PathBuf,
+        cx: &mut gpui::VisualTestContext,
+    ) -> bool {
+        let modal = self.read_with(cx, |mw, cx| {
+            mw.active_modal::<WorkspaceConfigurationManagementModal>(cx)
+        });
+        let Some(modal) = modal else {
+            return false;
+        };
+        let old_root = old_root.to_path_buf();
+        cx.with_window(self.entity_id(), |window, cx| {
+            modal.update(cx, |modal, cx| {
+                let members = modal.unavailable_members.get(&configuration_id)?;
+                let member = members.iter().find(|m| m.old_root == old_root).cloned()?;
+                modal.handle_located_path(configuration_id, member, new_root, window, cx);
+                Some(true)
+            })
+        })
+        .flatten()
+        .unwrap_or(false)
+    }
+
+    fn test_start_locate_member(
+        &self,
+        configuration_id: WorkspaceConfigurationId,
+        old_root: &Path,
+        cx: &mut gpui::VisualTestContext,
+    ) -> bool {
+        let modal = self.read_with(cx, |mw, cx| {
+            mw.active_modal::<WorkspaceConfigurationManagementModal>(cx)
+        });
+        let Some(modal) = modal else {
+            return false;
+        };
+        let old_root = old_root.to_path_buf();
+        cx.with_window(self.entity_id(), |window, cx| {
+            modal.update(cx, |modal, cx| {
+                let members = modal.unavailable_members.get(&configuration_id)?;
+                let member = members.iter().find(|m| m.old_root == old_root).cloned()?;
+                modal.start_locate(configuration_id, member, window, cx);
+                Some(true)
+            })
+        })
+        .flatten()
+        .unwrap_or(false)
+    }
 }
 
 impl MultiWorkspace {
@@ -1262,7 +1351,14 @@ enum WorkspaceConfigurationManagementMode {
     },
 }
 
-struct WorkspaceConfigurationManagementModal {
+#[derive(Clone, Debug)]
+pub(crate) struct UnavailableWorkspaceMember {
+    pub(crate) workspace_id: WorkspaceId,
+    pub(crate) old_root: PathBuf,
+    pub(crate) label: String,
+}
+
+pub(crate) struct WorkspaceConfigurationManagementModal {
     focus_handle: FocusHandle,
     delete_focus_handle: FocusHandle,
     done_focus_handle: FocusHandle,
@@ -1275,7 +1371,10 @@ struct WorkspaceConfigurationManagementModal {
     selected_configuration_id: Option<WorkspaceConfigurationId>,
     mode: WorkspaceConfigurationManagementMode,
     busy: bool,
-    error: Option<String>,
+    pub(crate) error: Option<String>,
+    pub(crate) unavailable_members:
+        HashMap<WorkspaceConfigurationId, Vec<UnavailableWorkspaceMember>>,
+    _check_task: Option<Task<()>>,
 }
 
 impl WorkspaceConfigurationManagementModal {
@@ -1287,7 +1386,7 @@ impl WorkspaceConfigurationManagementModal {
         let selected_configuration_id = WorkspaceConfigurationStore::try_global(cx)
             .and_then(|store| store.configurations().first())
             .map(|configuration| configuration.id);
-        Self {
+        let mut modal = Self {
             focus_handle: cx.focus_handle(),
             delete_focus_handle: cx.focus_handle(),
             done_focus_handle: cx.focus_handle(),
@@ -1301,7 +1400,11 @@ impl WorkspaceConfigurationManagementModal {
             mode: WorkspaceConfigurationManagementMode::List,
             busy: false,
             error: None,
-        }
+            unavailable_members: HashMap::new(),
+            _check_task: None,
+        };
+        modal.check_unavailable_members(cx);
+        modal
     }
 
     fn cancel(&mut self, _: &menu::Cancel, window: &mut Window, cx: &mut Context<Self>) {
@@ -1354,6 +1457,338 @@ impl WorkspaceConfigurationManagementModal {
         self.error = None;
         self.delete_cancel_focus_handle.focus(window, cx);
         cx.notify();
+    }
+
+    pub(crate) fn check_unavailable_members(&mut self, cx: &mut Context<Self>) {
+        let multi_workspace = self.multi_workspace.clone();
+        self._check_task = Some(cx.spawn(async move |this, cx| {
+            let Some(multi_workspace) = multi_workspace.upgrade() else {
+                return;
+            };
+            let (app_state, configurations) = this
+                .read_with(cx, |_, cx| {
+                    let app_state = multi_workspace
+                        .read(cx)
+                        .workspace()
+                        .read(cx)
+                        .app_state()
+                        .clone();
+                    let configurations = WorkspaceConfigurationStore::try_global(cx)
+                        .map(|store| store.configurations().to_vec())
+                        .unwrap_or_default();
+                    (app_state, configurations)
+                })
+                .ok()
+                .unzip();
+            let (Some(app_state), Some(configurations)) = (app_state, configurations) else {
+                return;
+            };
+
+            let mut unavailable_map: HashMap<
+                WorkspaceConfigurationId,
+                Vec<UnavailableWorkspaceMember>,
+            > = HashMap::new();
+            for config in configurations {
+                let mut unavailable_in_config = Vec::new();
+                for member in &config.members {
+                    let db_paths = this
+                        .read_with(cx, |_, cx| {
+                            let db = WorkspaceDb::global(cx);
+                            if let Ok(Some(paths)) = db.workspace_paths_for_id(member.workspace_id)
+                            {
+                                Some(paths.paths().to_vec())
+                            } else if let Ok(Some((_, paths))) =
+                                db.workspace_paths_for_local_identity_paths(&member.identity_paths)
+                            {
+                                Some(paths.paths().to_vec())
+                            } else {
+                                None
+                            }
+                        })
+                        .ok()
+                        .flatten();
+                    let paths = match db_paths {
+                        Some(paths) if !paths.is_empty() => paths,
+                        _ => member.identity_paths.clone(),
+                    };
+
+                    for path in paths {
+                        let exists = app_state.fs.metadata(&path).await.ok().flatten().is_some();
+                        if !exists {
+                            let label = path
+                                .file_name()
+                                .map(|s| s.to_string_lossy().to_string())
+                                .unwrap_or_else(|| path.to_string_lossy().to_string());
+                            unavailable_in_config.push(UnavailableWorkspaceMember {
+                                workspace_id: member.workspace_id,
+                                old_root: path,
+                                label,
+                            });
+                            break;
+                        }
+                    }
+                }
+                if !unavailable_in_config.is_empty() {
+                    unavailable_map.insert(config.id, unavailable_in_config);
+                }
+            }
+
+            this.update(cx, |this, cx| {
+                this.unavailable_members = unavailable_map;
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn start_locate(
+        &mut self,
+        configuration_id: WorkspaceConfigurationId,
+        member: UnavailableWorkspaceMember,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy {
+            return;
+        }
+        self.busy = true;
+        self.error = None;
+        cx.notify();
+
+        let prompt_title = format!("Locate “{}”", member.label);
+        let prompt = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(SharedString::from(prompt_title)),
+        });
+
+        cx.spawn_in(window, async move |this, cx| {
+            let result = prompt.await;
+            let selected_path = match result {
+                Ok(Ok(Some(mut paths))) if !paths.is_empty() => paths.remove(0),
+                _ => {
+                    this.update_in(cx, |this, _window, cx| {
+                        this.busy = false;
+                        cx.notify();
+                    })?;
+                    return anyhow::Ok(());
+                }
+            };
+
+            // The picker opens wherever macOS last left it, and confirming with nothing
+            // selected returns that folder. A differently named folder is the signature
+            // of that one-click accident, so make the user confirm it before any write.
+            if selected_path.file_name() != member.old_root.file_name() {
+                let selected_name = selected_path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| selected_path.display().to_string());
+                // Choose Another Folder… comes first so it is the default (Return) button:
+                // a reflexive confirm must not commit the folder we are asking about.
+                let use_selected = format!("Use “{selected_name}”");
+                let confirm = this.update_in(cx, |_, window, cx| {
+                    window.prompt(
+                        PromptLevel::Warning,
+                        &format!("Relocate “{}” to “{selected_name}”?", member.label),
+                        Some(&format!(
+                            "The folder names don’t match.\n\nFrom: {}\nTo: {}",
+                            member.old_root.display(),
+                            selected_path.display()
+                        )),
+                        &["Choose Another Folder…", use_selected.as_str(), "Cancel"],
+                        cx,
+                    )
+                })?;
+                match confirm.await {
+                    Ok(0) => {
+                        this.update_in(cx, |this, window, cx| {
+                            this.busy = false;
+                            this.start_locate(configuration_id, member, window, cx);
+                        })?;
+                        return anyhow::Ok(());
+                    }
+                    Ok(1) => {}
+                    _ => {
+                        this.update_in(cx, |this, _window, cx| {
+                            this.busy = false;
+                            cx.notify();
+                        })?;
+                        return anyhow::Ok(());
+                    }
+                }
+            }
+
+            this.update_in(cx, |this, window, cx| {
+                this.handle_located_path(configuration_id, member, selected_path, window, cx);
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    pub(crate) fn handle_located_path(
+        &mut self,
+        configuration_id: WorkspaceConfigurationId,
+        member: UnavailableWorkspaceMember,
+        selected_path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let store = match WorkspaceConfigurationStore::try_global(cx) {
+            Some(store) => store,
+            None => {
+                self.busy = false;
+                cx.notify();
+                return;
+            }
+        };
+        let Some(configuration) = store.configuration(configuration_id) else {
+            self.busy = false;
+            cx.notify();
+            return;
+        };
+
+        let collision_in_config = configuration.members.iter().any(|m| {
+            m.workspace_id != member.workspace_id
+                && m.identity_paths.iter().any(|p| p == &selected_path)
+        });
+        if collision_in_config {
+            self.busy = false;
+            self.error = Some(format!(
+                "Cannot relocate: “{}” is already a member of this configuration.",
+                selected_path.display()
+            ));
+            cx.notify();
+            return;
+        }
+
+        if let Some(current_mw_entity) = self.multi_workspace.upgrade() {
+            let current_workspaces = current_mw_entity
+                .read(cx)
+                .workspaces()
+                .cloned()
+                .collect::<Vec<_>>();
+            for ws in current_workspaces {
+                let (ws_db_id, contains_selected) = {
+                    let ws_read = ws.read(cx);
+                    (
+                        ws_read.database_id(),
+                        ws_read
+                            .project_group_key(cx)
+                            .path_list()
+                            .paths()
+                            .contains(&selected_path),
+                    )
+                };
+                if ws_db_id == Some(member.workspace_id) {
+                    self.busy = false;
+                    self.error = Some(
+                        "Cannot relocate: this workspace is currently open in this window. Close it before relocating.".to_string(),
+                    );
+                    cx.notify();
+                    return;
+                }
+                if contains_selected {
+                    self.busy = false;
+                    self.error = Some(format!(
+                        "Cannot relocate: “{}” is currently open in this window.",
+                        selected_path.display()
+                    ));
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+
+        let current_window_id = window.window_handle().window_id();
+        let my_multi_workspace_id = self.multi_workspace.entity_id();
+        let other_mw_entities = cx
+            .windows()
+            .into_iter()
+            .filter_map(|w| w.downcast::<MultiWorkspace>())
+            .filter(|w| w.window_id() != current_window_id)
+            .filter_map(|w| w.entity(cx).ok())
+            .filter(|e| e.entity_id() != my_multi_workspace_id)
+            .collect::<Vec<_>>();
+
+        for other_mw_entity in other_mw_entities {
+            let other_workspaces = other_mw_entity
+                .read(cx)
+                .workspaces()
+                .cloned()
+                .collect::<Vec<_>>();
+            for ws in other_workspaces {
+                let (ws_db_id, contains_selected) = {
+                    let ws_read = ws.read(cx);
+                    (
+                        ws_read.database_id(),
+                        ws_read
+                            .project_group_key(cx)
+                            .path_list()
+                            .paths()
+                            .contains(&selected_path),
+                    )
+                };
+                if ws_db_id == Some(member.workspace_id) {
+                    self.busy = false;
+                    self.error = Some(
+                        "Cannot relocate: this workspace is currently open in another window. Close it before relocating.".to_string(),
+                    );
+                    cx.notify();
+                    return;
+                }
+                if contains_selected {
+                    self.busy = false;
+                    self.error = Some(format!(
+                        "Cannot relocate: “{}” is currently open in another window.",
+                        selected_path.display()
+                    ));
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+
+        self.busy = true;
+        self.error = None;
+        cx.notify();
+
+        let relocate = WorkspaceConfigurationStore::mutate_global(
+            WorkspaceConfigurationMutation::RelocateWorkspace {
+                id: configuration_id,
+                workspace_id: member.workspace_id,
+                old_root: member.old_root,
+                new_root: selected_path,
+            },
+            cx,
+        );
+
+        cx.spawn_in(window, async move |this, cx| {
+            let result = relocate.await;
+            this.update_in(cx, |this, _window, cx| {
+                this.busy = false;
+                match result {
+                    Ok(_) => {
+                        this.error = None;
+                        this.check_unavailable_members(cx);
+                    }
+                    Err(error) => {
+                        log::error!(
+                            "failed to relocate workspace {:?} in configuration {:?}: {error:#}",
+                            member.workspace_id,
+                            configuration_id
+                        );
+                        this.error = Some(format!(
+                            "Couldn't Relocate Workspace Folder\n\nSee the Zed log for details: {error}"
+                        ));
+                    }
+                }
+                cx.notify();
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     fn select_next(
@@ -1730,80 +2165,186 @@ impl WorkspaceConfigurationManagementModal {
 
             let rename_name = configuration.name.clone();
             let delete_name = configuration.name.clone();
-            rows.push(
-                h_flex()
-                    .id(("workspace-configuration-management-row", index))
-                    .when(index > 0, |this| {
-                        this.border_t_1()
-                            .border_color(cx.theme().colors().border_variant)
-                    })
-                    .w_full()
-                    .min_w_0()
-                    .justify_between()
-                    .gap_3()
-                    .px_3()
-                    .py_2()
-                    .border_l_2()
-                    .border_color(if is_selected {
-                        cx.theme().colors().border_focused
-                    } else {
-                        cx.theme().colors().border.opacity(0.)
-                    })
-                    .cursor_pointer()
-                    .hover(|this| this.bg(cx.theme().colors().ghost_element_hover))
-                    .when(is_selected, |this| {
-                        this.bg(cx.theme().colors().ghost_element_selected)
-                    })
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.selected_configuration_id = Some(configuration_id);
-                        this.focus_handle.focus(window, cx);
-                        cx.notify();
-                    }))
-                    .child(
-                        h_flex()
-                            .min_w_0()
-                            .gap_2()
-                            .child(configuration_marker(is_active))
-                            .child(Label::new(configuration.name).truncate()),
-                    )
-                    .child(
-                        h_flex()
-                            .flex_none()
-                            .gap_1()
-                            .child(
-                                Button::new(("rename-workspace-configuration", index), "Rename")
-                                    .style(ButtonStyle::Subtle)
-                                    .disabled(self.busy)
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.selected_configuration_id = Some(configuration_id);
-                                        this.start_rename(
-                                            configuration_id,
-                                            rename_name.clone(),
-                                            window,
-                                            cx,
-                                        );
-                                    })),
+            let unavailable_in_row = self
+                .unavailable_members
+                .get(&configuration_id)
+                .cloned()
+                .unwrap_or_default();
+            let has_unavailable = !unavailable_in_row.is_empty();
+
+            let header_row = h_flex()
+                .id(("workspace-configuration-management-row", index))
+                .w_full()
+                .min_w_0()
+                .justify_between()
+                .gap_3()
+                .px_3()
+                .py_2()
+                .border_l_2()
+                .border_color(if is_selected {
+                    cx.theme().colors().border_focused
+                } else {
+                    cx.theme().colors().border.opacity(0.)
+                })
+                .cursor_pointer()
+                .hover(|this| this.bg(cx.theme().colors().ghost_element_hover))
+                .when(is_selected, |this| {
+                    this.bg(cx.theme().colors().ghost_element_selected)
+                })
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.selected_configuration_id = Some(configuration_id);
+                    this.focus_handle.focus(window, cx);
+                    cx.notify();
+                }))
+                .child(
+                    h_flex()
+                        .min_w_0()
+                        .gap_2()
+                        .child(configuration_marker(is_active))
+                        .child(Label::new(configuration.name).truncate())
+                        .when(has_unavailable, |this| {
+                            this.child(
+                                Icon::new(IconName::Warning)
+                                    .size(IconSize::Small)
+                                    .color(Color::Warning),
                             )
+                        }),
+                )
+                .child(
+                    h_flex()
+                        .flex_none()
+                        .gap_1()
+                        .child(
+                            Button::new(("rename-workspace-configuration", index), "Rename")
+                                .style(ButtonStyle::Subtle)
+                                .disabled(self.busy)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.selected_configuration_id = Some(configuration_id);
+                                    this.start_rename(
+                                        configuration_id,
+                                        rename_name.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                })),
+                        )
+                        .child(
+                            Button::new(("delete-workspace-configuration", index), "Delete")
+                                .style(ButtonStyle::Subtle)
+                                .when(is_selected, |this| {
+                                    this.track_focus(&self.delete_focus_handle)
+                                        .tab_index(0_isize)
+                                })
+                                .disabled(self.busy)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.start_delete(
+                                        configuration_id,
+                                        delete_name.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                })),
+                        ),
+                );
+
+            if is_selected && has_unavailable {
+                let mut row_children = vec![header_row.into_any_element()];
+                for (member_idx, member) in unavailable_in_row.into_iter().enumerate() {
+                    let member_clone = member.clone();
+                    row_children.push(
+                        v_flex()
+                            .mx_3()
+                            .my_1()
+                            .p_2()
+                            .gap_1()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(cx.theme().colors().border_variant)
+                            .bg(cx.theme().colors().editor_background)
                             .child(
-                                Button::new(("delete-workspace-configuration", index), "Delete")
-                                    .style(ButtonStyle::Subtle)
-                                    .when(is_selected, |this| {
-                                        this.track_focus(&self.delete_focus_handle)
-                                            .tab_index(0_isize)
-                                    })
-                                    .disabled(self.busy)
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.start_delete(
-                                            configuration_id,
-                                            delete_name.clone(),
-                                            window,
-                                            cx,
-                                        );
-                                    })),
-                            ),
-                    )
-                    .into_any_element(),
-            );
+                                h_flex()
+                                    .justify_between()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        v_flex()
+                                            .min_w_0()
+                                            .gap_0p5()
+                                            .child(
+                                                h_flex()
+                                                    .gap_1()
+                                                    .items_center()
+                                                    .child(
+                                                        Icon::new(IconName::Warning)
+                                                            .size(IconSize::Small)
+                                                            .color(Color::Warning),
+                                                    )
+                                                    .child(
+                                                        Label::new(format!(
+                                                            "Unavailable folder: {}",
+                                                            member.label
+                                                        ))
+                                                        .size(LabelSize::Small)
+                                                        .color(Color::Warning),
+                                                    ),
+                                            )
+                                            .child(
+                                                Label::new(
+                                                    member.old_root.to_string_lossy().to_string(),
+                                                )
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted)
+                                                .truncate(),
+                                            ),
+                                    )
+                                    .child(
+                                        Button::new(
+                                            SharedString::from(format!(
+                                                "locate-workspace-folder-{index}-{member_idx}"
+                                            )),
+                                            "Locate…",
+                                        )
+                                        .size(ButtonSize::Compact)
+                                        .style(ButtonStyle::Filled)
+                                        .disabled(self.busy)
+                                        .on_click(
+                                            cx.listener(move |this, _, window, cx| {
+                                                this.start_locate(
+                                                    configuration_id,
+                                                    member_clone.clone(),
+                                                    window,
+                                                    cx,
+                                                );
+                                            }),
+                                        ),
+                                    ),
+                            )
+                            .into_any_element(),
+                    );
+                }
+
+                rows.push(
+                    v_flex()
+                        .when(index > 0, |this| {
+                            this.border_t_1()
+                                .border_color(cx.theme().colors().border_variant)
+                        })
+                        .w_full()
+                        .children(row_children)
+                        .into_any_element(),
+                );
+            } else {
+                rows.push(
+                    v_flex()
+                        .when(index > 0, |this| {
+                            this.border_t_1()
+                                .border_color(cx.theme().colors().border_variant)
+                        })
+                        .w_full()
+                        .child(header_row)
+                        .into_any_element(),
+                );
+            }
         }
 
         v_flex()

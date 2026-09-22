@@ -7,7 +7,7 @@ use crate::multi_workspace::{
     SelectPreviousWorkspaceConfiguration, WorkspaceConfigurationSwitchTestStage,
 };
 use crate::persistence::WorkspaceConfigurationStore;
-use crate::workspace_tabs::workspace_tab_paths;
+use crate::workspace_tabs::{MultiWorkspaceTestExt, workspace_tab_paths};
 use agent_settings::AgentSettings;
 use client::proto;
 use db::kvp::KeyValueStore;
@@ -9422,6 +9422,529 @@ async fn test_keep_project_removal_of_remote_workspace_reopens_local_neighbor(
             multi_workspace.workspace().read(cx).project_group_key(cx),
             local_key,
             "KeepProject with nothing live left should still reopen the local adjacent group"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_workspace_configuration_management_modal_detects_unavailable_paths_and_relocates_folder(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    cx.update(crate::register_serializable_item::<crate::item::test::TestItem>);
+    reset_workspace_configuration_store(cx).await;
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_current", json!({ "curr.txt": "curr" }))
+        .await;
+    fs.insert_tree("/root_target_a", json!({ "a.txt": "hello a" }))
+        .await;
+    fs.insert_tree("/root_target_b", json!({ "b.txt": "hello b" }))
+        .await;
+    cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+
+    let project_current = Project::test(fs.clone(), ["/root_current".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_current, window, cx));
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        for workspace in multi_workspace.ordered_workspaces(cx) {
+            workspace.update(cx, |workspace, _cx| workspace.set_random_database_id());
+        }
+    });
+    let save_outgoing = multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.save_configuration_as("Outgoing".to_string(), cx)
+    });
+    let outgoing_configuration_id = save_outgoing.await.unwrap();
+    cx.run_until_parked();
+
+    let target_a = WorkspaceId(9200);
+    let target_b = WorkspaceId(9201);
+    let config_id = seed_workspace_configuration(
+        "Target Config",
+        &[(target_a, "/root_target_a"), (target_b, "/root_target_b")],
+        target_a,
+        cx,
+    )
+    .await;
+
+    // Seed target_b with an open TestItem tab to verify it restores intact after relocation
+    let db = cx.update(|_window, cx| WorkspaceDb::global(cx));
+    db.save_workspace_checked(strict_restore_fixture(
+        target_b,
+        "/root_target_b",
+        crate::persistence::model::SerializedPaneGroup::Pane(
+            crate::persistence::model::SerializedPane::new(
+                vec![crate::persistence::model::SerializedItem::new(
+                    "TestItem", 42, true, false,
+                )],
+                true,
+                0,
+            ),
+        ),
+    ))
+    .await
+    .unwrap();
+
+    let old_root_b = PathBuf::from("/root_target_b");
+
+    // Simulate moved or unmounted folder for member b
+    fs.remove_dir(
+        Path::new("/root_target_b"),
+        fs::RemoveOptions {
+            recursive: true,
+            ignore_if_not_exists: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        fs.metadata(Path::new("/root_target_b"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // Negative control 1: attempt to switch to config_id before locating -> fails with unavailable error!
+    let switch_fail = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.switch_workspace_configuration(config_id, window, cx)
+    });
+    let err = switch_fail.await.unwrap_err();
+    assert!(
+        err.to_string().contains("is unavailable"),
+        "expected switch failure for unavailable path, got: {err}"
+    );
+    multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        assert_eq!(
+            multi_workspace.active_configuration_id(),
+            Some(outgoing_configuration_id)
+        );
+    });
+
+    // Open management modal
+    cx.dispatch_action(ManageWorkspaceConfigurations);
+    cx.run_until_parked();
+
+    // Verify modal is open and has warning badge for config_id
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert!(multi_workspace.test_workspace_configuration_management_modal_is_open(cx));
+        assert!(
+            multi_workspace
+                .test_workspace_configuration_management_has_unavailable_badge(config_id, cx)
+        );
+    });
+
+    // Create relocated target directory on filesystem
+    let new_root_b = PathBuf::from("/root_target_b_relocated");
+    fs.insert_tree(
+        "/root_target_b_relocated",
+        json!({ "b.txt": "hello b relocated" }),
+    )
+    .await;
+
+    // Negative control 2a: attempt to relocate to /root_current which is open in the current window
+    let located = multi_workspace.test_locate_member(
+        config_id,
+        &old_root_b,
+        PathBuf::from("/root_current"),
+        cx,
+    );
+    assert!(located);
+    cx.run_until_parked();
+
+    // Verify current-window path collision was rejected and error banner was set
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        let modal = multi_workspace
+            .active_modal::<crate::workspace_tabs::WorkspaceConfigurationManagementModal>(cx)
+            .expect("modal must remain open on collision");
+        let error = modal
+            .read(cx)
+            .error
+            .clone()
+            .expect("error must be set on collision");
+        assert!(
+            error.contains("currently open in this window"),
+            "expected open window collision error, got: {error}"
+        );
+    });
+
+    // Negative control 2b: attempt to relocate an active workspace currently open in this window
+    let outgoing_member = cx.read(|cx| {
+        WorkspaceConfigurationStore::global(cx)
+            .configuration(outgoing_configuration_id)
+            .unwrap()
+            .members[0]
+            .clone()
+    });
+    fs.remove_dir(
+        Path::new("/root_current"),
+        fs::RemoveOptions {
+            recursive: true,
+            ignore_if_not_exists: false,
+        },
+    )
+    .await
+    .unwrap();
+    let modal = multi_workspace.read_with(cx, |mw, cx| {
+        mw.active_modal::<crate::workspace_tabs::WorkspaceConfigurationManagementModal>(cx)
+            .unwrap()
+    });
+    modal.update(cx, |modal, cx| modal.check_unavailable_members(cx));
+    cx.run_until_parked();
+
+    let located = multi_workspace.test_locate_member(
+        outgoing_configuration_id,
+        &outgoing_member.identity_paths[0],
+        PathBuf::from("/root_target_b_relocated"),
+        cx,
+    );
+    assert!(located);
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        let modal = multi_workspace
+            .active_modal::<crate::workspace_tabs::WorkspaceConfigurationManagementModal>(cx)
+            .expect("modal must remain open on collision");
+        let error = modal
+            .read(cx)
+            .error
+            .clone()
+            .expect("error must be set on collision");
+        assert!(
+            error.contains("currently open in this window. Close it before relocating"),
+            "expected open workspace error, got: {error}"
+        );
+    });
+
+    fs.insert_tree("/root_current", json!({ "curr.txt": "curr" }))
+        .await;
+
+    // Negative control 2c: attempt to relocate to /root_target_a which already exists in this configuration
+    let located = multi_workspace.test_locate_member(
+        config_id,
+        &old_root_b,
+        PathBuf::from("/root_target_a"),
+        cx,
+    );
+    assert!(located);
+    cx.run_until_parked();
+
+    // Verify same-configuration collision was rejected and error banner was set
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        let modal = multi_workspace
+            .active_modal::<crate::workspace_tabs::WorkspaceConfigurationManagementModal>(cx)
+            .expect("modal must remain open on collision");
+        let error = modal
+            .read(cx)
+            .error
+            .clone()
+            .expect("error must be set on collision");
+        assert!(
+            error.contains("already a member of this configuration"),
+            "expected same-configuration collision error, got: {error}"
+        );
+    });
+
+    // Now relocate to valid new path /root_target_b_relocated
+    let located =
+        multi_workspace.test_locate_member(config_id, &old_root_b, new_root_b.clone(), cx);
+    assert!(located);
+    cx.run_until_parked();
+
+    // Verify that the configuration was updated with the new path
+    let config = cx
+        .read(|cx| {
+            WorkspaceConfigurationStore::global(cx)
+                .configuration(config_id)
+                .cloned()
+        })
+        .unwrap();
+    assert!(
+        config
+            .members
+            .iter()
+            .any(|m| m.identity_paths.contains(&new_root_b)),
+        "configuration member must reflect relocated root"
+    );
+
+    // Verify warning badge is cleared because new_root_b exists
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert!(
+            !multi_workspace
+                .test_workspace_configuration_management_has_unavailable_badge(config_id, cx),
+            "warning badge must be cleared after locating folder"
+        );
+    });
+
+    // Close the management modal with Escape
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert!(!multi_workspace.test_workspace_configuration_management_modal_is_open(cx));
+    });
+
+    // Now switch to config_id to verify end-to-end switch succeeds without error!
+    let switch = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.switch_workspace_configuration(config_id, window, cx)
+    });
+    switch.await.unwrap();
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(multi_workspace.active_configuration_id(), Some(config_id));
+        let paths: Vec<PathBuf> = multi_workspace
+            .workspaces()
+            .flat_map(|w| workspace_tab_paths(w.read(cx), cx))
+            .collect();
+        assert!(
+            paths.contains(&new_root_b),
+            "workspaces must contain relocated path: {paths:?}"
+        );
+
+        // Verify that target_b restored with its serialized tab intact
+        let workspace_b = multi_workspace
+            .workspaces()
+            .find(|w| workspace_tab_paths(w.read(cx), cx).contains(&new_root_b))
+            .expect("must find workspace for relocated path");
+        let active_pane = workspace_b.read(cx).active_pane();
+        assert_eq!(
+            active_pane.read(cx).items_len(),
+            1,
+            "relocated workspace must restore serialized tab"
+        );
+        let item = active_pane
+            .read(cx)
+            .active_item()
+            .expect("must have active item");
+        assert!(
+            item.downcast::<crate::item::test::TestItem>().is_some(),
+            "restored item must be TestItem"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_workspace_configuration_management_modal_confirms_locate_when_folder_name_differs(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    reset_workspace_configuration_store(cx).await;
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_current", json!({ "curr.txt": "curr" }))
+        .await;
+    fs.insert_tree("/src/app", json!({ "a.txt": "a" })).await;
+    fs.insert_tree("/moved/nvim.ymd", json!({ "b.txt": "b" }))
+        .await;
+    fs.insert_tree("/src/pi-mojo", json!({ "c.txt": "c" }))
+        .await;
+    fs.insert_tree("/src/scratch", json!({ "d.txt": "d" }))
+        .await;
+    cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+
+    let project_current = Project::test(fs.clone(), ["/root_current".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_current, window, cx));
+
+    // `/src/nvim.ymd` and `/src/notes` are missing on disk; `/src/app` is present.
+    let member_app = WorkspaceId(9300);
+    let member_nvim = WorkspaceId(9301);
+    let member_notes = WorkspaceId(9302);
+    let config_id = seed_workspace_configuration(
+        "Active Projects",
+        &[
+            (member_app, "/src/app"),
+            (member_nvim, "/src/nvim.ymd"),
+            (member_notes, "/src/notes"),
+        ],
+        member_app,
+        cx,
+    )
+    .await;
+    let identity_of = |workspace_id: WorkspaceId, cx: &mut VisualTestContext| {
+        cx.read(|cx| {
+            WorkspaceConfigurationStore::global(cx)
+                .configuration(config_id)
+                .unwrap()
+                .members
+                .iter()
+                .find(|member| member.workspace_id == workspace_id)
+                .unwrap()
+                .identity_paths
+                .clone()
+        })
+    };
+
+    cx.dispatch_action(ManageWorkspaceConfigurations);
+    cx.run_until_parked();
+
+    // Picker returns a differently named folder (the macOS "last folder" default) → confirm first.
+    assert!(multi_workspace.test_start_locate_member(config_id, Path::new("/src/nvim.ymd"), cx));
+    cx.run_until_parked();
+    cx.simulate_path_prompt_response(|_| Some(vec![PathBuf::from("/src/pi-mojo")]));
+    cx.run_until_parked();
+    let (title, detail) = cx
+        .pending_prompt()
+        .expect("a differently named folder must ask before relocating");
+    assert_eq!(title, "Relocate “nvim.ymd” to “pi-mojo”?");
+    assert!(
+        detail.contains("/src/nvim.ymd") && detail.contains("/src/pi-mojo"),
+        "{detail}"
+    );
+
+    // Cancel writes nothing.
+    cx.simulate_prompt_answer("Cancel");
+    cx.run_until_parked();
+    assert_eq!(
+        identity_of(member_nvim, cx),
+        vec![PathBuf::from("/src/nvim.ymd")]
+    );
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert!(
+            multi_workspace
+                .test_workspace_configuration_management_has_unavailable_badge(config_id, cx)
+        );
+    });
+
+    // Choose Another Folder… reopens the picker; a same-named folder relocates without asking.
+    assert!(multi_workspace.test_start_locate_member(config_id, Path::new("/src/nvim.ymd"), cx));
+    cx.run_until_parked();
+    cx.simulate_path_prompt_response(|_| Some(vec![PathBuf::from("/src/pi-mojo")]));
+    cx.run_until_parked();
+    cx.simulate_prompt_answer("Choose Another Folder…");
+    cx.run_until_parked();
+    assert!(
+        cx.did_prompt_for_paths(),
+        "Choose Another Folder… must reopen the folder picker"
+    );
+    cx.simulate_path_prompt_response(|_| Some(vec![PathBuf::from("/moved/nvim.ymd")]));
+    cx.run_until_parked();
+    assert!(!cx.has_pending_prompt(), "a same-named folder must not ask");
+    assert_eq!(
+        identity_of(member_nvim, cx),
+        vec![PathBuf::from("/moved/nvim.ymd")]
+    );
+
+    // Use “<folder>” commits the differently named folder.
+    assert!(multi_workspace.test_start_locate_member(config_id, Path::new("/src/notes"), cx));
+    cx.run_until_parked();
+    cx.simulate_path_prompt_response(|_| Some(vec![PathBuf::from("/src/scratch")]));
+    cx.run_until_parked();
+    cx.simulate_prompt_answer("Use “scratch”");
+    cx.run_until_parked();
+    assert_eq!(
+        identity_of(member_notes, cx),
+        vec![PathBuf::from("/src/scratch")]
+    );
+    assert_eq!(identity_of(member_app, cx), vec![PathBuf::from("/src/app")]);
+}
+
+#[gpui::test]
+async fn test_workspace_configuration_management_modal_rejects_other_window_collisions(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    reset_workspace_configuration_store(cx).await;
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_win1", json!({ "1.txt": "" })).await;
+    fs.insert_tree("/root_win2", json!({ "2.txt": "" })).await;
+    fs.insert_tree("/root_member_old", json!({ "old.txt": "" }))
+        .await;
+    fs.insert_tree("/root_member_relocated", json!({ "new.txt": "" }))
+        .await;
+    cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+
+    let project_1 = Project::test(fs.clone(), ["/root_win1".as_ref()], cx).await;
+    let (multi_workspace_1, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_1, window, cx));
+
+    let member_ws_id = WorkspaceId(9301);
+    let config_id = seed_workspace_configuration(
+        "Collisions Config",
+        &[(member_ws_id, "/root_member_old")],
+        member_ws_id,
+        cx,
+    )
+    .await;
+
+    // Window 2: contains multi_workspace_2 with project on /root_win2
+    let project_2 = Project::test(fs.clone(), ["/root_win2".as_ref()], cx).await;
+    let win2_handle = cx.add_window(|window, cx| MultiWorkspace::test_new(project_2, window, cx));
+    cx.run_until_parked();
+
+    // Make /root_member_old unavailable so modal flags it
+    fs.remove_dir(
+        Path::new("/root_member_old"),
+        fs::RemoveOptions {
+            recursive: true,
+            ignore_if_not_exists: false,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Open management modal in Window 1
+    cx.dispatch_action(ManageWorkspaceConfigurations);
+    cx.run_until_parked();
+
+    // 1. Test "folder open in another window" collision:
+    // Try to relocate member to /root_win2, which is open in Window 2
+    let located = multi_workspace_1.test_locate_member(
+        config_id,
+        &PathBuf::from("/root_member_old"),
+        PathBuf::from("/root_win2"),
+        cx,
+    );
+    assert!(located);
+    cx.run_until_parked();
+
+    multi_workspace_1.read_with(cx, |mw, cx| {
+        let modal = mw
+            .active_modal::<crate::workspace_tabs::WorkspaceConfigurationManagementModal>(cx)
+            .expect("modal must remain open on collision");
+        let error = modal
+            .read(cx)
+            .error
+            .clone()
+            .expect("error must be set on collision");
+        assert!(
+            error.contains("“/root_win2” is currently open in another window"),
+            "expected folder open in another window error, got: {error}"
+        );
+    });
+
+    // 2. Test "member open in another window" collision:
+    // In Window 2, set the workspace database_id to member_ws_id
+    win2_handle
+        .update(cx, |mw, _window, cx| {
+            let ws = mw.workspace().clone();
+            ws.update(cx, |ws, _cx| {
+                ws.set_database_id(member_ws_id);
+            });
+        })
+        .unwrap();
+
+    // Try to relocate member to /root_member_relocated while Window 2 has that workspace open
+    let located = multi_workspace_1.test_locate_member(
+        config_id,
+        &PathBuf::from("/root_member_old"),
+        PathBuf::from("/root_member_relocated"),
+        cx,
+    );
+    assert!(located);
+    cx.run_until_parked();
+
+    multi_workspace_1.read_with(cx, |mw, cx| {
+        let modal = mw
+            .active_modal::<crate::workspace_tabs::WorkspaceConfigurationManagementModal>(cx)
+            .expect("modal must remain open on collision");
+        let error = modal
+            .read(cx)
+            .error
+            .clone()
+            .expect("error must be set on collision");
+        assert!(
+            error.contains(
+                "this workspace is currently open in another window. Close it before relocating"
+            ),
+            "expected member open in another window error, got: {error}"
         );
     });
 }

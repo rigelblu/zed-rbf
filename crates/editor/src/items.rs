@@ -3718,4 +3718,119 @@ mod tests {
             assert!(buffer.is_dirty());
         });
     }
+
+    // Proves the #zed-72 claim: if editors.path is not translated during relocation,
+    // editor deserialization either fails or opens from a wrong worktree. The project's
+    // worktree is at /new/project; find_worktree returns None for the old path.
+    #[gpui::test]
+    async fn test_editor_deserialize_fails_with_stale_path_after_relocation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx, |_| {});
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/new/project"),
+            json!({
+                "src": {
+                    "lib.rs": "fn relocated() {}"
+                }
+            }),
+        )
+        .await;
+
+        let project =
+            Project::test(fs.clone(), [path!("/new/project").as_ref()], cx).await;
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let db = cx.update(|_, cx| workspace::WorkspaceDb::global(cx));
+        let editor_db = cx.update(|_, cx| EditorDb::global(cx));
+
+        // --- Positive: translated path finds the correct worktree and loads content ---
+        {
+            let workspace_id = db.next_id().await.unwrap();
+            let item_id = 1001 as ItemId;
+            editor_db
+                .save_serialized_editor(
+                    item_id,
+                    workspace_id,
+                    SerializedEditor {
+                        abs_path: Some(PathBuf::from(path!("/new/project/src/lib.rs"))),
+                        contents: None,
+                        language: None,
+                        mtime: None,
+                    },
+                )
+                .await
+                .unwrap();
+
+            let editor =
+                deserialize_editor(item_id, workspace_id, workspace.clone(), project.clone(), cx)
+                    .await;
+
+            editor.update(cx, |editor, cx| {
+                assert_eq!(editor.text(cx), "fn relocated() {}");
+                let buffer = editor.buffer().read(cx).as_singleton().unwrap().read(cx);
+                let file = buffer.file().expect("should have a file");
+                assert_eq!(file.full_path(cx), Path::new("project/src/lib.rs"));
+                let project_worktrees = project.read(cx).worktrees(cx).collect::<Vec<_>>();
+                assert_eq!(project_worktrees.len(), 1);
+                assert_eq!(
+                    file.worktree_id(cx),
+                    project_worktrees[0].read(cx).id(),
+                    "editor should be opened from the project's worktree"
+                );
+            });
+        }
+
+        // --- Negative control: stale path is NOT in any project worktree ---
+        // This proves relocation is required: without path translation,
+        // find_worktree returns None for the old path, and deserialization
+        // cannot restore the file from the project's worktree.
+        {
+            let stale_path = PathBuf::from(path!("/old/project/src/lib.rs"));
+            let found = project.update(cx, |project, cx| {
+                project.find_worktree(&stale_path, cx)
+            });
+            assert!(
+                found.is_none(),
+                "stale path should not be found in any project worktree — \
+                 this is what causes tab restoration failure when editors.path \
+                 is not translated during relocation"
+            );
+
+            // Deserializing with the stale path fails to restore the project file:
+            // it creates an empty scratch buffer instead of loading the relocated file.
+            let workspace_id = db.next_id().await.unwrap();
+            let item_id = 1002 as ItemId;
+            editor_db
+                .save_serialized_editor(
+                    item_id,
+                    workspace_id,
+                    SerializedEditor {
+                        abs_path: Some(stale_path),
+                        contents: None,
+                        language: None,
+                        mtime: None,
+                    },
+                )
+                .await
+                .unwrap();
+
+            let editor =
+                deserialize_editor(item_id, workspace_id, workspace.clone(), project.clone(), cx)
+                    .await;
+
+            editor.update(cx, |editor, cx| {
+                assert_ne!(
+                    editor.text(cx),
+                    "fn relocated() {}",
+                    "stale path should NOT load the relocated file content"
+                );
+                assert_eq!(editor.text(cx), "");
+            });
+        }
+    }
 }

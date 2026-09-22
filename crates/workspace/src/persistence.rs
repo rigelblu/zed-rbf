@@ -479,6 +479,12 @@ pub enum WorkspaceConfigurationMutation {
     Delete {
         id: model::WorkspaceConfigurationId,
     },
+    RelocateWorkspace {
+        id: model::WorkspaceConfigurationId,
+        workspace_id: WorkspaceId,
+        old_root: PathBuf,
+        new_root: PathBuf,
+    },
 }
 
 /// What a successful mutation produced.
@@ -491,16 +497,25 @@ pub struct StoreCommit {
     pub generation: u64,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RelocateResult {
+    Translated(WorkspaceId),
+    Relinked {
+        old_id: WorkspaceId,
+        new_id: WorkspaceId,
+    },
+}
+
 /// The one owner of every saved workspace configuration in this process.
 ///
 /// All Zed windows share one `App`, so a single global here genuinely serializes every
 /// writer: there is no second process to race with.
 pub struct WorkspaceConfigurationStore {
     /// The latest value this process committed, mirrored in memory so the menu can render
-    /// names without touching the database.
+    /// synchronously on every paint, plus the lock that gives `shutdown` its snapshot.
     committed: model::WorkspaceConfigurationCollection,
     generation: u64,
-    /// Set when the stored value must not be overwritten. Every mutation is refused while
+    /// When the store encounters corruption, a schema too new to parse, or a read failure,
     /// it holds a value.
     blocked: Option<StoreBlock>,
     workspace_row_reservations: HashMap<Uuid, HashSet<WorkspaceId>>,
@@ -514,6 +529,8 @@ pub struct WorkspaceConfigurationStore {
     queue_tail: Option<Task<()>>,
     #[cfg(test)]
     fail_writes_for_tests: bool,
+    #[cfg(test)]
+    pub(crate) fail_relocate_in_savepoint_for_tests: bool,
 }
 
 impl gpui::Global for WorkspaceConfigurationStore {}
@@ -568,6 +585,8 @@ impl WorkspaceConfigurationStore {
             queue_tail: None,
             #[cfg(test)]
             fail_writes_for_tests: false,
+            #[cfg(test)]
+            fail_relocate_in_savepoint_for_tests: false,
         }
     }
 
@@ -596,6 +615,11 @@ impl WorkspaceConfigurationStore {
     #[cfg(test)]
     pub(crate) fn set_write_failure_for_tests(fail: bool, cx: &mut App) {
         cx.global_mut::<Self>().fail_writes_for_tests = fail;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_fail_relocate_in_savepoint_for_tests(fail: bool, cx: &mut App) {
+        cx.global_mut::<Self>().fail_relocate_in_savepoint_for_tests = fail;
     }
 
     #[cfg(test)]
@@ -793,7 +817,7 @@ impl WorkspaceConfigurationStore {
         mutation: WorkspaceConfigurationMutation,
         cx: &mut AsyncApp,
     ) -> Result<StoreCommit> {
-        let (mut collection, kvp) = cx.update(|cx| {
+        let (mut collection, kvp, db, _fail_savepoint_for_tests) = cx.update(|cx| {
             let this = Self::global(cx);
             if let Some(blocked) = this.blocked.clone() {
                 anyhow::bail!("{}", blocked.user_facing_message());
@@ -803,32 +827,172 @@ impl WorkspaceConfigurationStore {
                 !this.fail_writes_for_tests,
                 "forced workspace configuration write failure"
             );
-            Ok((this.committed.clone(), KeyValueStore::global(cx)))
+            Ok((
+                this.committed.clone(),
+                KeyValueStore::global(cx),
+                WorkspaceDb::global(cx),
+                #[cfg(test)]
+                this.fail_relocate_in_savepoint_for_tests,
+                #[cfg(not(test))]
+                false,
+            ))
         })?;
 
-        let id = Self::apply_to_collection(&mut collection, mutation)?;
+        match mutation {
+            WorkspaceConfigurationMutation::RelocateWorkspace {
+                id,
+                workspace_id,
+                old_root,
+                new_root,
+            } => {
+                anyhow::ensure!(
+                    collection.configurations.iter().any(|c| c.id == id),
+                    "that workspace configuration no longer exists"
+                );
+                let member_identity_paths = if let Some(target_configuration) =
+                    collection.configurations.iter().find(|c| c.id == id)
+                {
+                    for member in &target_configuration.members {
+                        if member.workspace_id != workspace_id {
+                            anyhow::ensure!(
+                                !member.identity_paths.iter().any(|p| p == &new_root),
+                                "“{}” is already a member of this configuration.",
+                                new_root.display()
+                            );
+                        }
+                    }
+                    target_configuration
+                        .members
+                        .iter()
+                        .find(|m| m.workspace_id == workspace_id)
+                        .map(|m| m.identity_paths.clone())
+                        .context("that workspace is no longer a member of this configuration")?
+                } else {
+                    anyhow::bail!("that workspace configuration no longer exists");
+                };
 
-        let json = serde_json::to_string(&collection)
-            .context("serializing the workspace configuration collection")?;
+                let updated_collection = db
+                    .write(move |conn| {
+                        conn.with_savepoint("relocate_workspace", || {
+                            let relocate_result = WorkspaceDb::relocate_workspace_root_internal(
+                                conn,
+                                workspace_id,
+                                &member_identity_paths,
+                                &old_root,
+                                &new_root,
+                            )?;
 
-        // The in-memory value advances only after the write lands, so a failed write
-        // leaves both the stored value and this process's view of it untouched.
-        kvp.scoped(WORKSPACE_CONFIGURATIONS_NAMESPACE)
-            .write(WORKSPACE_CONFIGURATIONS_KEY.to_string(), json)
-            .await
-            .context("writing the workspace configuration collection")?;
-        Ok(cx.update(|cx| {
-            cx.update_global::<Self, _>(|this, cx| {
-                this.committed = collection.clone();
-                *this.shutdown_committed.lock() = collection;
-                this.generation += 1;
-                cx.refresh_windows();
-                StoreCommit {
-                    id,
-                    generation: this.generation,
+                            match relocate_result {
+                                RelocateResult::Relinked { old_id, new_id } => {
+                                    Self::apply_relocate_to_collection(
+                                        &mut collection,
+                                        old_id,
+                                        new_id,
+                                        &old_root,
+                                        &new_root,
+                                    );
+                                }
+                                RelocateResult::Translated(ws_id) => {
+                                    Self::apply_relocate_to_collection(
+                                        &mut collection,
+                                        ws_id,
+                                        ws_id,
+                                        &old_root,
+                                        &new_root,
+                                    );
+                                }
+                            }
+
+                            let json = serde_json::to_string(&collection)
+                                .context("serializing the workspace configuration collection")?;
+
+                            conn.exec_bound::<(&str, &str, &str)>(
+                                "INSERT OR REPLACE INTO scoped_kv_store(namespace, key, value) VALUES ((?), (?), (?))",
+                            )?((
+                                WORKSPACE_CONFIGURATIONS_NAMESPACE,
+                                WORKSPACE_CONFIGURATIONS_KEY,
+                                &json,
+                            ))
+                            .context("writing the workspace configuration collection")?;
+
+                            #[cfg(test)]
+                            if _fail_savepoint_for_tests {
+                                anyhow::bail!("forced error after writes to test savepoint rollback");
+                            }
+
+                            Ok(collection)
+                        })
+                    })
+                    .await?;
+
+                collection = updated_collection;
+
+                Ok(cx.update(|cx| {
+                    cx.update_global::<Self, _>(|this, cx| {
+                        this.committed = collection.clone();
+                        *this.shutdown_committed.lock() = collection;
+                        this.generation += 1;
+                        cx.refresh_windows();
+                        StoreCommit {
+                            id,
+                            generation: this.generation,
+                        }
+                    })
+                }))
+            }
+            _ => {
+                let id = Self::apply_to_collection(&mut collection, mutation)?;
+                let json = serde_json::to_string(&collection)
+                    .context("serializing the workspace configuration collection")?;
+                kvp.scoped(WORKSPACE_CONFIGURATIONS_NAMESPACE)
+                    .write(WORKSPACE_CONFIGURATIONS_KEY.to_string(), json)
+                    .await
+                    .context("writing the workspace configuration collection")?;
+
+                Ok(cx.update(|cx| {
+                    cx.update_global::<Self, _>(|this, cx| {
+                        this.committed = collection.clone();
+                        *this.shutdown_committed.lock() = collection;
+                        this.generation += 1;
+                        cx.refresh_windows();
+                        StoreCommit {
+                            id,
+                            generation: this.generation,
+                        }
+                    })
+                }))
+            }
+        }
+    }
+
+    fn apply_relocate_to_collection(
+        collection: &mut model::WorkspaceConfigurationCollection,
+        old_id: WorkspaceId,
+        new_id: WorkspaceId,
+        old_root: &Path,
+        new_root: &Path,
+    ) {
+        for configuration in &mut collection.configurations {
+            for member in &mut configuration.members {
+                if member.workspace_id == old_id || member.workspace_id == new_id {
+                    member.workspace_id = new_id;
+                    let mut new_identity_paths = Vec::new();
+                    for path in &member.identity_paths {
+                        if let Some(translated) = translate_path(path, old_root, new_root) {
+                            new_identity_paths.push(translated);
+                        } else {
+                            new_identity_paths.push(path.clone());
+                        }
+                    }
+                    new_identity_paths.sort();
+                    new_identity_paths.dedup();
+                    member.identity_paths = new_identity_paths;
                 }
-            })
-        }))
+            }
+            if configuration.active_member == Some(old_id) {
+                configuration.active_member = Some(new_id);
+            }
+        }
     }
 
     fn apply_to_collection(
@@ -906,10 +1070,58 @@ impl WorkspaceConfigurationStore {
                 collection.configurations.remove(configuration_index);
                 id
             }
+            WorkspaceConfigurationMutation::RelocateWorkspace { id, .. } => id,
         };
 
         Ok(id)
     }
+}
+
+fn translate_path(path: &Path, old_root: &Path, new_root: &Path) -> Option<PathBuf> {
+    if path == old_root {
+        Some(new_root.to_path_buf())
+    } else if let Ok(suffix) = path.strip_prefix(old_root) {
+        Some(new_root.join(suffix))
+    } else {
+        None
+    }
+}
+
+fn translate_json_paths(value: &mut serde_json::Value, old_root: &Path, new_root: &Path) -> bool {
+    let mut modified = false;
+    match value {
+        serde_json::Value::String(s) => {
+            let path = Path::new(s);
+            if let Some(translated) = translate_path(path, old_root, new_root) {
+                *s = translated.to_string_lossy().into_owned();
+                modified = true;
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                if translate_json_paths(item, old_root, new_root) {
+                    modified = true;
+                }
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for item in map.values_mut() {
+                if translate_json_paths(item, old_root, new_root) {
+                    modified = true;
+                }
+            }
+        }
+        _ => {}
+    }
+    modified
+}
+
+fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
+    let exists = conn.select_row_bound::<&str, i64>(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?1",
+    )?(name)?
+    .is_some();
+    Ok(exists)
 }
 
 pub fn workspace_configuration_referenced_workspace_ids(cx: &App) -> Option<HashSet<WorkspaceId>> {
@@ -1954,6 +2166,43 @@ impl WorkspaceDb {
         Ok(None)
     }
 
+    pub(crate) fn workspace_paths_for_id(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<Option<PathList>> {
+        let row: Option<(String, String)> = self.select_row_bound(sql! {
+            SELECT paths, paths_order FROM workspaces WHERE workspace_id = ?
+        })?(workspace_id)?;
+        if let Some((paths, order)) = row {
+            let serialized = SerializedPathList { paths, order };
+            Ok(Some(PathList::deserialize(&serialized)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub(crate) fn workspace_paths_for_local_identity_paths(
+        &self,
+        identity_paths: &[PathBuf],
+    ) -> Result<Option<(WorkspaceId, PathList)>> {
+        if identity_paths.is_empty() {
+            return Ok(None);
+        }
+        for (workspace_id, paths, stored_identity_paths, remote_connection_id, _, _) in
+            self.recent_workspaces()?
+        {
+            if remote_connection_id.is_none()
+                && stored_identity_paths
+                    .unwrap_or_else(|| paths.clone())
+                    .paths()
+                    == identity_paths
+            {
+                return Ok(Some((workspace_id, paths)));
+            }
+        }
+        Ok(None)
+    }
+
     fn bookmarks(
         &self,
         workspace_id: WorkspaceId,
@@ -2339,6 +2588,415 @@ impl WorkspaceDb {
 
     pub(crate) async fn save_workspace(&self, workspace: SerializedWorkspace) {
         self.save_workspace_checked(workspace).await.log_err();
+    }
+
+    fn find_local_workspace_by_identity_paths_on_connection(
+        conn: &Connection,
+        identity_paths: &[PathBuf],
+    ) -> Result<Option<(WorkspaceId, String, String, Option<String>, Option<String>)>> {
+        if identity_paths.is_empty() {
+            return Ok(None);
+        }
+        let rows: Vec<(WorkspaceId, String, String, Option<String>, Option<String>)> = conn.select_bound(
+            "SELECT workspace_id, paths, paths_order, identity_paths, identity_paths_order FROM workspaces WHERE remote_connection_id IS NULL ORDER BY timestamp DESC",
+        )?(())?;
+        for (id, paths_str, order_str, id_paths_str, id_order_str) in rows {
+            let stored_identity = if let (Some(id_p), Some(id_o)) = (&id_paths_str, &id_order_str) {
+                PathList::deserialize(&SerializedPathList {
+                    paths: id_p.clone(),
+                    order: id_o.clone(),
+                })
+            } else {
+                PathList::deserialize(&SerializedPathList {
+                    paths: paths_str.clone(),
+                    order: order_str.clone(),
+                })
+            };
+            if stored_identity.paths() == identity_paths {
+                return Ok(Some((id, paths_str, order_str, id_paths_str, id_order_str)));
+            }
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn relocate_workspace_root_internal(
+        conn: &Connection,
+        workspace_id: WorkspaceId,
+        identity_paths: &[PathBuf],
+        old_root: &Path,
+        new_root: &Path,
+    ) -> Result<RelocateResult> {
+        let actual_workspace_id = if table_exists(conn, "workspaces")? {
+            let row = conn.select_row_bound::<WorkspaceId, (String, String, Option<String>, Option<String>)>(
+                "SELECT paths, paths_order, identity_paths, identity_paths_order FROM workspaces WHERE workspace_id = ?1",
+            )?(workspace_id)?;
+
+            let (actual_workspace_id, paths_str, order_str, identity_paths_str, identity_order_str) =
+                match row {
+                    Some(r) => (workspace_id, r.0, r.1, r.2, r.3),
+                    None => {
+                        let mut candidate_identity_paths = if identity_paths.is_empty() {
+                            vec![old_root.to_path_buf()]
+                        } else {
+                            identity_paths.to_vec()
+                        };
+                        candidate_identity_paths.sort();
+                        let fallback_row =
+                            Self::find_local_workspace_by_identity_paths_on_connection(
+                                conn,
+                                &candidate_identity_paths,
+                            )?;
+                        fallback_row.with_context(|| {
+                            format!("workspace {workspace_id:?} not found in database")
+                        })?
+                    }
+                };
+
+            let serialized_paths = SerializedPathList {
+                paths: paths_str,
+                order: order_str,
+            };
+            let path_list = PathList::deserialize(&serialized_paths);
+            let mut translated_any = false;
+            let new_ordered_roots: Vec<PathBuf> = path_list
+                .ordered_paths()
+                .map(|path| {
+                    if let Some(translated) = translate_path(path, old_root, new_root) {
+                        translated_any = true;
+                        translated
+                    } else {
+                        path.clone()
+                    }
+                })
+                .collect();
+
+            anyhow::ensure!(
+                translated_any,
+                "no root matching “{}” was found in workspace {:?}",
+                old_root.display(),
+                actual_workspace_id
+            );
+
+            let mut seen_roots = HashSet::default();
+            for root in &new_ordered_roots {
+                anyhow::ensure!(
+                    seen_roots.insert(root.clone()),
+                    "Duplicate root path in workspace after relocation: {}",
+                    root.display()
+                );
+            }
+
+            let new_path_list = PathList::new(&new_ordered_roots);
+            let new_serialized = new_path_list.serialize();
+
+            let new_identity_serialized = if let (Some(id_paths_str), Some(id_order_str)) =
+                (identity_paths_str, identity_order_str)
+            {
+                let id_serialized = SerializedPathList {
+                    paths: id_paths_str,
+                    order: id_order_str,
+                };
+                let id_path_list = PathList::deserialize(&id_serialized);
+                let new_id_ordered_roots: Vec<PathBuf> = id_path_list
+                    .ordered_paths()
+                    .map(|path| {
+                        translate_path(path, old_root, new_root).unwrap_or_else(|| path.clone())
+                    })
+                    .collect();
+                let new_id_list = PathList::new(&new_id_ordered_roots);
+                Some(new_id_list.serialize())
+            } else {
+                None
+            };
+
+            let existing_other_workspace: Option<WorkspaceId> = conn
+                .select_row_bound::<(WorkspaceId, &str), WorkspaceId>(
+                    "SELECT workspace_id FROM workspaces WHERE workspace_id != ?1 AND paths = ?2 AND remote_connection_id IS NULL",
+                )?((actual_workspace_id, &new_serialized.paths))?;
+            if let Some(existing_id) = existing_other_workspace {
+                return Ok(RelocateResult::Relinked {
+                    old_id: workspace_id,
+                    new_id: existing_id,
+                });
+            }
+
+            conn.exec_bound::<(WorkspaceId, &str, &str, Option<&str>, Option<&str>)>(
+                "UPDATE workspaces SET paths = ?2, paths_order = ?3, identity_paths = ?4, identity_paths_order = ?5 WHERE workspace_id = ?1",
+            )?((
+                actual_workspace_id,
+                &new_serialized.paths,
+                &new_serialized.order,
+                new_identity_serialized.as_ref().map(|s| s.paths.as_str()),
+                new_identity_serialized.as_ref().map(|s| s.order.as_str()),
+            ))?;
+
+            actual_workspace_id
+        } else {
+            workspace_id
+        };
+
+        if table_exists(conn, "editors")? {
+            let rows: Vec<(ItemId, Option<PathBuf>, Option<String>)> =
+                conn.select_bound::<WorkspaceId, (ItemId, Option<PathBuf>, Option<String>)>(
+                    "SELECT item_id, path, buffer_path FROM editors WHERE workspace_id = ?1",
+                )?(actual_workspace_id)?;
+
+            for (item_id, maybe_path, maybe_buffer_path) in rows {
+                let mut changed = false;
+                let updated_path = match maybe_path {
+                    Some(ref p) => match translate_path(p, old_root, new_root) {
+                        Some(new_p) => {
+                            changed = true;
+                            Some(new_p)
+                        }
+                        None => Some(p.clone()),
+                    },
+                    None => None,
+                };
+
+                let updated_buffer_path = match maybe_buffer_path {
+                    Some(ref s) => {
+                        let p = Path::new(s);
+                        match translate_path(p, old_root, new_root) {
+                            Some(new_p) => {
+                                changed = true;
+                                Some(new_p.to_string_lossy().into_owned())
+                            }
+                            None => Some(s.clone()),
+                        }
+                    }
+                    None => updated_path
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().into_owned()),
+                };
+
+                if changed {
+                    conn.exec_bound::<(Option<PathBuf>, Option<String>, ItemId, WorkspaceId)>(
+                        "UPDATE editors SET path = ?1, buffer_path = ?2 WHERE item_id = ?3 AND workspace_id = ?4",
+                    )?((updated_path, updated_buffer_path, item_id, actual_workspace_id))?;
+                }
+            }
+        }
+
+        if table_exists(conn, "file_folds")? {
+            let rows: Vec<PathBuf> = conn.select_bound::<WorkspaceId, PathBuf>(
+                "SELECT DISTINCT path FROM file_folds WHERE workspace_id = ?1",
+            )?(actual_workspace_id)?;
+
+            for old_path in rows {
+                if let Some(new_path) = translate_path(&old_path, old_root, new_root) {
+                    conn.exec_bound::<(PathBuf, WorkspaceId, PathBuf)>(
+                        "UPDATE file_folds SET path = ?1 WHERE workspace_id = ?2 AND path = ?3",
+                    )?((new_path, actual_workspace_id, old_path))?;
+                }
+            }
+        }
+
+        if table_exists(conn, "bookmarks")? {
+            let rows: Vec<PathBuf> = conn.select_bound::<WorkspaceId, PathBuf>(
+                "SELECT DISTINCT path FROM bookmarks WHERE workspace_id = ?1",
+            )?(actual_workspace_id)?;
+
+            for old_path in rows {
+                if let Some(new_path) = translate_path(&old_path, old_root, new_root) {
+                    conn.exec_bound::<(PathBuf, WorkspaceId, PathBuf)>(
+                        "UPDATE bookmarks SET path = ?1 WHERE workspace_id = ?2 AND path = ?3",
+                    )?((new_path, actual_workspace_id, old_path))?;
+                }
+            }
+        }
+
+        if table_exists(conn, "breakpoints")? {
+            let rows: Vec<PathBuf> = conn.select_bound::<WorkspaceId, PathBuf>(
+                "SELECT DISTINCT path FROM breakpoints WHERE workspace_id = ?1",
+            )?(actual_workspace_id)?;
+
+            for old_path in rows {
+                if let Some(new_path) = translate_path(&old_path, old_root, new_root) {
+                    conn.exec_bound::<(PathBuf, WorkspaceId, PathBuf)>(
+                        "UPDATE breakpoints SET path = ?1 WHERE workspace_id = ?2 AND path = ?3",
+                    )?((new_path, actual_workspace_id, old_path))?;
+                }
+            }
+        }
+
+        if table_exists(conn, "user_toolchains")? {
+            let rows: Vec<(i64, String, String, Option<String>)> = conn.select_bound::<WorkspaceId, (i64, String, String, Option<String>)>(
+                "SELECT rowid, worktree_root_path, path, raw_json FROM user_toolchains WHERE workspace_id = ?1",
+            )?(actual_workspace_id)?;
+
+            for (rowid, old_root_str, old_toolchain_path_str, raw_json) in rows {
+                let mut updated_root = None;
+                let mut updated_toolchain = None;
+                if let Some(new_p) = translate_path(Path::new(&old_root_str), old_root, new_root) {
+                    updated_root = Some(new_p.to_string_lossy().into_owned());
+                }
+                if let Some(new_p) =
+                    translate_path(Path::new(&old_toolchain_path_str), old_root, new_root)
+                {
+                    updated_toolchain = Some(new_p.to_string_lossy().into_owned());
+                }
+                let mut updated_raw_json = raw_json.clone();
+                let mut raw_json_changed = false;
+                if let Some(ref rj) = raw_json {
+                    if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(rj) {
+                        if translate_json_paths(&mut val, old_root, new_root) {
+                            if let Ok(serialized) = serde_json::to_string(&val) {
+                                updated_raw_json = Some(serialized);
+                                raw_json_changed = true;
+                            }
+                        }
+                    }
+                }
+                if updated_root.is_some() || updated_toolchain.is_some() || raw_json_changed {
+                    let new_root_val = updated_root.as_ref().unwrap_or(&old_root_str);
+                    let new_toolchain_val = updated_toolchain
+                        .as_ref()
+                        .unwrap_or(&old_toolchain_path_str);
+                    conn.exec_bound::<(String, String, Option<String>, i64)>(
+                        "UPDATE user_toolchains SET worktree_root_path = ?1, path = ?2, raw_json = ?3 WHERE rowid = ?4",
+                    )?((new_root_val.clone(), new_toolchain_val.clone(), updated_raw_json, rowid))?;
+                }
+            }
+        }
+
+        if table_exists(conn, "terminals")? {
+            let rows: Vec<(ItemId, Option<PathBuf>, Option<String>)> = conn
+                .select_bound::<WorkspaceId, (ItemId, Option<PathBuf>, Option<String>)>(
+                    "SELECT item_id, working_directory, working_directory_path FROM terminals WHERE workspace_id = ?1",
+                )?(actual_workspace_id)?;
+
+            for (item_id, maybe_wd, maybe_wd_path) in rows {
+                let mut changed = false;
+                let updated_wd = match maybe_wd {
+                    Some(ref p) => match translate_path(p, old_root, new_root) {
+                        Some(new_p) => {
+                            changed = true;
+                            Some(new_p)
+                        }
+                        None => Some(p.clone()),
+                    },
+                    None => None,
+                };
+
+                let updated_wd_path = match maybe_wd_path {
+                    Some(ref s) => {
+                        let p = Path::new(s);
+                        match translate_path(p, old_root, new_root) {
+                            Some(new_p) => {
+                                changed = true;
+                                Some(new_p.to_string_lossy().into_owned())
+                            }
+                            None => Some(s.clone()),
+                        }
+                    }
+                    None => updated_wd
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().into_owned()),
+                };
+
+                if changed {
+                    conn.exec_bound::<(Option<PathBuf>, Option<String>, ItemId, WorkspaceId)>(
+                        "UPDATE terminals SET working_directory = ?1, working_directory_path = ?2 WHERE item_id = ?3 AND workspace_id = ?4",
+                    )?((updated_wd, updated_wd_path, item_id, actual_workspace_id))?;
+                }
+            }
+        }
+
+        if table_exists(conn, "vim_marks")? {
+            let rows: Vec<(String, Option<PathBuf>)> = conn
+                .select_bound::<WorkspaceId, (String, Option<PathBuf>)>(
+                    "SELECT mark_name, path FROM vim_marks WHERE workspace_id = ?1",
+                )?(actual_workspace_id)?;
+
+            for (mark_name, maybe_path) in rows {
+                if let Some(ref path) = maybe_path {
+                    if let Some(new_path) = translate_path(path, old_root, new_root) {
+                        conn.exec_bound::<(Option<PathBuf>, WorkspaceId, String, Option<PathBuf>)>(
+                            "UPDATE vim_marks SET path = ?1 WHERE workspace_id = ?2 AND mark_name = ?3 AND path = ?4",
+                        )?((Some(new_path), actual_workspace_id, mark_name, Some(path.clone())))?;
+                    }
+                }
+            }
+        }
+
+        if table_exists(conn, "vim_global_marks_paths")? {
+            let rows: Vec<(String, Option<PathBuf>)> = conn
+                .select_bound::<WorkspaceId, (String, Option<PathBuf>)>(
+                    "SELECT mark_name, path FROM vim_global_marks_paths WHERE workspace_id = ?1",
+                )?(actual_workspace_id)?;
+
+            for (mark_name, maybe_path) in rows {
+                if let Some(ref path) = maybe_path {
+                    if let Some(new_path) = translate_path(path, old_root, new_root) {
+                        conn.exec_bound::<(Option<PathBuf>, WorkspaceId, String, Option<PathBuf>)>(
+                            "UPDATE vim_global_marks_paths SET path = ?1 WHERE workspace_id = ?2 AND mark_name = ?3 AND path = ?4",
+                        )?((Some(new_path), actual_workspace_id, mark_name, Some(path.clone())))?;
+                    }
+                }
+            }
+        }
+
+        if table_exists(conn, "markdown_previews")? {
+            let rows: Vec<(ItemId, Option<PathBuf>)> = conn
+                .select_bound::<WorkspaceId, (ItemId, Option<PathBuf>)>(
+                    "SELECT item_id, abs_path FROM markdown_previews WHERE workspace_id = ?1",
+                )?(actual_workspace_id)?;
+
+            for (item_id, maybe_path) in rows {
+                if let Some(ref path) = maybe_path {
+                    if let Some(new_path) = translate_path(path, old_root, new_root) {
+                        conn.exec_bound::<(Option<PathBuf>, ItemId, WorkspaceId)>(
+                            "UPDATE markdown_previews SET abs_path = ?1 WHERE item_id = ?2 AND workspace_id = ?3",
+                        )?((Some(new_path), item_id, actual_workspace_id))?;
+                    }
+                }
+            }
+        }
+
+        if table_exists(conn, "image_viewers")? {
+            let rows: Vec<(ItemId, Option<PathBuf>)> = conn
+                .select_bound::<WorkspaceId, (ItemId, Option<PathBuf>)>(
+                    "SELECT item_id, image_path FROM image_viewers WHERE workspace_id = ?1",
+                )?(actual_workspace_id)?;
+
+            for (item_id, maybe_path) in rows {
+                if let Some(ref path) = maybe_path {
+                    if let Some(new_path) = translate_path(path, old_root, new_root) {
+                        conn.exec_bound::<(Option<PathBuf>, ItemId, WorkspaceId)>(
+                            "UPDATE image_viewers SET image_path = ?1 WHERE item_id = ?2 AND workspace_id = ?3",
+                        )?((Some(new_path), item_id, actual_workspace_id))?;
+                    }
+                }
+            }
+        }
+
+        if table_exists(conn, "git_graphs")? {
+            let rows: Vec<(ItemId, Option<String>)> = conn
+                .select_bound::<WorkspaceId, (ItemId, Option<String>)>(
+                    "SELECT item_id, repo_working_path FROM git_graphs WHERE workspace_id = ?1",
+                )?(actual_workspace_id)?;
+
+            for (item_id, maybe_path) in rows {
+                if let Some(ref s) = maybe_path {
+                    let p = Path::new(s);
+                    if let Some(new_path) = translate_path(p, old_root, new_root) {
+                        conn.exec_bound::<(Option<String>, ItemId, WorkspaceId)>(
+                            "UPDATE git_graphs SET repo_working_path = ?1 WHERE item_id = ?2 AND workspace_id = ?3",
+                        )?((Some(new_path.to_string_lossy().into_owned()), item_id, actual_workspace_id))?;
+                    }
+                }
+            }
+        }
+
+        if actual_workspace_id != workspace_id {
+            Ok(RelocateResult::Relinked {
+                old_id: workspace_id,
+                new_id: actual_workspace_id,
+            })
+        } else {
+            Ok(RelocateResult::Translated(actual_workspace_id))
+        }
     }
 
     #[cfg(test)]
@@ -8005,5 +8663,1164 @@ mod tests {
         // scrub has to survive being run again on an already-scrubbed store.
         db.scrub_open_component("git".into()).await.unwrap();
         assert_eq!(sorted_open_components(&db, id), after_first);
+    }
+
+    #[gpui::test]
+    async fn test_relocate_workspace_mutation_translates_both_editor_columns(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        clear_raw_configurations(cx).await;
+        cx.update(|cx| WorkspaceConfigurationStore::init(cx));
+        let store = WorkspaceConfigurationStoreTestHandle;
+        let db = cx.update(|cx| WorkspaceDb::global(cx));
+
+        let ws_id = WorkspaceId(100);
+        let old_root = PathBuf::from("/test/old/project");
+        let new_root = PathBuf::from("/test/new/project");
+
+        let commit = store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Create {
+                        name: "My Project".to_string(),
+                        members: vec![model::WorkspaceConfigurationMember {
+                            workspace_id: ws_id,
+                            identity_paths: vec![old_root.clone()],
+                        }],
+                        active_member: Some(ws_id),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        let initial_old_root = old_root.clone();
+        db.write(move |conn| {
+            conn.exec("CREATE TABLE IF NOT EXISTS editors (item_id INTEGER, workspace_id INTEGER, path BLOB, buffer_path TEXT, PRIMARY KEY(item_id, workspace_id))")?()?;
+            conn.exec("CREATE TABLE IF NOT EXISTS workspaces (workspace_id INTEGER PRIMARY KEY, paths TEXT, paths_order TEXT, identity_paths TEXT, identity_paths_order TEXT)")?()?;
+
+            let paths = initial_old_root.to_string_lossy().to_string();
+            conn.exec_bound::<(WorkspaceId, &str, &str, Option<&str>, Option<&str>)>(
+                "INSERT INTO workspaces (workspace_id, paths, paths_order, identity_paths, identity_paths_order) VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?((ws_id, &paths, "0", Some(&paths), Some("0")))?;
+
+            let old_file_path = initial_old_root.join("src/lib.rs");
+            conn.exec_bound::<(ItemId, WorkspaceId, Option<PathBuf>, Option<String>)>(
+                "INSERT INTO editors (item_id, workspace_id, path, buffer_path) VALUES (?1, ?2, ?3, ?4)",
+            )?((1, ws_id, Some(old_file_path.clone()), Some(old_file_path.to_string_lossy().to_string())))?;
+
+            anyhow::Ok(())
+        })
+        .await
+        .unwrap();
+
+        db.write(move |conn| {
+            let (path, buffer_path): (Option<PathBuf>, Option<String>) = conn
+                .select_row_bound::<(ItemId, WorkspaceId), (Option<PathBuf>, Option<String>)>(
+                    "SELECT path, buffer_path FROM editors WHERE item_id = ?1 AND workspace_id = ?2",
+                )?((1, ws_id))?
+                .unwrap();
+            assert_eq!(path, Some(PathBuf::from("/test/old/project/src/lib.rs")));
+            assert_eq!(buffer_path.as_deref(), Some("/test/old/project/src/lib.rs"));
+            anyhow::Ok(())
+        })
+        .await
+        .unwrap();
+
+        store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::RelocateWorkspace {
+                        id: commit.id,
+                        workspace_id: ws_id,
+                        old_root: old_root.clone(),
+                        new_root: new_root.clone(),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        db.write(move |conn| {
+            let (path, buffer_path): (Option<PathBuf>, Option<String>) = conn
+                .select_row_bound::<(ItemId, WorkspaceId), (Option<PathBuf>, Option<String>)>(
+                    "SELECT path, buffer_path FROM editors WHERE item_id = ?1 AND workspace_id = ?2",
+                )?((1, ws_id))?
+                .unwrap();
+
+            assert_eq!(
+                path,
+                Some(PathBuf::from("/test/new/project/src/lib.rs")),
+                "editors.path (BLOB) must be updated to new_root"
+            );
+            assert_eq!(
+                buffer_path.as_deref(),
+                Some("/test/new/project/src/lib.rs"),
+                "editors.buffer_path (TEXT) must be updated to new_root"
+            );
+
+            let (paths, identity_paths): (String, Option<String>) = conn
+                .select_row_bound::<WorkspaceId, (String, Option<String>)>(
+                    "SELECT paths, identity_paths FROM workspaces WHERE workspace_id = ?1",
+                )?(ws_id)?
+                .unwrap();
+            assert_eq!(paths, "/test/new/project");
+            assert_eq!(identity_paths.as_deref(), Some("/test/new/project"));
+
+            anyhow::Ok(())
+        })
+        .await
+        .unwrap();
+
+        store.read_with(cx, |store, _| {
+            let config = store.configuration(commit.id).unwrap();
+            assert_eq!(
+                config.members[0].identity_paths,
+                vec![PathBuf::from("/test/new/project")]
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_relocate_workspace_does_not_corrupt_sibling_prefixes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        clear_raw_configurations(cx).await;
+        cx.update(|cx| WorkspaceConfigurationStore::init(cx));
+        let store = WorkspaceConfigurationStoreTestHandle;
+        let db = cx.update(|cx| WorkspaceDb::global(cx));
+
+        let ws_id = WorkspaceId(101);
+        let old_root = PathBuf::from("/test/repo");
+        let new_root = PathBuf::from("/test/repo-renamed");
+
+        let commit = store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Create {
+                        name: "Sibling Test".to_string(),
+                        members: vec![model::WorkspaceConfigurationMember {
+                            workspace_id: ws_id,
+                            identity_paths: vec![old_root.clone()],
+                        }],
+                        active_member: Some(ws_id),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        db.write(move |conn| {
+            conn.exec("CREATE TABLE IF NOT EXISTS editors (item_id INTEGER, workspace_id INTEGER, path BLOB, buffer_path TEXT, PRIMARY KEY(item_id, workspace_id))")?()?;
+            conn.exec("CREATE TABLE IF NOT EXISTS workspaces (workspace_id INTEGER PRIMARY KEY, paths TEXT, paths_order TEXT, identity_paths TEXT, identity_paths_order TEXT)")?()?;
+
+            conn.exec_bound::<(WorkspaceId, &str, &str, Option<&str>, Option<&str>)>(
+                "INSERT INTO workspaces (workspace_id, paths, paths_order, identity_paths, identity_paths_order) VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?((ws_id, "/test/repo", "0", Some("/test/repo"), Some("0")))?;
+
+            let item1_path = PathBuf::from("/test/repo/src/lib.rs");
+            conn.exec_bound::<(ItemId, WorkspaceId, Option<PathBuf>, Option<String>)>(
+                "INSERT INTO editors (item_id, workspace_id, path, buffer_path) VALUES (?1, ?2, ?3, ?4)",
+            )?((1, ws_id, Some(item1_path.clone()), Some(item1_path.to_string_lossy().to_string())))?;
+
+            let item2_path = PathBuf::from("/test/repo-sibling/src/other.rs");
+            conn.exec_bound::<(ItemId, WorkspaceId, Option<PathBuf>, Option<String>)>(
+                "INSERT INTO editors (item_id, workspace_id, path, buffer_path) VALUES (?1, ?2, ?3, ?4)",
+            )?((2, ws_id, Some(item2_path.clone()), Some(item2_path.to_string_lossy().to_string())))?;
+
+            anyhow::Ok(())
+        })
+        .await
+        .unwrap();
+
+        store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::RelocateWorkspace {
+                        id: commit.id,
+                        workspace_id: ws_id,
+                        old_root: old_root.clone(),
+                        new_root: new_root.clone(),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        db.write(move |conn| {
+            let (path1, buf1): (Option<PathBuf>, Option<String>) = conn
+                .select_row_bound::<(ItemId, WorkspaceId), (Option<PathBuf>, Option<String>)>(
+                    "SELECT path, buffer_path FROM editors WHERE item_id = ?1 AND workspace_id = ?2",
+                )?((1, ws_id))?
+                .unwrap();
+            assert_eq!(path1, Some(PathBuf::from("/test/repo-renamed/src/lib.rs")));
+            assert_eq!(buf1.as_deref(), Some("/test/repo-renamed/src/lib.rs"));
+
+            let (path2, buf2): (Option<PathBuf>, Option<String>) = conn
+                .select_row_bound::<(ItemId, WorkspaceId), (Option<PathBuf>, Option<String>)>(
+                    "SELECT path, buffer_path FROM editors WHERE item_id = ?1 AND workspace_id = ?2",
+                )?((2, ws_id))?
+                .unwrap();
+            assert_eq!(
+                path2,
+                Some(PathBuf::from("/test/repo-sibling/src/other.rs")),
+                "sibling path prefix must not be corrupted"
+            );
+            assert_eq!(
+                buf2.as_deref(),
+                Some("/test/repo-sibling/src/other.rs"),
+                "sibling buffer path must not be corrupted"
+            );
+
+            anyhow::Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_relocate_workspace_reconstructs_multi_root_path_list(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        clear_raw_configurations(cx).await;
+        cx.update(|cx| WorkspaceConfigurationStore::init(cx));
+        let store = WorkspaceConfigurationStoreTestHandle;
+        let db = cx.update(|cx| WorkspaceDb::global(cx));
+
+        let ws_id = WorkspaceId(102);
+        let root_a = PathBuf::from("/multi/root_b");
+        let root_b = PathBuf::from("/multi/root_a");
+
+        let commit = store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Create {
+                        name: "Multi-Root".to_string(),
+                        members: vec![model::WorkspaceConfigurationMember {
+                            workspace_id: ws_id,
+                            identity_paths: vec![root_a.clone(), root_b.clone()],
+                        }],
+                        active_member: Some(ws_id),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        let initial_root_a = root_a.clone();
+        let initial_root_b = root_b.clone();
+        db.write(move |conn| {
+            conn.exec("CREATE TABLE IF NOT EXISTS workspaces (workspace_id INTEGER PRIMARY KEY, paths TEXT, paths_order TEXT, identity_paths TEXT, identity_paths_order TEXT)")?()?;
+
+            let path_list = PathList::new(&[&initial_root_a, &initial_root_b]);
+            let serialized = path_list.serialize();
+
+            conn.exec_bound::<(WorkspaceId, &str, &str, Option<&str>, Option<&str>)>(
+                "INSERT INTO workspaces (workspace_id, paths, paths_order, identity_paths, identity_paths_order) VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?((ws_id, &serialized.paths, &serialized.order, Some(&serialized.paths), Some(&serialized.order)))?;
+
+            anyhow::Ok(())
+        })
+        .await
+        .unwrap();
+
+        let new_root_b = PathBuf::from("/multi/new_a");
+        store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::RelocateWorkspace {
+                        id: commit.id,
+                        workspace_id: ws_id,
+                        old_root: root_b.clone(),
+                        new_root: new_root_b.clone(),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        db.write(move |conn| {
+            let (paths, order): (String, String) = conn
+                .select_row_bound::<WorkspaceId, (String, String)>(
+                    "SELECT paths, paths_order FROM workspaces WHERE workspace_id = ?1",
+                )?(ws_id)?
+            .unwrap();
+
+            let reloaded = PathList::deserialize(&SerializedPathList { paths, order });
+            let ordered_roots: Vec<&PathBuf> = reloaded.ordered_paths().collect();
+            assert_eq!(ordered_roots, vec![&root_a, &new_root_b]);
+            assert_eq!(reloaded.paths(), &[new_root_b, root_a]);
+
+            anyhow::Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_relocate_workspace_updates_shared_configurations(cx: &mut gpui::TestAppContext) {
+        clear_raw_configurations(cx).await;
+        cx.update(|cx| WorkspaceConfigurationStore::init(cx));
+        let store = WorkspaceConfigurationStoreTestHandle;
+
+        let ws_id = WorkspaceId(103);
+        let old_root = PathBuf::from("/shared/project");
+        let new_root = PathBuf::from("/shared/moved_project");
+
+        let db = cx.update(|cx| WorkspaceDb::global(cx));
+        db.write({
+            let old_root = old_root.clone();
+            move |conn| {
+                conn.exec_bound::<(WorkspaceId, &str, &str, Option<&str>, Option<&str>)>(
+                    "INSERT INTO workspaces (workspace_id, paths, paths_order, identity_paths, identity_paths_order) VALUES (?1, ?2, ?3, ?4, ?5)",
+                )?((ws_id, old_root.to_str().unwrap(), "", Some(old_root.to_str().unwrap()), Some("")))?;
+                anyhow::Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+        let config_a = store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Create {
+                        name: "Config A".to_string(),
+                        members: vec![model::WorkspaceConfigurationMember {
+                            workspace_id: ws_id,
+                            identity_paths: vec![old_root.clone()],
+                        }],
+                        active_member: Some(ws_id),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        let config_b = store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Create {
+                        name: "Config B".to_string(),
+                        members: vec![model::WorkspaceConfigurationMember {
+                            workspace_id: ws_id,
+                            identity_paths: vec![old_root.clone()],
+                        }],
+                        active_member: Some(ws_id),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::RelocateWorkspace {
+                        id: config_a.id,
+                        workspace_id: ws_id,
+                        old_root: old_root.clone(),
+                        new_root: new_root.clone(),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        store.read_with(cx, |store, _| {
+            let ca = store.configuration(config_a.id).unwrap();
+            let cb = store.configuration(config_b.id).unwrap();
+
+            assert_eq!(ca.members[0].identity_paths, vec![new_root.clone()]);
+            assert_eq!(cb.members[0].identity_paths, vec![new_root.clone()]);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_relocate_rejects_collisions(cx: &mut gpui::TestAppContext) {
+        clear_raw_configurations(cx).await;
+        cx.update(|cx| WorkspaceConfigurationStore::init(cx));
+        let store = WorkspaceConfigurationStoreTestHandle;
+
+        let ws1 = WorkspaceId(104);
+        let ws2 = WorkspaceId(105);
+        let root1 = PathBuf::from("/col/repo1");
+        let root2 = PathBuf::from("/col/repo2");
+
+        let config = store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Create {
+                        name: "Collision Config".to_string(),
+                        members: vec![
+                            model::WorkspaceConfigurationMember {
+                                workspace_id: ws1,
+                                identity_paths: vec![root1.clone()],
+                            },
+                            model::WorkspaceConfigurationMember {
+                                workspace_id: ws2,
+                                identity_paths: vec![root2.clone()],
+                            },
+                        ],
+                        active_member: Some(ws1),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        let result = store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::RelocateWorkspace {
+                        id: config.id,
+                        workspace_id: ws1,
+                        old_root: root1.clone(),
+                        new_root: root2.clone(),
+                    },
+                    cx,
+                )
+            })
+            .await;
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("already a member of this configuration"),
+            "expected collision error, got: {err_msg}"
+        );
+
+        store.read_with(cx, |store, _| {
+            let c = store.configuration(config.id).unwrap();
+            assert_eq!(c.members[0].identity_paths, vec![root1]);
+            assert_eq!(c.members[1].identity_paths, vec![root2]);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_relocate_relinks_when_existing_workspace_row_exists(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        clear_raw_configurations(cx).await;
+        cx.update(|cx| WorkspaceConfigurationStore::init(cx));
+        let store = WorkspaceConfigurationStoreTestHandle;
+        let db = cx.update(|cx| WorkspaceDb::global(cx));
+
+        let ws1 = WorkspaceId(201);
+        let ws2 = WorkspaceId(202);
+        let old_root = PathBuf::from("/existing/old_root");
+        let target_root = PathBuf::from("/existing/target_root");
+
+        let config = store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Create {
+                        name: "Existing Row Test".to_string(),
+                        members: vec![model::WorkspaceConfigurationMember {
+                            workspace_id: ws1,
+                            identity_paths: vec![old_root.clone()],
+                        }],
+                        active_member: Some(ws1),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        db.write({
+            let old_root = old_root.clone();
+            let target_root = target_root.clone();
+            move |conn| {
+                conn.exec("CREATE TABLE IF NOT EXISTS workspaces (workspace_id INTEGER PRIMARY KEY, paths TEXT, paths_order TEXT, identity_paths TEXT, identity_paths_order TEXT, remote_connection_id INTEGER)")?()?;
+
+                conn.exec_bound::<(WorkspaceId, &str, &str, Option<&str>, Option<&str>)>(
+                    "INSERT INTO workspaces (workspace_id, paths, paths_order, identity_paths, identity_paths_order) VALUES (?1, ?2, ?3, ?4, ?5)",
+                )?((ws1, old_root.to_str().unwrap(), "", Some(old_root.to_str().unwrap()), Some("")))?;
+
+                conn.exec_bound::<(WorkspaceId, &str, &str, Option<&str>, Option<&str>)>(
+                    "INSERT INTO workspaces (workspace_id, paths, paths_order, identity_paths, identity_paths_order) VALUES (?1, ?2, ?3, ?4, ?5)",
+                )?((ws2, target_root.to_str().unwrap(), "", Some(target_root.to_str().unwrap()), Some("")))?;
+
+                anyhow::Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+        let commit = store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::RelocateWorkspace {
+                        id: config.id,
+                        workspace_id: ws1,
+                        old_root: old_root.clone(),
+                        new_root: target_root.clone(),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .expect("relocating to an existing workspace root must re-link without error");
+
+        assert_eq!(commit.id, config.id);
+
+        // Verify configuration member was re-linked to ws2!
+        store.read_with(cx, |store, _| {
+            let c = store.configuration(config.id).unwrap();
+            assert_eq!(
+                c.members[0].workspace_id, ws2,
+                "member must be re-linked to existing workspace ws2"
+            );
+            assert_eq!(c.members[0].identity_paths, vec![target_root.clone()]);
+            assert_eq!(
+                c.active_member,
+                Some(ws2),
+                "active member must be updated to ws2"
+            );
+        });
+
+        // Verify that workspace 202 was NOT deleted or overwritten, and workspace 201 remains!
+        let target_root_str = target_root.to_str().unwrap().to_string();
+        db.write(move |conn| {
+            let ws1_paths: Option<String> = conn.select_row_bound::<WorkspaceId, String>(
+                "SELECT paths FROM workspaces WHERE workspace_id = ?1",
+            )?(ws1)?;
+            let ws2_paths: Option<String> = conn.select_row_bound::<WorkspaceId, String>(
+                "SELECT paths FROM workspaces WHERE workspace_id = ?1",
+            )?(ws2)?;
+
+            assert_eq!(
+                ws1_paths.as_deref(),
+                Some(old_root.to_str().unwrap()),
+                "workspace 1 must remain untouched"
+            );
+            assert_eq!(
+                ws2_paths.as_deref(),
+                Some(target_root_str.as_str()),
+                "workspace 2 must NOT be deleted or overwritten by relocation attempt"
+            );
+            anyhow::Ok(())
+        })
+        .await
+        .unwrap();
+
+        // Verify reload from KVP persists the re-linked member
+        let reloaded = cx.update(|cx| cx.new(|cx| WorkspaceConfigurationStore::load(cx)));
+        reloaded.read_with(cx, |store, _| {
+            let c = store.configuration(config.id).unwrap();
+            assert_eq!(c.members[0].workspace_id, ws2);
+            assert_eq!(c.members[0].identity_paths, vec![target_root]);
+            assert_eq!(c.active_member, Some(ws2));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_relocate_translates_folds_bookmarks_breakpoints_stored_as_blobs(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        clear_raw_configurations(cx).await;
+        cx.update(|cx| WorkspaceConfigurationStore::init(cx));
+        let store = WorkspaceConfigurationStoreTestHandle;
+        let db = cx.update(|cx| WorkspaceDb::global(cx));
+
+        let ws_id = WorkspaceId(203);
+        let old_root = PathBuf::from("/blob_test/old_root");
+        let new_root = PathBuf::from("/blob_test/new_root");
+
+        db.write({
+            let old_root = old_root.clone();
+            move |conn| {
+                conn.exec_bound::<(WorkspaceId, &str, &str, Option<&str>, Option<&str>)>(
+                    "INSERT INTO workspaces (workspace_id, paths, paths_order, identity_paths, identity_paths_order) VALUES (?1, ?2, ?3, ?4, ?5)",
+                )?((ws_id, old_root.to_str().unwrap(), "", Some(old_root.to_str().unwrap()), Some("")))?;
+                anyhow::Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+        let config = store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Create {
+                        name: "Blob Translation Test".to_string(),
+                        members: vec![model::WorkspaceConfigurationMember {
+                            workspace_id: ws_id,
+                            identity_paths: vec![old_root.clone()],
+                        }],
+                        active_member: Some(ws_id),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        let old_file = Path::new("/blob_test/old_root/src/main.rs");
+        let new_file = PathBuf::from("/blob_test/new_root/src/main.rs");
+
+        let mut bookmarks = BTreeMap::default();
+        bookmarks.insert(
+            Arc::from(old_file),
+            vec![SerializedBookmark {
+                row: 42,
+                label: "test_bm".into(),
+            }],
+        );
+        let mut breakpoints = BTreeMap::default();
+        breakpoints.insert(
+            Arc::from(old_file),
+            vec![SourceBreakpoint {
+                row: 10,
+                path: Arc::from(old_file),
+                message: None,
+                condition: None,
+                hit_condition: None,
+                state: BreakpointState::Enabled,
+            }],
+        );
+
+        let ws = SerializedWorkspace {
+            id: ws_id,
+            paths: PathList::new(std::slice::from_ref(&old_root)),
+            identity_paths: Some(PathList::new(std::slice::from_ref(&old_root))),
+            location: model::SerializedWorkspaceLocation::Local,
+            center_group: model::SerializedPaneGroup::Pane(model::SerializedPane::new(
+                Vec::new(),
+                true,
+                0,
+            )),
+            window_bounds: Default::default(),
+            display: Default::default(),
+            docks: Default::default(),
+            bookmarks,
+            breakpoints,
+            centered_layout: false,
+            session_id: None,
+            window_id: None,
+            user_toolchains: Default::default(),
+        };
+
+        db.save_workspace_checked(ws).await.unwrap();
+
+        // Seed file_folds table with BLOB path
+        db.write({
+            let old_file = old_file.to_path_buf();
+            move |conn| {
+                conn.exec("CREATE TABLE IF NOT EXISTS file_folds (workspace_id INTEGER NOT NULL, path BLOB NOT NULL, start INTEGER NOT NULL, end INTEGER NOT NULL, start_fingerprint TEXT, end_fingerprint TEXT, PRIMARY KEY(workspace_id, path, start))")?()?;
+                conn.exec_bound::<(WorkspaceId, &Path, i64, i64)>(
+                    "INSERT INTO file_folds (workspace_id, path, start, end) VALUES (?1, ?2, ?3, ?4)",
+                )?((ws_id, &old_file, 5, 15))?;
+                anyhow::Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+        // Relocate
+        store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::RelocateWorkspace {
+                        id: config.id,
+                        workspace_id: ws_id,
+                        old_root: old_root.clone(),
+                        new_root: new_root.clone(),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        // Verify that bookmarks, breakpoints, and file_folds are all updated
+        db.write(move |conn| {
+            let bm_paths: Vec<PathBuf> = conn.select_bound::<WorkspaceId, PathBuf>(
+                "SELECT path FROM bookmarks WHERE workspace_id = ?1",
+            )?(ws_id)?;
+            assert_eq!(
+                bm_paths,
+                vec![new_file.clone()],
+                "bookmarks BLOB path must be translated"
+            );
+
+            let bp_paths: Vec<PathBuf> = conn.select_bound::<WorkspaceId, PathBuf>(
+                "SELECT path FROM breakpoints WHERE workspace_id = ?1",
+            )?(ws_id)?;
+            assert_eq!(
+                bp_paths,
+                vec![new_file.clone()],
+                "breakpoints BLOB path must be translated"
+            );
+
+            let fold_paths: Vec<PathBuf> = conn.select_bound::<WorkspaceId, PathBuf>(
+                "SELECT path FROM file_folds WHERE workspace_id = ?1",
+            )?(ws_id)?;
+            assert_eq!(
+                fold_paths,
+                vec![new_file],
+                "file_folds BLOB path must be translated"
+            );
+
+            anyhow::Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_relocate_rollback_on_savepoint_failure(cx: &mut gpui::TestAppContext) {
+        clear_raw_configurations(cx).await;
+        cx.update(|cx| WorkspaceConfigurationStore::init(cx));
+        let store = WorkspaceConfigurationStoreTestHandle;
+        let db = cx.update(|cx| WorkspaceDb::global(cx));
+
+        let ws_id = WorkspaceId(204);
+        let old_root = PathBuf::from("/rollback/old_root");
+        let new_root = PathBuf::from("/rollback/new_root");
+
+        db.write({
+            let old_root = old_root.clone();
+            move |conn| {
+                conn.exec("CREATE TABLE IF NOT EXISTS workspaces (workspace_id INTEGER PRIMARY KEY, paths TEXT, paths_order TEXT, identity_paths TEXT, identity_paths_order TEXT, remote_connection_id INTEGER)")?()?;
+
+                conn.exec_bound::<(WorkspaceId, &str, &str, Option<&str>, Option<&str>)>(
+                    "INSERT INTO workspaces (workspace_id, paths, paths_order, identity_paths, identity_paths_order) VALUES (?1, ?2, ?3, ?4, ?5)",
+                )?((ws_id, old_root.to_str().unwrap(), "", Some(old_root.to_str().unwrap()), Some("")))?;
+
+                anyhow::Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+        let config = store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Create {
+                        name: "Rollback Test".to_string(),
+                        members: vec![model::WorkspaceConfigurationMember {
+                            workspace_id: ws_id,
+                            identity_paths: vec![old_root.clone()],
+                        }],
+                        active_member: Some(ws_id),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        // Enable forced error after savepoint writes (C4)
+        cx.update(|cx| {
+            WorkspaceConfigurationStore::set_fail_relocate_in_savepoint_for_tests(true, cx);
+        });
+
+        let result = store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::RelocateWorkspace {
+                        id: config.id,
+                        workspace_id: ws_id,
+                        old_root: old_root.clone(),
+                        new_root: new_root.clone(),
+                    },
+                    cx,
+                )
+            })
+            .await;
+
+        assert!(
+            result.is_err(),
+            "relocate must fail when savepoint error triggers"
+        );
+
+        // Verify in-memory collection is unchanged
+        store.read_with(cx, |store, _| {
+            let c = store.configuration(config.id).unwrap();
+            assert_eq!(c.members[0].identity_paths, vec![old_root.clone()]);
+        });
+
+        // Verify disk KVP is unchanged
+        let reloaded = cx.update(|cx| cx.new(|cx| WorkspaceConfigurationStore::load(cx)));
+        reloaded.read_with(cx, |store, _| {
+            let c = store.configuration(config.id).unwrap();
+            assert_eq!(c.members[0].identity_paths, vec![old_root.clone()]);
+        });
+
+        // Verify SQLite workspace row was rolled back to old_root
+        db.write(move |conn| {
+            let paths: String = conn.select_row_bound::<WorkspaceId, String>(
+                "SELECT paths FROM workspaces WHERE workspace_id = ?1",
+            )?(ws_id)?
+            .unwrap();
+            assert_eq!(
+                paths,
+                old_root.to_str().unwrap(),
+                "workspaces.paths must roll back to old_root on savepoint failure"
+            );
+            anyhow::Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_relocate_survives_reload_from_kvp(cx: &mut gpui::TestAppContext) {
+        clear_raw_configurations(cx).await;
+        cx.update(|cx| WorkspaceConfigurationStore::init(cx));
+        let store = WorkspaceConfigurationStoreTestHandle;
+        let db = cx.update(|cx| WorkspaceDb::global(cx));
+
+        let ws_id = WorkspaceId(205);
+        let old_root = PathBuf::from("/reload_test/old_root");
+        let new_root = PathBuf::from("/reload_test/new_root");
+
+        let config = store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Create {
+                        name: "Reload Test".to_string(),
+                        members: vec![model::WorkspaceConfigurationMember {
+                            workspace_id: ws_id,
+                            identity_paths: vec![old_root.clone()],
+                        }],
+                        active_member: Some(ws_id),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        db.write({
+            let old_root = old_root.clone();
+            move |conn| {
+                conn.exec("CREATE TABLE IF NOT EXISTS workspaces (workspace_id INTEGER PRIMARY KEY, paths TEXT, paths_order TEXT, identity_paths TEXT, identity_paths_order TEXT, remote_connection_id INTEGER)")?()?;
+                conn.exec_bound::<(WorkspaceId, &str, &str, Option<&str>, Option<&str>)>(
+                    "INSERT INTO workspaces (workspace_id, paths, paths_order, identity_paths, identity_paths_order) VALUES (?1, ?2, ?3, ?4, ?5)",
+                )?((ws_id, old_root.to_str().unwrap(), "", Some(old_root.to_str().unwrap()), Some("")))?;
+                anyhow::Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+        store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::RelocateWorkspace {
+                        id: config.id,
+                        workspace_id: ws_id,
+                        old_root: old_root.clone(),
+                        new_root: new_root.clone(),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        // Reload store from disk KVP
+        let reloaded = cx.update(|cx| cx.new(|cx| WorkspaceConfigurationStore::load(cx)));
+        reloaded.read_with(cx, |store, _| {
+            let c = store.configuration(config.id).unwrap();
+            assert_eq!(
+                c.members[0].identity_paths,
+                vec![new_root],
+                "relocated identity paths must survive reloading from SQLite KVP"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_relocate_translates_user_toolchains_and_avoids_sibling_venv(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        clear_raw_configurations(cx).await;
+        cx.update(|cx| WorkspaceConfigurationStore::init(cx));
+        let store = WorkspaceConfigurationStoreTestHandle;
+        let db = cx.update(|cx| WorkspaceDb::global(cx));
+
+        let ws_id = WorkspaceId(210);
+        let old_root = PathBuf::from("/src/app");
+        let new_root = PathBuf::from("/code/app");
+
+        let config = store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Create {
+                        name: "Toolchains Test".to_string(),
+                        members: vec![model::WorkspaceConfigurationMember {
+                            workspace_id: ws_id,
+                            identity_paths: vec![old_root.clone()],
+                        }],
+                        active_member: Some(ws_id),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        let initial_json =
+            r#"{"binary":"/src/app/bin/python","sibling_venv":"/src/app-venv/bin/python"}"#;
+
+        db.write({
+            let old_root = old_root.clone();
+            let initial_json = initial_json.to_string();
+            move |conn| {
+                conn.exec("CREATE TABLE IF NOT EXISTS workspaces (workspace_id INTEGER PRIMARY KEY, paths TEXT, paths_order TEXT, identity_paths TEXT, identity_paths_order TEXT, remote_connection_id INTEGER)")?()?;
+                conn.exec_bound::<(WorkspaceId, &str, &str, Option<&str>, Option<&str>)>(
+                    "INSERT INTO workspaces (workspace_id, paths, paths_order, identity_paths, identity_paths_order) VALUES (?1, ?2, ?3, ?4, ?5)",
+                )?((ws_id, old_root.to_str().unwrap(), "", Some(old_root.to_str().unwrap()), Some("")))?;
+
+                conn.exec("CREATE TABLE IF NOT EXISTS user_toolchains (remote_connection_id INTEGER, workspace_id INTEGER, worktree_root_path TEXT, relative_worktree_path TEXT, language_name TEXT, name TEXT, path TEXT, raw_json TEXT, PRIMARY KEY(remote_connection_id, workspace_id, worktree_root_path, relative_worktree_path, language_name, name))")?()?;
+                conn.exec_bound::<(Option<i32>, WorkspaceId, &str, &str, &str, &str, &str, Option<&str>)>(
+                    "INSERT INTO user_toolchains (remote_connection_id, workspace_id, worktree_root_path, relative_worktree_path, language_name, name, path, raw_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                )?((None, ws_id, old_root.to_str().unwrap(), "", "Python", "Python 3", "/src/app/bin/python", Some(&initial_json)))?;
+
+                anyhow::Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+        store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::RelocateWorkspace {
+                        id: config.id,
+                        workspace_id: ws_id,
+                        old_root: old_root.clone(),
+                        new_root: new_root.clone(),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        db.write(move |conn| {
+            let (worktree_root, path, raw_json): (String, String, Option<String>) = conn
+                .select_row_bound::<WorkspaceId, (String, String, Option<String>)>(
+                    "SELECT worktree_root_path, path, raw_json FROM user_toolchains WHERE workspace_id = ?1",
+                )?(ws_id)?
+                .unwrap();
+
+            assert_eq!(worktree_root, "/code/app", "worktree_root_path must be translated");
+            assert_eq!(path, "/code/app/bin/python", "toolchain path must be translated");
+
+            let parsed: serde_json::Value = serde_json::from_str(&raw_json.expect("raw_json present")).unwrap();
+            assert_eq!(
+                parsed["binary"],
+                "/code/app/bin/python",
+                "subpath in raw_json must be translated"
+            );
+            assert_eq!(
+                parsed["sibling_venv"],
+                "/src/app-venv/bin/python",
+                "sibling-prefix path (/src/app-venv) must NOT be corrupted by relocation"
+            );
+
+            anyhow::Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_relocate_relinks_when_member_row_missing_but_identity_matches(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        clear_raw_configurations(cx).await;
+        cx.update(|cx| WorkspaceConfigurationStore::init(cx));
+        let store = WorkspaceConfigurationStoreTestHandle;
+        let db = cx.update(|cx| WorkspaceDb::global(cx));
+
+        let member_id = WorkspaceId(7);
+        let actual_row_id = WorkspaceId(12);
+        let decoy_row_id = WorkspaceId(99);
+        let old_root = PathBuf::from("/missing_row/old_root");
+        let new_root = PathBuf::from("/missing_row/new_root");
+        let sibling_root = PathBuf::from("/missing_row/sibling_root");
+
+        // Member 7 is multi-root: [sibling_root, old_root]
+        let mut member_identity = vec![sibling_root.clone(), old_root.clone()];
+        member_identity.sort();
+
+        // Seed configuration 1 with member_id = 7 (which has NO row in SQLite workspaces table)
+        let config1 = store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Create {
+                        name: "Missing Row Test Config 1".to_string(),
+                        members: vec![model::WorkspaceConfigurationMember {
+                            workspace_id: member_id,
+                            identity_paths: member_identity.clone(),
+                        }],
+                        active_member: Some(member_id),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        // Seed configuration 2 (S1) with member 12 (which will be the resolved row)
+        let config2 = store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Create {
+                        name: "Config 2 Holding Member 12".to_string(),
+                        members: vec![model::WorkspaceConfigurationMember {
+                            workspace_id: actual_row_id,
+                            identity_paths: member_identity.clone(),
+                        }],
+                        active_member: Some(actual_row_id),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        // Seed SQLite:
+        // - Row 99: Decoy single-root row at old_root. The old buggy fallback (WHERE paths = ?1)
+        //   would match this row. The identity-based lookup must NOT match it.
+        // - Row 12: Multi-root row matching member_identity.
+        db.write({
+            let old_root = old_root.clone();
+            let sibling_root = sibling_root.clone();
+            let member_identity = member_identity.clone();
+            move |conn| {
+                conn.exec("CREATE TABLE IF NOT EXISTS workspaces (workspace_id INTEGER PRIMARY KEY, paths TEXT, paths_order TEXT, identity_paths TEXT, identity_paths_order TEXT, remote_connection_id INTEGER)")?()?;
+
+                // Decoy row 99 (single root at old_root)
+                conn.exec_bound::<(WorkspaceId, &str, &str, Option<&str>, Option<&str>)>(
+                    "INSERT INTO workspaces (workspace_id, paths, paths_order, identity_paths, identity_paths_order) VALUES (?1, ?2, ?3, ?4, ?5)",
+                )?((decoy_row_id, old_root.to_str().unwrap(), "", Some(old_root.to_str().unwrap()), Some("")))?;
+
+                // Target row 12 (multi-root)
+                let serialized_paths = format!("{}\n{}", sibling_root.to_str().unwrap(), old_root.to_str().unwrap());
+                let serialized_identity = format!("{}\n{}", member_identity[0].to_str().unwrap(), member_identity[1].to_str().unwrap());
+                conn.exec_bound::<(WorkspaceId, &str, &str, Option<&str>, Option<&str>)>(
+                    "INSERT INTO workspaces (workspace_id, paths, paths_order, identity_paths, identity_paths_order) VALUES (?1, ?2, ?3, ?4, ?5)",
+                )?((actual_row_id, &serialized_paths, "", Some(&serialized_identity), Some("")))?;
+
+                conn.exec("CREATE TABLE IF NOT EXISTS editors (item_id INTEGER, workspace_id INTEGER, path BLOB, buffer_path TEXT, contents TEXT, language TEXT, mtime_seconds INTEGER, mtime_nanos INTEGER, PRIMARY KEY(item_id, workspace_id))")?()?;
+                conn.exec_bound::<(ItemId, WorkspaceId, PathBuf, &str)>(
+                    "INSERT INTO editors (item_id, workspace_id, path, buffer_path) VALUES (?1, ?2, ?3, ?4)",
+                )?((1, actual_row_id, old_root.join("main.rs"), old_root.join("main.rs").to_str().unwrap()))?;
+
+                anyhow::Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+        // Relocate member_id (7). The mutation must resolve actual_row_id (12) by identity,
+        // relocate row 12 (leaving decoy 99 untouched), relink member 7 to 12 in config1,
+        // AND update member 12's identity_paths in config2 (S1)!
+        store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::RelocateWorkspace {
+                        id: config1.id,
+                        workspace_id: member_id,
+                        old_root: old_root.clone(),
+                        new_root: new_root.clone(),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        let mut expected_new_identity = vec![sibling_root.clone(), new_root.clone()];
+        expected_new_identity.sort();
+
+        // Verify configuration 1: member 7 relinked to 12, identity updated
+        store.read_with(cx, |store, _| {
+            let c1 = store.configuration(config1.id).unwrap();
+            assert_eq!(
+                c1.members[0].workspace_id, actual_row_id,
+                "member workspace_id must be relinked to resolved row id 12"
+            );
+            assert_eq!(
+                c1.members[0].identity_paths, expected_new_identity,
+                "member identity_paths must be updated to new_root"
+            );
+            assert_eq!(
+                c1.active_member,
+                Some(actual_row_id),
+                "active_member must be updated to resolved row id 12"
+            );
+
+            // S1: Verify configuration 2: member 12 also has its identity_paths updated to new_root!
+            let c2 = store.configuration(config2.id).unwrap();
+            assert_eq!(c2.members[0].workspace_id, actual_row_id);
+            assert_eq!(
+                c2.members[0].identity_paths, expected_new_identity,
+                "config2 member 12 identity_paths must be updated to new_root"
+            );
+        });
+
+        // Verify SQLite rows:
+        db.write({
+            let old_root = old_root.clone();
+            let new_root = new_root.clone();
+            move |conn| {
+                // C7: Decoy row 99 was NOT modified
+                let decoy_paths: String = conn.select_row_bound::<WorkspaceId, String>(
+                    "SELECT paths FROM workspaces WHERE workspace_id = ?1",
+                )?(decoy_row_id)?
+                .unwrap();
+                assert_eq!(
+                    decoy_paths,
+                    old_root.to_str().unwrap(),
+                    "decoy row 99 must remain untouched"
+                );
+
+                // Row 12 was relocated
+                let id_paths: Option<String> = conn
+                    .select_row_bound::<WorkspaceId, Option<String>>(
+                        "SELECT identity_paths FROM workspaces WHERE workspace_id = ?1",
+                    )?(actual_row_id)?
+                .unwrap();
+                assert!(
+                    id_paths.unwrap().contains(new_root.to_str().unwrap()),
+                    "row 12 identity_paths must contain new_root"
+                );
+
+                let editor_path: Option<PathBuf> = conn
+                    .select_row_bound::<(ItemId, WorkspaceId), Option<PathBuf>>(
+                        "SELECT path FROM editors WHERE item_id = ?1 AND workspace_id = ?2",
+                    )?((1, actual_row_id))?
+                .unwrap();
+                assert_eq!(editor_path, Some(new_root.join("main.rs")));
+
+                // Verify row 7 does not exist in SQLite
+                let row_7_exists: Option<WorkspaceId> = conn
+                    .select_row_bound::<WorkspaceId, WorkspaceId>(
+                        "SELECT workspace_id FROM workspaces WHERE workspace_id = ?1",
+                    )?(member_id)?;
+                assert!(row_7_exists.is_none(), "no row 7 should have been created");
+
+                anyhow::Ok(())
+            }
+        })
+        .await
+        .unwrap();
     }
 }
