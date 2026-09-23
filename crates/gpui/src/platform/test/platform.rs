@@ -220,6 +220,12 @@ impl TestPlatform {
         ))
     }
 
+    pub(crate) fn pending_prompt_answers(&self) -> Option<Vec<String>> {
+        let prompts = self.prompts.borrow();
+        let prompt = prompts.multiple_choice.front()?;
+        Some(prompt.answers.clone())
+    }
+
     pub(crate) fn set_screen_capture_sources(&self, sources: Vec<TestScreenCaptureSource>) {
         *self.screen_capture_sources.borrow_mut() = sources;
     }

@@ -485,6 +485,42 @@ pub enum WorkspaceConfigurationMutation {
         old_root: PathBuf,
         new_root: PathBuf,
     },
+    /// Switch-time `Locate…` picked the folder set of a workspace already open in the
+    /// switching window (Collision Policy 2a). The member relinks to that workspace's live
+    /// id instead of translating its own rows: the open workspace may have no saved row
+    /// yet, or one that lags its live folders, so nothing is looked up by path.
+    RelinkWorkspace {
+        id: model::WorkspaceConfigurationId,
+        workspace_id: WorkspaceId,
+        old_root: PathBuf,
+        new_root: PathBuf,
+        open_workspace_id: WorkspaceId,
+    },
+}
+
+/// A relocate found nothing to move: the member no longer holds `old_root`, because
+/// something else moved or relinked it first — typically another window's Manage modal
+/// while a switch's folder picker was open. A switch restarts rather than failing.
+#[derive(Debug)]
+pub(crate) struct WorkspaceMemberAlreadyMoved;
+
+impl std::fmt::Display for WorkspaceMemberAlreadyMoved {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("that workspace folder was already moved")
+    }
+}
+
+impl std::error::Error for WorkspaceMemberAlreadyMoved {}
+
+/// Keeps `message` as what the user sees while letting callers recognize the case.
+fn member_already_moved(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(WorkspaceMemberAlreadyMoved).context(message.into())
+}
+
+pub(crate) fn workspace_member_was_already_moved(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<WorkspaceMemberAlreadyMoved>()
+        .is_some()
 }
 
 /// What a successful mutation produced.
@@ -504,6 +540,17 @@ pub(crate) enum RelocateResult {
         old_id: WorkspaceId,
         new_id: WorkspaceId,
     },
+}
+
+/// `RelocateWorkspace` and `RelinkWorkspace`, as one request.
+struct RelocateRequest {
+    id: model::WorkspaceConfigurationId,
+    workspace_id: WorkspaceId,
+    old_root: PathBuf,
+    new_root: PathBuf,
+    /// Set for Collision Policy 2a: relink to this workspace, open in the switching
+    /// window, and rewrite no workspace rows.
+    relink_to: Option<WorkspaceId>,
 }
 
 /// The one owner of every saved workspace configuration in this process.
@@ -817,7 +864,7 @@ impl WorkspaceConfigurationStore {
         mutation: WorkspaceConfigurationMutation,
         cx: &mut AsyncApp,
     ) -> Result<StoreCommit> {
-        let (mut collection, kvp, db, _fail_savepoint_for_tests) = cx.update(|cx| {
+        let (mut collection, kvp, db, fail_savepoint_for_tests) = cx.update(|cx| {
             let this = Self::global(cx);
             if let Some(blocked) = this.blocked.clone() {
                 anyhow::bail!("{}", blocked.user_facing_message());
@@ -845,100 +892,30 @@ impl WorkspaceConfigurationStore {
                 old_root,
                 new_root,
             } => {
-                anyhow::ensure!(
-                    collection.configurations.iter().any(|c| c.id == id),
-                    "that workspace configuration no longer exists"
-                );
-                let member_identity_paths = if let Some(target_configuration) =
-                    collection.configurations.iter().find(|c| c.id == id)
-                {
-                    for member in &target_configuration.members {
-                        if member.workspace_id != workspace_id {
-                            anyhow::ensure!(
-                                !member.identity_paths.iter().any(|p| p == &new_root),
-                                "“{}” is already a member of this configuration.",
-                                new_root.display()
-                            );
-                        }
-                    }
-                    target_configuration
-                        .members
-                        .iter()
-                        .find(|m| m.workspace_id == workspace_id)
-                        .map(|m| m.identity_paths.clone())
-                        .context("that workspace is no longer a member of this configuration")?
-                } else {
-                    anyhow::bail!("that workspace configuration no longer exists");
+                let request = RelocateRequest {
+                    id,
+                    workspace_id,
+                    old_root,
+                    new_root,
+                    relink_to: None,
                 };
-
-                let updated_collection = db
-                    .write(move |conn| {
-                        conn.with_savepoint("relocate_workspace", || {
-                            let relocate_result = WorkspaceDb::relocate_workspace_root_internal(
-                                conn,
-                                workspace_id,
-                                &member_identity_paths,
-                                &old_root,
-                                &new_root,
-                            )?;
-
-                            match relocate_result {
-                                RelocateResult::Relinked { old_id, new_id } => {
-                                    Self::apply_relocate_to_collection(
-                                        &mut collection,
-                                        old_id,
-                                        new_id,
-                                        &old_root,
-                                        &new_root,
-                                    );
-                                }
-                                RelocateResult::Translated(ws_id) => {
-                                    Self::apply_relocate_to_collection(
-                                        &mut collection,
-                                        ws_id,
-                                        ws_id,
-                                        &old_root,
-                                        &new_root,
-                                    );
-                                }
-                            }
-
-                            let json = serde_json::to_string(&collection)
-                                .context("serializing the workspace configuration collection")?;
-
-                            conn.exec_bound::<(&str, &str, &str)>(
-                                "INSERT OR REPLACE INTO scoped_kv_store(namespace, key, value) VALUES ((?), (?), (?))",
-                            )?((
-                                WORKSPACE_CONFIGURATIONS_NAMESPACE,
-                                WORKSPACE_CONFIGURATIONS_KEY,
-                                &json,
-                            ))
-                            .context("writing the workspace configuration collection")?;
-
-                            #[cfg(test)]
-                            if _fail_savepoint_for_tests {
-                                anyhow::bail!("forced error after writes to test savepoint rollback");
-                            }
-
-                            Ok(collection)
-                        })
-                    })
-                    .await?;
-
-                collection = updated_collection;
-
-                Ok(cx.update(|cx| {
-                    cx.update_global::<Self, _>(|this, cx| {
-                        this.committed = collection.clone();
-                        *this.shutdown_committed.lock() = collection;
-                        this.generation += 1;
-                        cx.refresh_windows();
-                        StoreCommit {
-                            id,
-                            generation: this.generation,
-                        }
-                    })
-                }))
+                Self::apply_relocate(request, collection, db, fail_savepoint_for_tests, cx).await
+            }
+            WorkspaceConfigurationMutation::RelinkWorkspace {
+                id,
+                workspace_id,
+                old_root,
+                new_root,
+                open_workspace_id,
+            } => {
+                let request = RelocateRequest {
+                    id,
+                    workspace_id,
+                    old_root,
+                    new_root,
+                    relink_to: Some(open_workspace_id),
+                };
+                Self::apply_relocate(request, collection, db, fail_savepoint_for_tests, cx).await
             }
             _ => {
                 let id = Self::apply_to_collection(&mut collection, mutation)?;
@@ -965,6 +942,120 @@ impl WorkspaceConfigurationStore {
         }
     }
 
+    async fn apply_relocate(
+        request: RelocateRequest,
+        mut collection: model::WorkspaceConfigurationCollection,
+        db: WorkspaceDb,
+        fail_savepoint_for_tests: bool,
+        cx: &mut AsyncApp,
+    ) -> Result<StoreCommit> {
+        let RelocateRequest {
+            id,
+            workspace_id,
+            old_root,
+            new_root,
+            relink_to,
+        } = request;
+        let target_configuration = collection
+            .configurations
+            .iter()
+            .find(|c| c.id == id)
+            .context("that workspace configuration no longer exists")?;
+        for member in &target_configuration.members {
+            if member.workspace_id != workspace_id {
+                anyhow::ensure!(
+                    !member.identity_paths.iter().any(|p| p == &new_root),
+                    "“{}” is already a member of this configuration.",
+                    new_root.display()
+                );
+                anyhow::ensure!(
+                    relink_to != Some(member.workspace_id),
+                    "“{}” is already a member of this configuration.",
+                    new_root.display()
+                );
+            }
+        }
+        let member_identity_paths = target_configuration
+            .members
+            .iter()
+            .find(|m| m.workspace_id == workspace_id)
+            .map(|m| m.identity_paths.clone())
+            .ok_or_else(|| {
+                member_already_moved("that workspace is no longer a member of this configuration")
+            })?;
+
+        let updated_collection = db
+            .write(move |conn| {
+                conn.with_savepoint("relocate_workspace", || {
+                    let relocate_result = match relink_to {
+                        None => WorkspaceDb::relocate_workspace_root_internal(
+                            conn,
+                            workspace_id,
+                            &member_identity_paths,
+                            &old_root,
+                            &new_root,
+                        )?,
+                        Some(open_workspace_id) => {
+                            WorkspaceDb::ensure_member_holds_root(
+                                conn,
+                                workspace_id,
+                                &member_identity_paths,
+                                &old_root,
+                            )?;
+                            RelocateResult::Relinked {
+                                old_id: workspace_id,
+                                new_id: open_workspace_id,
+                            }
+                        }
+                    };
+
+                    let (old_id, new_id) = match relocate_result {
+                        RelocateResult::Relinked { old_id, new_id } => (old_id, new_id),
+                        RelocateResult::Translated(ws_id) => (ws_id, ws_id),
+                    };
+                    Self::apply_relocate_to_collection(
+                        &mut collection,
+                        old_id,
+                        new_id,
+                        &old_root,
+                        &new_root,
+                    );
+
+                    let json = serde_json::to_string(&collection)
+                        .context("serializing the workspace configuration collection")?;
+
+                    conn.exec_bound::<(&str, &str, &str)>(
+                        "INSERT OR REPLACE INTO scoped_kv_store(namespace, key, value) VALUES ((?), (?), (?))",
+                    )?((
+                        WORKSPACE_CONFIGURATIONS_NAMESPACE,
+                        WORKSPACE_CONFIGURATIONS_KEY,
+                        &json,
+                    ))
+                    .context("writing the workspace configuration collection")?;
+
+                    if fail_savepoint_for_tests {
+                        anyhow::bail!("forced error after writes to test savepoint rollback");
+                    }
+
+                    Ok(collection)
+                })
+            })
+            .await?;
+
+        Ok(cx.update(|cx| {
+            cx.update_global::<Self, _>(|this, cx| {
+                this.committed = updated_collection.clone();
+                *this.shutdown_committed.lock() = updated_collection;
+                this.generation += 1;
+                cx.refresh_windows();
+                StoreCommit {
+                    id,
+                    generation: this.generation,
+                }
+            })
+        }))
+    }
+
     fn apply_relocate_to_collection(
         collection: &mut model::WorkspaceConfigurationCollection,
         old_id: WorkspaceId,
@@ -989,6 +1080,11 @@ impl WorkspaceConfigurationStore {
                     member.identity_paths = new_identity_paths;
                 }
             }
+            // A relink can rename a member to an id this configuration already holds.
+            let mut seen_workspace_ids = HashSet::default();
+            configuration
+                .members
+                .retain(|member| seen_workspace_ids.insert(member.workspace_id));
             if configuration.active_member == Some(old_id) {
                 configuration.active_member = Some(new_id);
             }
@@ -1070,7 +1166,8 @@ impl WorkspaceConfigurationStore {
                 collection.configurations.remove(configuration_index);
                 id
             }
-            WorkspaceConfigurationMutation::RelocateWorkspace { id, .. } => id,
+            WorkspaceConfigurationMutation::RelocateWorkspace { id, .. }
+            | WorkspaceConfigurationMutation::RelinkWorkspace { id, .. } => id,
         };
 
         Ok(id)
@@ -2619,6 +2716,64 @@ impl WorkspaceDb {
         Ok(None)
     }
 
+    /// The saved row a configuration member points at: its own row, or — when that row
+    /// is gone — the row whose identity matches the member's, mirroring `#zed-64` switch
+    /// resolution.
+    fn member_workspace_row(
+        conn: &Connection,
+        workspace_id: WorkspaceId,
+        identity_paths: &[PathBuf],
+        old_root: &Path,
+    ) -> Result<(WorkspaceId, String, String, Option<String>, Option<String>)> {
+        let row = conn.select_row_bound::<WorkspaceId, (String, String, Option<String>, Option<String>)>(
+            "SELECT paths, paths_order, identity_paths, identity_paths_order FROM workspaces WHERE workspace_id = ?1",
+        )?(workspace_id)?;
+        if let Some(row) = row {
+            return Ok((workspace_id, row.0, row.1, row.2, row.3));
+        }
+        let mut candidate_identity_paths = if identity_paths.is_empty() {
+            vec![old_root.to_path_buf()]
+        } else {
+            identity_paths.to_vec()
+        };
+        candidate_identity_paths.sort();
+        Self::find_local_workspace_by_identity_paths_on_connection(conn, &candidate_identity_paths)?
+            .with_context(|| format!("workspace {workspace_id:?} not found in database"))
+    }
+
+    /// Fails with [`WorkspaceMemberAlreadyMoved`] unless the member's saved row still has a
+    /// root at `old_root`. A relink writes no rows, so this is its only proof that nothing
+    /// moved the member first.
+    pub(crate) fn ensure_member_holds_root(
+        conn: &Connection,
+        workspace_id: WorkspaceId,
+        identity_paths: &[PathBuf],
+        old_root: &Path,
+    ) -> Result<()> {
+        if !table_exists(conn, "workspaces")? {
+            return Ok(());
+        }
+        let (actual_workspace_id, paths_str, order_str, _, _) =
+            Self::member_workspace_row(conn, workspace_id, identity_paths, old_root)?;
+        let path_list = PathList::deserialize(&SerializedPathList {
+            paths: paths_str,
+            order: order_str,
+        });
+        if path_list
+            .paths()
+            .iter()
+            .any(|path| path.starts_with(old_root))
+        {
+            Ok(())
+        } else {
+            Err(member_already_moved(format!(
+                "no root matching “{}” was found in workspace {:?}",
+                old_root.display(),
+                actual_workspace_id
+            )))
+        }
+    }
+
     pub(crate) fn relocate_workspace_root_internal(
         conn: &Connection,
         workspace_id: WorkspaceId,
@@ -2627,30 +2782,8 @@ impl WorkspaceDb {
         new_root: &Path,
     ) -> Result<RelocateResult> {
         let actual_workspace_id = if table_exists(conn, "workspaces")? {
-            let row = conn.select_row_bound::<WorkspaceId, (String, String, Option<String>, Option<String>)>(
-                "SELECT paths, paths_order, identity_paths, identity_paths_order FROM workspaces WHERE workspace_id = ?1",
-            )?(workspace_id)?;
-
             let (actual_workspace_id, paths_str, order_str, identity_paths_str, identity_order_str) =
-                match row {
-                    Some(r) => (workspace_id, r.0, r.1, r.2, r.3),
-                    None => {
-                        let mut candidate_identity_paths = if identity_paths.is_empty() {
-                            vec![old_root.to_path_buf()]
-                        } else {
-                            identity_paths.to_vec()
-                        };
-                        candidate_identity_paths.sort();
-                        let fallback_row =
-                            Self::find_local_workspace_by_identity_paths_on_connection(
-                                conn,
-                                &candidate_identity_paths,
-                            )?;
-                        fallback_row.with_context(|| {
-                            format!("workspace {workspace_id:?} not found in database")
-                        })?
-                    }
-                };
+                Self::member_workspace_row(conn, workspace_id, identity_paths, old_root)?;
 
             let serialized_paths = SerializedPathList {
                 paths: paths_str,
@@ -2670,12 +2803,13 @@ impl WorkspaceDb {
                 })
                 .collect();
 
-            anyhow::ensure!(
-                translated_any,
-                "no root matching “{}” was found in workspace {:?}",
-                old_root.display(),
-                actual_workspace_id
-            );
+            if !translated_any {
+                return Err(member_already_moved(format!(
+                    "no root matching “{}” was found in workspace {:?}",
+                    old_root.display(),
+                    actual_workspace_id
+                )));
+            }
 
             let mut seen_roots = HashSet::default();
             for root in &new_ordered_roots {
@@ -9221,6 +9355,106 @@ mod tests {
             assert_eq!(c.members[0].workspace_id, ws2);
             assert_eq!(c.members[0].identity_paths, vec![target_root]);
             assert_eq!(c.active_member, Some(ws2));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_relink_does_not_duplicate_member_in_other_configurations(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        clear_raw_configurations(cx).await;
+        cx.update(|cx| WorkspaceConfigurationStore::init(cx));
+        let store = WorkspaceConfigurationStoreTestHandle;
+        let db = cx.update(|cx| WorkspaceDb::global(cx));
+
+        let moved = WorkspaceId(211);
+        let target = WorkspaceId(212);
+        let old_root = PathBuf::from("/duplicate/old_root");
+        let target_root = PathBuf::from("/duplicate/target_root");
+
+        db.write({
+            let old_root = old_root.clone();
+            let target_root = target_root.clone();
+            move |conn| {
+                conn.exec_bound::<(WorkspaceId, &str, &str, Option<&str>, Option<&str>)>(
+                    "INSERT INTO workspaces (workspace_id, paths, paths_order, identity_paths, identity_paths_order) VALUES (?1, ?2, ?3, ?4, ?5)",
+                )?((moved, old_root.to_str().unwrap(), "", Some(old_root.to_str().unwrap()), Some("")))?;
+                conn.exec_bound::<(WorkspaceId, &str, &str, Option<&str>, Option<&str>)>(
+                    "INSERT INTO workspaces (workspace_id, paths, paths_order, identity_paths, identity_paths_order) VALUES (?1, ?2, ?3, ?4, ?5)",
+                )?((target, target_root.to_str().unwrap(), "", Some(target_root.to_str().unwrap()), Some("")))?;
+                anyhow::Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+        let relocating = store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Create {
+                        name: "Relocating".to_string(),
+                        members: vec![model::WorkspaceConfigurationMember {
+                            workspace_id: moved,
+                            identity_paths: vec![old_root.clone()],
+                        }],
+                        active_member: Some(moved),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let holds_both = store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::Create {
+                        name: "Holds Both".to_string(),
+                        members: vec![
+                            model::WorkspaceConfigurationMember {
+                                workspace_id: moved,
+                                identity_paths: vec![old_root.clone()],
+                            },
+                            model::WorkspaceConfigurationMember {
+                                workspace_id: target,
+                                identity_paths: vec![target_root.clone()],
+                            },
+                        ],
+                        active_member: Some(moved),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        store
+            .update(cx, |store, cx| {
+                store.mutate(
+                    WorkspaceConfigurationMutation::RelocateWorkspace {
+                        id: relocating.id,
+                        workspace_id: moved,
+                        old_root: old_root.clone(),
+                        new_root: target_root.clone(),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .expect("relocating onto an existing workspace row must relink");
+
+        store.read_with(cx, |store, _| {
+            let configuration = store.configuration(holds_both.id).unwrap();
+            let member_ids = configuration
+                .members
+                .iter()
+                .map(|member| member.workspace_id)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                member_ids,
+                vec![target],
+                "a configuration already holding the relink target must keep one member"
+            );
+            assert_eq!(configuration.active_member, Some(target));
         });
     }
 

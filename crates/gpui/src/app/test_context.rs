@@ -367,6 +367,11 @@ impl TestAppContext {
         self.test_platform.pending_prompt()
     }
 
+    /// Returns the answers of the open alert dialog.
+    pub fn pending_prompt_answers(&self) -> Option<Vec<String>> {
+        self.test_platform.pending_prompt_answers()
+    }
+
     /// All the urls that have been opened with cx.open_url() during this test.
     pub fn opened_url(&self) -> Option<String> {
         self.test_platform.opened_url.borrow().clone()

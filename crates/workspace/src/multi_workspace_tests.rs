@@ -803,9 +803,16 @@ async fn test_switch_workspace_configuration_rolls_back(cx: &mut TestAppContext)
         .expect("valid target configuration fixture")
         .id;
 
+    // `#zed-76.2`: a missing folder now stops at the recovery prompt; Cancel aborts.
     let missing_switch = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
         multi_workspace.switch_workspace_configuration(missing_configuration_id, window, cx)
     });
+    cx.run_until_parked();
+    let (title, _) = cx
+        .pending_prompt()
+        .expect("a missing folder must prompt before anything is staged");
+    assert_eq!(title, "Workspace Folder Not Found");
+    cx.simulate_prompt_answer("Cancel");
     assert!(missing_switch.await.is_err());
     multi_workspace.read_with(cx, |multi_workspace, cx| {
         assert_eq!(
@@ -9503,14 +9510,21 @@ async fn test_workspace_configuration_management_modal_detects_unavailable_paths
             .is_none()
     );
 
-    // Negative control 1: attempt to switch to config_id before locating -> fails with unavailable error!
+    // Negative control 1: switching before locating stops at the recovery prompt, and
+    // Cancel leaves the window as it was.
     let switch_fail = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
         multi_workspace.switch_workspace_configuration(config_id, window, cx)
     });
+    cx.run_until_parked();
+    let (title, _) = cx
+        .pending_prompt()
+        .expect("switching to a configuration with a missing folder must prompt");
+    assert_eq!(title, "Workspace Folder Not Found");
+    cx.simulate_prompt_answer("Cancel");
     let err = switch_fail.await.unwrap_err();
     assert!(
-        err.to_string().contains("is unavailable"),
-        "expected switch failure for unavailable path, got: {err}"
+        MultiWorkspace::workspace_configuration_switch_was_canceled(&err),
+        "expected a silent cancel for the unavailable path, got: {err}"
     );
     multi_workspace.read_with(cx, |multi_workspace, _cx| {
         assert_eq!(
@@ -9947,4 +9961,1270 @@ async fn test_workspace_configuration_management_modal_rejects_other_window_coll
             "expected member open in another window error, got: {error}"
         );
     });
+}
+
+// `#zed-76.2`: switch-time `Locate…` with loop restart.
+
+type ConfigurationId = crate::persistence::model::WorkspaceConfigurationId;
+
+/// A window on `/root_current`, saved as `Outgoing`, over a `FakeFs` that also holds
+/// `folders`. Every other folder a test names is missing on disk.
+async fn switch_locate_fixture<'a>(
+    folders: &[&str],
+    cx: &'a mut TestAppContext,
+) -> (
+    Arc<FakeFs>,
+    Entity<MultiWorkspace>,
+    &'a mut VisualTestContext,
+    ConfigurationId,
+) {
+    init_test(cx);
+    cx.update(crate::register_serializable_item::<TestItem>);
+    reset_workspace_configuration_store(cx).await;
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_current", json!({ "current.txt": "" }))
+        .await;
+    for folder in folders {
+        fs.insert_tree(folder, json!({ "file.txt": "" })).await;
+    }
+    cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+
+    let project = Project::test(fs.clone(), ["/root_current".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        for workspace in multi_workspace.ordered_workspaces(cx) {
+            workspace.update(cx, |workspace, _cx| workspace.set_random_database_id());
+        }
+    });
+    let outgoing = multi_workspace
+        .update(cx, |multi_workspace, cx| {
+            multi_workspace.save_configuration_as("Outgoing".to_string(), cx)
+        })
+        .await
+        .expect("failed to save the outgoing configuration");
+    cx.run_until_parked();
+    (fs, multi_workspace, cx, outgoing)
+}
+
+/// Saves each member with its folders (in displayed order) and one `TestItem` tab, then
+/// creates the configuration.
+async fn seed_switch_target(
+    name: &str,
+    members: &[(WorkspaceId, &[&str])],
+    active_member: WorkspaceId,
+    cx: &mut VisualTestContext,
+) -> ConfigurationId {
+    let db = cx.update(|_window, cx| WorkspaceDb::global(cx));
+    for (workspace_id, folders) in members {
+        let folders = folders.iter().map(PathBuf::from).collect::<Vec<_>>();
+        let mut workspace = strict_restore_fixture(
+            *workspace_id,
+            "/unused",
+            crate::persistence::model::SerializedPaneGroup::Pane(
+                crate::persistence::model::SerializedPane::new(
+                    vec![crate::persistence::model::SerializedItem::new(
+                        "TestItem", 42, true, false,
+                    )],
+                    true,
+                    0,
+                ),
+            ),
+        );
+        workspace.paths = PathList::new(&folders);
+        workspace.identity_paths = Some(PathList::new(&folders));
+        db.save_workspace_checked(workspace)
+            .await
+            .expect("failed to seed a switch target member");
+    }
+    cx.update(|_window, cx| {
+        WorkspaceConfigurationStore::mutate_global(
+            crate::persistence::WorkspaceConfigurationMutation::Create {
+                name: name.to_string(),
+                members: members
+                    .iter()
+                    .map(|(workspace_id, folders)| {
+                        let mut identity_paths =
+                            folders.iter().map(PathBuf::from).collect::<Vec<_>>();
+                        identity_paths.sort();
+                        crate::persistence::model::WorkspaceConfigurationMember {
+                            workspace_id: *workspace_id,
+                            identity_paths,
+                        }
+                    })
+                    .collect(),
+                active_member: Some(active_member),
+            },
+            cx,
+        )
+    })
+    .await
+    .expect("failed to seed the switch target")
+    .id
+}
+
+/// Opens `folder` as another workspace in the window, with a durable id, as the user
+/// would have done before switching.
+async fn open_workspace_in_window(
+    multi_workspace: &Entity<MultiWorkspace>,
+    fs: &Arc<FakeFs>,
+    folder: &str,
+    cx: &mut VisualTestContext,
+) -> Entity<Workspace> {
+    let project = Project::test(fs.clone(), [folder.as_ref()], cx).await;
+    let workspace = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project, window, cx)
+    });
+    // Adding it checkpointed `Outgoing` before it had an id; checkpoint again now that it
+    // has one, so the switch doesn't start by retrying a stale checkpoint.
+    workspace.update(cx, |workspace, _cx| workspace.set_random_database_id());
+    let checkpoint = multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.retry_configuration_checkpoint(cx)
+    });
+    cx.run_until_parked();
+    checkpoint
+        .await
+        .expect("failed to checkpoint the window with the opened workspace");
+    workspace
+}
+
+fn start_switch(
+    multi_workspace: &Entity<MultiWorkspace>,
+    configuration_id: ConfigurationId,
+    cx: &mut VisualTestContext,
+) -> Task<anyhow::Result<()>> {
+    let switch = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.switch_workspace_configuration(configuration_id, window, cx)
+    });
+    cx.run_until_parked();
+    switch
+}
+
+/// Asserts the recovery prompt is up for `label`, and returns its detail.
+#[track_caller]
+fn expect_recovery_prompt(label: &str, cx: &mut VisualTestContext) -> String {
+    let (title, detail) = cx
+        .pending_prompt()
+        .unwrap_or_else(|| panic!("expected the recovery prompt for “{label}”"));
+    assert_eq!(title, crate::multi_workspace::WORKSPACE_FOLDER_NOT_FOUND);
+    assert!(
+        detail.contains(&format!("the folder for “{label}”")),
+        "the recovery prompt must name “{label}”: {detail}"
+    );
+    detail
+}
+
+fn locate_from_recovery_prompt(label: &str, pick: Option<&str>, cx: &mut VisualTestContext) {
+    cx.simulate_prompt_answer(&format!("Locate “{label}”…"));
+    cx.run_until_parked();
+    assert!(
+        cx.did_prompt_for_paths(),
+        "Locate… must open the folder picker"
+    );
+    let pick = pick.map(|pick| vec![PathBuf::from(pick)]);
+    cx.simulate_path_prompt_response(|_| pick);
+    cx.run_until_parked();
+}
+
+fn configuration_members(
+    configuration_id: ConfigurationId,
+    cx: &mut VisualTestContext,
+) -> Vec<(WorkspaceId, Vec<PathBuf>)> {
+    workspace_configuration(configuration_id, cx)
+        .expect("the configuration must still exist")
+        .members
+        .into_iter()
+        .map(|member| (member.workspace_id, member.identity_paths))
+        .collect()
+}
+
+#[gpui::test]
+async fn test_switch_time_locate_restarts_loop_and_commits(cx: &mut TestAppContext) {
+    let (_fs, multi_workspace, cx, _outgoing) =
+        switch_locate_fixture(&["/t1/src/app", "/t1/moved/proj"], cx).await;
+    let member_app = WorkspaceId(9400);
+    let member_proj = WorkspaceId(9401);
+    let target = seed_switch_target(
+        "Active Projects",
+        &[
+            (member_app, &["/t1/src/app"]),
+            (member_proj, &["/t1/src/proj"]),
+        ],
+        member_app,
+        cx,
+    )
+    .await;
+
+    let switch = start_switch(&multi_workspace, target, cx);
+    let detail = expect_recovery_prompt("proj", cx);
+    assert_eq!(
+        detail,
+        "“Active Projects” couldn’t find the folder for “proj” at /t1/src/proj.\n\n\
+         Locate the folder to update “Active Projects”, or open the 1 available workspace."
+    );
+    assert_eq!(
+        cx.pending_prompt_answers()
+            .expect("the recovery prompt is open"),
+        [
+            "Locate “proj”…".to_string(),
+            "Open Available (1 of 2)".to_string(),
+            "Cancel".to_string()
+        ],
+        "Slice 3's recovery prompt offers Locate, Open Available, and Cancel"
+    );
+    multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        assert_eq!(
+            multi_workspace.configuration_switch_staged_members(),
+            0,
+            "no member may be staged while a folder is missing, not even the present one"
+        );
+        assert!(multi_workspace.configuration_switch_in_progress());
+    });
+
+    locate_from_recovery_prompt("proj", Some("/t1/moved/proj"), cx);
+    assert!(!cx.has_pending_prompt(), "a same-named pick must not ask");
+    switch
+        .await
+        .expect("the switch must commit after the restart");
+    cx.run_until_parked();
+
+    assert_eq!(
+        configuration_members(target, cx),
+        vec![
+            (member_app, vec![PathBuf::from("/t1/src/app")]),
+            (member_proj, vec![PathBuf::from("/t1/moved/proj")]),
+        ]
+    );
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(multi_workspace.active_configuration_id(), Some(target));
+        assert!(!multi_workspace.configuration_switch_in_progress());
+        assert_eq!(
+            multi_workspace.configuration_switch_staged_members(),
+            2,
+            "the restart stages both members"
+        );
+        let relocated = multi_workspace
+            .workspaces()
+            .find(|workspace| workspace.read(cx).database_id() == Some(member_proj))
+            .expect("the relocated member must be in the window");
+        assert_eq!(
+            workspace_tab_paths(relocated.read(cx), cx),
+            vec![PathBuf::from("/t1/moved/proj")]
+        );
+        let pane = relocated.read(cx).active_pane().read(cx);
+        assert_eq!(pane.items_len(), 1, "the relocated member keeps its tab");
+        assert!(
+            pane.active_item()
+                .and_then(|item| item.downcast::<TestItem>())
+                .is_some()
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_switch_time_locate_cancel_and_dismiss_change_nothing(cx: &mut TestAppContext) {
+    let (_fs, multi_workspace, cx, outgoing) =
+        switch_locate_fixture(&["/t2/src/app", "/t2/src/other-name"], cx).await;
+    let member_app = WorkspaceId(9410);
+    let member_proj = WorkspaceId(9411);
+    let target = seed_switch_target(
+        "Active Projects",
+        &[
+            (member_app, &["/t2/src/app"]),
+            (member_proj, &["/t2/src/proj"]),
+        ],
+        member_app,
+        cx,
+    )
+    .await;
+    let target_before = workspace_configuration(target, cx);
+    let assert_unchanged = |cx: &mut VisualTestContext| {
+        assert!(
+            !cx.has_pending_prompt(),
+            "a cancel is silent: no Couldn’t Switch alert, no second prompt"
+        );
+        assert_eq!(workspace_configuration(target, cx), target_before);
+        multi_workspace.read_with(cx, |multi_workspace, _cx| {
+            assert_eq!(multi_workspace.active_configuration_id(), Some(outgoing));
+            assert_eq!(multi_workspace.workspaces().count(), 1);
+            assert!(!multi_workspace.configuration_switch_in_progress());
+        });
+    };
+    let switch_from_ui = |cx: &mut VisualTestContext| {
+        multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+            multi_workspace.switch_workspace_configuration_from_ui(
+                target,
+                "Active Projects".to_string(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+    };
+
+    // Cancel on the recovery prompt.
+    switch_from_ui(cx);
+    expect_recovery_prompt("proj", cx);
+    cx.simulate_prompt_answer("Cancel");
+    cx.run_until_parked();
+    assert_unchanged(cx);
+
+    // A dismissed picker.
+    switch_from_ui(cx);
+    expect_recovery_prompt("proj", cx);
+    locate_from_recovery_prompt("proj", None, cx);
+    assert_unchanged(cx);
+
+    // A differently named pick asks, with Choose Another Folder… as the default; a
+    // dismissed second picker cancels.
+    switch_from_ui(cx);
+    expect_recovery_prompt("proj", cx);
+    locate_from_recovery_prompt("proj", Some("/t2/src/other-name"), cx);
+    let (title, detail) = cx
+        .pending_prompt()
+        .expect("a differently named folder must ask before relocating");
+    assert_eq!(title, "Relocate “proj” to “other-name”?");
+    assert!(
+        detail.contains("From: /t2/src/proj\nTo: /t2/src/other-name"),
+        "{detail}"
+    );
+    assert_eq!(
+        crate::workspace_folder_locate::name_mismatch_answers("other-name")[0],
+        crate::workspace_folder_locate::CHOOSE_ANOTHER_FOLDER,
+        "Choose Another Folder… must be the default (first) button"
+    );
+    cx.simulate_prompt_answer("Choose Another Folder…");
+    cx.run_until_parked();
+    assert!(
+        cx.did_prompt_for_paths(),
+        "Choose Another Folder… must reopen the folder picker"
+    );
+    cx.simulate_path_prompt_response(|_| None);
+    cx.run_until_parked();
+    assert_unchanged(cx);
+
+    // Cancel on the name-mismatch confirm.
+    switch_from_ui(cx);
+    expect_recovery_prompt("proj", cx);
+    locate_from_recovery_prompt("proj", Some("/t2/src/other-name"), cx);
+    cx.simulate_prompt_answer("Cancel");
+    cx.run_until_parked();
+    assert_unchanged(cx);
+}
+
+#[gpui::test]
+async fn test_switch_time_locate_prompts_per_missing_folder_and_cancel_keeps_relocates(
+    cx: &mut TestAppContext,
+) {
+    let (_fs, multi_workspace, cx, outgoing) =
+        switch_locate_fixture(&["/t3/src/app", "/t3/moved/proj"], cx).await;
+    let member_app = WorkspaceId(9420);
+    let member_proj = WorkspaceId(9421);
+    let member_notes = WorkspaceId(9422);
+    let target = seed_switch_target(
+        "Active Projects",
+        &[
+            (member_app, &["/t3/src/app"]),
+            (member_proj, &["/t3/src/proj"]),
+            (member_notes, &["/t3/src/notes"]),
+        ],
+        member_app,
+        cx,
+    )
+    .await;
+
+    let switch = start_switch(&multi_workspace, target, cx);
+    let detail = expect_recovery_prompt("proj", cx);
+    assert!(
+        detail.contains("at /t3/src/proj. 1 other folder also missing."),
+        "{detail}"
+    );
+    locate_from_recovery_prompt("proj", Some("/t3/moved/proj"), cx);
+
+    let detail = expect_recovery_prompt("notes", cx);
+    assert!(!detail.contains("also missing"), "{detail}");
+    cx.simulate_prompt_answer("Cancel");
+    cx.run_until_parked();
+
+    let error = switch.await.expect_err("Cancel must abort the switch");
+    assert!(
+        MultiWorkspace::workspace_configuration_switch_was_canceled(&error),
+        "{error:#}"
+    );
+    assert_eq!(
+        configuration_members(target, cx),
+        vec![
+            (member_app, vec![PathBuf::from("/t3/src/app")]),
+            (member_proj, vec![PathBuf::from("/t3/moved/proj")]),
+            (member_notes, vec![PathBuf::from("/t3/src/notes")]),
+        ],
+        "Cancel aborts the switch only; the earlier relocate stays saved"
+    );
+    multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        assert_eq!(multi_workspace.active_configuration_id(), Some(outgoing));
+    });
+}
+
+#[gpui::test]
+async fn test_switch_time_locate_collision_alerts_then_prompts_again(cx: &mut TestAppContext) {
+    let (_fs, multi_workspace, cx, _outgoing) = switch_locate_fixture(&["/t4/src/app"], cx).await;
+    let member_app = WorkspaceId(9430);
+    let member_proj = WorkspaceId(9431);
+    let target = seed_switch_target(
+        "Active Projects",
+        &[
+            (member_app, &["/t4/src/app"]),
+            (member_proj, &["/t4/src/proj"]),
+        ],
+        member_app,
+        cx,
+    )
+    .await;
+    let target_before = workspace_configuration(target, cx);
+
+    let switch = start_switch(&multi_workspace, target, cx);
+    expect_recovery_prompt("proj", cx);
+    locate_from_recovery_prompt("proj", Some("/t4/src/app"), cx);
+    cx.simulate_prompt_answer("Use “app”");
+    cx.run_until_parked();
+
+    let (title, detail) = cx
+        .pending_prompt()
+        .expect("a collision must explain itself");
+    assert_eq!(title, "Couldn’t Relocate");
+    assert_eq!(
+        detail,
+        "“/t4/src/app” is already a member of this configuration."
+    );
+    cx.simulate_prompt_answer("OK");
+    cx.run_until_parked();
+
+    expect_recovery_prompt("proj", cx);
+    cx.simulate_prompt_answer("Cancel");
+    cx.run_until_parked();
+    let error = switch.await.expect_err("Cancel must abort the switch");
+    assert!(MultiWorkspace::workspace_configuration_switch_was_canceled(
+        &error
+    ));
+    assert_eq!(workspace_configuration(target, cx), target_before);
+}
+
+#[gpui::test]
+async fn test_switch_time_locate_relinks_to_workspace_open_in_switching_window(
+    cx: &mut TestAppContext,
+) {
+    let (fs, multi_workspace, cx, _outgoing) =
+        switch_locate_fixture(&["/t5/src/app", "/t5/moved/proj"], cx).await;
+    let open = open_workspace_in_window(&multi_workspace, &fs, "/t5/moved/proj", cx).await;
+    let open_item = open.update_in(cx, |workspace, window, cx| {
+        let item = cx.new(|cx| TestItem::new(cx));
+        workspace.add_item_to_active_pane(Box::new(item.clone()), None, true, window, cx);
+        item.entity_id()
+    });
+    let open_id = open.read_with(cx, |workspace, _cx| workspace.database_id().unwrap());
+    // The open workspace has no saved row yet: the relink must not need one.
+    let db = cx.update(|_window, cx| WorkspaceDb::global(cx));
+    db.write(move |conn| {
+        conn.exec_bound::<WorkspaceId>("DELETE FROM workspaces WHERE workspace_id = ?1")?(open_id)
+    })
+    .await
+    .expect("failed to drop the open workspace's row");
+    assert!(db.workspace_for_id_checked(open_id).unwrap().is_none());
+
+    let member_app = WorkspaceId(9440);
+    let member_proj = WorkspaceId(9441);
+    let target = seed_switch_target(
+        "Active Projects",
+        &[
+            (member_app, &["/t5/src/app"]),
+            (member_proj, &["/t5/src/proj"]),
+        ],
+        member_proj,
+        cx,
+    )
+    .await;
+    let target_before = workspace_configuration(target, cx);
+
+    // The Manage modal still rejects the same pick.
+    cx.dispatch_action(ManageWorkspaceConfigurations);
+    cx.run_until_parked();
+    assert!(multi_workspace.test_locate_member(
+        target,
+        Path::new("/t5/src/proj"),
+        PathBuf::from("/t5/moved/proj"),
+        cx
+    ));
+    cx.run_until_parked();
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        let modal = multi_workspace
+            .active_modal::<crate::workspace_tabs::WorkspaceConfigurationManagementModal>(cx)
+            .expect("the modal stays open on a collision");
+        assert_eq!(
+            modal.read(cx).error.as_deref(),
+            Some("Cannot relocate: “/t5/moved/proj” is currently open in this window.")
+        );
+    });
+    assert_eq!(workspace_configuration(target, cx), target_before);
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    // At switch time it relinks to the open workspace and carries it in live.
+    let switch = start_switch(&multi_workspace, target, cx);
+    expect_recovery_prompt("proj", cx);
+    locate_from_recovery_prompt("proj", Some("/t5/moved/proj"), cx);
+    assert!(
+        !cx.has_pending_prompt(),
+        "a pick matching an open workspace is not a collision at switch time"
+    );
+    switch.await.expect("the switch must commit");
+    cx.run_until_parked();
+
+    assert_eq!(
+        configuration_members(target, cx),
+        vec![
+            (member_app, vec![PathBuf::from("/t5/src/app")]),
+            (open_id, vec![PathBuf::from("/t5/moved/proj")]),
+        ],
+        "the member relinks to the open workspace's live id"
+    );
+    assert_eq!(
+        workspace_configuration(target, cx).unwrap().active_member,
+        Some(open_id)
+    );
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(multi_workspace.active_configuration_id(), Some(target));
+        assert!(
+            multi_workspace
+                .workspaces()
+                .any(|workspace| workspace == &open),
+            "the open workspace is carried in, not restaged"
+        );
+        assert_eq!(multi_workspace.workspace(), &open);
+        let pane = open.read(cx).active_pane().read(cx);
+        assert_eq!(pane.items_len(), 1);
+        assert_eq!(
+            pane.active_item().map(|item| item.item_id()),
+            Some(open_item),
+            "the open workspace keeps its current tabs"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_switch_does_not_prompt_to_save_member_carried_into_target(cx: &mut TestAppContext) {
+    let (fs, multi_workspace, cx, _outgoing) =
+        switch_locate_fixture(&["/t11/shared", "/t11/other"], cx).await;
+    let shared = open_workspace_in_window(&multi_workspace, &fs, "/t11/shared", cx).await;
+    let dirty_item = shared.update_in(cx, |workspace, window, cx| {
+        let item = cx.new(|cx| TestItem::new(cx).with_dirty(true));
+        workspace.add_item_to_active_pane(Box::new(item.clone()), None, true, window, cx);
+        item
+    });
+    let shared_id = shared.read_with(cx, |workspace, _cx| workspace.database_id().unwrap());
+    let other = WorkspaceId(9500);
+    let target = seed_switch_target(
+        "Shares A Member",
+        &[(shared_id, &["/t11/shared"]), (other, &["/t11/other"])],
+        other,
+        cx,
+    )
+    .await;
+
+    let switch = start_switch(&multi_workspace, target, cx);
+    assert!(
+        !cx.has_pending_prompt(),
+        "a member that stays open must not ask to save its dirty items"
+    );
+    switch.await.expect("the switch must commit");
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        assert_eq!(multi_workspace.active_configuration_id(), Some(target));
+        assert!(
+            multi_workspace
+                .workspaces()
+                .any(|workspace| workspace == &shared),
+            "the shared member is carried in, not restaged"
+        );
+    });
+    assert!(dirty_item.read_with(cx, |item, _cx| item.is_dirty));
+}
+
+#[gpui::test]
+async fn test_switch_time_locate_rejects_partial_match_of_multi_folder_member(
+    cx: &mut TestAppContext,
+) {
+    let (fs, multi_workspace, cx, _outgoing) =
+        switch_locate_fixture(&["/t6/src/b", "/t6/moved/a"], cx).await;
+    open_workspace_in_window(&multi_workspace, &fs, "/t6/moved/a", cx).await;
+    let member = WorkspaceId(9450);
+    let target =
+        seed_switch_target("Pair", &[(member, &["/t6/src/a", "/t6/src/b"])], member, cx).await;
+    let target_before = workspace_configuration(target, cx);
+
+    let switch = start_switch(&multi_workspace, target, cx);
+    expect_recovery_prompt("a", cx);
+    locate_from_recovery_prompt("a", Some("/t6/moved/a"), cx);
+
+    let (title, detail) = cx
+        .pending_prompt()
+        .expect("[/t6/moved/a, /t6/src/b] is not the open workspace's [/t6/moved/a]");
+    assert_eq!(title, "Couldn’t Relocate");
+    assert_eq!(detail, "“/t6/moved/a” is currently open in this window.");
+    cx.simulate_prompt_answer("OK");
+    cx.run_until_parked();
+    expect_recovery_prompt("a", cx);
+    cx.simulate_prompt_answer("Cancel");
+    cx.run_until_parked();
+    let error = switch.await.expect_err("Cancel must abort the switch");
+    assert!(MultiWorkspace::workspace_configuration_switch_was_canceled(
+        &error
+    ));
+    assert_eq!(workspace_configuration(target, cx), target_before);
+}
+
+#[gpui::test]
+async fn test_switch_time_locate_restarts_when_member_moved_while_picker_open(
+    cx: &mut TestAppContext,
+) {
+    let (_fs, multi_workspace, cx, _outgoing) =
+        switch_locate_fixture(&["/t7/src/app", "/t7/moved/proj", "/t7/elsewhere/proj"], cx).await;
+    let member_app = WorkspaceId(9460);
+    let member_proj = WorkspaceId(9461);
+    let target = seed_switch_target(
+        "Active Projects",
+        &[
+            (member_app, &["/t7/src/app"]),
+            (member_proj, &["/t7/src/proj"]),
+        ],
+        member_app,
+        cx,
+    )
+    .await;
+
+    let switch = start_switch(&multi_workspace, target, cx);
+    expect_recovery_prompt("proj", cx);
+    cx.simulate_prompt_answer("Locate “proj”…");
+    cx.run_until_parked();
+    assert!(cx.did_prompt_for_paths());
+
+    // Another window's Manage modal moves the member while this picker is open.
+    cx.update(|_window, cx| {
+        WorkspaceConfigurationStore::mutate_global(
+            crate::persistence::WorkspaceConfigurationMutation::RelocateWorkspace {
+                id: target,
+                workspace_id: member_proj,
+                old_root: PathBuf::from("/t7/src/proj"),
+                new_root: PathBuf::from("/t7/moved/proj"),
+            },
+            cx,
+        )
+    })
+    .await
+    .expect("the concurrent relocate must succeed");
+
+    cx.simulate_path_prompt_response(|_| Some(vec![PathBuf::from("/t7/elsewhere/proj")]));
+    cx.run_until_parked();
+    assert!(
+        !cx.has_pending_prompt(),
+        "the restart finds the member already moved and available"
+    );
+    switch
+        .await
+        .expect("an already-moved member restarts the loop, then commits");
+    assert_eq!(
+        configuration_members(target, cx),
+        vec![
+            (member_app, vec![PathBuf::from("/t7/src/app")]),
+            (member_proj, vec![PathBuf::from("/t7/moved/proj")]),
+        ],
+        "the first relocate wins; the stale pick writes nothing"
+    );
+    multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        assert_eq!(multi_workspace.active_configuration_id(), Some(target));
+    });
+}
+
+#[gpui::test]
+async fn test_switch_time_locate_restart_recaptures_outgoing_workspaces(cx: &mut TestAppContext) {
+    let (fs, multi_workspace, cx, outgoing) =
+        switch_locate_fixture(&["/t8/src/app", "/t8/moved/proj", "/t8/root_extra"], cx).await;
+    let member_app = WorkspaceId(9470);
+    let member_proj = WorkspaceId(9471);
+    let target = seed_switch_target(
+        "Active Projects",
+        &[
+            (member_app, &["/t8/src/app"]),
+            (member_proj, &["/t8/src/proj"]),
+        ],
+        member_app,
+        cx,
+    )
+    .await;
+
+    let switch = start_switch(&multi_workspace, target, cx);
+    expect_recovery_prompt("proj", cx);
+    cx.simulate_prompt_answer("Locate “proj”…");
+    cx.run_until_parked();
+    assert!(cx.did_prompt_for_paths());
+
+    // A workspace joins the switching window while the picker is open.
+    let extra = open_workspace_in_window(&multi_workspace, &fs, "/t8/root_extra", cx).await;
+    let extra_id = extra.read_with(cx, |workspace, _cx| workspace.database_id().unwrap());
+
+    cx.simulate_path_prompt_response(|_| Some(vec![PathBuf::from("/t8/moved/proj")]));
+    cx.run_until_parked();
+    switch.await.expect("the switch must commit");
+
+    assert!(
+        configuration_members(outgoing, cx)
+            .iter()
+            .any(|(workspace_id, _)| *workspace_id == extra_id),
+        "the restart recaptures the outgoing set, so the checkpoint keeps the workspace added mid-picker"
+    );
+    multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        assert_eq!(multi_workspace.active_configuration_id(), Some(target));
+    });
+}
+
+#[gpui::test]
+async fn test_switch_time_locate_fails_when_located_folder_is_still_missing(
+    cx: &mut TestAppContext,
+) {
+    let (_fs, multi_workspace, cx, outgoing) = switch_locate_fixture(&["/t9/src/app"], cx).await;
+    let member_app = WorkspaceId(9480);
+    let member_proj = WorkspaceId(9481);
+    let target = seed_switch_target(
+        "Active Projects",
+        &[
+            (member_app, &["/t9/src/app"]),
+            (member_proj, &["/t9/src/proj"]),
+        ],
+        member_app,
+        cx,
+    )
+    .await;
+
+    let switch = start_switch(&multi_workspace, target, cx);
+    expect_recovery_prompt("proj", cx);
+    // The picked folder is gone by the time the loop restarts.
+    locate_from_recovery_prompt("proj", Some("/t9/gone/proj"), cx);
+    assert!(
+        !cx.has_pending_prompt(),
+        "a folder still missing right after a relocate must not prompt again"
+    );
+    let error = switch.await.expect_err("the switch must fail");
+    assert!(
+        !MultiWorkspace::workspace_configuration_switch_was_canceled(&error),
+        "this is a failure the user sees, not a silent cancel"
+    );
+    assert!(
+        format!("{error:#}").contains("still missing at /t9/gone/proj"),
+        "{error:#}"
+    );
+    assert_eq!(
+        configuration_members(target, cx)[1],
+        (member_proj, vec![PathBuf::from("/t9/gone/proj")]),
+        "the relocate itself stays saved"
+    );
+    multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        assert_eq!(multi_workspace.active_configuration_id(), Some(outgoing));
+    });
+}
+
+#[gpui::test]
+async fn test_switch_time_locate_window_removed_while_picker_pending(cx: &mut TestAppContext) {
+    let (fs, multi_workspace, cx, outgoing) =
+        switch_locate_fixture(&["/t10/src/app", "/t10/moved/proj", "/t10/root_other"], cx).await;
+    let member_app = WorkspaceId(9490);
+    let member_proj = WorkspaceId(9491);
+    let target = seed_switch_target(
+        "Active Projects",
+        &[
+            (member_app, &["/t10/src/app"]),
+            (member_proj, &["/t10/src/proj"]),
+        ],
+        member_app,
+        cx,
+    )
+    .await;
+    let target_before = workspace_configuration(target, cx);
+
+    let project = Project::test(fs.clone(), ["/t10/root_other".as_ref()], cx).await;
+    let switching_window =
+        cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    cx.run_until_parked();
+    let switch = switching_window
+        .update(cx, |multi_workspace, window, cx| {
+            multi_workspace
+                .workspace()
+                .update(cx, |workspace, _cx| workspace.set_random_database_id());
+            multi_workspace.switch_workspace_configuration(target, window, cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    expect_recovery_prompt("proj", cx);
+    cx.simulate_prompt_answer("Locate “proj”…");
+    cx.run_until_parked();
+    assert!(cx.did_prompt_for_paths());
+
+    switching_window
+        .update(cx, |_, window, _cx| window.remove_window())
+        .unwrap();
+    cx.run_until_parked();
+    cx.simulate_path_prompt_response(|_| Some(vec![PathBuf::from("/t10/moved/proj")]));
+    cx.run_until_parked();
+
+    assert!(
+        switch.await.is_err(),
+        "a switch whose window is gone can't commit"
+    );
+    assert_eq!(
+        workspace_configuration(target, cx),
+        target_before,
+        "nothing is written once the switching window is gone"
+    );
+    multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        assert_eq!(multi_workspace.active_configuration_id(), Some(outgoing));
+    });
+}
+#[gpui::test]
+async fn test_open_available_button_order_and_counts(cx: &mut TestAppContext) {
+    let (fs, multi_workspace, cx, _outgoing) =
+        switch_locate_fixture(&["/t_btn/app", "/t_btn/multi_ok", "/t_btn/open"], cx).await;
+
+    // Member 1: open in window.
+    let open_workspace = open_workspace_in_window(&multi_workspace, &fs, "/t_btn/open", cx).await;
+    let member_open =
+        open_workspace.read_with(cx, |workspace, _cx| workspace.database_id().unwrap());
+
+    let member_app = WorkspaceId(9500); // Exists
+    let member_proj = WorkspaceId(9501); // Missing
+    let member_multi = WorkspaceId(9502); // 2 folders, 1 missing
+
+    let target = seed_switch_target(
+        "Slice3 Btn",
+        &[
+            (member_open, &["/t_btn/open"]),
+            (member_app, &["/t_btn/app"]),
+            (member_proj, &["/t_btn/missing_proj"]),
+            (member_multi, &["/t_btn/multi_ok", "/t_btn/multi_missing"]),
+        ],
+        member_open,
+        cx,
+    )
+    .await;
+
+    fs.remove_dir(
+        "/t_btn/open".as_ref(),
+        fs::RemoveOptions {
+            recursive: true,
+            ignore_if_not_exists: true,
+        },
+    )
+    .await
+    .unwrap();
+    let _switch = start_switch(&multi_workspace, target, cx);
+
+    let detail = expect_recovery_prompt("missing_proj", cx);
+
+    assert_eq!(
+        detail,
+        "“Slice3 Btn” couldn’t find the folder for “missing_proj” at /t_btn/missing_proj. 1 other folder also missing.\n\n\
+         Locate the folder to update “Slice3 Btn”, or open the 2 available workspaces."
+    );
+
+    let answers = cx.pending_prompt_answers().unwrap();
+    assert_eq!(
+        answers,
+        [
+            "Locate “missing_proj”…".to_string(),
+            "Open Available (2 of 4)".to_string(),
+            "Cancel".to_string()
+        ]
+    );
+
+    cx.simulate_prompt_answer("Cancel");
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+async fn test_open_available_hidden_when_no_member_available(cx: &mut TestAppContext) {
+    let (_fs, multi_workspace, cx, _outgoing) = switch_locate_fixture(&[], cx).await;
+
+    let member_proj = WorkspaceId(9601);
+    let target = seed_switch_target(
+        "Slice3 NoAvail",
+        &[(member_proj, &["/t_no/missing_proj"])],
+        member_proj,
+        cx,
+    )
+    .await;
+
+    let _switch = start_switch(&multi_workspace, target, cx);
+    let detail = expect_recovery_prompt("missing_proj", cx);
+
+    assert_eq!(
+        detail,
+        "“Slice3 NoAvail” couldn’t find the folder for “missing_proj” at /t_no/missing_proj.\n\n\
+         Locate the folder to update “Slice3 NoAvail”."
+    );
+
+    let answers = cx.pending_prompt_answers().unwrap();
+    assert_eq!(
+        answers,
+        ["Locate “missing_proj”…".to_string(), "Cancel".to_string()]
+    );
+
+    cx.simulate_prompt_answer("Cancel");
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+async fn test_open_available_skips_all_missing_without_further_prompts(cx: &mut TestAppContext) {
+    let (_fs, multi_workspace, cx, _outgoing) =
+        switch_locate_fixture(&["/t_skip/app", "/t_skip/multi_ok"], cx).await;
+
+    let member_app = WorkspaceId(9700); // Exists
+    let member_proj = WorkspaceId(9701); // Missing
+    let member_multi = WorkspaceId(9702); // 2 folders, 1 missing
+
+    let target = seed_switch_target(
+        "Slice3 Skip",
+        &[
+            (member_app, &["/t_skip/app"]),
+            (member_proj, &["/t_skip/missing_proj"]),
+            (member_multi, &["/t_skip/multi_ok", "/t_skip/multi_missing"]),
+        ],
+        member_app,
+        cx,
+    )
+    .await;
+
+    let switch = start_switch(&multi_workspace, target, cx);
+    let detail = expect_recovery_prompt("missing_proj", cx);
+
+    assert_eq!(
+        detail,
+        "“Slice3 Skip” couldn’t find the folder for “missing_proj” at /t_skip/missing_proj. 1 other folder also missing.\n\n\
+         Locate the folder to update “Slice3 Skip”, or open the 1 available workspace."
+    );
+
+    cx.simulate_prompt_answer("Open Available (1 of 3)");
+
+    switch
+        .await
+        .expect("switch completes without further prompts");
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        let workspace = multi_workspace.workspace().read(cx);
+        assert_eq!(workspace.database_id(), Some(member_app));
+        assert_eq!(multi_workspace.workspaces().count(), 1);
+        assert_eq!(multi_workspace.active_configuration_id(), None);
+    });
+}
+
+#[gpui::test]
+async fn test_open_available_keeps_earlier_relocate(cx: &mut TestAppContext) {
+    let (_fs, multi_workspace, cx, _outgoing) =
+        switch_locate_fixture(&["/t_reloc/app", "/t_reloc/moved_proj"], cx).await;
+
+    let member_app = WorkspaceId(9800);
+    let member_proj = WorkspaceId(9801);
+    let member_missing = WorkspaceId(9802);
+
+    let target = seed_switch_target(
+        "Slice3 Reloc",
+        &[
+            (member_app, &["/t_reloc/app"]),
+            (member_proj, &["/t_reloc/missing_proj"]),
+            (member_missing, &["/t_reloc/missing_miss"]),
+        ],
+        member_app,
+        cx,
+    )
+    .await;
+
+    let switch = start_switch(&multi_workspace, target, cx);
+
+    expect_recovery_prompt("missing_proj", cx);
+    locate_from_recovery_prompt("missing_proj", Some("/t_reloc/moved_proj"), cx);
+    cx.simulate_prompt_answer("Use “moved_proj”");
+    cx.run_until_parked();
+
+    expect_recovery_prompt("missing_miss", cx);
+    cx.simulate_prompt_answer("Open Available (2 of 3)");
+
+    switch.await.expect("switch completes");
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        let workspaces: Vec<_> = multi_workspace.workspaces().collect();
+        assert_eq!(
+            workspaces.len(),
+            2,
+            "Both app and relocated proj should be open"
+        );
+
+        let ids: Vec<_> = workspaces
+            .iter()
+            .map(|workspace| workspace.read(cx).database_id())
+            .collect();
+        assert!(ids.contains(&Some(member_app)));
+        assert!(ids.contains(&Some(member_proj)));
+        assert!(!ids.contains(&Some(member_missing)));
+
+        assert_eq!(multi_workspace.active_configuration_id(), None);
+    });
+
+    let relocated_member = workspace_configuration(target, cx)
+        .expect("the configuration still exists")
+        .members
+        .into_iter()
+        .find(|member| member.workspace_id == member_proj)
+        .expect("the relocated member is still saved");
+    assert_eq!(
+        relocated_member.identity_paths,
+        vec![PathBuf::from("/t_reloc/moved_proj")],
+        "the earlier relocate is saved"
+    );
+}
+
+#[gpui::test]
+async fn test_open_available_falls_back_when_active_member_missing(cx: &mut TestAppContext) {
+    let (_fs, multi_workspace, cx, _outgoing) =
+        switch_locate_fixture(&["/t_fb/app1", "/t_fb/app2"], cx).await;
+
+    let member_missing = WorkspaceId(9901); // Missing, was active
+    let member_app1 = WorkspaceId(9902);
+    let member_app2 = WorkspaceId(9903);
+
+    let target = seed_switch_target(
+        "Slice3 FB",
+        &[
+            (member_missing, &["/t_fb/missing"]),
+            (member_app1, &["/t_fb/app1"]),
+            (member_app2, &["/t_fb/app2"]),
+        ],
+        member_missing, // it is the active one
+        cx,
+    )
+    .await;
+
+    let switch = start_switch(&multi_workspace, target, cx);
+    expect_recovery_prompt("missing", cx);
+
+    cx.simulate_prompt_answer("Open Available (2 of 3)");
+
+    switch.await.expect("switch completes");
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        let workspace = multi_workspace.workspace().read(cx);
+        // The first available member should become active
+        assert_eq!(workspace.database_id(), Some(member_app1));
+    });
+
+    // Variant: active member present stays active
+    let (_fs, multi_workspace, cx, _outgoing) = switch_locate_fixture(&["/t_fb/app3"], cx).await;
+    let second_member_missing = WorkspaceId(9911);
+    let member_app3 = WorkspaceId(9912); // Present, and active
+    let second_target = seed_switch_target(
+        "Slice3 FB2",
+        &[
+            (second_member_missing, &["/t_fb/missing2"]),
+            (member_app3, &["/t_fb/app3"]),
+        ],
+        member_app3, // active
+        cx,
+    )
+    .await;
+
+    let second_switch = start_switch(&multi_workspace, second_target, cx);
+    expect_recovery_prompt("missing2", cx);
+    cx.simulate_prompt_answer("Open Available (1 of 2)");
+    second_switch.await.expect("switch completes");
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        let workspace = multi_workspace.workspace().read(cx);
+        assert_eq!(
+            workspace.database_id(),
+            Some(member_app3),
+            "Active member is present, should stay active"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_open_available_commits_unnamed_and_survives_checkpoint_and_quit(
+    cx: &mut TestAppContext,
+) {
+    let (fs, multi_workspace, cx, _outgoing) = switch_locate_fixture(&["/t_ch/app1"], cx).await;
+
+    let member_missing = WorkspaceId(10101); // Missing
+    let member_app = WorkspaceId(10102);
+
+    let target = seed_switch_target(
+        "Slice3 Detached",
+        &[
+            (member_missing, &["/t_ch/missing"]),
+            (member_app, &["/t_ch/app1"]),
+        ],
+        member_app,
+        cx,
+    )
+    .await;
+
+    let switch = start_switch(&multi_workspace, target, cx);
+    expect_recovery_prompt("missing", cx);
+
+    cx.simulate_prompt_answer("Open Available (1 of 2)");
+
+    switch.await.expect("switch completes");
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(
+            multi_workspace.active_configuration_id(),
+            None,
+            "Committed as unnamed"
+        );
+        assert_eq!(
+            multi_workspace.workspace_tab_heading_label(cx).as_ref(),
+            "Workspaces",
+            "the heading names no configuration"
+        );
+    });
+
+    let _workspace = open_workspace_in_window(&multi_workspace, &fs, "/t_ch/app2", cx).await;
+    let quit_task =
+        multi_workspace.update(cx, |multi_workspace, cx| multi_workspace.app_will_quit(cx));
+    quit_task.await;
+
+    assert_eq!(
+        configuration_members(target, cx),
+        vec![
+            (member_missing, vec![PathBuf::from("/t_ch/missing")]),
+            (member_app, vec![PathBuf::from("/t_ch/app1")]),
+        ],
+        "the saved configuration keeps every member at its old path"
+    );
+    assert_eq!(
+        workspace_configuration(target, cx)
+            .expect("the configuration still exists")
+            .active_member,
+        Some(member_app)
+    );
+}
+
+#[gpui::test]
+async fn test_open_available_choice_survives_restart(cx: &mut TestAppContext) {
+    let (fs, multi_workspace, cx, _outgoing) =
+        switch_locate_fixture(&["/t_rs/app1", "/t_rs/app2"], cx).await;
+
+    let member_missing = WorkspaceId(10201); // Missing
+    let member_app = WorkspaceId(10202);
+
+    let target = seed_switch_target(
+        "Slice3 Rs",
+        &[
+            (member_missing, &["/t_rs/missing"]),
+            (member_app, &["/t_rs/app1"]),
+        ],
+        member_app,
+        cx,
+    )
+    .await;
+
+    let switch = start_switch(&multi_workspace, target, cx);
+    expect_recovery_prompt("missing", cx);
+
+    // Simulate bumping outgoing generation (restart) by opening a workspace while prompt is open
+    open_workspace_in_window(&multi_workspace, &fs, "/t_rs/extra", cx).await;
+
+    cx.simulate_prompt_answer("Open Available (1 of 2)");
+
+    switch.await.expect("switch completes");
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        let workspace = multi_workspace.workspace().read(cx);
+        // It should commit successfully without prompting again
+        assert_eq!(workspace.database_id(), Some(member_app));
+    });
+}
+
+#[gpui::test]
+async fn test_open_available_then_switch_away_prompts_to_save(cx: &mut TestAppContext) {
+    let (_fs, multi_workspace, cx, _outgoing) = switch_locate_fixture(&["/t_sa/app1"], cx).await;
+
+    let member_missing = WorkspaceId(10301); // Missing
+    let member_app = WorkspaceId(10302);
+
+    let target = seed_switch_target(
+        "Slice3 SA",
+        &[
+            (member_missing, &["/t_sa/missing"]),
+            (member_app, &["/t_sa/app1"]),
+        ],
+        member_app,
+        cx,
+    )
+    .await;
+
+    let switch = start_switch(&multi_workspace, target, cx);
+    expect_recovery_prompt("missing", cx);
+    cx.simulate_prompt_answer("Open Available (1 of 2)");
+    switch.await.expect("switch completes");
+    cx.run_until_parked();
+
+    let second_target = seed_switch_target(
+        "Slice3 SA2",
+        &[(WorkspaceId(10303), &["/t_sa/app1"])],
+        WorkspaceId(10303),
+        cx,
+    )
+    .await;
+
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.switch_workspace_configuration_from_ui(
+            second_target,
+            "Slice3 SA2".to_string(),
+            window,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    assert!(
+        cx.has_pending_prompt(),
+        "Should prompt to save current workspace"
+    );
+    cx.simulate_prompt_answer("Switch Without Saving");
+
+    // Test the second switch completes
+    cx.run_until_parked();
+    multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        assert_eq!(
+            multi_workspace.active_configuration_id(),
+            Some(second_target)
+        );
+    });
+
+    assert_eq!(
+        configuration_members(target, cx),
+        vec![
+            (member_missing, vec![PathBuf::from("/t_sa/missing")]),
+            (member_app, vec![PathBuf::from("/t_sa/app1")]),
+        ],
+        "Switch Without Saving leaves the saved configuration unchanged"
+    );
+    assert_eq!(
+        workspace_configuration(target, cx)
+            .expect("the configuration still exists")
+            .active_member,
+        Some(member_app)
+    );
 }

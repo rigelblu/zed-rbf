@@ -36,6 +36,10 @@ use crate::{
     persistence::{
         WorkspaceConfigurationMutation, WorkspaceConfigurationStore,
         model::{MultiWorkspaceState, WorkspaceConfigurationId, WorkspaceConfigurationMember},
+        workspace_member_was_already_moved,
+    },
+    workspace_folder_locate::{
+        LocateEntry, LocateOutcome, UnavailableWorkspaceMember, locate_workspace_folder,
     },
     workspace_tabs::workspace_tab_paths_are_empty,
 };
@@ -542,6 +546,98 @@ enum WorkspaceConfigurationTargetMember {
     Serialized(crate::persistence::model::SerializedWorkspace),
 }
 
+/// A folder of a saved target member that the switch's availability preflight found
+/// missing on disk.
+struct MissingTargetFolder {
+    member: UnavailableWorkspaceMember,
+    /// The member's saved folders in displayed order, the missing one included.
+    member_folders: Vec<PathBuf>,
+}
+
+/// The folder the switch just relocated, kept for exactly one preflight.
+///
+/// If the preflight right after a `Relocated` outcome still finds that member's folder
+/// missing — at the picked path or the old one — the switch fails instead of prompting
+/// again, so a folder that vanishes as soon as it is picked can't loop the user.
+struct RelocatedFolder {
+    workspace_id: WorkspaceId,
+    old_root: PathBuf,
+    new_root: PathBuf,
+}
+
+impl RelocatedFolder {
+    fn is_missing_again(&self, missing: &[MissingTargetFolder]) -> bool {
+        missing.iter().any(|folder| {
+            folder.member.workspace_id == self.workspace_id
+                && (folder.member.old_root == self.old_root
+                    || folder.member.old_root == self.new_root)
+        })
+    }
+}
+
+pub(crate) const WORKSPACE_FOLDER_NOT_FOUND: &str = "Workspace Folder Not Found";
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub(crate) enum RecoveryAnswer {
+    Locate,
+    OpenAvailable,
+    Cancel,
+}
+
+/// The recovery prompt's buttons, primary first; `Open Available` appears only when a workspace is available.
+pub(crate) fn missing_folder_answers(
+    label: &str,
+    available_count: usize,
+    member_count: usize,
+) -> Vec<(String, RecoveryAnswer)> {
+    let mut answers = vec![(format!("Locate “{label}”…"), RecoveryAnswer::Locate)];
+    if available_count > 0 {
+        answers.push((
+            format!("Open Available ({} of {})", available_count, member_count),
+            RecoveryAnswer::OpenAvailable,
+        ));
+    }
+    answers.push(("Cancel".to_string(), RecoveryAnswer::Cancel));
+    answers
+}
+
+fn missing_folder_detail(
+    configuration_name: &str,
+    folder: &MissingTargetFolder,
+    others: usize,
+    available_count: usize,
+) -> String {
+    let mut detail = format!(
+        "“{configuration_name}” couldn’t find the folder for “{}” at {}.",
+        folder.member.label,
+        folder.member.old_root.display()
+    );
+    if others > 0 {
+        let noun = if others == 1 { "folder" } else { "folders" };
+        detail.push_str(&format!(" {others} other {noun} also missing."));
+    }
+    if available_count == 1 {
+        detail.push_str(&format!(
+            "\n\nLocate the folder to update “{configuration_name}”, or open the 1 available workspace."
+        ));
+    } else if available_count > 1 {
+        detail.push_str(&format!(
+            "\n\nLocate the folder to update “{configuration_name}”, or open the {available_count} available workspaces."
+        ));
+    } else {
+        detail.push_str(&format!(
+            "\n\nLocate the folder to update “{configuration_name}”."
+        ));
+    }
+    detail
+}
+
+enum RecoveryChoice {
+    Locate(LocateOutcome),
+    OpenAvailable,
+    Cancel,
+}
+
 #[derive(Debug)]
 struct WorkspaceConfigurationSwitchCanceled;
 
@@ -645,6 +741,10 @@ pub struct MultiWorkspace {
     configuration_switch_gate_focus_handle: FocusHandle,
     #[cfg(test)]
     configuration_switch_test_pause: Option<WorkspaceConfigurationSwitchTestPause>,
+    /// How many members a switch has started staging, so tests can prove the
+    /// availability preflight runs before any of them.
+    #[cfg(test)]
+    configuration_switch_staged_members: usize,
     #[cfg(test)]
     configuration_save_test_pause: Option<WorkspaceConfigurationSaveTestPause>,
     _serialize_task: Option<Task<()>>,
@@ -1059,6 +1159,11 @@ impl MultiWorkspace {
     }
 
     #[cfg(test)]
+    pub(crate) fn configuration_switch_staged_members(&self) -> usize {
+        self.configuration_switch_staged_members
+    }
+
+    #[cfg(test)]
     pub(crate) fn pause_configuration_switch_for_test(
         &mut self,
         stage: WorkspaceConfigurationSwitchTestStage,
@@ -1156,15 +1261,20 @@ impl MultiWorkspace {
         }
     }
 
+    /// `source` is read directly rather than through its window handle: the switch runs
+    /// this while its own window is being updated, and a window handle can't be read then,
+    /// so members open in the switching window used to be missed and restaged.
     fn resolve_workspace_configuration_target(
         configuration: &crate::persistence::model::WorkspaceConfiguration,
-        source_window_id: WindowId,
+        source: &MultiWorkspace,
         cx: &App,
     ) -> Result<Vec<WorkspaceConfigurationTargetMember>> {
         let db = crate::persistence::WorkspaceDb::global(cx);
         let mut target = Vec::with_capacity(configuration.members.len());
         for member in &configuration.members {
-            let mut local_workspace = None;
+            let is_member = |workspace: &&Entity<Workspace>| {
+                workspace.read(cx).database_id() == Some(member.workspace_id)
+            };
             for window in cx
                 .windows()
                 .into_iter()
@@ -1174,20 +1284,17 @@ impl MultiWorkspace {
                     Ok(multi_workspace) => multi_workspace,
                     Err(_) => continue,
                 };
-                let matching_workspace = multi_workspace.workspaces().find(|workspace| {
-                    workspace.read(cx).database_id() == Some(member.workspace_id)
-                });
-                let Some(matching_workspace) = matching_workspace else {
-                    continue;
-                };
                 anyhow::ensure!(
-                    multi_workspace.window_id == source_window_id,
+                    multi_workspace.window_id == source.window_id
+                        || !multi_workspace
+                            .workspaces()
+                            .any(|workspace| is_member(&workspace)),
                     "“{}” can’t be switched to because workspace “{}” is open in another window",
                     configuration.name,
                     Self::workspace_configuration_member_label(member)
                 );
-                local_workspace = Some(matching_workspace.clone());
             }
+            let local_workspace = source.workspaces().find(is_member).cloned();
 
             if let Some(workspace) = local_workspace {
                 target.push(WorkspaceConfigurationTargetMember::Live(workspace));
@@ -1222,8 +1329,97 @@ impl MultiWorkspace {
         Ok(target)
     }
 
-    fn target_is_unowned_elsewhere(
+    /// Every missing folder of the target's saved members, in member order and then each
+    /// workspace's displayed folder order. Reads the same paths `prepare_local_strict`
+    /// checks. An `fs` error is a switch error, not a missing folder.
+    async fn missing_target_folders(
         configuration: &crate::persistence::model::WorkspaceConfiguration,
+        target: &[WorkspaceConfigurationTargetMember],
+        fs: &dyn Fs,
+    ) -> Result<Vec<MissingTargetFolder>> {
+        let mut missing = Vec::new();
+        for (member, target_member) in configuration.members.iter().zip(target) {
+            let WorkspaceConfigurationTargetMember::Serialized(serialized_workspace) =
+                target_member
+            else {
+                continue;
+            };
+            let member_folders = serialized_workspace
+                .paths
+                .ordered_paths()
+                .cloned()
+                .collect::<Vec<_>>();
+            for folder in &member_folders {
+                if fs.metadata(folder).await?.is_none() {
+                    missing.push(MissingTargetFolder {
+                        member: UnavailableWorkspaceMember::new(
+                            member.workspace_id,
+                            folder.clone(),
+                        ),
+                        member_folders: member_folders.clone(),
+                    });
+                }
+            }
+        }
+        Ok(missing)
+    }
+
+    /// The recovery prompt for one missing folder, then — on `Locate…` — the shared
+    /// locate flow.
+    async fn recover_missing_folder(
+        this: WeakEntity<Self>,
+        configuration_id: WorkspaceConfigurationId,
+        configuration_name: &str,
+        folder: &MissingTargetFolder,
+        others: usize,
+        available_count: usize,
+        member_count: usize,
+        cx: &mut gpui::AsyncWindowContext,
+    ) -> Result<RecoveryChoice> {
+        let answers = missing_folder_answers(&folder.member.label, available_count, member_count);
+        let detail = missing_folder_detail(configuration_name, folder, others, available_count);
+        let prompt = cx.update(|window, cx| {
+            let labels = answers
+                .iter()
+                .map(|(label, _)| label.as_str())
+                .collect::<Vec<_>>();
+            window.prompt(
+                gpui::PromptLevel::Warning,
+                WORKSPACE_FOLDER_NOT_FOUND,
+                Some(&detail),
+                &labels,
+                cx,
+            )
+        })?;
+
+        let answer = prompt
+            .await
+            .log_err()
+            .and_then(|answer_index| answers.get(answer_index))
+            .map(|(_, answer)| answer);
+
+        match answer {
+            Some(RecoveryAnswer::Locate) => {
+                let outcome = locate_workspace_folder(
+                    this,
+                    configuration_id,
+                    &folder.member,
+                    &LocateEntry::Switch {
+                        member_folders: folder.member_folders.clone(),
+                    },
+                    cx,
+                )
+                .await?;
+                Ok(RecoveryChoice::Locate(outcome))
+            }
+            Some(RecoveryAnswer::OpenAvailable) => Ok(RecoveryChoice::OpenAvailable),
+            Some(RecoveryAnswer::Cancel) | None => Ok(RecoveryChoice::Cancel),
+        }
+    }
+
+    fn target_is_unowned_elsewhere(
+        configuration_name: &str,
+        members: &[crate::persistence::model::WorkspaceConfigurationMember],
         target: &[Entity<Workspace>],
         source_window_id: WindowId,
         cx: &App,
@@ -1240,7 +1436,7 @@ impl MultiWorkspace {
             if multi_workspace.window_id == source_window_id {
                 continue;
             }
-            for (workspace, member) in target.iter().zip(&configuration.members) {
+            for (workspace, member) in target.iter().zip(members) {
                 let workspace = workspace.read(cx);
                 let workspace_id = workspace.database_id();
                 let workspace_identity = workspace.project_group_key(cx).path_list().clone();
@@ -1251,7 +1447,7 @@ impl MultiWorkspace {
                             || candidate.project_group_key(cx).path_list() == &workspace_identity
                     }),
                     "“{}” can’t be switched to because workspace “{}” is open in another window",
-                    configuration.name,
+                    configuration_name,
                     Self::workspace_configuration_member_label(member)
                 );
             }
@@ -1274,7 +1470,7 @@ impl MultiWorkspace {
 
     fn commit_workspace_configuration(
         &mut self,
-        configuration_id: WorkspaceConfigurationId,
+        configuration_id: Option<WorkspaceConfigurationId>,
         target: Vec<Entity<Workspace>>,
         active_member: WorkspaceId,
         window: &mut Window,
@@ -1318,7 +1514,7 @@ impl MultiWorkspace {
             .collect();
         self.project_groups = project_groups;
         self.active_workspace_id.set(active_workspace.entity_id());
-        self.active_configuration_id = Some(configuration_id);
+        self.active_configuration_id = configuration_id;
         self.configuration_checkpoint_error = None;
         self.workspace_configuration_generation += 1;
 
@@ -1392,6 +1588,8 @@ impl MultiWorkspace {
                     }
                 }
 
+                let mut just_relocated: Option<RelocatedFolder> = None;
+                let mut open_available_chosen = false;
                 loop {
                     let (outgoing_configuration_id, outgoing_snapshot) =
                         this.read_with(cx, |this, cx| {
@@ -1406,16 +1604,110 @@ impl MultiWorkspace {
                             .cloned()
                             .context("that workspace configuration no longer exists")
                     })??;
-                    let target_members = cx.update(|_window, cx| {
+                    let target_members = this.read_with(cx, |this, cx| {
                         Self::resolve_workspace_configuration_target(
                             &target_configuration,
-                            source_window_id,
+                            this,
                             cx,
                         )
                     })??;
 
+                    // `#zed-76`: catch missing folders here, before anything is staged,
+                    // so the user can locate them. `prepare_local_strict` still checks
+                    // each path, as a backstop for a folder that vanishes mid-switch.
+                    let relocated_last = just_relocated.take();
+                    let missing = Self::missing_target_folders(
+                        &target_configuration,
+                        &target_members,
+                        app_state.fs.as_ref(),
+                    )
+                    .await?;
+
+                    let mut missing_member_ids = HashSet::default();
+                    for missing_folder in &missing {
+                        missing_member_ids.insert(missing_folder.member.workspace_id);
+                    }
+                    let member_count = target_members.len();
+                    let available_count = member_count - missing_member_ids.len();
+
+                    if !open_available_chosen {
+                        if let Some(folder) = missing.first() {
+                            if let Some(relocated) = relocated_last
+                                && relocated.is_missing_again(&missing)
+                            {
+                                anyhow::bail!(
+                                    "“{}” is still missing at {} after it was located",
+                                    folder.member.label,
+                                    folder.member.old_root.display()
+                                );
+                            }
+                            let outcome = Self::recover_missing_folder(
+                                this.clone(),
+                                configuration_id,
+                                &target_configuration.name,
+                                folder,
+                                missing.len() - 1,
+                                available_count,
+                                member_count,
+                                cx,
+                            )
+                            .await;
+                            match outcome {
+                                Ok(RecoveryChoice::Locate(LocateOutcome::Relocated {
+                                    new_root,
+                                })) => {
+                                    just_relocated = Some(RelocatedFolder {
+                                        workspace_id: folder.member.workspace_id,
+                                        old_root: folder.member.old_root.clone(),
+                                        new_root,
+                                    });
+                                }
+                                Ok(RecoveryChoice::Locate(LocateOutcome::Collision(
+                                    mut message,
+                                ))) => {
+                                    // The modal shows it after "Cannot relocate: "; here it opens the detail.
+                                    if let Some(first_letter) = message.get_mut(0..1) {
+                                        first_letter.make_ascii_uppercase();
+                                    }
+                                    let alert = cx.update(|window, cx| {
+                                        window.prompt(
+                                            gpui::PromptLevel::Warning,
+                                            "Couldn’t Relocate",
+                                            Some(&message),
+                                            &["OK"],
+                                            cx,
+                                        )
+                                    })?;
+                                    alert.await.log_err();
+                                }
+                                Ok(RecoveryChoice::Locate(LocateOutcome::Canceled))
+                                | Ok(RecoveryChoice::Cancel) => {
+                                    return Err(WorkspaceConfigurationSwitchCanceled.into());
+                                }
+                                Ok(RecoveryChoice::OpenAvailable) => {
+                                    open_available_chosen = true;
+                                }
+                                // Something else moved the member while the picker was open;
+                                // the restart finds it wherever it is now.
+                                Err(error) if workspace_member_was_already_moved(&error) => {}
+                                Err(error) => return Err(error),
+                            }
+                            if !open_available_chosen {
+                                continue;
+                            }
+                        }
+                    }
+
                     let mut target = Vec::with_capacity(target_members.len());
-                    for member in target_members {
+                    for (member, configuration_member) in target_members
+                        .into_iter()
+                        .zip(&target_configuration.members)
+                    {
+                        if open_available_chosen {
+                            if missing_member_ids.contains(&configuration_member.workspace_id) {
+                                continue;
+                            }
+                        }
                         match member {
                             WorkspaceConfigurationTargetMember::Live(workspace) => {
                                 target.push(workspace)
@@ -1423,6 +1715,10 @@ impl MultiWorkspace {
                             WorkspaceConfigurationTargetMember::Serialized(
                                 serialized_workspace,
                             ) => {
+                                #[cfg(test)]
+                                this.update(cx, |this, _cx| {
+                                    this.configuration_switch_staged_members += 1;
+                                })?;
                                 let prepared = cx.update(|_window, cx| {
                                     Workspace::prepare_local_strict(
                                         serialized_workspace,
@@ -1444,7 +1740,12 @@ impl MultiWorkspace {
                     )
                     .await?;
 
-                    for workspace in &outgoing_snapshot.workspaces {
+                    // Members carried into the target stay open, so their dirty items aren't closing.
+                    for workspace in outgoing_snapshot
+                        .workspaces
+                        .iter()
+                        .filter(|workspace| !target.contains(workspace))
+                    {
                         let should_continue = workspace
                             .update_in(cx, |workspace, window, cx| {
                                 workspace.prompt_to_save_or_discard_dirty_items(window, cx)
@@ -1514,9 +1815,21 @@ impl MultiWorkspace {
                         }
                     }
 
-                    let active_member = target_configuration
+                    let mut active_member = target_configuration
                         .active_member
                         .context("the target configuration has no active workspace")?;
+                    let mut valid_members = target_configuration.members.clone();
+                    if open_available_chosen {
+                        valid_members
+                            .retain(|member| !missing_member_ids.contains(&member.workspace_id));
+                        if missing_member_ids.contains(&active_member) {
+                            active_member = valid_members
+                                .first()
+                                .map(|member| member.workspace_id)
+                                .context("no available members")?;
+                        }
+                    }
+
                     #[cfg(test)]
                     Self::reach_configuration_switch_test_pause(
                         &this,
@@ -1538,13 +1851,18 @@ impl MultiWorkspace {
                             "the target workspace configuration changed during restore"
                         );
                         Self::target_is_unowned_elsewhere(
-                            &target_configuration,
+                            &target_configuration.name,
+                            &valid_members,
                             &target,
                             source_window_id,
                             cx,
                         )?;
                         this.commit_workspace_configuration(
-                            configuration_id,
+                            if open_available_chosen {
+                                None
+                            } else {
+                                Some(configuration_id)
+                            },
                             target,
                             active_member,
                             window,
@@ -1683,6 +2001,8 @@ impl MultiWorkspace {
             configuration_switch_gate_focus_handle: cx.focus_handle(),
             #[cfg(test)]
             configuration_switch_test_pause: None,
+            #[cfg(test)]
+            configuration_switch_staged_members: 0,
             #[cfg(test)]
             configuration_save_test_pause: None,
             _serialize_task: None,
@@ -3594,7 +3914,10 @@ impl MultiWorkspace {
     /// every retained workspace, capture a live snapshot for the active one, and rebind
     /// each retained row to this window's session so restart reopens them all. Upstream's
     /// version only drains pending tasks, which leaves stale rows split across window ids.
-    fn app_will_quit(&mut self, cx: &mut Context<Self>) -> impl Future<Output = ()> + use<> {
+    pub(crate) fn app_will_quit(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> impl Future<Output = ()> + use<> {
         let mut tasks: Vec<Task<()>> = Vec::new();
         let mut configuration_checkpoint = None;
         let active_configuration_id = self.active_configuration_id;

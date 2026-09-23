@@ -19,7 +19,7 @@ use ui_input::InputField;
 use util::ResultExt as _;
 
 use crate::{
-    ModalView, MultiWorkspace, SaveWorkspaceConfigurationAs, Workspace, WorkspaceId,
+    ModalView, MultiWorkspace, SaveWorkspaceConfigurationAs, Workspace,
     multi_workspace::{
         ManageWorkspaceConfigurations, SelectNextWorkspaceConfiguration,
         SelectPreviousWorkspaceConfiguration, Sidebar, SidebarEvent, SidebarSide,
@@ -27,6 +27,9 @@ use crate::{
     persistence::{
         StoreBlock, WorkspaceConfigurationMutation, WorkspaceConfigurationStore, WorkspaceDb,
         model::WorkspaceConfigurationId,
+    },
+    workspace_folder_locate::{
+        LocateEntry, LocateOutcome, UnavailableWorkspaceMember, locate_workspace_folder,
     },
 };
 
@@ -830,6 +833,21 @@ impl MultiWorkspaceTestExt for Entity<MultiWorkspace> {
 }
 
 impl MultiWorkspace {
+    fn active_configuration_name(&self, cx: &App) -> Option<String> {
+        self.active_configuration_id()
+            .and_then(|configuration_id| {
+                WorkspaceConfigurationStore::try_global(cx)
+                    .and_then(|store| store.configuration(configuration_id))
+            })
+            .map(|configuration| configuration.name.clone())
+    }
+
+    pub(crate) fn workspace_tab_heading_label(&self, cx: &App) -> SharedString {
+        self.active_configuration_name(cx)
+            .map(|name| format!("Workspaces: {name}").into())
+            .unwrap_or_else(|| "Workspaces".into())
+    }
+
     /// Takes the handle rather than reaching for `cx.weak_entity()` so it can be
     /// called from the occupant's render, where `cx` is `Context<WorkspacesSidebar>`
     /// and the only `MultiWorkspace` handle in scope is the one the occupant holds.
@@ -838,17 +856,8 @@ impl MultiWorkspace {
         multi_workspace: WeakEntity<MultiWorkspace>,
         cx: &App,
     ) -> AnyElement {
-        let active_name = self
-            .active_configuration_id()
-            .and_then(|configuration_id| {
-                WorkspaceConfigurationStore::try_global(cx)
-                    .and_then(|store| store.configuration(configuration_id))
-            })
-            .map(|configuration| configuration.name.clone());
-        let label: SharedString = active_name
-            .as_ref()
-            .map(|name| format!("Workspaces: {name}").into())
-            .unwrap_or_else(|| "Workspaces".into());
+        let active_name = self.active_configuration_name(cx);
+        let label = self.workspace_tab_heading_label(cx);
         let is_stale = self.configuration_checkpoint_error().is_some();
         let mut tooltip = active_name
             .map(|name| format!("Workspace Configurations: {name}"))
@@ -1351,13 +1360,6 @@ enum WorkspaceConfigurationManagementMode {
     },
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct UnavailableWorkspaceMember {
-    pub(crate) workspace_id: WorkspaceId,
-    pub(crate) old_root: PathBuf,
-    pub(crate) label: String,
-}
-
 pub(crate) struct WorkspaceConfigurationManagementModal {
     focus_handle: FocusHandle,
     delete_focus_handle: FocusHandle,
@@ -1515,15 +1517,8 @@ impl WorkspaceConfigurationManagementModal {
                     for path in paths {
                         let exists = app_state.fs.metadata(&path).await.ok().flatten().is_some();
                         if !exists {
-                            let label = path
-                                .file_name()
-                                .map(|s| s.to_string_lossy().to_string())
-                                .unwrap_or_else(|| path.to_string_lossy().to_string());
-                            unavailable_in_config.push(UnavailableWorkspaceMember {
-                                workspace_id: member.workspace_id,
-                                old_root: path,
-                                label,
-                            });
+                            unavailable_in_config
+                                .push(UnavailableWorkspaceMember::new(member.workspace_id, path));
                             break;
                         }
                     }
@@ -1555,78 +1550,25 @@ impl WorkspaceConfigurationManagementModal {
         self.error = None;
         cx.notify();
 
-        let prompt_title = format!("Locate “{}”", member.label);
-        let prompt = cx.prompt_for_paths(gpui::PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: false,
-            prompt: Some(SharedString::from(prompt_title)),
-        });
-
+        let multi_workspace = self.multi_workspace.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let result = prompt.await;
-            let selected_path = match result {
-                Ok(Ok(Some(mut paths))) if !paths.is_empty() => paths.remove(0),
-                _ => {
-                    this.update_in(cx, |this, _window, cx| {
-                        this.busy = false;
-                        cx.notify();
-                    })?;
-                    return anyhow::Ok(());
-                }
-            };
-
-            // The picker opens wherever macOS last left it, and confirming with nothing
-            // selected returns that folder. A differently named folder is the signature
-            // of that one-click accident, so make the user confirm it before any write.
-            if selected_path.file_name() != member.old_root.file_name() {
-                let selected_name = selected_path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| selected_path.display().to_string());
-                // Choose Another Folder… comes first so it is the default (Return) button:
-                // a reflexive confirm must not commit the folder we are asking about.
-                let use_selected = format!("Use “{selected_name}”");
-                let confirm = this.update_in(cx, |_, window, cx| {
-                    window.prompt(
-                        PromptLevel::Warning,
-                        &format!("Relocate “{}” to “{selected_name}”?", member.label),
-                        Some(&format!(
-                            "The folder names don’t match.\n\nFrom: {}\nTo: {}",
-                            member.old_root.display(),
-                            selected_path.display()
-                        )),
-                        &["Choose Another Folder…", use_selected.as_str(), "Cancel"],
-                        cx,
-                    )
-                })?;
-                match confirm.await {
-                    Ok(0) => {
-                        this.update_in(cx, |this, window, cx| {
-                            this.busy = false;
-                            this.start_locate(configuration_id, member, window, cx);
-                        })?;
-                        return anyhow::Ok(());
-                    }
-                    Ok(1) => {}
-                    _ => {
-                        this.update_in(cx, |this, _window, cx| {
-                            this.busy = false;
-                            cx.notify();
-                        })?;
-                        return anyhow::Ok(());
-                    }
-                }
-            }
-
-            this.update_in(cx, |this, window, cx| {
-                this.handle_located_path(configuration_id, member, selected_path, window, cx);
-            })?;
-            anyhow::Ok(())
+            let result = locate_workspace_folder(
+                multi_workspace,
+                configuration_id,
+                &member,
+                &LocateEntry::ManageModal,
+                cx,
+            )
+            .await;
+            this.update(cx, |this, cx| {
+                this.finish_locate(configuration_id, &member, result, cx)
+            })
         })
         .detach_and_log_err(cx);
     }
 
+    /// The second half of `Locate…`, for a folder already picked.
+    #[cfg(test)]
     pub(crate) fn handle_located_path(
         &mut self,
         configuration_id: WorkspaceConfigurationId,
@@ -1635,160 +1577,57 @@ impl WorkspaceConfigurationManagementModal {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let store = match WorkspaceConfigurationStore::try_global(cx) {
-            Some(store) => store,
-            None => {
-                self.busy = false;
-                cx.notify();
-                return;
-            }
-        };
-        let Some(configuration) = store.configuration(configuration_id) else {
-            self.busy = false;
-            cx.notify();
-            return;
-        };
-
-        let collision_in_config = configuration.members.iter().any(|m| {
-            m.workspace_id != member.workspace_id
-                && m.identity_paths.iter().any(|p| p == &selected_path)
-        });
-        if collision_in_config {
-            self.busy = false;
-            self.error = Some(format!(
-                "Cannot relocate: “{}” is already a member of this configuration.",
-                selected_path.display()
-            ));
-            cx.notify();
-            return;
-        }
-
-        if let Some(current_mw_entity) = self.multi_workspace.upgrade() {
-            let current_workspaces = current_mw_entity
-                .read(cx)
-                .workspaces()
-                .cloned()
-                .collect::<Vec<_>>();
-            for ws in current_workspaces {
-                let (ws_db_id, contains_selected) = {
-                    let ws_read = ws.read(cx);
-                    (
-                        ws_read.database_id(),
-                        ws_read
-                            .project_group_key(cx)
-                            .path_list()
-                            .paths()
-                            .contains(&selected_path),
-                    )
-                };
-                if ws_db_id == Some(member.workspace_id) {
-                    self.busy = false;
-                    self.error = Some(
-                        "Cannot relocate: this workspace is currently open in this window. Close it before relocating.".to_string(),
-                    );
-                    cx.notify();
-                    return;
-                }
-                if contains_selected {
-                    self.busy = false;
-                    self.error = Some(format!(
-                        "Cannot relocate: “{}” is currently open in this window.",
-                        selected_path.display()
-                    ));
-                    cx.notify();
-                    return;
-                }
-            }
-        }
-
-        let current_window_id = window.window_handle().window_id();
-        let my_multi_workspace_id = self.multi_workspace.entity_id();
-        let other_mw_entities = cx
-            .windows()
-            .into_iter()
-            .filter_map(|w| w.downcast::<MultiWorkspace>())
-            .filter(|w| w.window_id() != current_window_id)
-            .filter_map(|w| w.entity(cx).ok())
-            .filter(|e| e.entity_id() != my_multi_workspace_id)
-            .collect::<Vec<_>>();
-
-        for other_mw_entity in other_mw_entities {
-            let other_workspaces = other_mw_entity
-                .read(cx)
-                .workspaces()
-                .cloned()
-                .collect::<Vec<_>>();
-            for ws in other_workspaces {
-                let (ws_db_id, contains_selected) = {
-                    let ws_read = ws.read(cx);
-                    (
-                        ws_read.database_id(),
-                        ws_read
-                            .project_group_key(cx)
-                            .path_list()
-                            .paths()
-                            .contains(&selected_path),
-                    )
-                };
-                if ws_db_id == Some(member.workspace_id) {
-                    self.busy = false;
-                    self.error = Some(
-                        "Cannot relocate: this workspace is currently open in another window. Close it before relocating.".to_string(),
-                    );
-                    cx.notify();
-                    return;
-                }
-                if contains_selected {
-                    self.busy = false;
-                    self.error = Some(format!(
-                        "Cannot relocate: “{}” is currently open in another window.",
-                        selected_path.display()
-                    ));
-                    cx.notify();
-                    return;
-                }
-            }
-        }
-
         self.busy = true;
         self.error = None;
         cx.notify();
 
-        let relocate = WorkspaceConfigurationStore::mutate_global(
-            WorkspaceConfigurationMutation::RelocateWorkspace {
-                id: configuration_id,
-                workspace_id: member.workspace_id,
-                old_root: member.old_root,
-                new_root: selected_path,
-            },
+        let relocate = crate::workspace_folder_locate::relocate_to_located_folder(
+            &self.multi_workspace,
+            window.window_handle().window_id(),
+            configuration_id,
+            &member,
+            &LocateEntry::ManageModal,
+            selected_path,
             cx,
         );
-
         cx.spawn_in(window, async move |this, cx| {
             let result = relocate.await;
-            this.update_in(cx, |this, _window, cx| {
-                this.busy = false;
-                match result {
-                    Ok(_) => {
-                        this.error = None;
-                        this.check_unavailable_members(cx);
-                    }
-                    Err(error) => {
-                        log::error!(
-                            "failed to relocate workspace {:?} in configuration {:?}: {error:#}",
-                            member.workspace_id,
-                            configuration_id
-                        );
-                        this.error = Some(format!(
-                            "Couldn't Relocate Workspace Folder\n\nSee the Zed log for details: {error}"
-                        ));
-                    }
-                }
-                cx.notify();
-            })?;
-            anyhow::Ok(())
+            this.update(cx, |this, cx| {
+                this.finish_locate(configuration_id, &member, result, cx)
+            })
         })
         .detach_and_log_err(cx);
+    }
+
+    fn finish_locate(
+        &mut self,
+        configuration_id: WorkspaceConfigurationId,
+        member: &UnavailableWorkspaceMember,
+        result: anyhow::Result<LocateOutcome>,
+        cx: &mut Context<Self>,
+    ) {
+        self.busy = false;
+        match result {
+            Ok(LocateOutcome::Relocated { .. }) => {
+                self.error = None;
+                self.check_unavailable_members(cx);
+            }
+            Ok(LocateOutcome::Collision(message)) => {
+                self.error = Some(format!("Cannot relocate: {message}"));
+            }
+            Ok(LocateOutcome::Canceled) => {}
+            Err(error) => {
+                log::error!(
+                    "failed to relocate workspace {:?} in configuration {:?}: {error:#}",
+                    member.workspace_id,
+                    configuration_id
+                );
+                self.error = Some(format!(
+                    "Couldn't Relocate Workspace Folder\n\nSee the Zed log for details: {error}"
+                ));
+            }
+        }
+        cx.notify();
     }
 
     fn select_next(

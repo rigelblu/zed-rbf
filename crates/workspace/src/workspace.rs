@@ -29,6 +29,7 @@ mod toast_layer;
 mod toolbar;
 pub mod welcome;
 pub mod workspace_error;
+mod workspace_folder_locate;
 mod workspace_settings;
 pub mod workspace_tabs;
 

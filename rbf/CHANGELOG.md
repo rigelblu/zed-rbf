@@ -3,6 +3,10 @@ title: "Zed RBF Changelog"
 ---
 
 # 🔵⋯ [Unreleased]
+- 2026-09-22 - fix (ux) | repair a saved workspace configuration whose folder moved, from `Manage Workspace Configurations…` → `Locate…`, keeping its tabs, buffers and editor state — instead of a configuration you can no longer open; a picked folder with a different name asks first, with `Choose Another Folder…` as the safe default (#zed-76) [@zed-rbf]
+- 2026-09-23 - fix (ux) | switch to a configuration with a missing folder and fix it on the spot — `Workspace Folder Not Found` offers `Locate “<folder>”…` per missing folder, and a folder you already have open in the window is reused with its tabs — instead of `Couldn’t Switch` and a dead end (#zed-76) [@zed-rbf]
+- 2026-09-23 - feat (ux) | open the rest of a configuration when a folder can't be reached right now (an unmounted drive) — `Open Available (8 of 9)` opens what's there in an unnamed window and never saves the smaller set over your configuration, so the next switch finds all nine again (#zed-76) [@zed-rbf]
+- Note: switching now keeps a workspace shared by both configurations open as-is, with its splits, scroll and unsaved changes, instead of saving, closing and rebuilding it.
 
 ---
 
