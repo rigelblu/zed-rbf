@@ -118,6 +118,7 @@ The configured order is the display order. `~` and `$VAR` expand. Missing paths 
 - Restores open workspace tabs, layout, and edit states stably across app restarts
 - Grouped tab management and close controls directly on the tab strip
 - Save the current vertical-tab workspace set as a named configuration, then switch the same window between saved sets while restoring each workspace's latest editor and pane state
+- A saved configuration whose folder moved or is unreachable stays usable: `Locate…` it from `Manage Workspace Configurations…` or from the `Workspace Folder Not Found` prompt when you switch, or choose `Open Available (<N> of <M>)` to open the rest without changing the saved configuration. A workspace shared by both configurations stays open as-is across a switch (since `v0.66.0`)
 - The tab strip lives in the same window-level slot as the threads sidebar, with a bottom-bar icon each. Click one to load it, click it again to close the slot, click the other to swap. The two icons sit together at one end of the bar, separated from the rest
 - Both work with AI turned off: the slot holds the strip alone, and the threads icon does not render
 - The slot's width is drag-resizable and remembered per occupant; double-click the edge to reset. The strip never had this as a fixed 168px rail
