@@ -107,8 +107,12 @@ log "Log: $log_path"
 
 log ""
 log "== fetch =="
-if ! run_logged jj git fetch --remote upstream; then
-  log "Error: jj git fetch --remote upstream failed."
+# Only main: the sync needs nothing else, and a full fetch prunes upstream's deleted
+# branches. A jj command that imports git refs mid-fetch (jjui refreshing, a prompt)
+# then forks the operation, and the merge rebased ~2,200 upstream commits into
+# mutable copies on 2026-11-09. main only fast-forwards, so this fetch never prunes.
+if ! run_logged jj git fetch --remote upstream --branch main; then
+  log "Error: jj git fetch --remote upstream --branch main failed."
   exit 1
 fi
 
